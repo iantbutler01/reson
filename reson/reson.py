@@ -2,13 +2,26 @@
 from __future__ import annotations
 
 from asimov.services.inference_clients import InferenceClient, ChatMessage, ChatRole
-from typing import Callable, TypeVar, ParamSpec
+from typing import List, Dict, Any, AsyncGenerator, Optional, Type, TypeVar, get_origin, get_args, Callable, TypeVar, ParamSpec
 from reson.stores import StoreConfigBase, MemoryStore, MemoryStoreConfig, RedisStore, RedisStoreConfig, PostgresStore, PostgresStoreConfig, Store
 from asimov.asimov_base import AsimovBase
 from pydantic import PrivateAttr, Field
 
 import inspect, functools
 from typing import Callable, ParamSpec, TypeVar, Awaitable, Any, AsyncIterator
+import re
+import json
+from asimov.services.inference_clients import ChatMessage, ChatRole
+
+from reson.utils.parsers import OutputParser, get_default_parser
+
+from reson.utils.inference import (
+    create_google_gemini_api_client,
+    create_openrouter_inference_client,
+    create_anthropic_inference_client,
+    create_bedrock_inference_client,
+)
+from reson.tracing_inference_client import TracingInferenceClient
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -67,6 +80,7 @@ class Runtime(AsimovBase):
     _tools: dict[str, Callable] = PrivateAttr(default_factory=dict)
     _default_prompt: str = PrivateAttr(default="")
     _context: _Ctx = PrivateAttr(default=None)
+    _return_type: type | None = PrivateAttr(default=None)
     
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
@@ -86,21 +100,99 @@ class Runtime(AsimovBase):
         """Execute a single, non-streaming LLM call."""
         self.used = True
         prompt = prompt or self._default_prompt
-        return await _call_llm(prompt, self.model, self._tools, output_type, self.store)
+        # Use _return_type if output_type is not provided
+        effective_output_type = output_type if output_type is not None else self._return_type
+        return await _call_llm(prompt, self.model, self._tools, effective_output_type, self.store)
 
     async def run_stream(
         self,
         *,
-        prompt: str | None,
-        output_type: type,
+        prompt: str | None = None,
+        output_type: type | None = None,
     ) -> AsyncIterator[Any]:
         """Execute a streaming LLM call yielding chunks as they arrive."""
         self.used = True
         prompt = prompt or self._default_prompt
+        # Use _return_type if output_type is not provided
+        effective_output_type = output_type if output_type is not None else self._return_type
         async for chunk in _call_llm_stream(
-            prompt, self.model, self._tools, output_type, self.store
+            prompt, self.model, self._tools, effective_output_type, self.store
         ):
             yield chunk
+    
+    async def run_with_baml(
+        self,
+        *,
+        baml_request: Any,
+        output_type: type | None = None,
+    ):
+        """
+        Execute an LLM call using a BAML request.
+        
+        Args:
+            baml_request: A BAML request object
+            output_type: The type to parse into
+        """
+        self.used = True
+        try:
+            # Get the parser
+            from reson.utils.parsers import get_default_parser
+            parser = get_default_parser()
+            
+            # Attempt to access BAML parser methods if this is the BAML parser
+            if hasattr(parser, "extract_prompt_from_baml_request"):
+                # Extract the prompt from the BAML request
+                prompt = parser.extract_prompt_from_baml_request(baml_request)
+                
+                # Use _return_type if output_type is not provided
+                effective_output_type = output_type if output_type is not None else self._return_type
+                
+                # Call the LLM using the extracted prompt
+                return await _call_llm(prompt, self.model, self._tools, effective_output_type, self.store)
+            else:
+                # If not using BAML parser, use the BAML request directly
+                return await baml_request
+        except Exception as e:
+            raise RuntimeError(f"Error executing BAML request: {e}")
+    
+    async def run_stream_with_baml(
+        self,
+        *,
+        baml_request: Any,
+        output_type: type | None = None,
+    ) -> AsyncIterator[Any]:
+        """
+        Execute a streaming LLM call using a BAML request.
+        
+        Args:
+            baml_request: A BAML request object
+            output_type: The type to parse into
+        """
+        self.used = True
+        try:
+            # Get the parser
+            from reson.utils.parsers import get_default_parser
+            parser = get_default_parser()
+            
+            # Attempt to access BAML parser methods if this is the BAML parser
+            if hasattr(parser, "extract_prompt_from_baml_request"):
+                # Extract the prompt from the BAML request
+                prompt = parser.extract_prompt_from_baml_request(baml_request)
+                
+                # Use _return_type if output_type is not provided
+                effective_output_type = output_type if output_type is not None else self._return_type
+                
+                # Call the LLM using the extracted prompt
+                async for chunk in _call_llm_stream(
+                    prompt, self.model, self._tools, effective_output_type, self.store
+                ):
+                    yield chunk
+            else:
+                # If not using BAML parser, use the BAML request directly
+                async for chunk in baml_request.stream():
+                    yield chunk
+        except Exception as e:
+            raise RuntimeError(f"Error executing BAML streaming request: {e}")
 
     @property
     def context(self):
@@ -108,18 +200,70 @@ class Runtime(AsimovBase):
         return self._context
 
 
-import re
-from asimov.services.inference_clients import ChatMessage, ChatRole
-from typing import List, Dict, Any, AsyncGenerator
 
-from reson.utils.inference import (
-    create_google_gemini_api_client,
-    create_openrouter_inference_client,
-    create_anthropic_inference_client,
-    create_bedrock_inference_client,
-    create_google_anthropic_inference_client,
-)
-from reson.tracing_inference_client import TracingInferenceClient
+def _create_empty_value(output_type):
+    """
+    Create an appropriate empty value for the given type.
+    This properly handles generics like List, Dict, etc.
+    
+    Args:
+        output_type: The type to create an empty value for
+        
+    Returns:
+        An empty value appropriate for the type
+    """
+    # Handle None type
+    if output_type is None:
+        return None
+    
+    # Get origin and args for generic types
+    origin = get_origin(output_type)
+    args = get_args(output_type)
+    
+    # Handle list types (List[T])
+    if origin == list:
+        return []
+    
+    # Handle dict types (Dict[K, V])
+    if origin == dict:
+        return {}
+    
+    # Handle Union types (including Optional[T])
+    if origin == Union:
+        if type(None) in args:  # Handle Optional[T]
+            # Return None for Optional types
+            return None
+        else:
+            # For Union[A, B, ...], try to create empty A
+            return _create_empty_value(args[0])
+    
+    # Handle primitive types
+    if output_type == str:
+        return ""
+    if output_type == int:
+        return 0
+    if output_type == float:
+        return 0.0
+    if output_type == bool:
+        return False
+    
+    # Handle Pydantic models (v1 or v2)
+    if hasattr(output_type, "model_construct") or hasattr(output_type, "construct"):
+        try:
+            # Try to construct an empty instance with default values
+            if hasattr(output_type, "model_construct"):  # Pydantic v2
+                return output_type.model_construct()
+            else:  # Pydantic v1
+                return output_type.construct()
+        except Exception:
+            pass
+    
+    # Try direct instantiation with no args as fallback
+    try:
+        return output_type()
+    except Exception:
+        # If all else fails, return None
+        return None
 
 async def _create_inference_client(model_str, store=None):
     """Create an appropriate inference client based on the model string."""
@@ -133,13 +277,17 @@ async def _create_inference_client(model_str, store=None):
     if provider == "openrouter":
         client = create_openrouter_inference_client(model_name)
     elif provider == "anthropic":
-        client = create_anthropic_inference_client(model_name)
+        # Parse out thinking parameter if provided
+        thinking_match = re.match(r"(.+)@thinking=(\d+)", model_name)
+        if thinking_match:
+            model_name, thinking = thinking_match.groups()
+            client = create_anthropic_inference_client(model_name, thinking=int(thinking))
+        else:
+            client = create_anthropic_inference_client(model_name)
     elif provider == "bedrock":
         client = create_bedrock_inference_client(model_name)
     elif provider == "google-gemini":
         client = create_google_gemini_api_client(model_name)
-    elif provider == "google-anthropic":
-        client = create_google_anthropic_inference_client(model_name)
     else:
         raise ValueError(f"Unsupported provider: {provider}")
     
@@ -149,7 +297,7 @@ async def _create_inference_client(model_str, store=None):
 def _create_chat_message(prompt):
     """Convert a prompt string to a ChatMessage."""
     if isinstance(prompt, str):
-        return [ChatMessage(role=ChatRole.user, content=prompt)]
+        return [ChatMessage(role=ChatRole.USER, content=prompt)]
     return prompt
 
 def _convert_tools_to_tuple_format(tools_dict):
@@ -176,10 +324,29 @@ def _convert_tools_to_tuple_format(tools_dict):
     
     return formatted_tools
 
+def _get_parser_for_type(output_type=None) -> OutputParser:
+    """Get the appropriate parser for the given output type."""
+    # For now, just use the default parser
+    # In the future, we might select based on type or user configuration
+    return get_default_parser()
+
+import os  # Add import at the top if not already there
+
 async def _call_llm(prompt, model, tools, output_type, store=None):
     """Execute a non-streaming LLM call, possibly with tool use."""
+    print(f"Calling LLM with output type: {output_type}")
     client = await _create_inference_client(model, store)
-    messages = _create_chat_message(prompt)
+    
+    # Get the appropriate parser
+    parser = _get_parser_for_type(output_type)
+    
+    # Enhance the prompt with type information if output_type is provided
+    if output_type:
+        enhanced_prompt = parser.enhance_prompt(prompt, output_type)
+    else:
+        enhanced_prompt = prompt
+    
+    messages = _create_chat_message(enhanced_prompt)
     
     if tools:
         # Convert tools to the format expected by tool_chain
@@ -207,7 +374,17 @@ async def _call_llm(prompt, model, tools, output_type, store=None):
                 temperature=0.5,
             )
         
-        return output_type() if output_type else result
+        # If output_type is provided, parse the result
+        if output_type:
+            result_text = result if isinstance(result, str) else json.dumps(result)
+            parsed_result = parser.parse(result_text, output_type)
+            if parsed_result.success:
+                return parsed_result.value
+            else:
+                # If parsing fails, create an appropriate empty value based on type
+                return _create_empty_value(output_type)
+        else:
+            return result
     else:
         # Standard LLM call without tools
         result = await client.get_generation(
@@ -216,12 +393,69 @@ async def _call_llm(prompt, model, tools, output_type, store=None):
             top_p=0.9,
             temperature=0.5,
         )
-        return output_type() if output_type else result
+        
+        # If output_type is provided, parse the result
+        if output_type:
+            print(f"LLM Response to parse:\n{result[:500]}...")  # Print first 500 chars
+            
+            # Log enhanced prompt for debugging
+            print(f"Enhanced prompt was:\n{enhanced_prompt[:500]}...")
+            
+            parsed_result = parser.parse(result, output_type)
+            if parsed_result.success:
+                print(f"Successfully parsed result: {parsed_result.value}")
+                return parsed_result.value
+            else:
+                print(f"Parsing failed with error: {parsed_result.error}")
+                # Try a more aggressive approach to find any valid JSON in the response
+                try:
+                    import re
+                    json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', result)
+                    if json_match:
+                        json_str = json_match.group(0)
+                        print(f"Attempting to parse extracted JSON: {json_str[:100]}...")
+                        json_data = json.loads(json_str)
+                        
+                        # For List[Person], try to convert the JSON to the right type
+                        origin = get_origin(output_type)
+                        args = get_args(output_type)
+                        
+                        if origin == list and args:
+                            item_type = args[0]
+                            # Try to convert each item to the expected type
+                            if hasattr(item_type, "model_validate"):  # Pydantic v2
+                                items = [item_type.model_validate(item) for item in json_data]
+                                print(f"Manual JSON extraction succeeded with {len(items)} items")
+                                return items
+                except Exception as e:
+                    print(f"Manual JSON extraction failed: {e}")
+                
+                # If all parsing attempts fail, create an appropriate empty value
+                print(f"Returning empty value for type: {output_type}")
+                return _create_empty_value(output_type)
+        else:
+            return result
 
 async def _call_llm_stream(prompt, model, tools, output_type, store=None):
     """Execute a streaming LLM call, possibly with tool use."""
+    print(f"Streaming LLM call with output type: {output_type}")
     client = await _create_inference_client(model, store)
-    messages = _create_chat_message(prompt)
+    
+    # Get the appropriate parser
+    parser = _get_parser_for_type(output_type)
+    
+    # Enhance the prompt with type information if output_type is provided
+    if output_type:
+        enhanced_prompt = parser.enhance_prompt(prompt, output_type)
+    else:
+        enhanced_prompt = prompt
+    
+    messages = _create_chat_message(enhanced_prompt)
+    
+    # Create a streaming parser if output_type is provided
+    stream_parser = None
+    if output_type:
+        stream_parser = parser.create_stream_parser(output_type)
     
     if tools:
         # Convert tools to the format expected by tool_chain
@@ -232,28 +466,44 @@ async def _call_llm_stream(prompt, model, tools, output_type, store=None):
         
         try:
             # First try to use _unstructured_stream
-            result = await client._unstructured_stream(
+            async for chunk in client._unstructured_stream(
                 serialized_messages=serialized_messages,
                 system=None,
                 max_tokens=8192,
                 top_p=0.9,
                 temperature=0.5,
-            )
+            ):
+                if output_type and stream_parser:
+                    # Feed the chunk to the parser
+                    result = parser.feed_chunk(stream_parser, chunk)
+                    if result.value is not None:
+                        yield result.value
+                else:
+                    yield chunk
         except (AttributeError, NotImplementedError):
             # Fall back to _tool_chain_stream if _unstructured_stream is not available
-            result = await client._tool_chain_stream(
+            async for chunk in client._tool_chain_stream(
                 serialized_messages=serialized_messages,
                 tools=formatted_tools,
                 system=None,
                 max_tokens=8192,
                 top_p=0.9,
                 temperature=0.5,
-            )
+            ):
+                if output_type and stream_parser:
+                    # Feed the chunk to the parser
+                    chunk_str = chunk if isinstance(chunk, str) else json.dumps(chunk)
+                    result = parser.feed_chunk(stream_parser, chunk_str)
+                    if result.value is not None:
+                        yield result.value
+                else:
+                    yield chunk
         
-        if output_type:
-            yield output_type()
-        else:
-            yield result
+        # Validate the final result if using a parser
+        if output_type and stream_parser:
+            final_result = parser.validate_final(stream_parser)
+            if final_result.success and final_result.value is not None:
+                yield final_result.value
     else:
         # Standard streaming without tools
         full_output = ""
@@ -264,11 +514,19 @@ async def _call_llm_stream(prompt, model, tools, output_type, store=None):
             temperature=0.5,
         ):
             full_output += chunk
-            if output_type:
-                # In a real implementation, you might need partial parsing logic here
-                yield chunk
+            if output_type and stream_parser:
+                # Feed the chunk to the parser
+                result = parser.feed_chunk(stream_parser, chunk)
+                if result.value is not None:
+                    yield result.value
             else:
                 yield chunk
+        
+        # Validate the final result if using a parser
+        if output_type and stream_parser:
+            final_result = parser.validate_final(stream_parser)
+            if final_result.success and final_result.value is not None:
+                yield final_result.value
 
 
 # ───────── decorator ─────────
@@ -301,6 +559,9 @@ def agentic(
                 store=store_obj,
             )
             rt._default_prompt = default_prompt
+            # Set the return type from the function's signature
+            if ret_type != inspect.Signature.empty and ret_type is not None:
+                rt._return_type = ret_type
 
             ba = sig.bind_partial(*args, **kwargs, runtime=rt)
 
@@ -321,3 +582,6 @@ def agentic(
 
         return functools.wraps(fn)(wrapper)
     return decorator
+
+
+__all__ = ["agentic", "Runtime"]
