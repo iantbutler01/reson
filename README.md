@@ -4,6 +4,8 @@
 
 Reson helps you build AI agents that *actually work*. Instead of writing complex prompt chains or struggling with output parsing, you just define Python types for your outputs and reson handles the rest.
 
+Most AI frameworks get you 80% of the way there with nice demos, but fall apart when it's time to deploy to production. Reson solves that last crucial 20% because it's built on battle-tested implementation that's been running in production for over a year at [bismuth.sh](https://www.bismuth.sh)
+
 ## Getting Started
 
 ```bash
@@ -147,10 +149,6 @@ async def extract_with_baml(runtime: Runtime):
 ## Examples
 
 Check out the `example.py` and `example_generator.py` files for complete working examples showing how to use the various features of reson in realistic scenarios.
-
-## Production Ready, Not Just a Prototype
-
-Most AI frameworks get you 80% of the way there with nice demos, but fall apart when it's time to deploy to production. Reson solves that last crucial 20% because it's built on battle-tested infrastructure that's already running in production environments.
 
 ### Enterprise-Grade Features Included:
 
