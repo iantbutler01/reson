@@ -1,15 +1,16 @@
 """
-GASP-based implementation of OutputParser.
+Type-based implementation of OutputParser.
 
-This parser uses the gasp-py library to handle structured LLM outputs
-with type-aware parsing.
+This parser uses a type-aware approach to handle structured LLM outputs
+with automatic schema detection and validation.
 """
 
 import json
 import re
 from typing import Any, Dict, Optional, Type, TypeVar, Union, get_args, get_origin
 
-from gasp import Deserializable, Parser
+from gasp import Parser
+from reson.types import Deserializable
 from gasp.jinja_helpers import create_type_environment
 import jinja2
 
@@ -17,22 +18,22 @@ from .base import OutputParser, ParserResult
 
 T = TypeVar('T')
 
-# Jinja2 environment with GASP filters
+# Jinja2 environment with type filters
 _jinja_env = create_type_environment()
 _jinja_env.filters["json"] = lambda obj: json.dumps(obj, indent=2)
 
 
-class GASPParser(OutputParser[T]):
+class TypeParser(OutputParser[T]):
     """
-    Parser implementation using GASP.
+    Parser implementation using type annotations.
     
-    This implementation uses GASP's tag-based parsing with type annotations
+    This implementation uses tag-based parsing with type annotations
     to handle LLM outputs.
     """
     
     def parse(self, output: str, output_type: Type[T]) -> ParserResult[T]:
         """
-        Parse complete output with GASP.
+        Parse complete output with type information.
         
         Args:
             output: The complete LLM output
@@ -62,7 +63,7 @@ class GASPParser(OutputParser[T]):
     
     def create_stream_parser(self, output_type: Type[T]) -> Any:
         """
-        Create a GASP Parser for streaming.
+        Create a Parser for streaming.
         
         Args:
             output_type: The type to parse into
@@ -79,7 +80,7 @@ class GASPParser(OutputParser[T]):
     
     def feed_chunk(self, stream_parser, chunk: str) -> ParserResult[T]:
         """
-        Feed a chunk to the GASP Parser.
+        Feed a chunk to the Parser.
         
         Args:
             stream_parser: A tuple of (parser, output_type) from create_stream_parser
@@ -121,7 +122,7 @@ class GASPParser(OutputParser[T]):
             except Exception as utf8_err:
                 # In case of UTF-8 boundary errors, keep collecting chunks
                 # We'll try again when more data arrives
-                print(f"GASP parser chunk error (likely UTF-8 boundary): {utf8_err}")
+                print(f"Parser chunk error (likely UTF-8 boundary): {utf8_err}")
                 return ParserResult(
                     value=None,
                     is_partial=True,
@@ -138,7 +139,7 @@ class GASPParser(OutputParser[T]):
                 raw_output=raw_output
             )
         except Exception as e:
-            print(f"GASP parser general error: {e}")
+            print(f"Parser general error: {e}")
             return ParserResult(
                 error=e,
                 is_partial=True,
@@ -171,7 +172,7 @@ class GASPParser(OutputParser[T]):
                 raw_output=getattr(parser, "_buffer", "")
             )
         except Exception as e:
-            print(f"GASP validation error: {e}")
+            print(f"Validation error: {e}")
             return ParserResult(
                 error=e,
                 is_partial=False,
@@ -180,7 +181,7 @@ class GASPParser(OutputParser[T]):
     
     def enhance_prompt(self, prompt: str, output_type: Type[T]) -> str:
         """
-        Enhance a prompt with GASP type information.
+        Enhance a prompt with type information.
         
         Args:
             prompt: The original prompt
@@ -200,18 +201,18 @@ class GASPParser(OutputParser[T]):
             return interpolate_prompt(prompt, output_type, format_tag="return_type")
         except Exception as e:
             # If GASP's enhancement fails, return the original prompt
-            print(f"Error enhancing prompt with GASP: {e}")
+            print(f"Error enhancing prompt with type information: {e}")
             return prompt
     
     def _create_parser(self, output_type: Type[T]) -> Parser:
         """
-        Create a GASP Parser for a specific type.
+        Create a Parser for a specific type.
         
         Args:
             output_type: The type to parse into
             
         Returns:
-            A GASP Parser instance
+            A Parser instance
         """
         # Get the origin type for generics (List, Dict, etc)
         origin_type = get_origin(output_type)
@@ -225,7 +226,7 @@ class GASPParser(OutputParser[T]):
         if hasattr(output_type, "model_validate") or hasattr(output_type, "parse_obj"):
             return Parser.from_pydantic(output_type)
         
-        # For GASP Deserializable classes (non-generic only)
+        # For Deserializable classes (non-generic only)
         # Only use issubclass for actual classes, not generic types
         try:
             if hasattr(output_type, "__mro__") and Deserializable in output_type.__mro__:
@@ -241,7 +242,7 @@ class GASPParser(OutputParser[T]):
         """
         Convert a result to the proper typed object if needed, handling nested objects.
         
-        For Pydantic models, GASP may return a dict during streaming.
+        For Pydantic models, the parser may return a dict during streaming.
         We need to convert this to a properly typed object, including all nested models.
         
         Args:

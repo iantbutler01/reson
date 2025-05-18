@@ -148,12 +148,12 @@ def get_default_parser() -> OutputParser:
     Get the default OutputParser implementation.
     
     The default is determined by availability:
-    1. GASPParser if GASP is installed (should always be available)
+    1. TypeParser (should always be available)
     2. BAML parser if BAML is available
     
     Returns:
         An OutputParser instance
     """
-    # GASP should always be available in this codebase
-    from .gasp_parser import GASPParser
-    return GASPParser()
+    # TypeParser should always be available in this codebase
+    from .type_parser import TypeParser
+    return TypeParser()
