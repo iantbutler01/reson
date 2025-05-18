@@ -197,7 +197,7 @@ result = await runtime.run(prompt=prompt)
 
 ### Storage Backends
 
-Configure different storage backends for context and tracing:
+Configure different storage backends for context management:
 
 ```python
 from reson.stores import MemoryStoreConfig, RedisStoreConfig, PostgresStoreConfig
