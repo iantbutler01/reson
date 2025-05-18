@@ -46,7 +46,7 @@ No need to worry about parsing JSON, handling errors, or crafting the perfect pr
 
 ### Type-Driven Responses
 
-Just define your output types using Pydantic models, Deserializable classes, or basic Python type hints, and reson will make sure the LLM generates outputs that match that structure.
+Just define your output types using Pydantic models, Deserializable classes, or basic Python type hints for scalars, and reson will make sure the LLM generates outputs that match that structure.
 
 ```python
 from pydantic import BaseModel  # Option 1: Pydantic models
