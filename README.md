@@ -146,6 +146,129 @@ async def extract_with_baml(runtime: Runtime):
     return await runtime.run_with_baml(baml_request=request)
 ```
 
+## Gradual complexity when you need it
+
+### Jinja2 Templating in Docstrings
+
+Your docstrings can use Jinja2 template syntax for dynamic prompt generation:
+
+```python
+@agentic(model="openrouter:openai/gpt-4o")
+async def extract_people(people_list: List[str], runtime: Runtime) -> List[Person]:
+    """
+    Extract people information from the following descriptions:
+    
+    {% for person_desc in people_list %}
+    Person {{ loop.index }}: {{ person_desc }}
+    {% endfor %}
+    
+    Return a list of Person objects with names, ages, and skills.
+    
+    {{return_type}}
+    """
+    return await runtime.run()
+```
+
+### Detailed Type Guidance with {{return_type}}
+
+The special `{{return_type}}` placeholder automatically inserts type information:
+
+```python
+@agentic(model="openrouter:openai/gpt-4o")
+async def extract_company(text: str, runtime: Runtime) -> Company:
+    """
+    Extract company information from this text.
+    
+    {{return_type}}
+    """
+    return await runtime.run()
+```
+
+You can also use it in custom prompts:
+
+```python
+prompt = f"""
+Analyze this data: {data}
+
+{{{{return_type}}}}  # Double braces for f-strings
+"""
+result = await runtime.run(prompt=prompt)
+```
+
+### Storage Backends
+
+Configure different storage backends for context and tracing:
+
+```python
+from reson.stores import MemoryStoreConfig, RedisStoreConfig, PostgresStoreConfig
+
+# In-memory storage (default)
+@agentic(model="openrouter:openai/gpt-4o")
+async def with_memory_store(runtime: Runtime): ...
+
+# Redis for persistent storage
+@agentic(
+    model="openrouter:openai/gpt-4o", 
+    store_cfg=RedisStoreConfig(
+        host="redis.example.com",
+        port=6379,
+        password="secret"
+    )
+)
+async def with_redis_store(runtime: Runtime): ...
+
+# Postgres for SQL-based storage
+@agentic(
+    model="openrouter:openai/gpt-4o",
+    store_cfg=PostgresStoreConfig(
+        dsn="postgresql://user:pass@db.example.com/db",
+        table="agent_traces"
+    )
+)
+async def with_postgres_store(runtime: Runtime): ...
+```
+
+### Tool Binding Control
+
+Control exactly which tools are accessible to the LLM:
+
+```python
+# By default, all callable parameters become tools
+@agentic(model="openrouter:openai/gpt-4o")
+async def default_behavior(search_database, update_records, runtime: Runtime):
+    # Both functions are automatically available to the LLM
+    return await runtime.run()
+
+# Disable autobind for precise control
+@agentic(model="openrouter:openai/gpt-4o", autobind=False)
+async def controlled_access(search_database, update_records, runtime: Runtime):
+    # Only explicitly registered tools are available
+    runtime.tool(search_database, name="search")
+    return await runtime.run()
+```
+
+### Context Management API
+
+Store and retrieve state between function calls:
+
+```python
+@agentic(model="openrouter:openai/gpt-4o")
+async def with_context(message: str, runtime: Runtime) -> str:
+    # Get conversation history (defaults to empty list if not found)
+    history = await runtime.context.get("conversation", [])
+    history.append(f"User: {message}")
+    
+    # Use the history in your prompt
+    prompt = "\n".join(history)
+    response = await runtime.run(prompt=prompt)
+    
+    # Update the history for next time
+    history.append(f"Assistant: {response}")
+    await runtime.context.set("conversation", history)
+    
+    return response
+```
+
 ## Examples
 
 Check out the `example.py` and `example_generator.py` files for complete working examples showing how to use the various features of reson in realistic scenarios.
