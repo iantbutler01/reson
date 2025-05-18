@@ -1,7 +1,5 @@
 # Reson
 
-A lightweight, type-driven framework for building AI agents without the bloat.
-
 ## What is Reson?
 
 Reson helps you build AI agents that *actually work*. Instead of writing complex prompt chains or struggling with output parsing, you just define Python types for your outputs and reson handles the rest. It's like having a smart assistant for your AI assistant code.
