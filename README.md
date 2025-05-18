@@ -108,7 +108,7 @@ async def write_story(topic: str, runtime: Runtime) -> str:
 
 ### Generator Yield Semantics
 
-Now you can create agentic functions that yield results incrementally:
+Create agentic functions that yield results incrementally:
 
 ```python
 from typing import AsyncGenerator, Dict, List
@@ -133,7 +133,7 @@ This is great for:
 
 ### BAML Integration
 
-Seamlessly integrate with BAML for enhanced prompt engineering:
+Seamlessly integrate with BAML to use their prompt generation and output parsing, everything is still run by Reson and our robustness guarantees:
 
 ```python
 @agentic(model="anthropic:claude-3-opus-20240229")
@@ -144,7 +144,7 @@ async def extract_with_baml(runtime: Runtime):
     return await runtime.run_with_baml(baml_request=request)
 ```
 
-## Real-World Examples
+## Examples
 
 Check out the `example.py` and `example_generator.py` files for complete working examples showing how to use the various features of reson in realistic scenarios.
 
