@@ -54,9 +54,9 @@ Connect to various LLM providers with a simple string:
 
 ```python
 @agentic(model="openrouter:openai/gpt-4o")  # OpenRouter
-@agentic(model="anthropic:claude-3-opus-20240229")  # Anthropic
-@agentic(model="bedrock:anthropic.claude-3-sonnet-20240229-v1:0")  # AWS Bedrock
-@agentic(model="google-gemini:gemini-pro")  # Google Gemini
+@agentic(model="anthropic:claude-3-7-sonnet-latest")  # Anthropic
+@agentic(model="bedrock:anthropic.claude-3-7-sonnet-20250219-v1:0")  # AWS Bedrock
+@agentic(model="google-gemini:gemini-2.5-pro-preview-05-06")  # Google Gemini
 ```
 
 ### Tool Registration
@@ -289,8 +289,7 @@ We're grateful to @dexhorthy and the @humanlayer team for articulating these pri
            yield {"type": "result", "document": doc, "analysis": result}
    ```
 
-4. **Keep it simple**: Reson is designed to be lightweight and easy to use. If you find yourself writing complex code, you might be overcomplicating things.
-
 ## Why the Name?
 
 Because good AI interactions should "resonate" with users and be in harmony with the developer's intent. Plus, it's short and hopefully easy to remember!
+(Not to mention the domain was available.)
