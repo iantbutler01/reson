@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from asimov.services.inference_clients import InferenceClient, ChatMessage, ChatRole
-from typing import List, Dict, Any, AsyncGenerator, Optional, Type, TypeVar, get_origin, get_args, Callable, TypeVar, ParamSpec
+from typing import List, Dict, Any, AsyncGenerator, Optional, Type, TypeVar, get_origin, get_args, Callable, TypeVar, ParamSpec, Union, Awaitable
 from reson.stores import StoreConfigBase, MemoryStore, MemoryStoreConfig, RedisStore, RedisStoreConfig, PostgresStore, PostgresStoreConfig, Store
 from asimov.asimov_base import AsimovBase
 from pydantic import PrivateAttr, Field
 
 import inspect, functools
-from typing import Callable, ParamSpec, TypeVar, Awaitable, Any, AsyncIterator
+from typing import Callable, ParamSpec, TypeVar, Awaitable, Any, AsyncIterator, Union
 import re
 import json
 from asimov.services.inference_clients import ChatMessage, ChatRole
@@ -538,47 +538,125 @@ def agentic(
     autobind: bool = True,
 ):
     """
-    Decorator factory:
-      • model   – model identifier ("openai:gpt-4o")
-      • store   – "memory" | "redis" | "postgres"  (fill in adapters later)
-      • autobind – automatically expose callable params as tools
+    Decorator factory for agentic functions that interact with LLMs.
+    
+    There are two ways to use this decorator:
+    
+    1. With regular async functions - the function will be executed and its
+       return value will be awaited and returned.
+       
+    2. With async generator functions - the function will be treated as a generator
+       and values yielded from the function will be yielded from the decorator.
+       This allows for streaming results or providing intermediate status updates.
+    
+    Parameters:
+      • model (str) – model identifier (e.g., "openrouter:openai/gpt-4o")
+      • api_key (str, optional) – API key for the model provider
+      • store_cfg (StoreConfigBase) – configuration for storage ("memory", "redis", "postgres")
+      • autobind (bool) – automatically expose callable params as tools
+
+    In generator mode, you can yield values as they are processed:
+    
+    ```python
+    @agentic(model="openrouter:openai/gpt-4o")
+    async def process_items(items: List[str], runtime: Runtime) -> AsyncGenerator[Dict, None]:
+        for item in items:
+            result = await runtime.run(prompt=f"Process: {item}")
+            yield {"item": item, "result": result}
+    
+    # Usage
+    async for result in process_items(my_items):
+        print(result)
+    ```
     """
 
     store_obj = _build_store(store_cfg) 
-    def decorator(fn: Callable[P, R]) -> Callable[P, Awaitable[R]]:
+    def decorator(fn: Callable[P, R]) -> Callable[P, Union[Awaitable[R], AsyncGenerator]]:
         sig = inspect.signature(fn)
         if "runtime" not in sig.parameters:
             raise TypeError("`runtime` parameter missing in agentic function")
 
         default_prompt = inspect.getdoc(fn) or ""
-        ret_type       = sig.return_annotation
-
-        async def wrapper(*args: P.args, **kwargs: P.kwargs):   # type: ignore[override]
-            rt = Runtime(
-                model=model,
-                store=store_obj,
-            )
-            rt._default_prompt = default_prompt
-            # Set the return type from the function's signature
-            if ret_type != inspect.Signature.empty and ret_type is not None:
-                rt._return_type = ret_type
-
-            ba = sig.bind_partial(*args, **kwargs, runtime=rt)
-
-            if autobind:
-                for name, param in sig.parameters.items():
-                    val = ba.arguments.get(name)
-                    if callable(val):
-                        rt.tool(val, name=name)
-
-            result = await fn(*ba.args, **ba.kwargs)
-
-            if not rt.used:
-                raise RuntimeError(
-                    "agentic function completed without calling runtime.run() "
-                    "or runtime.run_stream()"
+        ret_type = sig.return_annotation
+        
+        # Check if the function is an async generator
+        is_async_gen = inspect.isasyncgenfunction(fn)
+        
+        # Check return type annotation if it's not directly detected as an async gen function
+        if not is_async_gen and ret_type != inspect.Signature.empty:
+            origin = get_origin(ret_type)
+            # Check if the return type is AsyncGenerator or AsyncIterator
+            if origin is not None:
+                try:
+                    is_async_gen = (
+                        origin is AsyncGenerator or 
+                        origin is AsyncIterator or
+                        (isinstance(origin, type) and issubclass(origin, (AsyncGenerator, AsyncIterator)))
+                    )
+                except TypeError:
+                    # In case origin is not a class, issubclass would fail
+                    pass
+        
+        if is_async_gen:
+            # Async generator wrapper
+            async def gen_wrapper(*args: P.args, **kwargs: P.kwargs):
+                rt = Runtime(
+                    model=model,
+                    store=store_obj,
                 )
-            return result
+                rt._default_prompt = default_prompt
+                # Set the return type from the function's signature
+                if ret_type != inspect.Signature.empty and ret_type is not None:
+                    rt._return_type = ret_type
+
+                ba = sig.bind_partial(*args, **kwargs, runtime=rt)
+
+                if autobind:
+                    for name, param in sig.parameters.items():
+                        val = ba.arguments.get(name)
+                        if callable(val):
+                            rt.tool(val, name=name)
+                
+                # Iterate and yield values from the generator
+                async for value in fn(*ba.args, **ba.kwargs):
+                    yield value
+                    
+                # Check runtime was used after generator is exhausted
+                if not rt.used:
+                    raise RuntimeError(
+                        "agentic generator function completed without calling runtime.run() "
+                        "or runtime.run_stream()"
+                    )
+                    
+            return functools.wraps(fn)(gen_wrapper)
+        else:
+            # Original async function wrapper
+            async def wrapper(*args: P.args, **kwargs: P.kwargs):   # type: ignore[override]
+                rt = Runtime(
+                    model=model,
+                    store=store_obj,
+                )
+                rt._default_prompt = default_prompt
+                # Set the return type from the function's signature
+                if ret_type != inspect.Signature.empty and ret_type is not None:
+                    rt._return_type = ret_type
+
+                ba = sig.bind_partial(*args, **kwargs, runtime=rt)
+
+                if autobind:
+                    for name, param in sig.parameters.items():
+                        val = ba.arguments.get(name)
+                        if callable(val):
+                            rt.tool(val, name=name)
+
+                result = await fn(*ba.args, **ba.kwargs)
+
+                if not rt.used:
+                    raise RuntimeError(
+                        "agentic function completed without calling runtime.run() "
+                        "or runtime.run_stream()"
+                    )
+                return result
 
         return functools.wraps(fn)(wrapper)
     return decorator
