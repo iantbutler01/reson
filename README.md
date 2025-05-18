@@ -2,26 +2,6 @@
 
 A lightweight, type-driven framework for building AI agents without the bloat.
 
-## Inspired by 12-Factor Agents
-
-Reson is built on principles aligned with [12-Factor Agents](https://github.com/humanlayer/12-factor-agents), an excellent set of guidelines for building production-ready AI applications developed by @dexhorthy and the @humanlayer team.
-
-We strongly agree with the 12-Factor approach and have designed reson to embody these principles through Python-native patterns:
-
-- Natural language inputs are converted to structured function calls
-- Developers have full control over prompts and context windows
-- Tools are represented as typed outputs with clear schemas
-- Execution state uses standard Python data structures
-- Launch, pause and resume operations use familiar generator patterns
-- Control flow follows standard Python semantics
-- Error handling is comprehensive and integrated
-- Components are small, focused, and composable
-- Everything is designed to be stateless and predictable
-
-Reson's goal is to provide one take on these principles with minimal abstractions, letting you build production-grade AI applications using familiar Python patterns. 
-
-We're grateful to @dexhorthy and the @humanlayer team for articulating these principles so clearly, and we encourage everyone to check out their excellent framework!
-
 ## What is Reson?
 
 Reson helps you build AI agents that *actually work*. Instead of writing complex prompt chains or struggling with output parsing, you just define Python types for your outputs and reson handles the rest. It's like having a smart assistant for your AI assistant code.
@@ -267,6 +247,26 @@ No need for complex state management or custom resumption tokens - Python's gene
 ### Simplifying AI Development
 
 Just as we moved from assembly to high-level languages, AI development should move from prompt engineering to semantic programming. Reson pushes toward a future where AI capabilities are just regular function calls in your codebase, not special constructs that need special handling.
+
+## Inspired by 12-Factor Agents
+
+Reson is built on principles aligned with [12-Factor Agents](https://github.com/humanlayer/12-factor-agents), an excellent set of guidelines for building production-ready AI applications developed by @dexhorthy and the @humanlayer team.
+
+We strongly agree with the 12-Factor approach and have designed reson to embody these principles through Python-native patterns:
+
+- Natural language inputs are converted to structured function calls
+- Developers have full control over prompts and context windows
+- Tools are represented as typed outputs with clear schemas
+- Execution state uses standard Python data structures
+- Launch, pause and resume operations use familiar generator patterns
+- Control flow follows standard Python semantics
+- Error handling is comprehensive and integrated
+- Components are small, focused, and composable
+- Everything is designed to be stateless and predictable
+
+Reson's goal is to provide one take on these principles with minimal abstractions, letting you build production-grade AI applications using familiar Python patterns. 
+
+We're grateful to @dexhorthy and the @humanlayer team for articulating these principles so clearly, and we encourage everyone to check out their excellent framework!
 
 ## Tips & Tricks
 
