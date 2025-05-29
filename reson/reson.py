@@ -66,13 +66,11 @@ def _create_pydantic_tool_model(func: Callable, name: str) -> Type:
     attrs = {
         '__annotations__': {},
         '__doc__': func.__doc__ or f"Tool for {name}",
-        # Use ClassVar to prevent Pydantic from treating these as fields
-        '_tool_func': func,
+        # Only store the tool name, not the function
         '_tool_name': name,
     }
     
     # Add annotations for ClassVar
-    attrs['__annotations__']['_tool_func'] = ClassVar[Callable]
     attrs['__annotations__']['_tool_name'] = ClassVar[str]
     
     # Add parameter fields
@@ -111,14 +109,14 @@ def _create_deserializable_tool_class(func: Callable, name: str) -> Type:
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
+        # Store tool name on instance
+        self._tool_name = name
     
     # Build class attributes
     class_attrs = {
         '__annotations__': annotations,
         '__doc__': func.__doc__ or f"Tool for {name}",
         '__init__': __init__,
-        '_tool_func': func,
-        '_tool_name': name,
     }
     
     # Add defaults as class attributes
@@ -311,7 +309,7 @@ class Runtime(ResonBase):
     
     def is_tool_call(self, result: Any) -> bool:
         """Check if a result is a tool call."""
-        return hasattr(result, '_tool_name') and hasattr(result, '_tool_func')
+        return hasattr(result, '_tool_name') and getattr(result, '_tool_name', None) in self._tools
     
     def get_tool_name(self, result: Any) -> Optional[str]:
         """Get the tool name from a tool call result."""
@@ -322,7 +320,12 @@ class Runtime(ResonBase):
         if not self.is_tool_call(tool_result):
             raise ValueError("Not a tool call result")
         
-        func = tool_result._tool_func
+        # Look up the function from the tools registry
+        tool_name = self.get_tool_name(tool_result)
+        func = self._tools.get(tool_name)
+        
+        if func is None:
+            raise ValueError(f"Tool '{tool_name}' not found in runtime tools")
         
         # Convert the tool model instance to kwargs
         if hasattr(tool_result, "model_dump"):  # Pydantic
@@ -336,9 +339,11 @@ class Runtime(ResonBase):
                      if not k.startswith('_')}
         
         # Debug print
-        print(f"DEBUG execute_tool: func={func}, kwargs={kwargs}")
+        print(f"DEBUG execute_tool: tool_name={tool_name}, func={func}, kwargs={kwargs}")
         
         # Execute the function
+        print(f"Executing tool: {tool_name} with args: {kwargs}")
+
         if inspect.iscoroutinefunction(func):
             return await func(**kwargs)
         else:

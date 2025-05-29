@@ -74,10 +74,14 @@ async def research_agent(
     for i in range(max_iterations):
         if runtime.is_tool_call(result):
             tool_name = runtime.get_tool_name(result)
+            print(result)
+
             print(f"LLM called tool: {tool_name}")
             
             # Execute the tool
             tool_output = await runtime.execute_tool(result)
+            print(tool_output)
+
             print(f"Tool returned: {tool_output}")
             
             # Add to context
@@ -91,6 +95,8 @@ async def research_agent(
             {chr(10).join(context)}
             
             Continue researching or provide final ResearchReport.
+
+            {{return_type}}
             """
             
             result = await runtime.run(prompt=prompt)
