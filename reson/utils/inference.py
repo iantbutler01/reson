@@ -1,6 +1,6 @@
 import re
 from typing import Optional, Protocol
-from asimov.services.inference_clients import (
+from reson.services.inference_clients import (
     InferenceClient,
     BedrockInferenceClient,
     AnthropicInferenceClient,

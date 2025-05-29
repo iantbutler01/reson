@@ -217,16 +217,19 @@ async def with_memory_store(runtime: Runtime): ...
 )
 async def with_redis_store(runtime: Runtime): ...
 
-# Postgres for SQL-based storage
+# PostgreSQL with JSONB document storage
 @agentic(
     model="openrouter:openai/gpt-4o",
     store_cfg=PostgresStoreConfig(
         dsn="postgresql://user:pass@db.example.com/db",
-        table="agent_traces"
+        table="agent_data",   # Table will be created if it doesn't exist
+        column="data"         # JSONB column that stores all context data
     )
 )
 async def with_postgres_store(runtime: Runtime): ...
 ```
+
+The PostgreSQL store uses a JSONB column for efficient document storage, allowing you to leverage PostgreSQL's reliability and query capabilities while storing context data as JSON documents.
 
 ### Tool Binding Control
 

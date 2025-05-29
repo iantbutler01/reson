@@ -6,8 +6,8 @@ import logging
 import math
 from typing import AsyncGenerator, Dict, List, Callable, Awaitable, Any, Optional, Tuple
 import opentelemetry.trace
-from asimov.caches.cache import Cache
-from asimov.services.inference_clients import (
+from reson.caches.cache import Cache
+from reson.services.inference_clients import (
     InferenceClient,
     ChatMessage,
     RetriesExceeded,
@@ -174,53 +174,6 @@ class TracingInferenceClient(InferenceClient):
         await trace_output(res, f"gen_output_{id}")
         return res
     
-    @with_fallback
-    async def _unstructured(
-        self,
-        serialized_messages: List[Dict[str, Any]],
-        system: Optional[str] = None,
-        max_tokens=8192,
-        top_p=0.9,
-        temperature=0.5,
-        middlewares: List[Callable[[dict[str, Any]], Awaitable[None]]] = [],
-    ):
-        res = await self.client._unstructured(
-            serialized_messages,
-            system,
-            max_tokens,
-            top_p,
-            temperature,
-            middlewares,
-        )
-        id = random.randrange(1000000)
-        await trace_output(serialized_messages, f"unstructured_input_{id}")
-        await trace_output(res, f"unstructured_output_{id}")
-        return res
-        
-    @with_fallback
-    async def _unstructured_stream(
-        self,
-        serialized_messages: List[Dict[str, Any]],
-        system: Optional[str] = None,
-        max_tokens=8192,
-        top_p=0.9,
-        temperature=0.5,
-        middlewares: List[Callable[[dict[str, Any]], Awaitable[None]]] = [],
-    ):
-        res = await self.client._unstructured_stream(
-            serialized_messages,
-            system,
-            max_tokens,
-            top_p,
-            temperature,
-            middlewares,
-        )
-        
-        id = random.randrange(1000000)
-        await trace_output(serialized_messages, f"unstructured_stream_input_{id}")
-        await trace_output(res, f"unstructured_stream_output_{id}")
-        return res
-
     @with_fallback
     async def _tool_chain_stream(
         self,

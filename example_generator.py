@@ -9,7 +9,7 @@ import asyncio
 from typing import AsyncGenerator, Dict, Any, List
 from pydantic import BaseModel
 
-from reson.reson import agentic, Runtime
+from reson.reson import agentic_generator, Runtime
 
 
 class DataItem(BaseModel):
@@ -19,7 +19,7 @@ class DataItem(BaseModel):
     processed: bool = False
 
 
-@agentic(model="openrouter:openai/gpt-4o")
+@agentic_generator(model="openrouter:openai/gpt-4o")
 async def process_data_stream(data: List[str], runtime: Runtime) -> AsyncGenerator[DataItem, None]:
     """
     Process each item in the data list one by one and yield the results.
@@ -36,6 +36,8 @@ async def process_data_stream(data: List[str], runtime: Runtime) -> AsyncGenerat
         Process this data item: "{item}"
         
         Return a more informative version with additional context or details.
+
+        {{return_type}}
         """
         
         result = await runtime.run(prompt=prompt, output_type=str)
@@ -50,7 +52,7 @@ async def process_data_stream(data: List[str], runtime: Runtime) -> AsyncGenerat
         yield data_item
 
 
-@agentic(model="openrouter:openai/gpt-4o")
+@agentic_generator(model="openrouter:openai/gpt-4o")
 async def process_data_with_status(data: List[str], runtime: Runtime) -> AsyncGenerator[Dict[str, Any], None]:
     """
     Process items and yield status updates along with results.
@@ -79,7 +81,7 @@ async def process_data_with_status(data: List[str], runtime: Runtime) -> AsyncGe
         }
         
         # Process the item
-        prompt = f"Summarize this text in one sentence: {item}"
+        prompt = f"Summarize this text in one sentence: {item} {{return_type}}"
         result = await runtime.run(prompt=prompt, output_type=str)
         
         # Yield the actual result

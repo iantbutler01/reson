@@ -78,7 +78,7 @@ class TypeParser(OutputParser[T]):
     # Class variable to store buffers for parsers
     _parser_buffers = {}
     
-    def feed_chunk(self, stream_parser, chunk: str) -> ParserResult[T]:
+    def feed_chunk(self, parser, chunk: str) -> ParserResult[T]:
         """
         Feed a chunk to the Parser.
         
@@ -90,7 +90,7 @@ class TypeParser(OutputParser[T]):
             The current parsed result with properly typed value
         """
         # Unpack the parser and output_type
-        parser, output_type = stream_parser
+        parser, output_type = parser
         
         # Use parser's id as a key in our buffer dictionary
         parser_id = id(parser)
@@ -146,7 +146,7 @@ class TypeParser(OutputParser[T]):
                 raw_output=self._parser_buffers[parser_id]["debug_buffer"]
             )
     
-    def validate_final(self, stream_parser) -> ParserResult[T]:
+    def validate_final(self, parser) -> ParserResult[T]:
         """
         Validate a streaming parser at the end.
         
@@ -157,7 +157,7 @@ class TypeParser(OutputParser[T]):
             The final validated result
         """
         # Unpack the parser and output_type
-        parser, output_type = stream_parser
+        parser, output_type = parser
         
         try:
             # Validate the final result
@@ -197,6 +197,8 @@ class TypeParser(OutputParser[T]):
         # Use GASP's interpolate_prompt to enhance the prompt with type information
         try:
             from gasp.template_helpers import interpolate_prompt
+            # Replace {return_type} with {{return_type}} before calling interpolate_prompt
+            prompt = prompt.replace("{return_type}", "{{return_type}}")
             # Use format_tag="return_type" as shown in the examples
             return interpolate_prompt(prompt, output_type, format_tag="return_type")
         except Exception as e:
@@ -298,7 +300,8 @@ class TypeParser(OutputParser[T]):
                             converted_dict[key] = value
                     
                     # Convert to proper type using model_construct without validation
-                    return output_type.model_construct(**converted_dict)
+
+                    return output_type.model_construct(**converted_dict) # type: ignore
                 except Exception as e:
                     print(f"Error converting dict to {output_type.__name__}: {e}")
                     return result

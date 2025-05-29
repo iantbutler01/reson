@@ -27,6 +27,23 @@ class Company(BaseModel):
     employees: List[Person]
     ceo: Optional[Person] = None
 
+# Scalar output type for GASP parsing
+@agentic(model="openrouter:openai/gpt-4o")
+async def extract_scalar(runtime: Runtime) -> str:
+    """
+    Return this string: "Hello, world!"
+    
+    {{return_type}}
+    """
+    # Debug: Print expected return type
+    print(f"Output type: {str}")
+    
+    # Use the enhanced prompt with Jinja2 template processing
+    result = await runtime.run()
+    print(f"Result type: {type(result).__name__}")
+    
+    return result
+
 
 # Example using GASP parsing
 @agentic(model="openrouter:openai/gpt-4o")
@@ -72,7 +89,7 @@ async def extract_company(prompt: str, runtime: Runtime) -> Company:
     - All employees mentioned and their skills
     - CEO information if available
     
-    {{{{return_type}}}}
+    {{return_type}}
     """
     
     # Streaming call with typed output
@@ -139,6 +156,9 @@ async def extract_with_baml_stream(runtime: Runtime):
 
 async def main():
     """Run the example."""
+    print("Extracting scalar value...")
+    scalar_value = await extract_scalar()
+
     print("Extracting people...")
     people = await extract_people(people_list=[
         "John Smith is a 42-year-old engineer with skills in Python, C++, and AI.",
