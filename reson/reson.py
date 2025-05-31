@@ -183,18 +183,36 @@ class Runtime(ResonBase):
     model: str
     store: Store
     used: bool = Field(default=False)
+    api_key: Optional[str] = Field(default=None, exclude=True)
 
     # ───── private runtime fields ─────
     _tools: dict[str, Callable] = PrivateAttr(default_factory=dict)
     _default_prompt: str = PrivateAttr(default="")
     _context: Optional[_Ctx] = PrivateAttr(default=None)
     _return_type: Optional[Type[Any]] = PrivateAttr(default=None)
+    _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
     
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
         self._context = _Ctx(self.store)
 
     # ───── public API ─────
+    @property
+    def raw_response(self) -> str:
+        """
+        Returns the accumulated raw string response from the LLM 
+        for the last run() or run_stream() call.
+        For run(), this is the complete raw response.
+        For run_stream(), this accumulates token by token and can be
+        inspected mid-stream. It represents the full raw response
+        once the stream is complete.
+        """
+        return "".join(self._raw_response_accumulator)
+
+    def clear_raw_response(self) -> None:
+        """Clears the accumulated raw LLM response."""
+        self._raw_response_accumulator = []
+
     def tool(self, fn: Callable, *, name: str | None = None):
         """Register a callable so the LLM can invoke it as a tool."""
         self._tools[name or fn.__name__] = fn
@@ -203,30 +221,74 @@ class Runtime(ResonBase):
         self,
         *,
         prompt: str | None = None,
+        system: Optional[str] = None,
+        history: Optional[List[ChatMessage]] = None,
         output_type: type | None = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ):
         """Execute a single, non-streaming LLM call."""
         self.used = True
+        self.clear_raw_response() # Clear accumulator for new call
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
-        return await _call_llm(prompt, self.model, self._tools, effective_output_type, self.store)
+        
+        # _call_llm will be modified to return (parsed_value, raw_response_str)
+        parsed_value, raw_response_str = await _call_llm(
+            prompt,
+            self.model,
+            self._tools, 
+            effective_output_type, 
+            self.store, 
+            self.api_key,
+            system=system,
+            history=history,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens
+        )
+        if raw_response_str is not None:
+            self._raw_response_accumulator.append(raw_response_str)
+        return parsed_value
 
     async def run_stream(
         self,
         *,
         prompt: str | None = None,
+        system: Optional[str] = None,
+        history: Optional[List[ChatMessage]] = None,
         output_type: type | None = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[Any]:
         """Execute a streaming LLM call yielding chunks as they arrive."""
         self.used = True
+        self.clear_raw_response() # Clear accumulator for new call
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
-        async for chunk in _call_llm_stream(
-            prompt, self.model, self._tools, effective_output_type, self.store
+        
+        # _call_llm_stream will be modified to yield (parsed_chunk, raw_chunk_str)
+        async for parsed_chunk, raw_chunk_str in _call_llm_stream(
+            prompt,
+            self.model,
+            self._tools, 
+            effective_output_type, 
+            self.store, 
+            self.api_key,
+            system=system,
+            history=history,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens
         ):
-            yield chunk
+            if raw_chunk_str is not None:
+                self._raw_response_accumulator.append(raw_chunk_str)
+            if parsed_chunk is not None: # Only yield if there's a parsed chunk
+                yield parsed_chunk
     
     async def run_with_baml(
         self,
@@ -322,6 +384,10 @@ class Runtime(ResonBase):
         
         # Look up the function from the tools registry
         tool_name = self.get_tool_name(tool_result)
+
+        if not tool_name:
+            raise ValueError("Tool result does not have a valid tool name")
+
         func = self._tools.get(tool_name)
         
         if func is None:
@@ -415,7 +481,7 @@ def _create_empty_value(output_type):
         # If all else fails, return None
         return None
 
-async def _create_inference_client(model_str, store=None):
+async def _create_inference_client(model_str, store=None, api_key=None):
     """Create an appropriate inference client based on the model string."""
     # Parse model string to get provider and model
     parts = model_str.split(":")
@@ -425,54 +491,24 @@ async def _create_inference_client(model_str, store=None):
     provider, model_name = parts
     
     if provider == "openrouter":
-        client = create_openrouter_inference_client(model_name)
+        client = create_openrouter_inference_client(model_name, api_key=api_key)
     elif provider == "anthropic":
         # Parse out thinking parameter if provided
         thinking_match = re.match(r"(.+)@thinking=(\d+)", model_name)
         if thinking_match:
             model_name, thinking = thinking_match.groups()
-            client = create_anthropic_inference_client(model_name, thinking=int(thinking))
+            client = create_anthropic_inference_client(model_name, thinking=int(thinking), api_key=api_key)
         else:
-            client = create_anthropic_inference_client(model_name)
+            client = create_anthropic_inference_client(model_name, api_key=api_key)
     elif provider == "bedrock":
         client = create_bedrock_inference_client(model_name)
     elif provider == "google-gemini":
-        client = create_google_gemini_api_client(model_name)
+        client = create_google_gemini_api_client(model_name, api_key=api_key)
     else:
         raise ValueError(f"Unsupported provider: {provider}")
     
     # Wrap in TracingInferenceClient
     return TracingInferenceClient(client, store)
-
-def _create_chat_message(prompt):
-    """Convert a prompt string to a ChatMessage."""
-    if isinstance(prompt, str):
-        return [ChatMessage(role=ChatRole.USER, content=prompt)]
-    return prompt
-
-def _convert_tools_to_tuple_format(tools_dict):
-    """Convert a tools dictionary to the format expected by tool_chain."""
-    formatted_tools = []
-    for tool_name, tool_fn in tools_dict.items():
-        # Create tool spec
-        spec = {
-            "name": tool_name,
-            "description": tool_fn.__doc__ or f"Tool {tool_name}",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-            }
-        }
-        
-        # Extract function signature for parameters if possible
-        sig = inspect.signature(tool_fn)
-        for param_name, param in sig.parameters.items():
-            if param_name != 'self':  # Skip self parameter for methods
-                spec["parameters"]["properties"][param_name] = {"type": "string"}
-        
-        formatted_tools.append((tool_fn, spec))
-    
-    return formatted_tools
 
 def _get_parser_for_type(output_type=None) -> OutputParser:
     """Get the appropriate parser for the given output type."""
@@ -480,13 +516,22 @@ def _get_parser_for_type(output_type=None) -> OutputParser:
     # In the future, we might select based on type or user configuration
     return get_default_parser()
 
-import os  # Add import at the top if not already there
-
-async def _call_llm(prompt, model, tools, output_type, store=None):
+async def _call_llm(
+    prompt: Optional[str], 
+    model: str, 
+    tools: Dict[str, Callable], 
+    output_type: Optional[Type[Any]], 
+    store: Optional[Store] = None, 
+    api_key: Optional[str] = None,
+    system: Optional[str] = None,
+    history: Optional[List[ChatMessage]] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    max_tokens: Optional[int] = None
+):
     """Execute a non-streaming LLM call, possibly with tool use."""
     print(f"Calling LLM with output type: {output_type}")
-    client = await _create_inference_client(model, store)
-    
+    client = await _create_inference_client(model, store, api_key)
     
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
@@ -510,47 +555,60 @@ async def _call_llm(prompt, model, tools, output_type, store=None):
             # Create Union type including tools and output
             effective_output_type = Union[*(tool_models + [output_type])]
 
-    print(tool_models)
-
     # Get the appropriate parser
     parser = _get_parser_for_type(effective_output_type)
     
-    # Enhance the prompt with type information
-    # Parser expects a single type, not a Union, so use original output_type for prompt enhancement
-    enhanced_prompt = parser.enhance_prompt(prompt, effective_output_type) if effective_output_type else prompt
-    from pprint import pprint
-    pprint(enhanced_prompt)  # Debugging: print the enhanced prompt
+    # Enhance the prompt string if a prompt is provided
+    enhanced_prompt_content = prompt
+    if prompt is not None and effective_output_type:
+        enhanced_prompt_content = parser.enhance_prompt(prompt, effective_output_type)
     
-    messages = _create_chat_message(enhanced_prompt)
+    # Construct messages list
+    messages: List[ChatMessage] = []
+    if system:
+        messages.append(ChatMessage(role=ChatRole.SYSTEM, content=system))
+    if history:
+        messages.extend(history)
+    if enhanced_prompt_content is not None: # Add the current prompt as a user message
+        messages.append(ChatMessage(role=ChatRole.USER, content=enhanced_prompt_content))
     
+    if not messages:
+        raise ValueError("LLM call attempted with no system message, history, or current prompt.")
+
     # Standard LLM call (now includes tool types in effective_output_type)
-    print(messages)
-
-    result = await client.get_generation(
-        messages=messages,
-        max_tokens=8192,
-        top_p=0.9,
-        temperature=0.01,
-    )
-
-    print(result)
+    call_kwargs = {
+        "messages": messages,
+        "max_tokens": max_tokens if max_tokens is not None else 8192,
+        "top_p": top_p if top_p is not None else 0.9,
+        "temperature": temperature if temperature is not None else 0.01,
+    }
+    result = await client.get_generation(**call_kwargs)
 
     # If output_type is provided, parse the result
     if effective_output_type and result is not None:
         parsed_result = parser.parse(result, effective_output_type)
         if parsed_result.success:
             print(parsed_result.value)  # Debugging: print the parsed value
-            return parsed_result.value
+            return parsed_result.value, result # Return raw string as well
         else:
             raise ValueError(f"Failed to parse result: {parsed_result.error}")
+    return None, result # Return raw string even if parsing fails or no output_type
 
-async def _call_llm_stream(prompt, model, tools, output_type, store=None):
+async def _call_llm_stream(
+    prompt: Optional[str], 
+    model: str, 
+    tools: Dict[str, Callable], 
+    output_type: Optional[Type[Any]], 
+    store: Optional[Store] = None, 
+    api_key: Optional[str] = None,
+    system: Optional[str] = None,
+    history: Optional[List[ChatMessage]] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    max_tokens: Optional[int] = None
+):
     """Execute a streaming LLM call, possibly with tool use."""
-    print(f"Streaming LLM call with output type: {output_type}")
-    client = await _create_inference_client(model, store)
-    
-    # Get the appropriate parser
-    parser = _get_parser_for_type(output_type)
+    client = await _create_inference_client(model, store, api_key=api_key)
     
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
@@ -572,65 +630,94 @@ async def _call_llm_stream(prompt, model, tools, output_type, store=None):
         if tool_models:
             # Create Union type including tools and output
             effective_output_type = Union[tuple(tool_models + [output_type])]
+
+    # Get the appropriate parser
+    parser = _get_parser_for_type(output_type)
     
-    # Enhance the prompt with type information
-    # Parser expects a single type, not a Union, so use original output_type for prompt enhancement
-    enhanced_prompt = parser.enhance_prompt(prompt, output_type) if output_type else prompt
+    # Enhance the prompt string if a prompt is provided
+    enhanced_prompt_content = prompt
+    if prompt is not None and output_type: # Note: using output_type for prompt enhancement, not effective_output_type
+        enhanced_prompt_content = parser.enhance_prompt(prompt, output_type)
     
-    messages = _create_chat_message(enhanced_prompt)
-    
+    # Construct messages list
+    messages: List[ChatMessage] = []
+    if system:
+        messages.append(ChatMessage(role=ChatRole.SYSTEM, content=system))
+    if history:
+        messages.extend(history)
+    if enhanced_prompt_content is not None: # Add the current prompt as a user message
+        messages.append(ChatMessage(role=ChatRole.USER, content=enhanced_prompt_content))
+
+    if not messages:
+        raise ValueError("LLM call attempted with no system message, history, or current prompt.")
+        
     # Create a streaming parser if output_type is provided
     stream_parser = None
     if effective_output_type:
         stream_parser = parser.create_stream_parser(effective_output_type)
     
     if tools and not _is_pydantic_type(output_type) and not _is_deserializable_type(output_type):
-        # Fall back to existing tool_chain for non-typed outputs
-        formatted_tools = _convert_tools_to_tuple_format(tools)
-        
-        async for chunk in client.connect_and_listen(
-            messages=messages,
-            max_tokens=8192,
-            top_p=0.9,
-            temperature=0.5,
-        ):
+        call_kwargs = {
+            "messages": messages,
+            "max_tokens": max_tokens if max_tokens is not None else 8192,
+            "top_p": top_p if top_p is not None else 0.9,
+            "temperature": temperature if temperature is not None else 0.5,
+        }
+        async for chunk in client.connect_and_listen(**call_kwargs):
             if effective_output_type and stream_parser:
                 # Feed the chunk to the parser
                 result = parser.feed_chunk(stream_parser, chunk)
-                if result.value is not None:
-                    yield result.value
+                # Yield tuple: (parsed_chunk, raw_chunk)
+                yield result.value, chunk 
             else:
-                yield chunk
-
+                # Yield tuple: (None or raw_chunk as parsed, raw_chunk)
+                yield chunk, chunk 
         
         # Validate the final result if using a parser
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
             if final_result.success and final_result.value is not None:
-                yield final_result.value
+                # For the final validation, there's no new "raw" chunk, 
+                # but we yield the parsed value. We could yield (final_result.value, None)
+                # or decide if the last raw chunk was already yielded.
+                # For simplicity, if it's just a validation yielding a final object,
+                # we might not have a corresponding *new* raw chunk.
+                # Let's assume the raw chunks are handled per-iteration.
+                # If final_result.value is a completion of parsing, we yield it.
+                # The raw stream has already been fully consumed.
+                # We need to ensure this doesn't break the tuple expectation in Runtime.
+                # A simple way is to yield (final_result.value, "") if it's a final parsed object.
+                yield final_result.value, "" # Yield empty string for raw part of final validation
     else:
         # Standard streaming (now includes tool types in effective_output_type)
-        full_output = ""
-        async for chunk in client.connect_and_listen(
-            messages=messages,
-            max_tokens=8192,
-            top_p=0.9,
-            temperature=0.5,
-        ):
-            full_output += chunk
+        full_output = "" # This was for non-parser streaming, which we'll adjust
+        call_kwargs = {
+            "messages": messages,
+            "max_tokens": max_tokens if max_tokens is not None else 8192,
+            "top_p": top_p if top_p is not None else 0.9,
+            "temperature": temperature if temperature is not None else 0.5,
+        }
+        async for raw_chunk_str in client.connect_and_listen(**call_kwargs):
+            # full_output += raw_chunk_str # No longer needed if accumulating in Runtime
+            parsed_chunk_value = None
             if effective_output_type and stream_parser:
                 # Feed the chunk to the parser
-                result = parser.feed_chunk(stream_parser, chunk)
+                result = parser.feed_chunk(stream_parser, raw_chunk_str)
                 if result.value is not None:
-                    yield result.value
+                    parsed_chunk_value = result.value
+                # If no parsed value from this chunk (e.g. partial JSON), parsed_chunk_value remains None
             else:
-                yield chunk
+                # If no parser, the raw chunk is the "parsed" chunk
+                parsed_chunk_value = raw_chunk_str
+            
+            yield parsed_chunk_value, raw_chunk_str # Yield tuple
         
         # Validate the final result if using a parser
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
             if final_result.success and final_result.value is not None:
-                yield final_result.value
+                # Yield the final validated object, with an empty string for raw part
+                yield final_result.value, ""
 
 def agentic(
     *,
@@ -749,6 +836,7 @@ def _agentic_core(
                 rt = Runtime(
                     model=model,
                     store=store_obj,
+                    api_key=api_key,
                 )
                 rt._default_prompt = default_prompt
                 # Set the return type from the function's signature
