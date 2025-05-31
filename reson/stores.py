@@ -6,7 +6,7 @@ from reson.data.postgres.manager import DatabaseManager
 from contextlib import asynccontextmanager
 
 from enum import Enum
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 
 class StoreKind(str, Enum):
@@ -43,6 +43,9 @@ _MEM: Dict[str, Any] = {}
 
 
 class MemoryStore(Store):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
     async def get(self, key, default=None, raw=False):
         return _MEM.get(key, default)
     async def set(self, key, value, raw=False):
@@ -53,9 +56,9 @@ class MemoryStore(Store):
         _MEM.clear()
     async def get_all(self):               
         return dict(_MEM)
-    async def publish_to_mailbox(self, _, __): 
+    async def publish_to_mailbox(self, _, __): # type: ignore[no-untyped-def]
         pass
-    async def get_message(self, __, timeout=None): 
+    async def get_message(self, __, timeout=None): # type: ignore[no-untyped-def]
         return None
     async def keys(self):                  
         return set(_MEM.keys())
@@ -68,7 +71,7 @@ class PostgresStore(Store):
     dsn: str
     table: str
     column: str  # JSONB column name
-    _db = None
+    _db: DatabaseManager = PrivateAttr()
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -171,8 +174,8 @@ class PostgresStore(Store):
         modified_mailbox_id = await self.apply_key_modifications(mailbox_id)
         await self.set(f"mailbox:{modified_mailbox_id}", value)
     
-    async def get_message(self, mailbox_id: str, timeout: Optional[float] = None):
-        modified_mailbox_id = await self.apply_key_modifications(mailbox_id)
+    async def get_message(self, mailbox: str, timeout: Optional[float] = None):
+        modified_mailbox_id = await self.apply_key_modifications(mailbox)
         key = f"mailbox:{modified_mailbox_id}"
         value = await self.get(key)
         await self.delete(key)

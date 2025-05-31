@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from reson.services.inference_clients import InferenceClient, ChatMessage, ChatRole
-from typing import List, Dict, Any, AsyncGenerator, Optional, Type, TypeVar, get_origin, get_args, Callable, ParamSpec, Union, Awaitable, cast, Concatenate
+from typing import List, Dict, Any, AsyncGenerator, Optional, Type, TypeVar, get_origin, get_args, Callable, ParamSpec, Union, Awaitable, cast, Concatenate, Coroutine
 from reson.stores import StoreConfigBase, MemoryStore, MemoryStoreConfig, RedisStore, RedisStoreConfig, PostgresStore, PostgresStoreConfig, Store
 from reson.reson_base import ResonBase
 from pydantic import PrivateAttr, Field, BaseModel
@@ -14,6 +14,12 @@ import json
 from reson.services.inference_clients import ChatMessage, ChatRole
 
 from reson.utils.parsers import OutputParser, get_default_parser
+
+try:
+    from reson.utils.parsers.baml_parser import BamlParser #type: ignore[import-untyped]
+except ImportError:
+    pass
+
 from reson.types import Deserializable
 
 from reson.utils.inference import (
@@ -26,6 +32,7 @@ from reson.tracing_inference_client import TracingInferenceClient
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
 
 def _is_pydantic_type(type_annotation) -> bool:
     """Check if a type is Pydantic-based."""
@@ -311,8 +318,9 @@ class Runtime(ResonBase):
             
             # Attempt to access BAML parser methods if this is the BAML parser
             if hasattr(parser, "extract_prompt_from_baml_request"):
+                typed_parser = cast(BamlParser, parser)
                 # Extract the prompt from the BAML request
-                prompt = parser.extract_prompt_from_baml_request(baml_request)
+                prompt = typed_parser.extract_prompt_from_baml_request(baml_request)
                 
                 # Use _return_type if output_type is not provided
                 effective_output_type = output_type if output_type is not None else self._return_type
@@ -346,8 +354,9 @@ class Runtime(ResonBase):
             
             # Attempt to access BAML parser methods if this is the BAML parser
             if hasattr(parser, "extract_prompt_from_baml_request"):
+                typed_parser = cast(BamlParser, parser)
                 # Extract the prompt from the BAML request
-                prompt = parser.extract_prompt_from_baml_request(baml_request)
+                prompt = typed_parser.extract_prompt_from_baml_request(baml_request)
                 
                 # Use _return_type if output_type is not provided
                 effective_output_type = output_type if output_type is not None else self._return_type
@@ -629,7 +638,7 @@ async def _call_llm_stream(
         
         if tool_models:
             # Create Union type including tools and output
-            effective_output_type = Union[tuple(tool_models + [output_type])]
+            effective_output_type = Union[*(tool_models + [output_type])]
 
     # Get the appropriate parser
     parser = _get_parser_for_type(output_type)
@@ -725,12 +734,10 @@ def agentic(
     api_key: str | None = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
-) -> Callable[[Callable[..., R]],
-              Callable[..., Awaitable[R]]]:
+) -> Any: # Temporarily cast to Any to isolate Pylance issue
     """Decorator for *awaitable* agentic functions."""
     return cast(
-        Callable[[Callable[..., R]],
-                Callable[..., Awaitable[R]]],
+        Any, # Temporarily cast to Any
         _agentic_core(
             model=model,
             api_key=api_key,
@@ -746,12 +753,10 @@ def agentic_generator(
     api_key: str | None = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
-) -> Callable[[Callable[..., AsyncGenerator[Any, None]]],
-              Callable[..., AsyncGenerator[Any, None]]]:
+) -> Any: # Temporarily cast to Any to isolate Pylance issue
     """Decorator for *async-generator* agentic functions."""
     return cast(
-        Callable[[Callable[..., AsyncGenerator[Any, None]]],
-                Callable[..., AsyncGenerator[Any, None]]],
+        Any, # Temporarily cast to Any
         _agentic_core(
             model=model,
             api_key=api_key,
