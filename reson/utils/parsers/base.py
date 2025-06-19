@@ -105,7 +105,7 @@ class OutputParser(Generic[T], abc.ABC):
         pass
     
     @abc.abstractmethod
-    def enhance_prompt(self, prompt: str, output_type: Type[T]) -> str:
+    def enhance_prompt(self, prompt: str, output_type: Type[T], call_context: Optional[Dict[str, Any]] = None) -> str:
         """
         Enhance a prompt with type information.
         

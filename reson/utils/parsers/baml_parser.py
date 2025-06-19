@@ -204,19 +204,20 @@ class BAMLParser(OutputParser[T]):
                 raw_output=parser["buffer"]
             )
     
-    def enhance_prompt(self, prompt: str, output_type: Type[T]) -> str:
+    def enhance_prompt(self, prompt: str, output_type: Type[T], call_context: Optional[Dict[str, Any]] = None) -> str:
         """
         Get the prompt template from BAML.
         
         Args:
             prompt: The original prompt
             output_type: The expected output type
+            call_context: Optional dictionary of arguments (ignored by BAMLParser)
             
         Returns:
             The enhanced prompt
         """
         # For BAML, we don't modify the prompt directly
-        # because BAML handles prompt templating itself
+        # because BAML handles prompt templating itself. call_context is ignored.
         return prompt
     
     def get_baml_request(self, prompt: str, output_type: Type[T]) -> Any:

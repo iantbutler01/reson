@@ -12,6 +12,7 @@ from typing import Callable, ParamSpec, TypeVar, Awaitable, Any, AsyncIterator, 
 import re
 import json
 from reson.services.inference_clients import ChatMessage, ChatRole
+from gasp.jinja_helpers import create_type_environment # Added import
 
 from reson.utils.parsers import OutputParser, get_default_parser
 
@@ -100,11 +101,13 @@ def _create_pydantic_tool_model(func: Callable, name: str) -> Type:
     
     return tool_class
 
+#TODO: This isn't properly creating a Deserializable class but because our parser can handle generic python types now it still works properly. 
 def _create_deserializable_tool_class(func: Callable, name: str) -> Type:
     """Create a Deserializable class from a callable's signature using type()."""
+
+
     sig = inspect.signature(func)
     
-    # Build annotations
     annotations = {}
     
     for param_name, param in sig.parameters.items():
@@ -112,26 +115,22 @@ def _create_deserializable_tool_class(func: Callable, name: str) -> Type:
             continue
         annotations[param_name] = param.annotation
     
-    # Define __init__ method for Deserializable
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
         # Store tool name on instance
         self._tool_name = name
     
-    # Build class attributes
     class_attrs = {
         '__annotations__': annotations,
         '__doc__': func.__doc__ or f"Tool for {name}",
         '__init__': __init__,
     }
     
-    # Add defaults as class attributes
     for param_name, param in sig.parameters.items():
         if param_name != 'self' and param.default != inspect.Parameter.empty:
             class_attrs[param_name] = param.default
     
-    # Create the class using type()
     tool_class = type(
         f"{name.capitalize()}Tool",
         (Deserializable,),  # Base class
@@ -198,6 +197,7 @@ class Runtime(ResonBase):
     _context: Optional[_Ctx] = PrivateAttr(default=None)
     _return_type: Optional[Type[Any]] = PrivateAttr(default=None)
     _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
+    _current_call_args: Optional[Dict[str, Any]] = PrivateAttr(default=None) # ADDED
     
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
@@ -233,7 +233,8 @@ class Runtime(ResonBase):
         output_type: type | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = None
+        # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
     ):
         """Execute a single, non-streaming LLM call."""
         self.used = True
@@ -254,8 +255,10 @@ class Runtime(ResonBase):
             history=history,
             temperature=temperature,
             top_p=top_p,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            call_context=self._current_call_args # MODIFIED: Use instance attr
         )
+
         if raw_response_str is not None:
             self._raw_response_accumulator.append(raw_response_str)
         return parsed_value
@@ -269,7 +272,8 @@ class Runtime(ResonBase):
         output_type: type | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = None
+        # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
     ) -> AsyncIterator[Any]:
         """Execute a streaming LLM call yielding chunks as they arrive."""
         self.used = True
@@ -290,7 +294,8 @@ class Runtime(ResonBase):
             history=history,
             temperature=temperature,
             top_p=top_p,
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
+            call_context=self._current_call_args # MODIFIED: Use instance attr
         ):
             if raw_chunk_str is not None:
                 self._raw_response_accumulator.append(raw_chunk_str)
@@ -413,12 +418,6 @@ class Runtime(ResonBase):
             kwargs = {k: v for k, v in tool_result.__dict__.items() 
                      if not k.startswith('_')}
         
-        # Debug print
-        print(f"DEBUG execute_tool: tool_name={tool_name}, func={func}, kwargs={kwargs}")
-        
-        # Execute the function
-        print(f"Executing tool: {tool_name} with args: {kwargs}")
-
         if inspect.iscoroutinefunction(func):
             return await func(**kwargs)
         else:
@@ -500,7 +499,13 @@ async def _create_inference_client(model_str, store=None, api_key=None):
     provider, model_name = parts
     
     if provider == "openrouter":
-        client = create_openrouter_inference_client(model_name, api_key=api_key)
+        reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
+        if reasoning_match:
+            model_name, reasoning = reasoning_match.groups()
+
+            client = create_openrouter_inference_client(model_name, reasoning=reasoning, api_key=api_key)
+        else:
+            client = create_openrouter_inference_client(model_name, api_key=api_key)
     elif provider == "anthropic":
         # Parse out thinking parameter if provided
         thinking_match = re.match(r"(.+)@thinking=(\d+)", model_name)
@@ -536,7 +541,8 @@ async def _call_llm(
     history: Optional[List[ChatMessage]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None,
+    call_context: Optional[Dict[str, Any]] = None # ADDED
 ):
     """Execute a non-streaming LLM call, possibly with tool use."""
     print(f"Calling LLM with output type: {output_type}")
@@ -570,7 +576,7 @@ async def _call_llm(
     # Enhance the prompt string if a prompt is provided
     enhanced_prompt_content = prompt
     if prompt is not None and effective_output_type:
-        enhanced_prompt_content = parser.enhance_prompt(prompt, effective_output_type)
+        enhanced_prompt_content = parser.enhance_prompt(prompt, effective_output_type, call_context=call_context) # MODIFIED
     
     # Construct messages list
     messages: List[ChatMessage] = []
@@ -596,11 +602,10 @@ async def _call_llm(
     # If output_type is provided, parse the result
     if effective_output_type and result is not None:
         parsed_result = parser.parse(result, effective_output_type)
+        print(parsed_result)
         if parsed_result.success:
-            print(parsed_result.value)  # Debugging: print the parsed value
             return parsed_result.value, result # Return raw string as well
-        else:
-            raise ValueError(f"Failed to parse result: {parsed_result.error}")
+
     return None, result # Return raw string even if parsing fails or no output_type
 
 async def _call_llm_stream(
@@ -614,7 +619,8 @@ async def _call_llm_stream(
     history: Optional[List[ChatMessage]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None,
+    call_context: Optional[Dict[str, Any]] = None # ADDED
 ):
     """Execute a streaming LLM call, possibly with tool use."""
     client = await _create_inference_client(model, store, api_key=api_key)
@@ -641,13 +647,18 @@ async def _call_llm_stream(
             effective_output_type = Union[*(tool_models + [output_type])]
 
     # Get the appropriate parser
-    parser = _get_parser_for_type(output_type)
+    parser = _get_parser_for_type(effective_output_type)
     
     # Enhance the prompt string if a prompt is provided
     enhanced_prompt_content = prompt
     if prompt is not None and output_type: # Note: using output_type for prompt enhancement, not effective_output_type
-        enhanced_prompt_content = parser.enhance_prompt(prompt, output_type)
+        enhanced_prompt_content = parser.enhance_prompt(prompt, output_type, call_context=call_context) # MODIFIED
     
+    # Create a streaming parser if output_type is provided
+    stream_parser = None
+    if effective_output_type:
+        stream_parser = parser.create_stream_parser(effective_output_type)
+
     # Construct messages list
     messages: List[ChatMessage] = []
     if system:
@@ -660,10 +671,6 @@ async def _call_llm_stream(
     if not messages:
         raise ValueError("LLM call attempted with no system message, history, or current prompt.")
         
-    # Create a streaming parser if output_type is provided
-    stream_parser = None
-    if effective_output_type:
-        stream_parser = parser.create_stream_parser(effective_output_type)
     
     if tools and not _is_pydantic_type(output_type) and not _is_deserializable_type(output_type):
         call_kwargs = {
@@ -686,20 +693,8 @@ async def _call_llm_stream(
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
             if final_result.success and final_result.value is not None:
-                # For the final validation, there's no new "raw" chunk, 
-                # but we yield the parsed value. We could yield (final_result.value, None)
-                # or decide if the last raw chunk was already yielded.
-                # For simplicity, if it's just a validation yielding a final object,
-                # we might not have a corresponding *new* raw chunk.
-                # Let's assume the raw chunks are handled per-iteration.
-                # If final_result.value is a completion of parsing, we yield it.
-                # The raw stream has already been fully consumed.
-                # We need to ensure this doesn't break the tuple expectation in Runtime.
-                # A simple way is to yield (final_result.value, "") if it's a final parsed object.
                 yield final_result.value, "" # Yield empty string for raw part of final validation
     else:
-        # Standard streaming (now includes tool types in effective_output_type)
-        full_output = "" # This was for non-parser streaming, which we'll adjust
         call_kwargs = {
             "messages": messages,
             "max_tokens": max_tokens if max_tokens is not None else 8192,
@@ -707,16 +702,13 @@ async def _call_llm_stream(
             "temperature": temperature if temperature is not None else 0.5,
         }
         async for raw_chunk_str in client.connect_and_listen(**call_kwargs):
-            # full_output += raw_chunk_str # No longer needed if accumulating in Runtime
             parsed_chunk_value = None
             if effective_output_type and stream_parser:
-                # Feed the chunk to the parser
                 result = parser.feed_chunk(stream_parser, raw_chunk_str)
+
                 if result.value is not None:
                     parsed_chunk_value = result.value
-                # If no parsed value from this chunk (e.g. partial JSON), parsed_chunk_value remains None
             else:
-                # If no parser, the raw chunk is the "parsed" chunk
                 parsed_chunk_value = raw_chunk_str
             
             yield parsed_chunk_value, raw_chunk_str # Yield tuple
@@ -807,8 +799,7 @@ def _agentic_core(
     ```
     """
 
-    store_obj = _build_store(store_cfg) 
-
+    store_obj = _build_store(store_cfg)
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         sig = inspect.signature(fn)
         if "runtime" not in sig.parameters:
@@ -843,7 +834,7 @@ def _agentic_core(
                     store=store_obj,
                     api_key=api_key,
                 )
-                rt._default_prompt = default_prompt
+                rt._default_prompt = default_prompt # Set raw docstring
                 # Set the return type from the function's signature
                 if ret_type != inspect.Signature.empty and ret_type is not None:
                     # For generators, extract the yield type
@@ -858,6 +849,8 @@ def _agentic_core(
                         rt._return_type = ret_type
 
                 ba = sig.bind_partial(*args, **kwargs, runtime=rt)
+                
+                rt._current_call_args = ba.arguments # Store args before calling fn
 
                 if autobind:
                     for name, param in sig.parameters.items():
@@ -865,9 +858,12 @@ def _agentic_core(
                         if callable(val):
                             rt.tool(val, name=name)
                 
-                # Iterate and yield values from the generator
-                async for value in fn(*ba.args, **ba.kwargs):
-                    yield value
+                try:
+                    # Iterate and yield values from the generator
+                    async for value in fn(*ba.args, **ba.kwargs):
+                        yield value
+                finally:
+                    rt._current_call_args = None # Clear args after fn completes
                     
                 # Check runtime was used after generator is exhausted
                 if not rt.used:
@@ -886,21 +882,27 @@ def _agentic_core(
                 rt = Runtime(
                     model=model,
                     store=store_obj,
+                    api_key=api_key, 
                 )
-                rt._default_prompt = default_prompt
+                rt._default_prompt = default_prompt # Set raw docstring
                 # Set the return type from the function's signature
                 if ret_type != inspect.Signature.empty and ret_type is not None:
                     rt._return_type = ret_type
 
                 ba = sig.bind_partial(*args, **kwargs, runtime=rt)
-
+                
+                rt._current_call_args = ba.arguments # Store args before calling fn
+                
                 if autobind:
                     for name, param in sig.parameters.items():
                         val = ba.arguments.get(name)
                         if callable(val):
                             rt.tool(val, name=name)
-
-                result = await fn(*ba.args, **ba.kwargs)
+                
+                try:
+                    result = await fn(*ba.args, **ba.kwargs)
+                finally:
+                    rt._current_call_args = None # Clear args after fn completes
 
                 if not rt.used:
                     raise RuntimeError(

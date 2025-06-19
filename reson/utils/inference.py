@@ -6,6 +6,7 @@ from reson.services.inference_clients import (
     AnthropicInferenceClient,
     OpenRouterInferenceClient,
     GoogleGenAIInferenceClient,
+    GoogleAnthropicInferenceClient,
 )
 import os
 
@@ -24,11 +25,12 @@ def create_google_gemini_api_client(
 
 
 def create_openrouter_inference_client(
-    model: str, api_key: Optional[str] = None
+    model: str, api_key: Optional[str] = None, reasoning: str = None
 ) -> OpenRouterInferenceClient:
     return OpenRouterInferenceClient(
         model=model,
         api_key=api_key or os.environ["OPENROUTER_KEY"],
+        reasoning=reasoning
     )
 
 
@@ -49,4 +51,12 @@ def create_bedrock_inference_client(
     return BedrockInferenceClient(
         model=model, 
         region_name=region_name
+    )
+
+
+def create_google_anthropic_inference_client(
+    model: str,
+) -> GoogleAnthropicInferenceClient:
+    return GoogleAnthropicInferenceClient(
+        model=model,
     )

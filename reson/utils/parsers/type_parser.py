@@ -109,13 +109,20 @@ class TypeParser(OutputParser[T]):
             # Accumulate the chunk in our buffer
             self._parser_buffers[parser_id]["chunk_buffer"] += chunk
             current_buffer = self._parser_buffers[parser_id]["chunk_buffer"]
-            
+
+            def truncate_to_valid_utf8(data: str) -> str:
+                encoded = data.encode("utf-8", errors="ignore")
+                decoded = encoded.decode("utf-8", errors="ignore")
+                return decoded
+
             # Defensive approach to handle UTF-8 boundary issues
             try:
                 # Feed the accumulated buffer to the parser
-                raw_result = parser.feed(current_buffer)
+                safe_buffer = truncate_to_valid_utf8(current_buffer)
+                raw_result = parser.feed(safe_buffer)
                 # If successful, clear chunk buffer
                 self._parser_buffers[parser_id]["chunk_buffer"] = ""
+            
                 
                 # Convert to typed object if needed
                 result = self._convert_to_typed_result(raw_result, output_type)
@@ -128,6 +135,7 @@ class TypeParser(OutputParser[T]):
                     is_partial=True,
                     raw_output=self._parser_buffers[parser_id]["debug_buffer"]
                 )
+
             
             # Get raw output from debug buffer
             raw_output = self._parser_buffers[parser_id]["debug_buffer"]
@@ -179,32 +187,52 @@ class TypeParser(OutputParser[T]):
                 raw_output=getattr(parser, "_buffer", "")
             )
     
-    def enhance_prompt(self, prompt: str, output_type: Type[T]) -> str:
+    def enhance_prompt(self, prompt: str, output_type: Type[T], call_context: Optional[Dict[str, Any]] = None) -> str:
         """
-        Enhance a prompt with type information.
+        Enhance a prompt with type information and Jinja2 rendering.
         
         Args:
             prompt: The original prompt
             output_type: The expected output type
+            call_context: Optional dictionary of arguments for Jinja2 rendering
             
         Returns:
-            The enhanced prompt
+            The enhanced and rendered prompt
         """
-        # If output_type is None, return the original prompt
-        if output_type is None:
+        # If output_type is None, and no call_context for Jinja, return original prompt
+        if output_type is None and not call_context:
             return prompt
-            
-        # Use GASP's interpolate_prompt to enhance the prompt with type information
-        try:
-            from gasp.template_helpers import interpolate_prompt
-            # Replace {return_type} with {{return_type}} before calling interpolate_prompt
-            prompt = prompt.replace("{return_type}", "{{return_type}}")
-            # Use format_tag="return_type" as shown in the examples
-            return interpolate_prompt(prompt, output_type, format_tag="return_type")
-        except Exception as e:
-            # If GASP's enhancement fails, return the original prompt
-            print(f"Error enhancing prompt with type information: {e}")
-            return prompt
+
+        processed_prompt = prompt
+        
+        # Stage 1: Interpolate {{return_type}} using GASP
+        if output_type is not None:
+            try:
+                from gasp.template_helpers import interpolate_prompt
+                # Ensure {return_type} becomes {{return_type}} for gasp's interpolate_prompt
+                # This step specifically handles the {{return_type}} placeholder.
+                type_placeholder_prompt = processed_prompt.replace("{return_type}", "{{return_type}}")
+                processed_prompt = interpolate_prompt(type_placeholder_prompt, output_type, format_tag="return_type")
+            except Exception as e:
+                print(f"Error enhancing prompt with type information (interpolate_prompt): {e}")
+                # Continue with the current prompt if type interpolation fails
+        
+        # Stage 2: Render with Jinja2 using call_context if provided
+        if call_context:
+            try:
+                # Ensure the _jinja_env is initialized (it should be by class instantiation)
+                if not hasattr(self, '_jinja_env') or self._jinja_env is None:
+                    # This is a fallback, should ideally not be needed if constructor sets it.
+                    self._jinja_env = create_type_environment()
+                    self._jinja_env.filters["json"] = lambda obj: json.dumps(obj, indent=2)
+                
+                template = self._jinja_env.from_string(processed_prompt)
+                processed_prompt = template.render(**call_context)
+            except Exception as e:
+                print(f"Error rendering prompt with Jinja2: {e}")
+                # Return the prompt as it was before Jinja rendering if Jinja fails
+
+        return processed_prompt
     
     def _create_parser(self, output_type: Type[T]) -> Parser:
         """
