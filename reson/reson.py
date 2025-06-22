@@ -28,6 +28,7 @@ from reson.utils.inference import (
     create_openrouter_inference_client,
     create_anthropic_inference_client,
     create_bedrock_inference_client,
+    create_vertex_gemini_api_client,
 )
 from reson.tracing_inference_client import TracingInferenceClient
 
@@ -42,7 +43,7 @@ def _is_pydantic_type(type_annotation) -> bool:
         # For generics like List[PydanticModel], check the args
         args = get_args(type_annotation)
         return any(_is_pydantic_type(arg) for arg in args if arg != type(None))
-    return hasattr(type_annotation, "model_validate")
+    return hasattr(type_annotation, "__mro__") and BaseModel in type_annotation.__mro__
 
 def _is_deserializable_type(type_annotation) -> bool:
     """Check if a type is Deserializable-based."""
@@ -67,9 +68,9 @@ def _validate_callable_params(func: Callable, name: str) -> None:
 def _create_pydantic_tool_model(func: Callable, name: str) -> Type:
     """Create a Pydantic model from a callable's signature."""
     from typing import ClassVar
-    
+
     sig = inspect.signature(func)
-    
+
     # Build the class dynamically
     attrs = {
         '__annotations__': {},
@@ -77,66 +78,66 @@ def _create_pydantic_tool_model(func: Callable, name: str) -> Type:
         # Only store the tool name, not the function
         '_tool_name': name,
     }
-    
+
     # Add annotations for ClassVar
     attrs['__annotations__']['_tool_name'] = ClassVar[str]
-    
+
     # Add parameter fields
     for param_name, param in sig.parameters.items():
         if param_name == 'self':
             continue
-        
+
         attrs['__annotations__'][param_name] = param.annotation
-        
+
         # Handle defaults
         if param.default != inspect.Parameter.empty:
             attrs[param_name] = param.default
-    
+
     # Create the class
     tool_class = type(
         f"{name.capitalize().replace('_', '')}Tool",
         (BaseModel,),
         attrs
     )
-    
+
     return tool_class
 
-#TODO: This isn't properly creating a Deserializable class but because our parser can handle generic python types now it still works properly. 
+#TODO: This isn't properly creating a Deserializable class but because our parser can handle generic python types now it still works properly.
 def _create_deserializable_tool_class(func: Callable, name: str) -> Type:
     """Create a Deserializable class from a callable's signature using type()."""
 
 
     sig = inspect.signature(func)
-    
+
     annotations = {}
-    
+
     for param_name, param in sig.parameters.items():
         if param_name == 'self':
             continue
         annotations[param_name] = param.annotation
-    
+
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
         # Store tool name on instance
         self._tool_name = name
-    
+
     class_attrs = {
         '__annotations__': annotations,
         '__doc__': func.__doc__ or f"Tool for {name}",
         '__init__': __init__,
     }
-    
+
     for param_name, param in sig.parameters.items():
         if param_name != 'self' and param.default != inspect.Parameter.empty:
             class_attrs[param_name] = param.default
-    
+
     tool_class = type(
         f"{name.capitalize()}Tool",
         (Deserializable,),  # Base class
         class_attrs
     )
-    
+
     return tool_class
 
 def _build_store(cfg: StoreConfigBase | None) -> Store:
@@ -150,7 +151,7 @@ def _build_store(cfg: StoreConfigBase | None) -> Store:
             db=cfg.db,
             password=cfg.password,
         )
-        
+
     if isinstance(cfg, PostgresStoreConfig):
         return PostgresStore(
             dsn=cfg.dsn,
@@ -166,10 +167,10 @@ class _Ctx:
     """Async wrapper around a Store instance."""
     def __init__(self, store: Store):
         self._store = store
-    
+
     async def get(self, k: str, d=None):
         return await self._store.get(k, d)
-    
+
     async def set(self, k: str, v: Any):
         await self._store.set(k, v)
 
@@ -199,7 +200,7 @@ class Runtime(ResonBase):
     _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
     _reasoning_accumulator: List[str] = PrivateAttr(default_factory=list)
     _current_call_args: Optional[Dict[str, Any]] = PrivateAttr(default=None) # ADDED
-    
+
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
         self._context = _Ctx(self.store)
@@ -208,7 +209,7 @@ class Runtime(ResonBase):
     @property
     def raw_response(self) -> str:
         """
-        Returns the accumulated raw string response from the LLM 
+        Returns the accumulated raw string response from the LLM
         for the last run() or run_stream() call.
         For run(), this is the complete raw response.
         For run_stream(), this accumulates token by token and can be
@@ -224,7 +225,7 @@ class Runtime(ResonBase):
     @property
     def reasoning(self) -> str:
         """
-        Returns the accumulated reasoning tokens from the LLM 
+        Returns the accumulated reasoning tokens from the LLM
         for the last run() or run_stream() call.
         """
         return "".join(self._reasoning_accumulator)
@@ -258,22 +259,22 @@ class Runtime(ResonBase):
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
-        
+
         # Determine which model to use
         effective_model = model if model is not None else self.model
         if effective_model is None:
             raise ValueError("No model specified. Provide model either in decorator or at runtime.")
-        
+
         # Determine which API key to use
         effective_api_key = api_key if api_key is not None else self.api_key
-        
+
         # _call_llm will be modified to return (parsed_value, raw_response_str, reasoning_str)
         result = await _call_llm(
             prompt,
             effective_model,
-            self._tools, 
-            effective_output_type, 
-            self.store, 
+            self._tools,
+            effective_output_type,
+            self.store,
             effective_api_key,
             system=system,
             history=history,
@@ -291,7 +292,7 @@ class Runtime(ResonBase):
         else:
             # Legacy format
             parsed_value, raw_response_str = result
-            
+
         if raw_response_str is not None:
             self._raw_response_accumulator.append(raw_response_str)
         return parsed_value
@@ -311,7 +312,7 @@ class Runtime(ResonBase):
         # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
     ) -> AsyncIterator[tuple[str, Any]]:
         """Execute a streaming LLM call yielding chunks as they arrive.
-        
+
         Yields:
             Tuples of (chunk_type, value) where:
             - ("reasoning", accumulated_reasoning_str) during reasoning phase
@@ -323,22 +324,22 @@ class Runtime(ResonBase):
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
-        
+
         # Determine which model to use
         effective_model = model if model is not None else self.model
         if effective_model is None:
             raise ValueError("No model specified. Provide model either in decorator or at runtime.")
-        
+
         # Determine which API key to use
         effective_api_key = api_key if api_key is not None else self.api_key
-        
+
         # _call_llm_stream will be modified to yield (parsed_chunk, raw_chunk_str, chunk_type)
         async for chunk_data in _call_llm_stream(
             prompt,
             effective_model,
-            self._tools, 
-            effective_output_type, 
-            self.store, 
+            self._tools,
+            effective_output_type,
+            self.store,
             effective_api_key,
             system=system,
             history=history,
@@ -366,7 +367,7 @@ class Runtime(ResonBase):
                 if parsed_chunk is not None:
                     # Always yield as tuple for consistency
                     yield ("content", parsed_chunk)
-    
+
     async def run_with_baml(
         self,
         *,
@@ -375,7 +376,7 @@ class Runtime(ResonBase):
     ):
         """
         Execute an LLM call using a BAML request.
-        
+
         Args:
             baml_request: A BAML request object
             output_type: The type to parse into
@@ -385,20 +386,20 @@ class Runtime(ResonBase):
             # Get the parser
             from reson.utils.parsers import get_default_parser
             parser = get_default_parser()
-            
+
             # Attempt to access BAML parser methods if this is the BAML parser
             if hasattr(parser, "extract_prompt_from_baml_request"):
                 typed_parser = cast(BamlParser, parser)
                 # Extract the prompt from the BAML request
                 prompt = typed_parser.extract_prompt_from_baml_request(baml_request)
-                
+
                 # Use _return_type if output_type is not provided
                 effective_output_type = output_type if output_type is not None else self._return_type
-                
+
                 # Determine which model to use
                 if self.model is None:
                     raise ValueError("No model specified. Provide model either in decorator or at runtime.")
-                
+
                 # Call the LLM using the extracted prompt
                 return await _call_llm(prompt, self.model, self._tools, effective_output_type, self.store)
             else:
@@ -406,7 +407,7 @@ class Runtime(ResonBase):
                 return await baml_request
         except Exception as e:
             raise RuntimeError(f"Error executing BAML request: {e}")
-    
+
     async def run_stream_with_baml(
         self,
         *,
@@ -415,7 +416,7 @@ class Runtime(ResonBase):
     ) -> AsyncIterator[Any]:
         """
         Execute a streaming LLM call using a BAML request.
-        
+
         Args:
             baml_request: A BAML request object
             output_type: The type to parse into
@@ -425,20 +426,20 @@ class Runtime(ResonBase):
             # Get the parser
             from reson.utils.parsers import get_default_parser
             parser = get_default_parser()
-            
+
             # Attempt to access BAML parser methods if this is the BAML parser
             if hasattr(parser, "extract_prompt_from_baml_request"):
                 typed_parser = cast(BamlParser, parser)
                 # Extract the prompt from the BAML request
                 prompt = typed_parser.extract_prompt_from_baml_request(baml_request)
-                
+
                 # Use _return_type if output_type is not provided
                 effective_output_type = output_type if output_type is not None else self._return_type
-                
+
                 # Determine which model to use
                 if self.model is None:
                     raise ValueError("No model specified. Provide model either in decorator or at runtime.")
-                
+
                 # Call the LLM using the extracted prompt
                 async for chunk in _call_llm_stream(
                     prompt, self.model, self._tools, effective_output_type, self.store
@@ -455,20 +456,20 @@ class Runtime(ResonBase):
     def context(self):
         """Legacy accessor for context."""
         return self._context
-    
+
     def is_tool_call(self, result: Any) -> bool:
         """Check if a result is a tool call."""
         return hasattr(result, '_tool_name') and getattr(result, '_tool_name', None) in self._tools
-    
+
     def get_tool_name(self, result: Any) -> Optional[str]:
         """Get the tool name from a tool call result."""
         return getattr(result, '_tool_name', None)
-    
+
     async def execute_tool(self, tool_result: Any) -> Any:
         """Execute a tool call result."""
         if not self.is_tool_call(tool_result):
             raise ValueError("Not a tool call result")
-        
+
         # Look up the function from the tools registry
         tool_name = self.get_tool_name(tool_result)
 
@@ -476,21 +477,21 @@ class Runtime(ResonBase):
             raise ValueError("Tool result does not have a valid tool name")
 
         func = self._tools.get(tool_name)
-        
+
         if func is None:
             raise ValueError(f"Tool '{tool_name}' not found in runtime tools")
-        
+
         # Convert the tool model instance to kwargs
         if hasattr(tool_result, "model_dump"):  # Pydantic
             # Get all fields excluding private attributes
             all_fields = tool_result.model_dump()
             # Remove any fields that start with underscore or are class-level attributes
-            kwargs = {k: v for k, v in all_fields.items() 
+            kwargs = {k: v for k, v in all_fields.items()
                      if not k.startswith('_') and k not in ['_tool_func', '_tool_name']}
         else:  # Deserializable
-            kwargs = {k: v for k, v in tool_result.__dict__.items() 
+            kwargs = {k: v for k, v in tool_result.__dict__.items()
                      if not k.startswith('_')}
-        
+
         if inspect.iscoroutinefunction(func):
             return await func(**kwargs)
         else:
@@ -502,29 +503,29 @@ def _create_empty_value(output_type):
     """
     Create an appropriate empty value for the given type.
     This properly handles generics like List, Dict, etc.
-    
+
     Args:
         output_type: The type to create an empty value for
-        
+
     Returns:
         An empty value appropriate for the type
     """
     # Handle None type
     if output_type is None:
         return None
-    
+
     # Get origin and args for generic types
     origin = get_origin(output_type)
     args = get_args(output_type)
-    
+
     # Handle list types (List[T])
     if origin == list:
         return []
-    
+
     # Handle dict types (Dict[K, V])
     if origin == dict:
         return {}
-    
+
     # Handle Union types (including Optional[T])
     if origin == Union:
         if type(None) in args:  # Handle Optional[T]
@@ -533,7 +534,7 @@ def _create_empty_value(output_type):
         else:
             # For Union[A, B, ...], try to create empty A
             return _create_empty_value(args[0])
-    
+
     # Handle primitive types
     if output_type == str:
         return ""
@@ -543,7 +544,7 @@ def _create_empty_value(output_type):
         return 0.0
     if output_type == bool:
         return False
-    
+
     # Handle Pydantic models (v1 or v2)
     if hasattr(output_type, "model_construct") or hasattr(output_type, "construct"):
         try:
@@ -554,7 +555,7 @@ def _create_empty_value(output_type):
                 return output_type.construct()
         except Exception:
             pass
-    
+
     # Try direct instantiation with no args as fallback
     try:
         return output_type()
@@ -568,9 +569,9 @@ async def _create_inference_client(model_str, store=None, api_key=None):
     parts = model_str.split(":")
     if len(parts) != 2:
         raise ValueError(f"Invalid model string format: {model_str}")
-    
+
     provider, model_name = parts
-    
+
     if provider == "openrouter":
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
         if not reasoning_match:
@@ -593,9 +594,11 @@ async def _create_inference_client(model_str, store=None, api_key=None):
         client = create_bedrock_inference_client(model_name)
     elif provider == "google-gemini":
         client = create_google_gemini_api_client(model_name, api_key=api_key)
+    elif provider == "vertex-gemini":
+        client = create_vertex_gemini_api_client(model_name)
     else:
         raise ValueError(f"Unsupported provider: {provider}")
-    
+
     # Wrap in TracingInferenceClient
     return TracingInferenceClient(client, store)
 
@@ -606,11 +609,11 @@ def _get_parser_for_type(output_type=None) -> OutputParser:
     return get_default_parser()
 
 async def _call_llm(
-    prompt: Optional[str], 
-    model: str, 
-    tools: Dict[str, Callable], 
-    output_type: Optional[Type[Any]], 
-    store: Optional[Store] = None, 
+    prompt: Optional[str],
+    model: str,
+    tools: Dict[str, Callable],
+    output_type: Optional[Type[Any]],
+    store: Optional[Store] = None,
     api_key: Optional[str] = None,
     system: Optional[str] = None,
     history: Optional[List[ChatMessage]] = None,
@@ -620,39 +623,40 @@ async def _call_llm(
     call_context: Optional[Dict[str, Any]] = None # ADDED
 ):
     """Execute a non-streaming LLM call, possibly with tool use."""
-    print(f"Calling LLM with output type: {output_type}")
     client = await _create_inference_client(model, store, api_key)
-    
+
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
-    
+
     if tools and output_type:
         # Validate all callables have typed parameters
         for name, func in tools.items():
             _validate_callable_params(func, name)
-        
+
         # Determine which type system to use based on output_type
         tool_models = []
         if _is_pydantic_type(output_type):
-            tool_models = [_create_pydantic_tool_model(func, name) 
+            tool_models = [_create_pydantic_tool_model(func, name)
                           for name, func in tools.items()]
 
         elif _is_deserializable_type(output_type):
-            tool_models = [_create_deserializable_tool_class(func, name) 
+            tool_models = [_create_deserializable_tool_class(func, name)
                           for name, func in tools.items()]
-        
+
         if tool_models:
             # Create Union type including tools and output
             effective_output_type = Union[*(tool_models + [output_type])]
 
     # Get the appropriate parser
     parser = _get_parser_for_type(effective_output_type)
-    
+
     # Enhance the prompt string if a prompt is provided
     enhanced_prompt_content = prompt
     if prompt is not None and effective_output_type:
         enhanced_prompt_content = parser.enhance_prompt(prompt, effective_output_type, call_context=call_context) # MODIFIED
-    
+
+    print(enhanced_prompt_content)
+
     # Construct messages list
     messages: List[ChatMessage] = []
     if system:
@@ -661,7 +665,7 @@ async def _call_llm(
         messages.extend(history)
     if enhanced_prompt_content is not None: # Add the current prompt as a user message
         messages.append(ChatMessage(role=ChatRole.USER, content=enhanced_prompt_content))
-    
+
     if not messages:
         raise ValueError("LLM call attempted with no system message, history, or current prompt.")
 
@@ -703,11 +707,11 @@ async def _call_llm(
             return result, result, None
 
 async def _call_llm_stream(
-    prompt: Optional[str], 
-    model: str, 
-    tools: Dict[str, Callable], 
-    output_type: Optional[Type[Any]], 
-    store: Optional[Store] = None, 
+    prompt: Optional[str],
+    model: str,
+    tools: Dict[str, Callable],
+    output_type: Optional[Type[Any]],
+    store: Optional[Store] = None,
     api_key: Optional[str] = None,
     system: Optional[str] = None,
     history: Optional[List[ChatMessage]] = None,
@@ -718,36 +722,36 @@ async def _call_llm_stream(
 ):
     """Execute a streaming LLM call, possibly with tool use."""
     client = await _create_inference_client(model, store, api_key=api_key)
-    
+
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
-    
+
     if tools and output_type:
         # Validate all callables have typed parameters
         for name, func in tools.items():
             _validate_callable_params(func, name)
-        
+
         # Determine which type system to use based on output_type
         tool_models = []
         if _is_pydantic_type(output_type):
-            tool_models = [_create_pydantic_tool_model(func, name) 
+            tool_models = [_create_pydantic_tool_model(func, name)
                           for name, func in tools.items()]
         elif _is_deserializable_type(output_type):
-            tool_models = [_create_deserializable_tool_class(func, name) 
+            tool_models = [_create_deserializable_tool_class(func, name)
                           for name, func in tools.items()]
-        
+
         if tool_models:
             # Create Union type including tools and output
             effective_output_type = Union[*(tool_models + [output_type])]
 
     # Get the appropriate parser
     parser = _get_parser_for_type(effective_output_type)
-    
+
     # Enhance the prompt string if a prompt is provided
     enhanced_prompt_content = prompt
     if prompt is not None and output_type: # Note: using output_type for prompt enhancement, not effective_output_type
         enhanced_prompt_content = parser.enhance_prompt(prompt, output_type, call_context=call_context) # MODIFIED
-    
+
     # Create a streaming parser if output_type is provided
     stream_parser = None
     if effective_output_type:
@@ -764,8 +768,8 @@ async def _call_llm_stream(
 
     if not messages:
         raise ValueError("LLM call attempted with no system message, history, or current prompt.")
-        
-    
+
+
     if tools and not _is_pydantic_type(output_type) and not _is_deserializable_type(output_type):
         call_kwargs = {
             "messages": messages,
@@ -779,11 +783,11 @@ async def _call_llm_stream(
                 # Feed the chunk to the parser
                 result = parser.feed_chunk(stream_parser, chunk)
                 # Yield tuple: (parsed_chunk, raw_chunk)
-                yield result.value, chunk 
+                yield result.value, chunk
             else:
                 # Yield tuple: (None or raw_chunk as parsed, raw_chunk)
-                yield chunk, chunk 
-        
+                yield chunk, chunk
+
         # Validate the final result if using a parser
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
@@ -821,7 +825,7 @@ async def _call_llm_stream(
                 else:
                     parsed_chunk_value = chunk
                 yield parsed_chunk_value, chunk, "content"
-        
+
         # Validate the final result if using a parser
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
@@ -877,16 +881,16 @@ def _agentic_core(
 ):
     """
     Decorator factory for agentic functions that interact with LLMs.
-    
+
     There are two ways to use this decorator:
-    
+
     1. With regular async functions - the function will be executed and its
        return value will be awaited and returned.
-       
+
     2. With async generator functions - the function will be treated as a generator
        and values yielded from the function will be yielded from the decorator.
        This allows for streaming results or providing intermediate status updates.
-    
+
     Parameters:
       • model (str, optional) – model identifier (e.g., "openrouter:openai/gpt-4o"). If not provided, must be specified at runtime.
       • api_key (str, optional) – API key for the model provider
@@ -894,14 +898,14 @@ def _agentic_core(
       • autobind (bool) – automatically expose callable params as tools
 
     In generator mode, you can yield values as they are processed:
-    
+
     ```python
     @agentic(model="openrouter:openai/gpt-4o")
     async def process_items(items: List[str], runtime: Runtime) -> AsyncGenerator[Dict, None]:
         for item in items:
             result = await runtime.run(prompt=f"Process: {item}")
             yield {"item": item, "result": result}
-    
+
     # Usage
     async for result in process_items(my_items):
         print(result)
@@ -916,10 +920,10 @@ def _agentic_core(
 
         default_prompt = inspect.getdoc(fn) or ""
         ret_type = sig.return_annotation
-        
+
         # Check if the function is an async generator
         is_async_gen = inspect.isasyncgenfunction(fn)
-        
+
         # Check return type annotation if it's not directly detected as an async gen function
         if not is_async_gen and ret_type != inspect.Signature.empty:
             origin = get_origin(ret_type)
@@ -927,14 +931,14 @@ def _agentic_core(
             if origin is not None:
                 try:
                     is_async_gen = (
-                        origin is AsyncGenerator or 
+                        origin is AsyncGenerator or
                         origin is AsyncIterator or
                         (isinstance(origin, type) and issubclass(origin, (AsyncGenerator, AsyncIterator)))
                     )
                 except TypeError:
                     # In case origin is not a class, issubclass would fail
                     pass
-        
+
         if is_async_gen:
             # Async generator wrapper
             async def gen_wrapper(*args, **kwargs):
@@ -958,7 +962,7 @@ def _agentic_core(
                         rt._return_type = ret_type
 
                 ba = sig.bind_partial(*args, **kwargs, runtime=rt)
-                
+
                 rt._current_call_args = ba.arguments # Store args before calling fn
 
                 if autobind:
@@ -966,24 +970,24 @@ def _agentic_core(
                         val = ba.arguments.get(name)
                         if callable(val):
                             rt.tool(val, name=name)
-                
+
                 try:
                     # Iterate and yield values from the generator
                     async for value in fn(*ba.args, **ba.kwargs):
                         yield value
                 finally:
                     rt._current_call_args = None # Clear args after fn completes
-                    
+
                 # Check runtime was used after generator is exhausted
                 if not rt.used:
                     raise RuntimeError(
                         "agentic generator function completed without calling runtime.run() "
                         "or runtime.run_stream()"
                     )
-                
-            
 
-                    
+
+
+
             return functools.wraps(fn)(gen_wrapper)
         else:
             # Original async function wrapper
@@ -991,7 +995,7 @@ def _agentic_core(
                 rt = Runtime(
                     model=model,
                     store=store_obj,
-                    api_key=api_key, 
+                    api_key=api_key,
                 )
                 rt._default_prompt = default_prompt # Set raw docstring
                 # Set the return type from the function's signature
@@ -999,15 +1003,15 @@ def _agentic_core(
                     rt._return_type = ret_type
 
                 ba = sig.bind_partial(*args, **kwargs, runtime=rt)
-                
+
                 rt._current_call_args = ba.arguments # Store args before calling fn
-                
+
                 if autobind:
                     for name, param in sig.parameters.items():
                         val = ba.arguments.get(name)
                         if callable(val):
                             rt.tool(val, name=name)
-                
+
                 try:
                     result = await fn(*ba.args, **ba.kwargs)
                 finally:
