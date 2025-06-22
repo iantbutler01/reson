@@ -60,3 +60,13 @@ def create_google_anthropic_inference_client(
     return GoogleAnthropicInferenceClient(
         model=model,
     )
+
+
+def create_vertex_gemini_api_client(
+    model: str
+) -> GoogleGenAIInferenceClient:
+    return GoogleGenAIInferenceClient(
+        model=model,
+        vertexai=True,
+        location="global",
+    )

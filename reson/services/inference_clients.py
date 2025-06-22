@@ -14,11 +14,10 @@ import backoff
 import opentelemetry.instrumentation.httpx
 import opentelemetry.trace
 import pydantic_core
-import vertexai.generative_models
-import google.api_core.exceptions
+import google.auth
+import google.auth.transport.requests
 from google import genai
 from google.genai import types
-import google.auth
 
 from reson.reson_base import ResonBase
 
@@ -564,10 +563,14 @@ class GoogleGenAIInferenceClient(InferenceClient):
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: Optional[str] = None,
+        **kwargs,
     ):
         super().__init__()
-        self.client = genai.Client(api_key=api_key)
+        if api_key:
+            self.client = genai.Client(api_key=api_key)
+        else:
+            self.client = genai.Client(**kwargs)
         self.model = model
 
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.get_generation")
@@ -594,11 +597,17 @@ class GoogleGenAIInferenceClient(InferenceClient):
                 system_instruction=system_instruction,
                 top_p=top_p,
                 max_output_tokens=max_tokens,
+                thinking_config=types.GenerationConfigThinkingConfig(
+                    include_thoughts=True,
+                    thinking_budget=16384,
+                ),
             ),
         )
 
         if not response.candidates:
             return ""
+
+        out_text = "\n".join(p.text for p in response.candidates[0].content.parts if p.text)
 
         await self._trace(
             [
@@ -608,10 +617,10 @@ class GoogleGenAIInferenceClient(InferenceClient):
                 }
                 for msg in messages
             ],
-            [{"text": response.text}],
+            [{"text": out_text}],
         )
 
-        return response.text
+        return out_text
 
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
@@ -636,6 +645,10 @@ class GoogleGenAIInferenceClient(InferenceClient):
                 system_instruction=system_instruction,
                 top_p=top_p,
                 max_output_tokens=max_tokens,
+                thinking_config=types.GenerationConfigThinkingConfig(
+                    include_thoughts=True,
+                    thinking_budget=16384,
+                ),
             ),
         )
 
@@ -656,6 +669,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
             ],
             [{"text": out}],
         )
+
 
 
 class OAIRequest(ResonBase):
@@ -915,212 +929,3 @@ class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
         )
 
 
-class GoogleGenAIInferenceClient(InferenceClient):
-    def __init__(
-        self,
-        model: str,
-        api_key: str,
-    ):
-        super().__init__()
-        self.client = genai.Client(api_key=api_key)
-        self.model = model
-
-    @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.get_generation")
-    @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
-    async def get_generation(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
-    ):
-        system_instruction = None
-
-        if messages[0].role.value == "system":
-            system_instruction = messages[0].content
-            messages = messages[1:]
-        # Convert messages to Google's format
-        processed_messages = [
-            types.Content(role=msg.role.value, parts=[types.Part(text=msg.content)])
-            for msg in messages
-        ]
-
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=processed_messages,
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                system_instruction=system_instruction,
-                top_p=top_p,
-                max_output_tokens=max_tokens,
-            ),
-        )
-
-        if not response.candidates:
-            return ""
-
-        await self._trace(
-            [
-                {
-                    "role": msg.role.value,
-                    "content": [{"type": "text", "text": msg.content}],
-                }
-                for msg in messages
-            ],
-            [{"text": response.text}],
-        )
-
-        return response.text
-
-    @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.connect_and_listen")
-    async def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
-    ):
-        system_instruction = None
-
-        if messages[0].role.value == "system":
-            system_instruction = messages[0].content
-            messages = messages[1:]
-
-        processed_messages = [
-            types.Content(role=msg.role.value, parts=[types.Part(text=msg.content)])
-            for msg in messages
-        ]
-
-        response = await self.client.aio.models.generate_content_stream(
-            model=self.model,
-            contents=processed_messages,
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                system_instruction=system_instruction,
-                top_p=top_p,
-                max_output_tokens=max_tokens,
-            ),
-        )
-
-        out = ""
-
-        async for chunk in response:
-            if chunk.text:
-                out += chunk.text
-                yield chunk.text
-
-        await self._trace(
-            [
-                {
-                    "role": msg.role.value,
-                    "content": [{"type": "text", "text": msg.content}],
-                }
-                for msg in messages
-            ],
-            [{"text": out}],
-        )
-
-
-class VertexInferenceClient(InferenceClient):
-    def __init__(self, model: str):
-        super().__init__()
-        self.model = model
-
-    @tracer.start_as_current_span(name="VertexInferenceClient.get_generation")
-    @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
-    async def get_generation(
-        self,
-        messages: List[ChatMessage],
-        max_tokens=4096,
-        top_p=0.9,
-        temperature=0.5,
-        schema=None,
-    ):
-        if messages[0].role == ChatRole.SYSTEM:
-            model = vertexai.generative_models.GenerativeModel(
-                self.model, system_instruction=messages[0].content
-            )
-            messages = messages[1:]
-        else:
-            model = vertexai.generative_models.GenerativeModel(self.model)
-
-        prefill = ""
-        if schema and messages[-1].role == ChatRole.ASSISTANT:
-            prefill = messages[-1].content
-            messages = messages[:-1]
-
-        try:
-            resp = await model.generate_content_async(
-                [
-                    vertexai.generative_models.Content(
-                        role=msg.role.value,
-                        parts=[vertexai.generative_models.Part.from_text(msg.content)],
-                    )
-                    for msg in messages
-                ],
-                generation_config=vertexai.generative_models.GenerationConfig(
-                    max_output_tokens=max_tokens,
-                    top_p=top_p,
-                    temperature=temperature,
-                    response_mime_type="application/json" if schema else None,
-                    response_schema=schema,
-                ),
-            )
-            if schema:
-                resp.text = resp.text[len(prefill) :]
-        except google.api_core.exceptions.TooManyRequests:
-            raise InferenceException("backoff")
-        except google.api_core.exceptions.BadRequest:
-            raise ValueError()
-        except google.api_core.exceptions.ServerError:
-            raise InferenceException("server_error")
-
-        self._cost.input_tokens += resp.usage_metadata.prompt_token_count
-        self._cost.output_tokens += resp.usage_metadata.candidates_token_count
-
-        await self._trace(
-            [
-                {
-                    "role": msg.role.value,
-                    "content": [{"text": msg.content}],
-                }
-                for msg in messages
-            ],
-            [{"text": resp.text}],
-        )
-        return resp.text
-
-    @tracer.start_as_current_span(name="VertexInferenceClient.connect_and_listen")
-    async def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
-    ):
-        if messages[0].role == ChatRole.SYSTEM:
-            model = vertexai.generative_models.GenerativeModel(
-                self.model, system_instruction=messages[0].content
-            )
-            messages = messages[1:]
-        else:
-            model = vertexai.generative_models.GenerativeModel(self.model)
-
-        out = ""
-        async for chunk in model.generate_content_async(
-            [
-                vertexai.generative_models.Content(
-                    role=msg.role.value,
-                    parts=[vertexai.generative_models.Part.from_text(msg.content)],
-                )
-                for msg in messages
-            ],
-            generation_config=vertexai.generative_models.GenerationConfig(
-                max_output_tokens=max_tokens, top_p=top_p, temperature=temperature
-            ),
-            stream=True,
-        ):
-            out += chunk.text
-            yield chunk.text
-            if chunk.usage_metadata:
-                self._cost.input_tokens += chunk.usage_metadata.prompt_token_count
-                self._cost.output_tokens += chunk.usage_metadata.candidates_token_count
-
-        await self._trace(
-            [
-                {
-                    "role": msg.role.value,
-                    "content": [{"text": msg.content}],
-                }
-                for msg in messages
-            ],
-            [{"text": out}],
-        )

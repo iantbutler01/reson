@@ -28,6 +28,7 @@ from reson.utils.inference import (
     create_openrouter_inference_client,
     create_anthropic_inference_client,
     create_bedrock_inference_client,
+    create_vertex_gemini_api_client,
 )
 from reson.tracing_inference_client import TracingInferenceClient
 
@@ -42,7 +43,7 @@ def _is_pydantic_type(type_annotation) -> bool:
         # For generics like List[PydanticModel], check the args
         args = get_args(type_annotation)
         return any(_is_pydantic_type(arg) for arg in args if arg != type(None))
-    return hasattr(type_annotation, "model_validate")
+    return hasattr(type_annotation, "__mro__") and BaseModel in type_annotation.__mro__
 
 def _is_deserializable_type(type_annotation) -> bool:
     """Check if a type is Deserializable-based."""
@@ -518,6 +519,8 @@ async def _create_inference_client(model_str, store=None, api_key=None):
         client = create_bedrock_inference_client(model_name)
     elif provider == "google-gemini":
         client = create_google_gemini_api_client(model_name, api_key=api_key)
+    elif provider == "vertex-gemini":
+        client = create_vertex_gemini_api_client(model_name)
     else:
         raise ValueError(f"Unsupported provider: {provider}")
     
@@ -545,7 +548,6 @@ async def _call_llm(
     call_context: Optional[Dict[str, Any]] = None # ADDED
 ):
     """Execute a non-streaming LLM call, possibly with tool use."""
-    print(f"Calling LLM with output type: {output_type}")
     client = await _create_inference_client(model, store, api_key)
     
     # Determine effective output type (with tools if applicable)
@@ -577,6 +579,8 @@ async def _call_llm(
     enhanced_prompt_content = prompt
     if prompt is not None and effective_output_type:
         enhanced_prompt_content = parser.enhance_prompt(prompt, effective_output_type, call_context=call_context) # MODIFIED
+
+    print(enhanced_prompt_content)
     
     # Construct messages list
     messages: List[ChatMessage] = []
@@ -602,7 +606,6 @@ async def _call_llm(
     # If output_type is provided, parse the result
     if effective_output_type and result is not None:
         parsed_result = parser.parse(result, effective_output_type)
-        print(parsed_result)
         if parsed_result.success:
             return parsed_result.value, result # Return raw string as well
 
