@@ -655,8 +655,6 @@ async def _call_llm(
     if prompt is not None and effective_output_type:
         enhanced_prompt_content = parser.enhance_prompt(prompt, effective_output_type, call_context=call_context) # MODIFIED
 
-    print(enhanced_prompt_content)
-
     # Construct messages list
     messages: List[ChatMessage] = []
     if system:
