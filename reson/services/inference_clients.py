@@ -586,16 +586,25 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
-        response = await self.client.aio.models.generate_content(
-            model=self.model,
-            contents=processed_messages,
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                system_instruction=system_instruction,
-                top_p=top_p,
-                max_output_tokens=max_tokens,
-            ),
-        )
+        try:
+            response = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=processed_messages,
+                config=types.GenerateContentConfig(
+                    temperature=temperature,
+                    system_instruction=system_instruction,
+                    top_p=top_p,
+                    max_output_tokens=max_tokens,
+                    thinking_config=types.GenerationConfigThinkingConfig(
+                        include_thoughts=True,
+                        thinking_budget=16384,
+                    ),
+                ),
+            )
+        except google.genai.errors.ClientError as e:
+            if e.code == 400:
+                raise NonRetryableException(str(e))
+            raise InferenceException(str(e))
 
         if not response.candidates:
             return ""
@@ -628,16 +637,25 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
-        response = await self.client.aio.models.generate_content_stream(
-            model=self.model,
-            contents=processed_messages,
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                system_instruction=system_instruction,
-                top_p=top_p,
-                max_output_tokens=max_tokens,
-            ),
-        )
+        try:
+            response = await self.client.aio.models.generate_content_stream(
+                model=self.model,
+                contents=processed_messages,
+                config=types.GenerateContentConfig(
+                    temperature=temperature,
+                    system_instruction=system_instruction,
+                    top_p=top_p,
+                    max_output_tokens=max_tokens,
+                    thinking_config=types.GenerationConfigThinkingConfig(
+                        include_thoughts=True,
+                        thinking_budget=16384,
+                    ),
+                ),
+            )
+        except google.genai.errors.ClientError as e:
+            if e.code == 400:
+                raise NonRetryableException(str(e))
+            raise InferenceException(str(e))
 
         out = ""
 
@@ -752,7 +770,7 @@ class OAIInferenceClient(InferenceClient):
             # Check for reasoning in the response
             content = body["choices"][0]["message"]["content"]
             reasoning = body["choices"][0]["message"].get("reasoning")
-            
+
             if reasoning:
                 return (content, reasoning)
             return content
