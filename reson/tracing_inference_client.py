@@ -158,8 +158,15 @@ class TracingInferenceClient(InferenceClient):
         async for token in self.client.connect_and_listen(
             messages, max_tokens, top_p, temperature
         ):
-            yield token
-            full_output += token
+            # Handle both tuple and string formats
+            if isinstance(token, tuple):
+                yield token  # Pass through the tuple
+                # Only accumulate content tokens for tracing
+                if len(token) == 2 and token[0] == "content":
+                    full_output += token[1]
+            else:
+                yield token  # Legacy string format
+                full_output += token
         id = random.randrange(1000000)
         await trace_output([m.model_dump() for m in messages], f"streaming_input_{id}")
         await trace_output(full_output, f"streaming_output_{id}")

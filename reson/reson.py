@@ -197,6 +197,7 @@ class Runtime(ResonBase):
     _context: Optional[_Ctx] = PrivateAttr(default=None)
     _return_type: Optional[Type[Any]] = PrivateAttr(default=None)
     _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
+    _reasoning_accumulator: List[str] = PrivateAttr(default_factory=list)
     _current_call_args: Optional[Dict[str, Any]] = PrivateAttr(default=None) # ADDED
     
     def model_post_init(self, __context):
@@ -220,6 +221,18 @@ class Runtime(ResonBase):
         """Clears the accumulated raw LLM response."""
         self._raw_response_accumulator = []
 
+    @property
+    def reasoning(self) -> str:
+        """
+        Returns the accumulated reasoning tokens from the LLM 
+        for the last run() or run_stream() call.
+        """
+        return "".join(self._reasoning_accumulator)
+
+    def clear_reasoning(self) -> None:
+        """Clears the accumulated reasoning tokens."""
+        self._reasoning_accumulator = []
+
     def tool(self, fn: Callable, *, name: str | None = None):
         """Register a callable so the LLM can invoke it as a tool."""
         self._tools[name or fn.__name__] = fn
@@ -239,12 +252,13 @@ class Runtime(ResonBase):
         """Execute a single, non-streaming LLM call."""
         self.used = True
         self.clear_raw_response() # Clear accumulator for new call
+        self.clear_reasoning() # Clear reasoning for new call
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
         
-        # _call_llm will be modified to return (parsed_value, raw_response_str)
-        parsed_value, raw_response_str = await _call_llm(
+        # _call_llm will be modified to return (parsed_value, raw_response_str, reasoning_str)
+        result = await _call_llm(
             prompt,
             self.model,
             self._tools, 
@@ -259,6 +273,15 @@ class Runtime(ResonBase):
             call_context=self._current_call_args # MODIFIED: Use instance attr
         )
 
+        # Handle tuple response with reasoning
+        if isinstance(result, tuple) and len(result) == 3:
+            parsed_value, raw_response_str, reasoning_str = result
+            if reasoning_str:
+                self._reasoning_accumulator.append(reasoning_str)
+        else:
+            # Legacy format
+            parsed_value, raw_response_str = result
+            
         if raw_response_str is not None:
             self._raw_response_accumulator.append(raw_response_str)
         return parsed_value
@@ -278,12 +301,13 @@ class Runtime(ResonBase):
         """Execute a streaming LLM call yielding chunks as they arrive."""
         self.used = True
         self.clear_raw_response() # Clear accumulator for new call
+        self.clear_reasoning() # Clear reasoning for new call
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
         
-        # _call_llm_stream will be modified to yield (parsed_chunk, raw_chunk_str)
-        async for parsed_chunk, raw_chunk_str in _call_llm_stream(
+        # _call_llm_stream will be modified to yield (parsed_chunk, raw_chunk_str, chunk_type)
+        async for chunk_data in _call_llm_stream(
             prompt,
             self.model,
             self._tools, 
@@ -297,10 +321,23 @@ class Runtime(ResonBase):
             max_tokens=max_tokens,
             call_context=self._current_call_args # MODIFIED: Use instance attr
         ):
-            if raw_chunk_str is not None:
-                self._raw_response_accumulator.append(raw_chunk_str)
-            if parsed_chunk is not None: # Only yield if there's a parsed chunk
-                yield parsed_chunk
+            # Handle tuple format with chunk type
+            if isinstance(chunk_data, tuple) and len(chunk_data) == 3:
+                parsed_chunk, raw_chunk_str, chunk_type = chunk_data
+                if chunk_type == "reasoning" and raw_chunk_str:
+                    self._reasoning_accumulator.append(raw_chunk_str)
+                    # Don't yield reasoning chunks
+                elif raw_chunk_str is not None:
+                    self._raw_response_accumulator.append(raw_chunk_str)
+                    if parsed_chunk is not None:
+                        yield parsed_chunk
+            else:
+                # Legacy format
+                parsed_chunk, raw_chunk_str = chunk_data
+                if raw_chunk_str is not None:
+                    self._raw_response_accumulator.append(raw_chunk_str)
+                if parsed_chunk is not None:
+                    yield parsed_chunk
     
     async def run_with_baml(
         self,
@@ -500,9 +537,11 @@ async def _create_inference_client(model_str, store=None, api_key=None):
     
     if provider == "openrouter":
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
+        if not reasoning_match:
+            # Try numeric pattern
+            reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
         if reasoning_match:
             model_name, reasoning = reasoning_match.groups()
-
             client = create_openrouter_inference_client(model_name, reasoning=reasoning, api_key=api_key)
         else:
             client = create_openrouter_inference_client(model_name, api_key=api_key)
@@ -599,14 +638,33 @@ async def _call_llm(
     }
     result = await client.get_generation(**call_kwargs)
 
-    # If output_type is provided, parse the result
-    if effective_output_type and result is not None:
-        parsed_result = parser.parse(result, effective_output_type)
-        print(parsed_result)
-        if parsed_result.success:
-            return parsed_result.value, result # Return raw string as well
-
-    return None, result # Return raw string even if parsing fails or no output_type
+    if isinstance(result, tuple) and len(result) == 2:
+        content, reasoning = result
+        # Parse the content if output_type is provided
+        if effective_output_type and content is not None:
+            parsed_result = parser.parse(content, effective_output_type)
+            print(parsed_result)
+            if parsed_result.success:
+                return parsed_result.value, content, reasoning
+            else:
+                # Parsing failed, return None for parsed value
+                return None, content, reasoning
+        else:
+            # No output_type specified, return content as-is
+            return content, content, reasoning
+    else:
+        # Legacy format - just content
+        if effective_output_type and result is not None:
+            parsed_result = parser.parse(result, effective_output_type)
+            print(parsed_result)
+            if parsed_result.success:
+                return parsed_result.value, result, None
+            else:
+                # Parsing failed, return None for parsed value
+                return None, result, None
+        else:
+            # No output_type specified, return result as-is
+            return result, result, None
 
 async def _call_llm_stream(
     prompt: Optional[str], 
@@ -701,24 +759,38 @@ async def _call_llm_stream(
             "top_p": top_p if top_p is not None else 0.9,
             "temperature": temperature if temperature is not None else 0.5,
         }
-        async for raw_chunk_str in client.connect_and_listen(**call_kwargs):
-            parsed_chunk_value = None
-            if effective_output_type and stream_parser:
-                result = parser.feed_chunk(stream_parser, raw_chunk_str)
-
-                if result.value is not None:
-                    parsed_chunk_value = result.value
+        async for chunk in client.connect_and_listen(**call_kwargs):
+            if isinstance(chunk, tuple) and len(chunk) == 2:
+                chunk_type, chunk_content = chunk
+                if chunk_type == "reasoning":
+                    # Yield reasoning chunks with type indicator
+                    yield None, chunk_content, "reasoning"
+                else:  # content
+                    parsed_chunk_value = None
+                    if effective_output_type and stream_parser:
+                        result = parser.feed_chunk(stream_parser, chunk_content)
+                        if result.value is not None:
+                            parsed_chunk_value = result.value
+                    else:
+                        parsed_chunk_value = chunk_content
+                    yield parsed_chunk_value, chunk_content, "content"
             else:
-                parsed_chunk_value = raw_chunk_str
-            
-            yield parsed_chunk_value, raw_chunk_str # Yield tuple
+                # Legacy format - just content
+                parsed_chunk_value = None
+                if effective_output_type and stream_parser:
+                    result = parser.feed_chunk(stream_parser, chunk)
+                    if result.value is not None:
+                        parsed_chunk_value = result.value
+                else:
+                    parsed_chunk_value = chunk
+                yield parsed_chunk_value, chunk, "content"
         
         # Validate the final result if using a parser
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
             if final_result.success and final_result.value is not None:
                 # Yield the final validated object, with an empty string for raw part
-                yield final_result.value, ""
+                yield final_result.value, "", ""
 
 def agentic(
     *,

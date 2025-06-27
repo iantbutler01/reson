@@ -705,7 +705,11 @@ class OAIInferenceClient(InferenceClient):
         ).model_dump(exclude={"stream_options", "tools", "tool_choice"})
 
         if self.reasoning:
-            request["reasoning"] = { "effort": self.reasoning }
+            # Determine if it's effort or max_tokens
+            if self.reasoning.isdigit():
+                request["reasoning"] = {"max_tokens": int(self.reasoning)}
+            else:
+                request["reasoning"] = {"effort": self.reasoning}
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -745,7 +749,13 @@ class OAIInferenceClient(InferenceClient):
                 [{"text": body["choices"][0]["message"]["content"]}],
             )
 
-            return body["choices"][0]["message"]["content"]
+            # Check for reasoning in the response
+            content = body["choices"][0]["message"]["content"]
+            reasoning = body["choices"][0]["message"].get("reasoning")
+            
+            if reasoning:
+                return (content, reasoning)
+            return content
 
     @tracer.start_as_current_span(name="OAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
@@ -767,6 +777,13 @@ class OAIInferenceClient(InferenceClient):
             stream_options={"include_usage": True},
         ).model_dump(exclude={"tools", "tool_choice"})
 
+        if self.reasoning:
+            # Determine if it's effort or max_tokens
+            if self.reasoning.isdigit():
+                request["reasoning"] = {"max_tokens": int(self.reasoning)}
+            else:
+                request["reasoning"] = {"effort": self.reasoning}
+
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST",
@@ -784,6 +801,7 @@ class OAIInferenceClient(InferenceClient):
                     raise InferenceException(await response.aread())
 
                 out = ""
+                reasoning_out = ""
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         if line.strip() == "data: [DONE]":
@@ -793,11 +811,16 @@ class OAIInferenceClient(InferenceClient):
                             raise InferenceException(
                                 data["error"]["message"] + f" ({data['error']})"
                             )
-                        if data["choices"] and data["choices"][0]["delta"].get(
-                            "content"
-                        ):
-                            out += data["choices"][0]["delta"]["content"]
-                            yield data["choices"][0]["delta"]["content"]
+                        if data["choices"]:
+                            delta = data["choices"][0]["delta"]
+                            # Check for reasoning first (it can come alongside content)
+                            if delta.get("reasoning"):
+                                reasoning_out += delta["reasoning"]
+                                yield ("reasoning", delta["reasoning"])
+                            # Check for content
+                            if delta.get("content"):
+                                out += delta["content"]
+                                yield ("content", delta["content"])
                         elif data.get("usage"):
                             self._cost.input_tokens += data["usage"]["prompt_tokens"]
                             # No reference to cached tokens in the docs for the streaming API response objects...
