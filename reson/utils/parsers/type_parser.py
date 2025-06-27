@@ -211,8 +211,8 @@ class TypeParser(OutputParser[T]):
                 from gasp.template_helpers import interpolate_prompt
                 # Ensure {return_type} becomes {{return_type}} for gasp's interpolate_prompt
                 # This step specifically handles the {{return_type}} placeholder.
-                type_placeholder_prompt = processed_prompt.replace("{return_type}", "{{return_type}}")
-                processed_prompt = interpolate_prompt(type_placeholder_prompt, output_type, format_tag="return_type")
+                print(output_type)
+                processed_prompt = interpolate_prompt(processed_prompt, output_type, format_tag="return_type")
             except Exception as e:
                 print(f"Error enhancing prompt with type information (interpolate_prompt): {e}")
                 # Continue with the current prompt if type interpolation fails
