@@ -56,6 +56,7 @@ class TypeParser(OutputParser[T]):
                 raw_output=output
             )
         except Exception as e:
+            print("WE HIT AN ERROR AND DIED: {e}")
             return ParserResult(
                 error=e,
                 raw_output=output

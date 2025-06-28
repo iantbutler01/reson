@@ -297,8 +297,14 @@ class Runtime(ResonBase):
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None
         # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
-    ) -> AsyncIterator[Any]:
-        """Execute a streaming LLM call yielding chunks as they arrive."""
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """Execute a streaming LLM call yielding chunks as they arrive.
+        
+        Yields:
+            Tuples of (chunk_type, value) where:
+            - ("reasoning", accumulated_reasoning_str) during reasoning phase
+            - ("content", parsed_chunk) during content generation phase
+        """
         self.used = True
         self.clear_raw_response() # Clear accumulator for new call
         self.clear_reasoning() # Clear reasoning for new call
@@ -326,18 +332,20 @@ class Runtime(ResonBase):
                 parsed_chunk, raw_chunk_str, chunk_type = chunk_data
                 if chunk_type == "reasoning" and raw_chunk_str:
                     self._reasoning_accumulator.append(raw_chunk_str)
-                    # Don't yield reasoning chunks
+                    # Yield reasoning progress
+                    yield ("reasoning", self.reasoning)
                 elif raw_chunk_str is not None:
                     self._raw_response_accumulator.append(raw_chunk_str)
                     if parsed_chunk is not None:
-                        yield parsed_chunk
+                        # Yield content with type indicator
+                        yield ("content", parsed_chunk)
             else:
-                # Legacy format
                 parsed_chunk, raw_chunk_str = chunk_data
                 if raw_chunk_str is not None:
                     self._raw_response_accumulator.append(raw_chunk_str)
                 if parsed_chunk is not None:
-                    yield parsed_chunk
+                    # Always yield as tuple for consistency
+                    yield ("content", parsed_chunk)
     
     async def run_with_baml(
         self,
@@ -738,6 +746,7 @@ async def _call_llm_stream(
             "temperature": temperature if temperature is not None else 0.5,
         }
         async for chunk in client.connect_and_listen(**call_kwargs):
+            print(f"CHUNK: {chunk}")
             if effective_output_type and stream_parser:
                 # Feed the chunk to the parser
                 result = parser.feed_chunk(stream_parser, chunk)
