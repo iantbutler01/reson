@@ -186,7 +186,7 @@ class Runtime(ResonBase):
     """
 
     # ───── public model fields ─────
-    model: str
+    model: Optional[str] = Field(default=None)
     store: Store
     used: bool = Field(default=False)
     api_key: Optional[str] = Field(default=None, exclude=True)
@@ -246,7 +246,9 @@ class Runtime(ResonBase):
         output_type: type | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None
         # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
     ):
         """Execute a single, non-streaming LLM call."""
@@ -257,14 +259,22 @@ class Runtime(ResonBase):
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
         
+        # Determine which model to use
+        effective_model = model if model is not None else self.model
+        if effective_model is None:
+            raise ValueError("No model specified. Provide model either in decorator or at runtime.")
+        
+        # Determine which API key to use
+        effective_api_key = api_key if api_key is not None else self.api_key
+        
         # _call_llm will be modified to return (parsed_value, raw_response_str, reasoning_str)
         result = await _call_llm(
             prompt,
-            self.model,
+            effective_model,
             self._tools, 
             effective_output_type, 
             self.store, 
-            self.api_key,
+            effective_api_key,
             system=system,
             history=history,
             temperature=temperature,
@@ -295,7 +305,9 @@ class Runtime(ResonBase):
         output_type: type | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None
         # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
     ) -> AsyncIterator[tuple[str, Any]]:
         """Execute a streaming LLM call yielding chunks as they arrive.
@@ -312,14 +324,22 @@ class Runtime(ResonBase):
         # Use _return_type if output_type is not provided
         effective_output_type = output_type if output_type is not None else self._return_type
         
+        # Determine which model to use
+        effective_model = model if model is not None else self.model
+        if effective_model is None:
+            raise ValueError("No model specified. Provide model either in decorator or at runtime.")
+        
+        # Determine which API key to use
+        effective_api_key = api_key if api_key is not None else self.api_key
+        
         # _call_llm_stream will be modified to yield (parsed_chunk, raw_chunk_str, chunk_type)
         async for chunk_data in _call_llm_stream(
             prompt,
-            self.model,
+            effective_model,
             self._tools, 
             effective_output_type, 
             self.store, 
-            self.api_key,
+            effective_api_key,
             system=system,
             history=history,
             temperature=temperature,
@@ -375,6 +395,10 @@ class Runtime(ResonBase):
                 # Use _return_type if output_type is not provided
                 effective_output_type = output_type if output_type is not None else self._return_type
                 
+                # Determine which model to use
+                if self.model is None:
+                    raise ValueError("No model specified. Provide model either in decorator or at runtime.")
+                
                 # Call the LLM using the extracted prompt
                 return await _call_llm(prompt, self.model, self._tools, effective_output_type, self.store)
             else:
@@ -410,6 +434,10 @@ class Runtime(ResonBase):
                 
                 # Use _return_type if output_type is not provided
                 effective_output_type = output_type if output_type is not None else self._return_type
+                
+                # Determine which model to use
+                if self.model is None:
+                    raise ValueError("No model specified. Provide model either in decorator or at runtime.")
                 
                 # Call the LLM using the extracted prompt
                 async for chunk in _call_llm_stream(
@@ -803,7 +831,7 @@ async def _call_llm_stream(
 
 def agentic(
     *,
-    model: str,
+    model: Optional[str] = None,
     api_key: str | None = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
@@ -822,7 +850,7 @@ def agentic(
 
 def agentic_generator(
     *,
-    model: str,
+    model: Optional[str] = None,
     api_key: str | None = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
@@ -842,7 +870,7 @@ def agentic_generator(
 # ───────── decorator ─────────
 def _agentic_core(
     *,
-    model: str,
+    model: Optional[str] = None,
     api_key: Optional[str] = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
@@ -860,7 +888,7 @@ def _agentic_core(
        This allows for streaming results or providing intermediate status updates.
     
     Parameters:
-      • model (str) – model identifier (e.g., "openrouter:openai/gpt-4o")
+      • model (str, optional) – model identifier (e.g., "openrouter:openai/gpt-4o"). If not provided, must be specified at runtime.
       • api_key (str, optional) – API key for the model provider
       • store_cfg (StoreConfigBase) – configuration for storage ("memory", "redis", "postgres")
       • autobind (bool) – automatically expose callable params as tools
