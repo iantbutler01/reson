@@ -751,6 +751,8 @@ class OAIInferenceClient(InferenceClient):
         self.api_url = api_url
         self.api_key = api_key
         self.reasoning = reasoning
+        self.ranking_referer = None
+        self.ranking_title = None
 
     @tracer.start_as_current_span(name="OAIInferenceClient.get_generation")
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
@@ -784,10 +786,22 @@ class OAIInferenceClient(InferenceClient):
                 self.api_url,
                 json=request,
                 timeout=180,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=(
+                    {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    }
+                    | (
+                        {"HTTP-Referer": self.ranking_referer}
+                        if self.ranking_referer
+                        else ({})
+                        | (
+                            {"X-Title": self.ranking_title}
+                            if self.ranking_title
+                            else {}
+                        )
+                    )
+                ),
             )
 
             if response.status_code == 400:
@@ -860,7 +874,13 @@ class OAIInferenceClient(InferenceClient):
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
-                },
+                }
+                | (
+                    {"HTTP-Referer": self.ranking_referer}
+                    if self.ranking_referer
+                    else ({})
+                    | ({"X-Title": self.ranking_title} if self.ranking_title else {})
+                ),
                 timeout=180,
             ) as response:
                 if response.status_code == 400:
@@ -915,13 +935,22 @@ class OAIInferenceClient(InferenceClient):
 
 
 class OpenRouterInferenceClient(OAIInferenceClient):
-    def __init__(self, model: str, api_key: str, reasoning: str = None):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        reasoning: str = None,
+        ranking_referer: Optional[str] = None,
+        ranking_title: Optional[str] = None,
+    ):
         super().__init__(
             model,
             api_key,
             api_url="https://openrouter.ai/api/v1/chat/completions",
             reasoning=reasoning,
         )
+        self.ranking_referer = ranking_referer
+        self.ranking_title = ranking_title
 
     async def _populate_cost(self, id: str):
         await asyncio.sleep(0.5)
