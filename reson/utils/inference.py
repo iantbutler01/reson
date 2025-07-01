@@ -30,7 +30,7 @@ def create_openrouter_inference_client(
     return OpenRouterInferenceClient(
         model=model,
         api_key=api_key or os.environ["OPENROUTER_KEY"],
-        reasoning=reasoning
+        reasoning=reasoning,
     )
 
 
@@ -48,10 +48,7 @@ def create_bedrock_inference_client(
     model: str,
 ) -> BedrockInferenceClient:
     region_name = os.environ.get("AWS_REGION", "us-west-2")
-    return BedrockInferenceClient(
-        model=model, 
-        region_name=region_name
-    )
+    return BedrockInferenceClient(model=model, region_name=region_name)
 
 
 def create_google_anthropic_inference_client(
@@ -63,10 +60,12 @@ def create_google_anthropic_inference_client(
 
 
 def create_vertex_gemini_api_client(
-    model: str
+    model: str,
+    reasoning: Optional[str] = None,
 ) -> GoogleGenAIInferenceClient:
     return GoogleGenAIInferenceClient(
         model=model,
         vertexai=True,
         location="global",
+        reasoning=reasoning,
     )

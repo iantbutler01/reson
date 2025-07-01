@@ -16,6 +16,7 @@ import opentelemetry.trace
 import pydantic_core
 import google.auth
 import google.auth.transport.requests
+import google.genai.errors
 from google import genai
 from google.genai import types
 
@@ -138,6 +139,7 @@ class InferenceClient(ABC):
         self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
     ):
         pass
+
 
 class BedrockInferenceClient(InferenceClient):
     def __init__(self, model: str, region_name="us-east-1"):
@@ -269,6 +271,7 @@ class BedrockInferenceClient(InferenceClient):
                     self._cost.output_tokens += chunk_json["usage"]["output_tokens"]
 
             await self._trace(request.messages, [{"text": out}])
+
 
 class AnthropicInferenceClient(InferenceClient):
     def __init__(
@@ -564,6 +567,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
         self,
         model: str,
         api_key: Optional[str] = None,
+        reasoning: Optional[str] = None,
         **kwargs,
     ):
         super().__init__()
@@ -572,6 +576,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
         else:
             self.client = genai.Client(**kwargs)
         self.model = model
+        self.reasoning = reasoning
 
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.get_generation")
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
@@ -583,11 +588,18 @@ class GoogleGenAIInferenceClient(InferenceClient):
         if messages[0].role.value == "system":
             system_instruction = messages[0].content
             messages = messages[1:]
+
         # Convert messages to Google's format
         processed_messages = [
             types.Content(role=msg.role.value, parts=[types.Part(text=msg.content)])
             for msg in messages
         ]
+
+        thinking_budget = None
+        if self.reasoning:
+            # Determine if it's effort or max_tokens
+            if self.reasoning.isdigit():
+                thinking_budget = int(self.reasoning)
 
         try:
             response = await self.client.aio.models.generate_content(
@@ -598,9 +610,13 @@ class GoogleGenAIInferenceClient(InferenceClient):
                     system_instruction=system_instruction,
                     top_p=top_p,
                     max_output_tokens=max_tokens,
-                    thinking_config=types.GenerationConfigThinkingConfig(
-                        include_thoughts=True,
-                        thinking_budget=16384,
+                    thinking_config=(
+                        types.GenerationConfigThinkingConfig(
+                            include_thoughts=True,
+                            thinking_budget=thinking_budget,
+                        )
+                        if thinking_budget
+                        else None
                     ),
                 ),
             )
@@ -612,7 +628,14 @@ class GoogleGenAIInferenceClient(InferenceClient):
         if not response.candidates:
             return ""
 
-        out_text = "\n".join(p.text for p in response.candidates[0].content.parts if p.text)
+        reasoning = "\n".join(
+            p.text for p in response.candidates[0].content.parts if p.text and p.thought
+        )
+        out_text = "\n".join(
+            p.text
+            for p in response.candidates[0].content.parts
+            if p.text and not p.thought
+        )
 
         await self._trace(
             [
@@ -625,7 +648,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
             [{"text": out_text}],
         )
 
-        return out_text
+        return (out_text, reasoning)
 
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
@@ -642,6 +665,12 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
+        thinking_budget = None
+        if self.reasoning:
+            # Determine if it's effort or max_tokens
+            if self.reasoning.isdigit():
+                thinking_budget = int(self.reasoning)
+
         try:
             response = await self.client.aio.models.generate_content_stream(
                 model=self.model,
@@ -651,9 +680,13 @@ class GoogleGenAIInferenceClient(InferenceClient):
                     system_instruction=system_instruction,
                     top_p=top_p,
                     max_output_tokens=max_tokens,
-                    thinking_config=types.GenerationConfigThinkingConfig(
-                        include_thoughts=True,
-                        thinking_budget=16384,
+                    thinking_config=(
+                        types.GenerationConfigThinkingConfig(
+                            include_thoughts=True,
+                            thinking_budget=thinking_budget,
+                        )
+                        if thinking_budget
+                        else None
                     ),
                 ),
             )
@@ -665,9 +698,21 @@ class GoogleGenAIInferenceClient(InferenceClient):
         out = ""
 
         async for chunk in response:
-            if chunk.text:
-                out += chunk.text
-                yield chunk.text
+            reasoning = "\n".join(
+                p.text
+                for p in chunk.candidates[0].content.parts
+                if p.text and p.thought
+            )
+            out_text = "\n".join(
+                p.text
+                for p in chunk.candidates[0].content.parts
+                if p.text and not p.thought
+            )
+            if reasoning:
+                yield ("reasoning", reasoning)
+            else:
+                yield ("content", out_text)
+            out += reasoning + out_text
 
         await self._trace(
             [
@@ -679,7 +724,6 @@ class GoogleGenAIInferenceClient(InferenceClient):
             ],
             [{"text": out}],
         )
-
 
 
 class OAIRequest(ResonBase):
@@ -700,7 +744,7 @@ class OAIInferenceClient(InferenceClient):
         model: str,
         api_key: str,
         api_url: str = "https://api.openai.com/v1/chat/completions",
-        reasoning: str = None
+        reasoning: str = None,
     ):
         super().__init__()
         self.model = model
@@ -869,13 +913,14 @@ class OAIInferenceClient(InferenceClient):
     def include_cache_control(self):
         return "anthropic" in self.model
 
+
 class OpenRouterInferenceClient(OAIInferenceClient):
     def __init__(self, model: str, api_key: str, reasoning: str = None):
         super().__init__(
             model,
             api_key,
             api_url="https://openrouter.ai/api/v1/chat/completions",
-            reasoning = reasoning
+            reasoning=reasoning,
         )
 
     async def _populate_cost(self, id: str):
@@ -904,6 +949,7 @@ class OpenRouterInferenceClient(OAIInferenceClient):
                 self._cost.output_tokens += body["data"]["native_tokens_completion"]
                 self._cost.dollar_adjust += -(body["data"]["cache_discount"] or 0)
                 return
+
 
 class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
     def __init__(
@@ -960,5 +1006,3 @@ class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
                 "Authorization": f"Bearer {self._get_token()}",
             },
         )
-
-
