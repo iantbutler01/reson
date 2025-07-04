@@ -831,14 +831,12 @@ async def _call_llm_stream(
 
     # Enhance the prompt string if a prompt is provided
     enhanced_prompt_content = prompt
-    if (
-        prompt is not None and output_type
-    ):  # Note: using output_type for prompt enhancement, not effective_output_type
+    if prompt is not None and effective_output_type:
         enhanced_prompt_content = parser.enhance_prompt(
-            prompt, output_type, call_context=call_context
+            prompt, effective_output_type, call_context=call_context
         )  # MODIFIED
 
-    # Create a streaming parser if output_type is provided
+    # Create a streaming parser if effective_output_type is provided
     stream_parser = None
     if effective_output_type:
         stream_parser = parser.create_stream_parser(effective_output_type)

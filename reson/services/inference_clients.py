@@ -616,7 +616,9 @@ class GoogleGenAIInferenceClient(InferenceClient):
                             thinking_budget=thinking_budget,
                         )
                         if thinking_budget
-                        else None
+                        else types.GenerationConfigThinkingConfig(
+                            include_thoughts=True,
+                        )
                     ),
                 ),
             )
@@ -626,6 +628,10 @@ class GoogleGenAIInferenceClient(InferenceClient):
             raise InferenceException(str(e))
 
         if not response.candidates:
+            return ""
+
+        if not response.candidates[0].content.parts:
+            # Sometimes seeing this where we only get a bunch of citation_metadata back and no actual content
             return ""
 
         reasoning = "\n".join(
@@ -686,7 +692,9 @@ class GoogleGenAIInferenceClient(InferenceClient):
                             thinking_budget=thinking_budget,
                         )
                         if thinking_budget
-                        else None
+                        else types.GenerationConfigThinkingConfig(
+                            include_thoughts=True,
+                        )
                     ),
                 ),
             )
@@ -698,6 +706,15 @@ class GoogleGenAIInferenceClient(InferenceClient):
         out = ""
 
         async for chunk in response:
+            if not chunk.candidates:
+                continue
+            if not chunk.candidates[0].content:
+                # Sometimes seeing this where we only get a bunch of citation_metadata back and no actual content
+                continue
+            if not chunk.candidates[0].content.parts:
+                # Sometimes seeing this where we only get a bunch of citation_metadata back and no actual content
+                continue
+
             reasoning = "\n".join(
                 p.text
                 for p in chunk.candidates[0].content.parts
