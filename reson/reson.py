@@ -38,11 +38,6 @@ from typing import Union
 import types
 import sys
 
-# Define a type alias that covers all type-like objects
-if sys.version_info >= (3, 10):
-    TypeLike = Union[type, types.GenericAlias, types.UnionType, UnionType, Union]
-else:
-    TypeLike = Union[type, types.GenericAlias]
 from reson.reson_base import ResonBase
 from pydantic import ConfigDict, PrivateAttr, Field, BaseModel
 
