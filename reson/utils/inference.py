@@ -24,8 +24,17 @@ def create_google_gemini_api_client(
     )
 
 
+if os.environ.get("ART_ENABLED"):
+    from reson.services.inference_clients import ARTInferenceClient
+
+    def create_art_inference_client(
+        model: str, name, project, backend
+    ) -> ARTInferenceClient:
+        return ARTInferenceClient(name, model, project, backend)
+
+
 def create_openrouter_inference_client(
-    model: str, api_key: Optional[str] = None, reasoning: str = None
+    model: str, api_key: Optional[str] = None, reasoning: str = ""
 ) -> OpenRouterInferenceClient:
     return OpenRouterInferenceClient(
         model=model,

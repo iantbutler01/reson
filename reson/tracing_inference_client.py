@@ -20,11 +20,12 @@ tracer = opentelemetry.trace.get_tracer(__name__)
 
 _FALLBACK_TIME: Optional[datetime] = None
 
+
 def with_fallback(func):
     if asyncio.iscoroutinefunction(func):
 
         @functools.wraps(func)
-        async def wrapped(self, *args, **kwargs):
+        async def wrapped(self, *args, **kwargs):  # type: ignore
             try:
                 return await func(self, *args, **kwargs)
             except RetriesExceeded:

@@ -1,8 +1,13 @@
 # reson/agentic.py
 from __future__ import annotations
+from types import UnionType
+import uuid
 
-from reson.services.inference_clients import InferenceClient, ChatMessage, ChatRole
+from reson.training import TrainingManager
+from reson.services.inference_clients import ChatMessage, ChatRole
+import os
 from typing import (
+    Union,
     List,
     Dict,
     Any,
@@ -15,11 +20,10 @@ from typing import (
     Callable,
     ParamSpec,
     Union,
-    Awaitable,
+    Tuple,
     cast,
-    Concatenate,
-    Coroutine,
 )
+from pathlib import Path
 from reson.stores import (
     StoreConfigBase,
     MemoryStore,
@@ -30,8 +34,17 @@ from reson.stores import (
     PostgresStoreConfig,
     Store,
 )
+from typing import Union
+import types
+import sys
+
+# Define a type alias that covers all type-like objects
+if sys.version_info >= (3, 10):
+    TypeLike = Union[type, types.GenericAlias, types.UnionType, UnionType, Union]
+else:
+    TypeLike = Union[type, types.GenericAlias]
 from reson.reson_base import ResonBase
-from pydantic import PrivateAttr, Field, BaseModel
+from pydantic import ConfigDict, PrivateAttr, Field, BaseModel
 
 import inspect, functools
 from typing import Callable, ParamSpec, TypeVar, Awaitable, Any, AsyncIterator, Union
@@ -230,6 +243,7 @@ class Runtime(ResonBase):
     _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
     _reasoning_accumulator: List[str] = PrivateAttr(default_factory=list)
     _current_call_args: Optional[Dict[str, Any]] = PrivateAttr(default=None)  # ADDED
+    _training_manager: Optional[TrainingManager] = PrivateAttr(default=None)
 
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
@@ -268,20 +282,35 @@ class Runtime(ResonBase):
         """Register a callable so the LLM can invoke it as a tool."""
         self._tools[name or fn.__name__] = fn
 
+    def load_training_manager(self, path: Path | str):
+        self._training_manager = TrainingManager.load(path)
+
+    def init_training_manager(self, name: str):
+        self._training_manager = TrainingManager(name=name)
+
+        return self._training_manager
+
+    @property
+    def training_manager(self):
+        if not self._training_manager:
+            self.init_training_manager(str(uuid.uuid4()))
+
+        return self._training_manager
+
     async def run(
         self,
         *,
-        prompt: str | None = None,
+        prompt: Optional[str] = None,
         system: Optional[str] = None,
         history: Optional[List[ChatMessage]] = None,
-        output_type: type | None = None,
+        output_type: Optional[R] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
-        # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
-    ):
+        art_backend=None,
+    ) -> R:
         """Execute a single, non-streaming LLM call."""
         self.used = True
         self.clear_raw_response()  # Clear accumulator for new call
@@ -316,20 +345,17 @@ class Runtime(ResonBase):
             top_p=top_p,
             max_tokens=max_tokens,
             call_context=self._current_call_args,  # MODIFIED: Use instance attr
+            art_backend=art_backend,
         )
 
-        # Handle tuple response with reasoning
-        if isinstance(result, tuple) and len(result) == 3:
-            parsed_value, raw_response_str, reasoning_str = result
-            if reasoning_str:
-                self._reasoning_accumulator.append(reasoning_str)
-        else:
-            # Legacy format
-            parsed_value, raw_response_str = result
+        parsed_value, raw_response_str, reasoning_str = result
+        if reasoning_str:
+            self._reasoning_accumulator.append(reasoning_str)
 
         if raw_response_str is not None:
-            self._raw_response_accumulator.append(raw_response_str)
-        return parsed_value
+            self._raw_response_accumulator.append(raw_response_str)  # type: ignore
+
+        return parsed_value  # type: ignore
 
     async def run_stream(
         self,
@@ -337,13 +363,13 @@ class Runtime(ResonBase):
         prompt: str | None = None,
         system: Optional[str] = None,
         history: Optional[List[ChatMessage]] = None,
-        output_type: type | None = None,
+        output_type: Any | None = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
-        # agent_call_args: Optional[Dict[str, Any]] = None # REMOVED from signature
+        art_backend=None,
     ) -> AsyncIterator[tuple[str, Any]]:
         """Execute a streaming LLM call yielding chunks as they arrive.
 
@@ -385,6 +411,7 @@ class Runtime(ResonBase):
             top_p=top_p,
             max_tokens=max_tokens,
             call_context=self._current_call_args,  # MODIFIED: Use instance attr
+            art_backend=art_backend,
         ):
             # Handle tuple format with chunk type
             if isinstance(chunk_data, tuple) and len(chunk_data) == 3:
@@ -401,106 +428,10 @@ class Runtime(ResonBase):
             else:
                 parsed_chunk, raw_chunk_str = chunk_data
                 if raw_chunk_str is not None:
-                    self._raw_response_accumulator.append(raw_chunk_str)
+                    self._raw_response_accumulator.append(raw_chunk_str)  # type: ignore
                 if parsed_chunk is not None:
                     # Always yield as tuple for consistency
                     yield ("content", parsed_chunk)
-
-    async def run_with_baml(
-        self,
-        *,
-        baml_request: Any,
-        output_type: type | None = None,
-    ):
-        """
-        Execute an LLM call using a BAML request.
-
-        Args:
-            baml_request: A BAML request object
-            output_type: The type to parse into
-        """
-        self.used = True
-        try:
-            # Get the parser
-            from reson.utils.parsers import get_default_parser
-
-            parser = get_default_parser()
-
-            # Attempt to access BAML parser methods if this is the BAML parser
-            if hasattr(parser, "extract_prompt_from_baml_request"):
-                typed_parser = cast(BamlParser, parser)
-                # Extract the prompt from the BAML request
-                prompt = typed_parser.extract_prompt_from_baml_request(baml_request)
-
-                # Use _return_type if output_type is not provided
-                effective_output_type = (
-                    output_type if output_type is not None else self._return_type
-                )
-
-                # Determine which model to use
-                if self.model is None:
-                    raise ValueError(
-                        "No model specified. Provide model either in decorator or at runtime."
-                    )
-
-                # Call the LLM using the extracted prompt
-                return await _call_llm(
-                    prompt, self.model, self._tools, effective_output_type, self.store
-                )
-            else:
-                # If not using BAML parser, use the BAML request directly
-                return await baml_request
-        except Exception as e:
-            raise RuntimeError(f"Error executing BAML request: {e}")
-
-    async def run_stream_with_baml(
-        self,
-        *,
-        baml_request: Any,
-        output_type: type | None = None,
-    ) -> AsyncIterator[Any]:
-        """
-        Execute a streaming LLM call using a BAML request.
-
-        Args:
-            baml_request: A BAML request object
-            output_type: The type to parse into
-        """
-        self.used = True
-        try:
-            # Get the parser
-            from reson.utils.parsers import get_default_parser
-
-            parser = get_default_parser()
-
-            # Attempt to access BAML parser methods if this is the BAML parser
-            if hasattr(parser, "extract_prompt_from_baml_request"):
-                typed_parser = cast(BamlParser, parser)
-                # Extract the prompt from the BAML request
-                prompt = typed_parser.extract_prompt_from_baml_request(baml_request)
-
-                # Use _return_type if output_type is not provided
-                effective_output_type = (
-                    output_type if output_type is not None else self._return_type
-                )
-
-                # Determine which model to use
-                if self.model is None:
-                    raise ValueError(
-                        "No model specified. Provide model either in decorator or at runtime."
-                    )
-
-                # Call the LLM using the extracted prompt
-                async for chunk in _call_llm_stream(
-                    prompt, self.model, self._tools, effective_output_type, self.store
-                ):
-                    yield chunk
-            else:
-                # If not using BAML parser, use the BAML request directly
-                async for chunk in baml_request.stream():
-                    yield chunk
-        except Exception as e:
-            raise RuntimeError(f"Error executing BAML streaming request: {e}")
 
     @property
     def context(self):
@@ -620,7 +551,9 @@ def _create_empty_value(output_type):
         return None
 
 
-async def _create_inference_client(model_str, store=None, api_key=None):
+async def _create_inference_client(
+    model_str, store=None, api_key=None, art_backend=None
+):
     """Create an appropriate inference client based on the model string."""
     # Parse model string to get provider and model
     parts = model_str.split(":")
@@ -628,6 +561,20 @@ async def _create_inference_client(model_str, store=None, api_key=None):
         raise ValueError(f"Invalid model string format: {model_str}")
 
     provider, model_name = parts
+
+    if provider == "art" and os.environ.get("ART_ENABLED"):
+        from reson.utils.inference import create_art_inference_client
+
+        name_project_match = re.match(
+            r"(.+)@name=([a-z].*)project=([a-z].*)", model_name
+        )
+
+        if not name_project_match:
+            raise AttributeError("Name and Project must be included for ART runs.")
+
+        model, name, project = name_project_match.groups()
+
+        return create_art_inference_client(model, name, project, art_backend)
 
     if provider == "openrouter":
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
@@ -683,7 +630,7 @@ async def _call_llm(
     prompt: Optional[str],
     model: str,
     tools: Dict[str, Callable],
-    output_type: Optional[Type[Any]],
+    output_type: Optional[R],
     store: Optional[Store] = None,
     api_key: Optional[str] = None,
     system: Optional[str] = None,
@@ -692,9 +639,12 @@ async def _call_llm(
     top_p: Optional[float] = None,
     max_tokens: Optional[int] = None,
     call_context: Optional[Dict[str, Any]] = None,  # ADDED
+    art_backend=None,
 ):
     """Execute a non-streaming LLM call, possibly with tool use."""
-    client = await _create_inference_client(model, store, api_key)
+    client = await _create_inference_client(
+        model, store, api_key, art_backend=art_backend
+    )
 
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
@@ -728,7 +678,7 @@ async def _call_llm(
     enhanced_prompt_content = prompt
     if prompt is not None and effective_output_type:
         enhanced_prompt_content = parser.enhance_prompt(
-            prompt, effective_output_type, call_context=call_context
+            prompt, effective_output_type, call_context=call_context  # type: ignore
         )  # MODIFIED
 
     # Construct messages list
@@ -760,7 +710,7 @@ async def _call_llm(
         content, reasoning = result
         # Parse the content if output_type is provided
         if effective_output_type and content is not None:
-            parsed_result = parser.parse(content, effective_output_type)
+            parsed_result = parser.parse(content, effective_output_type)  # type: ignore
             print(parsed_result)
             if parsed_result.success:
                 return parsed_result.value, content, reasoning
@@ -773,7 +723,7 @@ async def _call_llm(
     else:
         # Legacy format - just content
         if effective_output_type and result is not None:
-            parsed_result = parser.parse(result, effective_output_type)
+            parsed_result = parser.parse(result, effective_output_type)  # type: ignore
             print(parsed_result)
             if parsed_result.success:
                 return parsed_result.value, result, None
@@ -798,9 +748,12 @@ async def _call_llm_stream(
     top_p: Optional[float] = None,
     max_tokens: Optional[int] = None,
     call_context: Optional[Dict[str, Any]] = None,  # ADDED
+    art_backend=None,
 ):
     """Execute a streaming LLM call, possibly with tool use."""
-    client = await _create_inference_client(model, store, api_key=api_key)
+    client = await _create_inference_client(
+        model, store, api_key=api_key, art_backend=art_backend
+    )
 
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
@@ -868,22 +821,20 @@ async def _call_llm_stream(
             "top_p": top_p if top_p is not None else 0.9,
             "temperature": temperature if temperature is not None else 0.5,
         }
-        async for chunk in client.connect_and_listen(**call_kwargs):
-            print(f"CHUNK: {chunk}")
-            if effective_output_type and stream_parser:
-                # Feed the chunk to the parser
-                result = parser.feed_chunk(stream_parser, chunk)
-                # Yield tuple: (parsed_chunk, raw_chunk)
-                yield result.value, chunk
-            else:
-                # Yield tuple: (None or raw_chunk as parsed, raw_chunk)
-                yield chunk, chunk
+        async for ctype, chunk in client.connect_and_listen(**call_kwargs):
+            if ctype == "reasoning":
+                yield None, chunk, "reasoning"
 
-        # Validate the final result if using a parser
+            if effective_output_type and stream_parser:
+                result = parser.feed_chunk(stream_parser, chunk)
+                yield result.value, chunk, ctype
+            else:
+                yield chunk, chunk, ctype
+
         if effective_output_type and stream_parser:
             final_result = parser.validate_final(stream_parser)
             if final_result.success and final_result.value is not None:
-                yield final_result.value, ""  # Yield empty string for raw part of final validation
+                yield final_result.value, ""
     else:
         call_kwargs = {
             "messages": messages,

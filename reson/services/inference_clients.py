@@ -19,6 +19,10 @@ import google.auth.transport.requests
 import google.genai.errors
 from google import genai
 from google.genai import types
+import os
+
+if os.environ.get("ART_ENABLED"):
+    import art
 
 from reson.reson_base import ResonBase
 
@@ -505,63 +509,6 @@ def smart_unescape_code(s: str) -> str:
     return result
 
 
-class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
-    def __init__(
-        self,
-        model: str,
-        region: str = "us-east5",
-        thinking: Optional[int] = None,
-    ):
-        InferenceClient.__init__(self)
-        self.model = model
-        self.region = region
-        self.thinking = thinking
-        self._get_token()
-
-    def _get_token(self):
-        if not hasattr(self, "creds"):
-            import google.oauth2.id_token
-            import google.auth.transport.requests
-
-            self.creds, self.project_id = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-
-        if not self.creds.token or self.creds.expired:
-            request = google.auth.transport.requests.Request()
-            self.creds.refresh(request)
-
-        return self.creds.token
-
-    async def _post(self, request: dict):
-        request.pop("model", None)
-        request["anthropic_version"] = "vertex-2023-10-16"
-
-        async with httpx.AsyncClient() as client:
-            return await client.post(
-                f"https://{self.region}-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{self.region}/publishers/anthropic/models/{self.model}:streamRawPredict",
-                timeout=180,
-                json=request,
-                headers={
-                    "Authorization": f"Bearer {self._get_token()}",
-                },
-            )
-
-    def _stream(self, client, request: dict):
-        request.pop("model", None)
-        request["anthropic_version"] = "vertex-2023-10-16"
-
-        return client.stream(
-            "POST",
-            f"https://{self.region}-aiplatform.googleapis.com/v1/projects/{self.project_id}/locations/{self.region}/publishers/anthropic/models/{self.model}:streamRawPredict",
-            timeout=180,
-            json=request,
-            headers={
-                "Authorization": f"Bearer {self._get_token()}",
-            },
-        )
-
-
 class GoogleGenAIInferenceClient(InferenceClient):
     def __init__(
         self,
@@ -995,6 +942,147 @@ class OpenRouterInferenceClient(OAIInferenceClient):
                 self._cost.output_tokens += body["data"]["native_tokens_completion"]
                 self._cost.dollar_adjust += -(body["data"]["cache_discount"] or 0)
                 return
+
+
+if os.environ.get("ART_ENABLED"):
+    import art
+
+    class ARTInferenceClient(InferenceClient):
+        def __init__(
+            self,
+            name: str,
+            model: str,
+            project: str,
+            backend,
+            reasoning: Optional[str] = None,
+        ):
+            super().__init__()
+            self.model = model
+            self.art_model = art.TrainableModel(
+                name=name,
+                project=project,
+                base_model=model,
+            )
+            self.backend = backend
+
+            self.reasoning = reasoning
+            self.openai_client: Any = None
+            self._initialize_lock = asyncio.Lock()
+
+        async def _initialize(self):
+            async with self._initialize_lock:
+                if self.openai_client:
+                    return
+
+                await self.art_model.register(self.backend)
+                self.openai_client = self.art_model.openai_client()
+
+        @tracer.start_as_current_span(name="ARTInferenceClient.get_generation")
+        @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
+        async def get_generation(
+            self,
+            messages: List[ChatMessage],
+            max_tokens=4096,
+            top_p=1.0,
+            temperature=0.5,
+        ):
+            if not self.openai_client:
+                await self._initialize()
+
+            processed_messages = [
+                {"role": m.role.value, "content": m.content} for m in messages
+            ]
+
+            request = OAIRequest(
+                model=self.model,
+                messages=processed_messages,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                temperature=temperature,
+                stream=False,
+            ).model_dump(exclude={"stream_options", "tools", "tool_choice"})
+
+            if self.reasoning:
+                if self.reasoning.isdigit():
+                    request["reasoning"] = {"max_tokens": int(self.reasoning)}
+                else:
+                    request["reasoning"] = {"effort": self.reasoning}
+
+            try:
+                response = await self.openai_client.chat.completions.create(**request)
+            except Exception as e:
+                raise InferenceException(str(e))
+
+            content = response.choices[0].message.content
+            reasoning = getattr(response.choices[0].message, "reasoning", None)
+
+            if response.usage:
+                self._cost.input_tokens += response.usage.prompt_tokens
+                self._cost.output_tokens += response.usage.completion_tokens
+
+            await self._trace(
+                processed_messages,
+                [{"text": content}],
+            )
+
+            if reasoning:
+                return (content, reasoning)
+            return content
+
+        @tracer.start_as_current_span(name="ARTInferenceClient.connect_and_listen")
+        async def connect_and_listen(
+            self,
+            messages: List[ChatMessage],
+            max_tokens=4096,
+            top_p=1.0,
+            temperature=0.5,
+        ):
+            if not self.openai_client:
+                await self._initialize()
+
+            processed_messages = [
+                {"role": msg.role.value, "content": msg.content} for msg in messages
+            ]
+
+            request = OAIRequest(
+                model=self.model,
+                messages=processed_messages,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                temperature=temperature,
+                stream=True,
+                stream_options={"include_usage": True},
+            ).model_dump(exclude={"tools", "tool_choice"})
+
+            if self.reasoning:
+                if self.reasoning.isdigit():
+                    request["reasoning"] = {"max_tokens": int(self.reasoning)}
+                else:
+                    request["reasoning"] = {"effort": self.reasoning}
+
+            try:
+                stream = await self.openai_client.chat.completions.create(**request)
+            except Exception as e:
+                raise InferenceException(str(e))
+
+            out = ""
+            async for chunk in stream:
+                if chunk.usage:
+                    self._cost.input_tokens += chunk.usage.prompt_tokens
+                    self._cost.output_tokens += chunk.usage.completion_tokens
+
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if reasoning := getattr(delta, "reasoning", None):
+                        yield "reasoning", reasoning
+                    if content := getattr(delta, "content", None):
+                        out += content
+                        yield "content", content
+
+            await self._trace(
+                processed_messages,
+                [{"text": out}],
+            )
 
 
 class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
