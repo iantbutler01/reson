@@ -73,13 +73,13 @@ Connect to various LLM providers with a simple string. API keys are generally ex
 
 ```python
 # Examples of model strings:
-# @agentic(model="openrouter:openai/gpt-4o")       # OpenRouter
-# @agentic(model="anthropic:claude-3-opus-20240229") # Anthropic (Direct)
-# @agentic(model="bedrock:anthropic.claude-3-sonnet-20240229-v1:0") # AWS Bedrock
-# @agentic(model="google-gemini:gemini-1.5-pro-latest") # Google Gemini API
-# @agentic(model="openai:gpt-4o")                  # OpenAI API
-# @agentic(model="vertexai:gemini-1.5-flash-001")    # Google Vertex AI (Direct)
-# @agentic(model="google-anthropic:claude-3-opus-20240229") # Anthropic on Vertex
+ @agentic(model="openrouter:openai/gpt-4o")       # OpenRouter
+ @agentic(model="anthropic:claude-3-opus-20240229") # Anthropic (Direct)
+ @agentic(model="bedrock:anthropic.claude-3-sonnet-20240229-v1:0") # AWS Bedrock
+ @agentic(model="google-gemini:gemini-1.5-pro-latest") # Google Gemini API
+ @agentic(model="openai:gpt-4o")                  # OpenAI API
+ @agentic(model="vertexai:gemini-1.5-flash-001")    # Google Vertex AI (Direct)
+ @agentic(model="google-anthropic:claude-3-opus-20240229") # Anthropic on Vertex
 ```
 
 ### Tool Registration
@@ -129,8 +129,8 @@ async def process_items(items: List[str], runtime: Runtime) -> AsyncGenerator[Di
         yield {"index": i, "item": item, "result": result}
 
 # Usage
-# async for result in process_items(my_items):
-#     print(f"Item {result['index']}: {result['result']}")
+ async for result in process_items(my_items):
+     print(f"Item {result['index']}: {result['result']}")
 ```
 
 This is great for:
@@ -196,13 +196,13 @@ async def extract_company(text: str, runtime: Runtime) -> Company:
 You can also use it in custom prompts passed to `runtime.run()`:
 
 ```python
-# data = "Some data string"
-# prompt = f"""
-# Analyze this data: {data}
+ data = "Some data string"
+ prompt = f"""
+ Analyze this data: {data}
 
-# {{{{return_type}}}}  # Double braces for f-strings if {{return_type}} is not a var
-# """
-# result = await runtime.run(prompt=prompt, output_type=Company)
+ {{{{return_type}}}}  # Double braces for f-strings if {{return_type}} is not a var
+ """
+ result = await runtime.run(prompt=prompt, output_type=Company)
 ```
 
 ### Storage Backends
@@ -213,29 +213,29 @@ Configure different storage backends for context and tracing:
 from reson.stores import MemoryStoreConfig, RedisStoreConfig, PostgresStoreConfig
 
 # In-memory storage (default)
-# @agentic(model="openrouter:openai/gpt-4o")
-# async def with_memory_store(runtime: Runtime): ...
+ @agentic(model="openrouter:openai/gpt-4o")
+ async def with_memory_store(runtime: Runtime): ...
 
-# Redis for persistent storage
-# @agentic(
-#     model="openrouter:openai/gpt-4o", 
-#     store_cfg=RedisStoreConfig(
-#         host="redis.example.com",
-#         port=6379,
-#         password="secret"
-#     )
-# )
+ Redis for persistent storage
+ @agentic(
+     model="openrouter:openai/gpt-4o", 
+     store_cfg=RedisStoreConfig(
+         host="redis.example.com",
+         port=6379,
+         password="secret"
+     )
+ )
 # async def with_redis_store(runtime: Runtime): ...
 
 # PostgreSQL with JSONB document storage
-# @agentic(
-#     model="openrouter:openai/gpt-4o",
-#     store_cfg=PostgresStoreConfig(
-#         dsn="postgresql://user:pass@db.example.com/db",
-#         table="agent_data",   # Table will be created if it doesn't exist
-#         column="data"         # JSONB column that stores all context data
-#     )
-# )
+ @agentic(
+     model="openrouter:openai/gpt-4o",
+     store_cfg=PostgresStoreConfig(
+         dsn="postgresql://user:pass@db.example.com/db",
+         table="agent_data",   # Table will be created if it doesn't exist
+         column="data"         # JSONB column that stores all context data
+     )
+ )
 # async def with_postgres_store(runtime: Runtime): ...
 ```
 
@@ -247,17 +247,17 @@ Control exactly which tools are accessible to the LLM:
 
 ```python
 # By default, all callable parameters become tools
-# @agentic(model="openrouter:openai/gpt-4o")
-# async def default_behavior(search_database, update_records, runtime: Runtime):
-#     # Both functions are automatically available to the LLM
-#     return await runtime.run()
+ @agentic(model="openrouter:openai/gpt-4o")
+ async def default_behavior(search_database, update_records, runtime: Runtime):
+     # Both functions are automatically available to the LLM
+     return await runtime.run()
 
 # Disable autobind for precise control
-# @agentic(model="openrouter:openai/gpt-4o", autobind=False)
-# async def controlled_access(search_database, update_records, runtime: Runtime):
-#     # Only explicitly registered tools are available
-#     runtime.tool(search_database, name="search") # Manually register 'search_database' as 'search'
-#     return await runtime.run()
+ @agentic(model="openrouter:openai/gpt-4o", autobind=False)
+ async def controlled_access(search_database, update_records, runtime: Runtime):
+     # Only explicitly registered tools are available
+     runtime.tool(search_database, name="search") # Manually register 'search_database' as 'search'
+     return await runtime.run()
 ```
 
 ### Context Management API
@@ -312,28 +312,28 @@ With reson, you use standard Python control flow exactly as you'd expect:
 
 ```python
 # class Analysis(BaseModel): ... # Define Analysis model
-# @agentic(model="openrouter:openai/gpt-4o")
-# async def analyze_data(data: List[Dict], runtime: Runtime) -> Analysis:
-#     # Normal conditionals
-#     if len(data) == 0:
-#         return Analysis(status="empty", results=[])
+ @agentic(model="openrouter:openai/gpt-4o")
+ async def analyze_data(data: List[Dict], runtime: Runtime) -> Analysis:
+     # Normal conditionals
+     if len(data) == 0:
+         return Analysis(status="empty", results=[])
         
-#     # Regular Python loops
-#     results_data = []
-#     for item in data:
-#         try:
-#             # Standard exception handling
-#             result = await runtime.run(prompt=f"Analyze this: {item}")
-#             results_data.append(result)
-#         except Exception as e:
-#             # Handle errors just like regular Python
-#             print(f"Error processing {item}: {e}")
+     # Regular Python loops
+     results_data = []
+     for item in data:
+         try:
+             # Standard exception handling
+             result = await runtime.run(prompt=f"Analyze this: {item}")
+             results_data.append(result)
+         except Exception as e:
+             # Handle errors just like regular Python
+             print(f"Error processing {item}: {e}")
             
-#     # Regular function calls mix with agentic functions
-#     # summary = await summarize_results(results_data, runtime) # Assuming summarize_results is another agentic fn
+     # Regular function calls mix with agentic functions
+     # summary = await summarize_results(results_data, runtime) # Assuming summarize_results is another agentic fn
     
-#     # Return normal Python objects
-#     return Analysis(status="complete", results=results_data, summary="summary_placeholder")
+     # Return normal Python objects
+     return Analysis(status="complete", results=results_data, summary="summary_placeholder")
 ```
 
 No special dispatch functions, no state machines to manage, no graph nodes to connect - just write normal Python.
@@ -348,20 +348,20 @@ Since agentic functions are just async functions, you compose them like any othe
 # class DocumentAnalysis(BaseModel): ...
 # class Document(BaseModel): text: str
 
-# # Split complex tasks into smaller, reusable functions
-# @agentic(model="openrouter:openai/gpt-4o") 
-# async def classify_text(text: str, runtime: Runtime) -> Category:
-#     return await runtime.run(prompt=f"Classify this text: {text}")
+ # Split complex tasks into smaller, reusable functions
+ @agentic(model="openrouter:openai/gpt-4o") 
+ async def classify_text(text: str, runtime: Runtime) -> Category:
+     return await runtime.run(prompt=f"Classify this text: {text}")
 
-# @agentic(model="openrouter:openai/gpt-4o")
-# async def extract_entities_from_text(text: str, runtime: Runtime) -> List[Entity]:
-#     return await runtime.run(prompt=f"Extract entities from: {text}")
+ @agentic(model="openrouter:openai/gpt-4o")
+ async def extract_entities_from_text(text: str, runtime: Runtime) -> List[Entity]:
+     return await runtime.run(prompt=f"Extract entities from: {text}")
 
-# # Compose them naturally
-# async def process_document(doc: Document) -> DocumentAnalysis:
-#     category = await classify_text(doc.text) # Assuming classify_text is defined
-#     entities = await extract_entities_from_text(doc.text) # Assuming extract_entities_from_text is defined
-#     return DocumentAnalysis(doc=doc, category=category, entities=entities)
+ # Compose them naturally
+ async def process_document(doc: Document) -> DocumentAnalysis:
+     category = await classify_text(doc.text) # Assuming classify_text is defined
+     entities = await extract_entities_from_text(doc.text) # Assuming extract_entities_from_text is defined
+     return DocumentAnalysis(doc=doc, category=category, entities=entities)
 ```
 
 ### Generator semantics for pause/resume
@@ -370,20 +370,20 @@ The new generator support means you can use Python's native `async for` to handl
 
 ```python
 # class Result(BaseModel): item: str; processed: Any
-# @agentic(model="openrouter:openai/gpt-4o")
-# async def process_with_pause(data: List[str], runtime: Runtime) -> AsyncGenerator[Result, None]:
-#     for item in data:
-#         # Process
-#         processed_result = await runtime.run(prompt=f"Process: {item}")
-#         # Yield (pause execution, return control to caller)
-#         yield Result(item=item, processed=processed_result)
-#         # Execution resumes here when the caller requests the next item
+ @agentic(model="openrouter:openai/gpt-4o")
+ async def process_with_pause(data: List[str], runtime: Runtime) -> AsyncGenerator[Result, None]:
+     for item in data:
+         # Process
+         processed_result = await runtime.run(prompt=f"Process: {item}")
+         # Yield (pause execution, return control to caller)
+         yield Result(item=item, processed=processed_result)
+         # Execution resumes here when the caller requests the next item
     
-# # Use standard Python iteration semantics
-# # async for result_item in process_with_pause(data):
-# #     # Do something with each result
-# #     # Maybe save to database, or wait for user confirmation
-# #     await save_result(result_item) # Assuming save_result is defined
+ # Use standard Python iteration semantics
+ # async for result_item in process_with_pause(data):
+ #     # Do something with each result
+ #     # Maybe save to database, or wait for user confirmation
+ #     await save_result(result_item) # Assuming save_result is defined
 ```
 
 No need for complex state management or custom resumption tokens - Python's generators handle the pause/resume pattern natively.
