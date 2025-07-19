@@ -139,20 +139,6 @@ This is great for:
 - Streaming results to users in real-time
 - Mixing status updates with actual results
 
-### BAML Integration
-
-Seamlessly integrate with BAML to use their prompt generation and output parsing; everything is still run by Reson with our robustness guarantees:
-
-```python
-# Assuming BAML client and functions are set up
-# @agentic(model="anthropic:claude-3-opus-20240229")
-# async def extract_with_baml(runtime: Runtime):
-#     """Use BAML integration to extract information."""
-#     import baml_client as b # Fictional BAML client import
-#     request = b.ExtractPerson("John Doe is 30 years old...") # Fictional BAML request
-#     return await runtime.run_with_baml(baml_request=request)
-```
-
 ## Extensible Architecture
 
 Reson is built with a modular design:
