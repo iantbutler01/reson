@@ -431,18 +431,18 @@ We're grateful to @dexhorthy and the @humanlayer team for articulating these pri
 3. **Generator semantics for progress reporting**: Use `agentic_generator` and `async for ... yield` when you need to show progress on long-running tasks or stream partial results:
 
    ```python
-#    @agentic_generator(model="openrouter:openai/gpt-4o") # Use agentic_generator for async generators
-#    async def analyze_documents_stream(docs: List[str], runtime: Runtime) -> AsyncGenerator[Dict, None]:
-#        total = len(docs)
-#        for i, doc in enumerate(docs):
-#            # Yield progress update first
-#            yield {"type": "progress", "done": i, "total": total}
+    @agentic_generator(model="openrouter:openai/gpt-4o") # Use agentic_generator for async generators
+    async def analyze_documents_stream(docs: List[str], runtime: Runtime) -> AsyncGenerator[Dict, None]:
+        total = len(docs)
+        for i, doc in enumerate(docs):
+           # Yield progress update first
+            yield {"type": "progress", "done": i, "total": total}
            
-#            # Process document
-#            result = await runtime.run(prompt=f"Analyze this document: {doc}")
+            # Process document
+            result = await runtime.run(prompt=f"Analyze this document: {doc}")
            
-#            # Yield actual result
-#            yield {"type": "result", "document": doc, "analysis": result}
+            # Yield actual result
+            yield {"type": "result", "document": doc, "analysis": result}
    ```
 
 ## Why the Name?
