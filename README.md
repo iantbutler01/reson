@@ -36,7 +36,7 @@ async def extract_people(text: str, runtime: Runtime) -> List[Person]:
     """
     # API keys for providers like OpenRouter are typically configured
     # via environment variables (e.g., OPENROUTER_KEY).
-    return await runtime.run(prompt=f"Extract people from: {text}")
+    return await runtime.run(prompt=f"Extract people from: {text}", output_type=List[Person])
 
 # Now you can just use it
 people = await extract_people("John is 30 and knows Python. Sarah is 28 and knows JavaScript.")
