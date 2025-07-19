@@ -146,7 +146,6 @@ Reson is built with a modular design:
 *   **Inference Clients**: Each LLM provider (OpenAI, Anthropic, Bedrock, etc.) has its own `InferenceClient` implementation. The `TracingInferenceClient` wraps these to add features like caching, cost tracking, request/response tracing, and fallback logic.
 *   **Output Parsers**: The `OutputParser` interface defines how LLM responses are converted into Python types.
     *   `TypeParser`: The default parser, uses `gasp` for robust parsing based on Python type hints, Pydantic models, and `Deserializable` classes.
-    *   `BAMLParser`: Integrates with BAML's parsing capabilities.
 *   **Stores**: For persisting context or trace data, with backends like memory, Redis, and PostgreSQL.
 
 This architecture allows for easier extension and maintenance.
