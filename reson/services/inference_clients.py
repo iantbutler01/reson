@@ -719,7 +719,7 @@ class OAIInferenceClient(InferenceClient):
         self.ranking_title = None
 
     @tracer.start_as_current_span(name="OAIInferenceClient.get_generation")
-    @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
+    @backoff.on_exception(backoff.expo, (InferenceException, httpx.HTTPError), max_time=60)
     async def get_generation(
         self, messages: List[ChatMessage], max_tokens=4096, top_p=1.0, temperature=0.5
     ):
