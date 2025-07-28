@@ -141,7 +141,6 @@ def _create_pydantic_tool_model(func: Callable, name: str) -> Type:
     return tool_class
 
 
-# TODO: This isn't properly creating a Deserializable class but because our parser can handle generic python types now it still works properly.
 def _create_deserializable_tool_class(func: Callable, name: str) -> Type:
     """Create a Deserializable class from a callable's signature using type()."""
 
