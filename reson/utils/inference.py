@@ -1,4 +1,3 @@
-import re
 from typing import Optional, Protocol
 from reson.services.inference_clients import (
     InferenceClient,
@@ -7,6 +6,7 @@ from reson.services.inference_clients import (
     OpenRouterInferenceClient,
     GoogleGenAIInferenceClient,
     GoogleAnthropicInferenceClient,
+    OAIInferenceClient,
 )
 import os
 
@@ -77,4 +77,13 @@ def create_vertex_gemini_api_client(
         vertexai=True,
         location="global",
         reasoning=reasoning,
+    )
+
+def create_openai_inference_client(
+    model: str,
+    api_key: Optional[str] = None,
+) -> OAIInferenceClient:
+    return OAIInferenceClient(
+        model=model,
+        api_key=api_key,
     )

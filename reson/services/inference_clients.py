@@ -719,7 +719,9 @@ class OAIInferenceClient(InferenceClient):
         self.ranking_title = None
 
     @tracer.start_as_current_span(name="OAIInferenceClient.get_generation")
-    @backoff.on_exception(backoff.expo, (InferenceException, httpx.HTTPError), max_time=60)
+    @backoff.on_exception(
+        backoff.expo, (InferenceException, httpx.HTTPError), max_time=60
+    )
     async def get_generation(
         self, messages: List[ChatMessage], max_tokens=4096, top_p=1.0, temperature=0.5
     ):
@@ -737,6 +739,11 @@ class OAIInferenceClient(InferenceClient):
             temperature=temperature,
             stream=False,
         ).model_dump(exclude={"stream_options", "tools", "tool_choice"})
+
+        if self.model in ("o3",):
+            request["max_completion_tokens"] = request.pop("max_tokens")
+            request.pop("temperature", None)
+            request.pop("top_p", None)
 
         if self.reasoning:
             # Determine if it's effort or max_tokens
@@ -829,6 +836,11 @@ class OAIInferenceClient(InferenceClient):
                 request["reasoning"] = {"max_tokens": int(self.reasoning)}
             else:
                 request["reasoning"] = {"effort": self.reasoning}
+
+        if self.model in ("o3",):
+            request["max_completion_tokens"] = request.pop("max_tokens")
+            request.pop("temperature", None)
+            request.pop("top_p", None)
 
         async with httpx.AsyncClient() as client:
             async with client.stream(

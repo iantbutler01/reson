@@ -63,6 +63,7 @@ from reson.utils.inference import (
     create_anthropic_inference_client,
     create_bedrock_inference_client,
     create_vertex_gemini_api_client,
+    create_openai_inference_client,
 )
 from reson.tracing_inference_client import TracingInferenceClient
 
@@ -606,6 +607,10 @@ async def _create_inference_client(
             client = create_vertex_gemini_api_client(model_name, reasoning=reasoning)
         else:
             client = create_vertex_gemini_api_client(model_name)
+    elif provider == "openai":
+        # Strip reasoning= from model name if present
+        model_name = re.sub(r"@reasoning=.*$", "", model_name)
+        client = create_openai_inference_client(model_name, api_key=api_key)
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
