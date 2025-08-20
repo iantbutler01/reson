@@ -5,22 +5,23 @@ from __future__ import annotations
 import os
 import importlib
 from threading import Lock
-from typing import Any, Optional, Sequence, Mapping, AsyncIterator, cast
+from typing import Any, Optional, Sequence, Mapping, AsyncIterator, Iterator, cast
 from contextvars import ContextVar
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import psycopg
 from psycopg.rows import dict_row, DictRow
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 
 class DatabaseManager:
     """
-    Async psycopg3 manager with:
+    Dual sync/async psycopg3 manager with:
       - one-instance-per-DSN (same behavior as your sync version)
       - ContextVar-based connection reuse across nested calls
       - DictRow typing so fetches are Mapping[str, Any]
       - correct commit/rollback at the outermost DB call
+      - Both synchronous and asynchronous interfaces with 'sync_' prefix
     """
 
     _instances: dict[str, dict] = {}
@@ -57,17 +58,30 @@ class DatabaseManager:
                 pass
 
         # ✅ Correct: pool is generic over the CONNECTION TYPE, not the row type
+        # Don't open the async pool immediately - it will be opened when needed
         self.pool: AsyncConnectionPool[psycopg.AsyncConnection[DictRow]] = (
             AsyncConnectionPool(
                 dsn,
                 min_size=1,
                 max_size=20,
                 timeout=30.0,
-                open=True,
+                open=False,  # Don't open immediately
             )
         )
 
+        # Synchronous pool for sync operations
+        self.sync_pool: ConnectionPool[psycopg.Connection[DictRow]] = ConnectionPool(
+            dsn,
+            min_size=1,
+            max_size=20,
+            timeout=30.0,
+            open=True,
+        )
+
+        self._async_pool_opened = False
+
         # Per-instance ContextVars so multiple DSNs don't clash
+        # Async context vars
         self._current_conn: ContextVar[Optional[psycopg.AsyncConnection[DictRow]]] = (
             ContextVar(
                 f"pg_current_conn_{id(self)}",
@@ -79,6 +93,18 @@ class DatabaseManager:
             default=0,
         )
 
+        # Sync context vars
+        self._sync_current_conn: ContextVar[Optional[psycopg.Connection[DictRow]]] = (
+            ContextVar(
+                f"pg_sync_current_conn_{id(self)}",
+                default=None,
+            )
+        )
+        self._sync_conn_depth: ContextVar[int] = ContextVar(
+            f"pg_sync_conn_depth_{id(self)}",
+            default=0,
+        )
+
         self.__class__._instances[dsn]["initialized"] = True
 
     @asynccontextmanager
@@ -86,6 +112,11 @@ class DatabaseManager:
         """
         Reuse one connection per task to prevent re-entrant pool.getconn() deadlocks.
         """
+        # Open async pool on first use
+        if not self._async_pool_opened:
+            await self.pool.open()
+            self._async_pool_opened = True
+
         existing = self._current_conn.get()
         if existing is not None:
             token_depth = self._conn_depth.set(self._conn_depth.get() + 1)
@@ -193,5 +224,128 @@ class DatabaseManager:
 
         return row["id"] if row is not None else None
 
+    @contextmanager
+    def sync_get_connection(self) -> Iterator[psycopg.Connection[DictRow]]:
+        """
+        Synchronous version of get_connection.
+        Reuse one connection per thread to prevent re-entrant pool.getconn() deadlocks.
+        """
+        existing = self._sync_current_conn.get()
+        if existing is not None:
+            token_depth = self._sync_conn_depth.set(self._sync_conn_depth.get() + 1)
+            try:
+                yield existing
+            finally:
+                self._sync_conn_depth.reset(token_depth)
+            return
+
+        conn: psycopg.Connection[DictRow] = self.sync_pool.getconn()
+        # Return dict-like rows (Mapping[str, Any])
+        conn.row_factory = dict_row
+
+        token_conn = self._sync_current_conn.set(conn)
+        token_depth = self._sync_conn_depth.set(1)
+        try:
+            yield conn
+        finally:
+            try:
+                self.sync_pool.putconn(conn)
+            finally:
+                self._sync_current_conn.reset(token_conn)
+                self._sync_conn_depth.reset(token_depth)
+
+    @contextmanager
+    def sync_get_cursor(
+        self,
+        *,
+        commit: bool = True,
+        cursor: Optional[psycopg.Cursor[DictRow]] = None,
+    ) -> Iterator[psycopg.Cursor[DictRow]]:
+        """
+        Yield a synchronous cursor.
+
+        - If 'cursor' is provided, we do not open/commit/rollback/close anything.
+        - If we open it:
+            - commit on success only at the outermost depth
+            - rollback on exception only at the outermost depth
+        """
+        if cursor is not None:
+            yield cursor
+            return
+
+        with self.sync_get_connection() as conn:
+            with conn.cursor() as cur:
+                try:
+                    yield cur
+                    if commit and self._sync_conn_depth.get() == 1:
+                        conn.commit()
+                except Exception:
+                    if self._sync_conn_depth.get() == 1:
+                        conn.rollback()
+                    raise
+
+    def sync_execute_query(
+        self,
+        query: Any,  # accept str/SQL/Composed/etc. (satisfies Pylance)
+        params: Optional[Sequence[Any]] = None,
+        *,
+        cursor: Optional[psycopg.Cursor[DictRow]] = None,
+    ) -> Optional[Sequence[Mapping[str, Any]]]:
+        """
+        Synchronous version of execute_query.
+        SELECT / RETURNING -> Sequence of mapping rows
+        DML without RETURNING -> None
+        """
+        if cursor is not None:
+            cursor.execute(cast(Any, query), params)
+            return cursor.fetchall() if cursor.description is not None else None
+
+        with self.sync_get_cursor() as cur:
+            cur.execute(cast(Any, query), params)
+            return cur.fetchall() if cur.description is not None else None
+
+    def sync_execute_and_fetch_one(
+        self,
+        query: Any,
+        params: Optional[Sequence[Any]] = None,
+        *,
+        cursor: Optional[psycopg.Cursor[DictRow]] = None,
+    ) -> Optional[Mapping[str, Any]]:
+        """
+        Synchronous version of execute_and_fetch_one.
+        """
+        if cursor is not None:
+            cursor.execute(cast(Any, query), params)
+            return cursor.fetchone()
+        with self.sync_get_cursor() as cur:
+            cur.execute(cast(Any, query), params)
+            return cur.fetchone()
+
+    def sync_execute_and_return_id(
+        self,
+        query: Any,
+        params: Optional[Sequence[Any]] = None,
+        *,
+        cursor: Optional[psycopg.Cursor[DictRow]] = None,
+    ):
+        """
+        Synchronous version of execute_and_return_id.
+        Expects the SQL to include `RETURNING id`.
+        """
+        if cursor is not None:
+            cursor.execute(cast(Any, query), params)
+            row = cursor.fetchone()
+        else:
+            with self.sync_get_cursor() as cur:
+                cur.execute(cast(Any, query), params)
+                row = cur.fetchone()
+
+        return row["id"] if row is not None else None
+
     async def close(self) -> None:
-        await self.pool.close()
+        if self._async_pool_opened:
+            await self.pool.close()
+
+    def sync_close(self) -> None:
+        """Synchronous version of close."""
+        self.sync_pool.close()

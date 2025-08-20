@@ -297,7 +297,7 @@ class Runtime(ResonBase):
         prompt: Optional[str] = None,
         system: Optional[str] = None,
         history: Optional[List[ChatMessage]] = None,
-        output_type: Optional[R] = None,
+        output_type: Optional[Type[R]] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
