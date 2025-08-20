@@ -277,13 +277,27 @@ class Tag(DBModel):
         return []  # Handled by PreloadAttribute
 
 
-# Register models
-registry = ModelRegistry()
-registry.register_model("Organization", Organization)
-registry.register_model("User", User)
-registry.register_model("Post", Post)
-registry.register_model("Subscription", Subscription)
-registry.register_model("Tag", Tag)
+# Don't register models at module level - will do it in fixture
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_model_registry():
+    """Clear ModelRegistry before and after test module to ensure test isolation."""
+    # Clear before tests run
+    registry = ModelRegistry()
+    registry.models.clear()
+
+    # Now register the models for this test module
+    registry.register_model("Organization", Organization)
+    registry.register_model("User", User)
+    registry.register_model("Post", Post)
+    registry.register_model("Subscription", Subscription)
+    registry.register_model("Tag", Tag)
+
+    yield  # Run tests
+
+    # Clear after tests complete
+    registry.models.clear()
 
 
 async def setup_test_schema():

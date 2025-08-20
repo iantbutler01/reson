@@ -188,10 +188,30 @@ async def cleanup_test_schema():
             await conn.commit()
 
 
-# Register models with the registry
-# Clear any existing registrations to avoid conflicts with other test files
-registry = ModelRegistry()
-registry.models.clear()
+# Don't register models at module level - will do it in fixture
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_model_registry():
+    """Clear ModelRegistry before and after test module to ensure test isolation."""
+    # Clear before tests run
+    registry = ModelRegistry()
+    registry.models.clear()
+
+    # Now register the models for this test module
+    registry.register_model("User", User)
+    registry.register_model("Organization", Organization)
+    registry.register_model("Subscription", Subscription)
+    registry.register_model("Project", Project)
+    registry.register_model("Profile", Profile)
+    registry.register_model("Tag", Tag)
+    registry.register_model("UserProject", UserProject)
+    registry.register_model("ProjectTag", ProjectTag)
+
+    yield  # Run tests
+
+    # Clear after tests complete
+    registry.models.clear()
 
 
 class User(DBModel):
@@ -577,16 +597,7 @@ class ProjectTag(JoinTableDBModel):
         return get_test_db_manager()
 
 
-# Register models
-# Register models
-registry.register_model("User", User)
-registry.register_model("Organization", Organization)
-registry.register_model("Subscription", Subscription)
-registry.register_model("Project", Project)
-registry.register_model("Profile", Profile)
-registry.register_model("Tag", Tag)
-registry.register_model("UserProject", UserProject)
-registry.register_model("ProjectTag", ProjectTag)
+# Models will be registered in the cleanup_model_registry fixture
 
 
 @pytest.fixture
@@ -733,6 +744,7 @@ class TestNestedPreload:
         # Check that subscription is loaded on the organization
         assert hasattr(org, "_preloaded_subscription")
         subscription = org.subscription
+        print("SUB", subscription)
         assert subscription is not None
         assert subscription.plan_name == "Enterprise"
 

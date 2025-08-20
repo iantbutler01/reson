@@ -651,22 +651,23 @@ class DBModel:
                         python_attr = col.python_name
                         break
 
-                if python_attr:
-                    fk_value = getattr(self, python_attr, None)
-                    if fk_value is not None:
-                        query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.ref_column} = %s"
-                        row = await self.__class__.db_manager().execute_and_fetch_one(
-                            query, params=(fk_value,), cursor=cursor
-                        )
-                        if row:
-                            related_obj = lazy_attr.model.from_db_row(row)
-                            lazy_attr.set_preloaded_value(self, related_obj)
-                        else:
-                            lazy_attr.set_preloaded_value(self, None)
+                # If we can't find the mapping, fall back to using foreign_key directly
+                # This handles cases where foreign_key might already be the Python attribute name
+                if not python_attr:
+                    python_attr = lazy_attr.foreign_key
+
+                fk_value = getattr(self, python_attr, None)
+                if fk_value is not None:
+                    query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.ref_column} = %s"
+                    row = await self.__class__.db_manager().execute_and_fetch_one(
+                        query, params=(fk_value,), cursor=cursor
+                    )
+                    if row:
+                        related_obj = lazy_attr.model.from_db_row(row)
+                        lazy_attr.set_preloaded_value(self, related_obj)
                     else:
                         lazy_attr.set_preloaded_value(self, None)
                 else:
-                    # FK column not found in COLUMNS - set to None
                     lazy_attr.set_preloaded_value(self, None)
 
             elif lazy_attr.reverse_fk and lazy_attr.references:
@@ -1208,22 +1209,23 @@ class DBModel:
                         python_attr = col.python_name
                         break
 
-                if python_attr:
-                    fk_value = getattr(self, python_attr, None)
-                    if fk_value is not None:
-                        query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.ref_column} = %s"
-                        row = self.__class__.db_manager().sync_execute_and_fetch_one(
-                            query, params=(fk_value,), cursor=cursor
-                        )
-                        if row:
-                            related_obj = lazy_attr.model.from_db_row(row)
-                            lazy_attr.set_preloaded_value(self, related_obj)
-                        else:
-                            lazy_attr.set_preloaded_value(self, None)
+                # If we can't find the mapping, fall back to using foreign_key directly
+                # This handles cases where foreign_key might already be the Python attribute name
+                if not python_attr:
+                    python_attr = lazy_attr.foreign_key
+
+                fk_value = getattr(self, python_attr, None)
+                if fk_value is not None:
+                    query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.ref_column} = %s"
+                    row = self.__class__.db_manager().sync_execute_and_fetch_one(
+                        query, params=(fk_value,), cursor=cursor
+                    )
+                    if row:
+                        related_obj = lazy_attr.model.from_db_row(row)
+                        lazy_attr.set_preloaded_value(self, related_obj)
                     else:
                         lazy_attr.set_preloaded_value(self, None)
                 else:
-                    # FK column not found in COLUMNS - set to None
                     lazy_attr.set_preloaded_value(self, None)
 
             elif lazy_attr.reverse_fk and lazy_attr.references:
