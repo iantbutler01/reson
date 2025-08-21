@@ -596,116 +596,41 @@ class DBModel:
                 "Entity must be persisted (have an id) before preloading."
             )
 
-        # Get attributes to preload
+        # If no attributes specified, preload all PreloadAttributes
         if attributes is None:
-            # Get all PreloadAttributes
-            preloadable = PreloadAttribute.get_preloadable_attributes(self.__class__)
-            attributes = list(preloadable.keys())
+            attributes = list(
+                PreloadAttribute.get_preloadable_attributes(self.__class__).keys()
+            )
 
-        if not attributes:
-            return self
+        print("ATTRIBUTES", attributes)
 
-        # Check if any attributes contain nested syntax
-        has_nested = any(">" in attr for attr in attributes)
+        # Use get_with_preload to fetch with JOINs (avoiding N+1)
+        new_inst = await self.__class__.get_with_preload(
+            self.id, attributes, cursor=cursor
+        )
 
-        if has_nested:
-            # Parse nested paths and organize by root
-            paths_by_root = self.__class__._parse_preload_paths(attributes)
+        # Copy preloaded attributes from new instance to self
+        for attr_path in attributes:
+            # Extract just the base attribute name from nested paths like "organization > subscription"
+            attr_name = attr_path.split(">")[0].strip()
 
-            # Process each root attribute
-            for root, paths in paths_by_root.items():
-                # Build tree for this root's paths
-                tree = self.__class__._build_preload_tree(paths)
-
-                # Apply nested preloads starting from this instance
-                await self.__class__._apply_nested_preloads([self], tree, cursor)
-
-            return self
-
-        # Original non-nested preloading logic
-        for attr_name in attributes:
             if not hasattr(self.__class__, attr_name):
-                raise AttributeError(
-                    f"Attribute '{attr_name}' does not exist on {self.__class__.__name__}"
-                )
+                continue
 
             lazy_attr = getattr(self.__class__, attr_name)
             if not isinstance(lazy_attr, PreloadAttribute):
-                raise AttributeError(
-                    f"Attribute '{attr_name}' is not a PreloadAttribute on {self.__class__.__name__}"
-                )
+                continue
 
-            # Skip if already loaded and refresh not requested
-            if not refresh:
-                preloaded_attr_name = f"_preloaded_{attr_name}"
-                if hasattr(self, preloaded_attr_name):
-                    continue
+            preloaded_attr_name = f"_preloaded_{attr_name}"
 
-            # Load based on relationship type
-            if lazy_attr.foreign_key and lazy_attr.references:
-                # Many-to-one: this table has FK to other table
-                # Map DB column name to Python attribute name
-                python_attr = None
-                for col in self.COLUMNS.values():
-                    if col.db_name == lazy_attr.foreign_key:
-                        python_attr = col.python_name
-                        break
+            # Skip if already loaded and not refreshing
+            if not refresh and hasattr(self, preloaded_attr_name):
+                continue
 
-                # If we can't find the mapping, fall back to using foreign_key directly
-                # This handles cases where foreign_key might already be the Python attribute name
-                if not python_attr:
-                    python_attr = lazy_attr.foreign_key
-
-                fk_value = getattr(self, python_attr, None)
-                if fk_value is not None:
-                    query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.ref_column} = %s"
-                    row = await self.__class__.db_manager().execute_and_fetch_one(
-                        query, params=(fk_value,), cursor=cursor
-                    )
-                    if row:
-                        related_obj = lazy_attr.model.from_db_row(row)
-                        lazy_attr.set_preloaded_value(self, related_obj)
-                    else:
-                        lazy_attr.set_preloaded_value(self, None)
-                else:
-                    lazy_attr.set_preloaded_value(self, None)
-
-            elif lazy_attr.reverse_fk and lazy_attr.references:
-                # One-to-many or One-to-one: other table has FK to this table
-                query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.reverse_fk} = %s"
-                rows = await self.__class__.db_manager().execute_query(
-                    query, params=(self.id,), cursor=cursor
-                )
-                if lazy_attr.relationship_type == "one_to_one":
-                    # For one-to-one, return single entity or None
-                    related_obj = lazy_attr.model.from_db_row(rows[0]) if rows else None
-                    lazy_attr.set_preloaded_value(self, related_obj)
-                else:
-                    # For one-to-many, return list
-                    related_objects = (
-                        [lazy_attr.model.from_db_row(row) for row in rows]
-                        if rows
-                        else []
-                    )
-                    lazy_attr.set_preloaded_value(self, related_objects)
-
-            elif lazy_attr.join_table and lazy_attr.references:
-                # Many-to-many: relationship through join table
-                join_fk = lazy_attr.join_fk or "source_id"
-                join_ref_fk = lazy_attr.join_ref_fk or "target_id"
-
-                query = (
-                    f"SELECT r.* FROM {lazy_attr.references} r "
-                    f"JOIN {lazy_attr.join_table} j ON j.{join_ref_fk} = r.{lazy_attr.ref_column} "
-                    f"WHERE j.{join_fk} = %s"
-                )
-                rows = await self.__class__.db_manager().execute_query(
-                    query, params=(self.id,), cursor=cursor
-                )
-                related_objects = (
-                    [lazy_attr.model.from_db_row(row) for row in rows] if rows else []
-                )
-                lazy_attr.set_preloaded_value(self, related_objects)
+            # Copy the preloaded value from new instance
+            if hasattr(new_inst, preloaded_attr_name):
+                value = getattr(new_inst, preloaded_attr_name)
+                lazy_attr.set_preloaded_value(self, value)
 
         return self
 
@@ -1123,7 +1048,6 @@ class DBModel:
         return instances[0] if instances else None
 
     # ---------- instance-level preloading (sync) ----------
-
     def sync_preload(
         self,
         attributes: Optional[List[str]] = None,
@@ -1154,116 +1078,50 @@ class DBModel:
                 "Entity must be persisted (have an id) before preloading."
             )
 
-        # Get attributes to preload
+        # If no attributes specified, preload all PreloadAttributes
         if attributes is None:
-            # Get all PreloadAttributes
-            preloadable = PreloadAttribute.get_preloadable_attributes(self.__class__)
-            attributes = list(preloadable.keys())
+            attributes = list(
+                PreloadAttribute.get_preloadable_attributes(self.__class__).keys()
+            )
 
-        if not attributes:
-            return self
+        print("SYNC_ATTRS", attributes)
 
-        # Check if any attributes contain nested syntax
-        has_nested = any(">" in attr for attr in attributes)
+        # Use sync_get_with_preload to fetch with JOINs (avoiding N+1)
+        new_inst = self.__class__.sync_get_with_preload(
+            self.id, attributes, cursor=cursor
+        )
 
-        if has_nested:
-            # Parse nested paths and organize by root
-            paths_by_root = self.__class__._parse_preload_paths(attributes)
+        # Copy preloaded attributes from new instance to self
+        for attr_path in attributes:
+            # Extract just the base attribute name from nested paths like "organization > subscription"
+            attr_name = attr_path.split(">")[0].strip()
 
-            # Process each root attribute
-            for root, paths in paths_by_root.items():
-                # Build tree for this root's paths
-                tree = self.__class__._build_preload_tree(paths)
+            print(attr_name)
 
-                # Apply nested preloads starting from this instance
-                self.__class__._sync_apply_nested_preloads([self], tree, cursor)
-
-            return self
-
-        # Original non-nested preloading logic
-        for attr_name in attributes:
             if not hasattr(self.__class__, attr_name):
-                raise AttributeError(
-                    f"Attribute '{attr_name}' does not exist on {self.__class__.__name__}"
-                )
+                print("CONITNUING")
+                continue
 
             lazy_attr = getattr(self.__class__, attr_name)
             if not isinstance(lazy_attr, PreloadAttribute):
-                raise AttributeError(
-                    f"Attribute '{attr_name}' is not a PreloadAttribute on {self.__class__.__name__}"
-                )
+                continue
 
-            # Skip if already loaded and refresh not requested
-            if not refresh:
-                preloaded_attr_name = f"_preloaded_{attr_name}"
-                if hasattr(self, preloaded_attr_name):
-                    continue
+            print("CHECK3")
 
-            # Load based on relationship type
-            if lazy_attr.foreign_key and lazy_attr.references:
-                # Many-to-one: this table has FK to other table
-                # Map DB column name to Python attribute name
-                python_attr = None
-                for col in self.COLUMNS.values():
-                    if col.db_name == lazy_attr.foreign_key:
-                        python_attr = col.python_name
-                        break
+            preloaded_attr_name = f"_preloaded_{attr_name}"
 
-                # If we can't find the mapping, fall back to using foreign_key directly
-                # This handles cases where foreign_key might already be the Python attribute name
-                if not python_attr:
-                    python_attr = lazy_attr.foreign_key
+            # Skip if already loaded and not refreshing
+            if not refresh and hasattr(self, preloaded_attr_name):
+                continue
 
-                fk_value = getattr(self, python_attr, None)
-                if fk_value is not None:
-                    query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.ref_column} = %s"
-                    row = self.__class__.db_manager().sync_execute_and_fetch_one(
-                        query, params=(fk_value,), cursor=cursor
-                    )
-                    if row:
-                        related_obj = lazy_attr.model.from_db_row(row)
-                        lazy_attr.set_preloaded_value(self, related_obj)
-                    else:
-                        lazy_attr.set_preloaded_value(self, None)
-                else:
-                    lazy_attr.set_preloaded_value(self, None)
+            print("CHECK 4")
 
-            elif lazy_attr.reverse_fk and lazy_attr.references:
-                # One-to-many or One-to-one: other table has FK to this table
-                query = f"SELECT * FROM {lazy_attr.references} WHERE {lazy_attr.reverse_fk} = %s"
-                rows = self.__class__.db_manager().sync_execute_query(
-                    query, params=(self.id,), cursor=cursor
-                )
-                if lazy_attr.relationship_type == "one_to_one":
-                    # For one-to-one, return single entity or None
-                    related_obj = lazy_attr.model.from_db_row(rows[0]) if rows else None
-                    lazy_attr.set_preloaded_value(self, related_obj)
-                else:
-                    # For one-to-many, return list
-                    related_objects = (
-                        [lazy_attr.model.from_db_row(row) for row in rows]
-                        if rows
-                        else []
-                    )
-                    lazy_attr.set_preloaded_value(self, related_objects)
-
-            elif lazy_attr.join_table and lazy_attr.references:
-                # Many-to-many: relationship through join table
-                join_fk = lazy_attr.join_fk or "source_id"
-                join_ref_fk = lazy_attr.join_ref_fk or "target_id"
-
-                query = (
-                    f"SELECT r.* FROM {lazy_attr.references} r "
-                    f"JOIN {lazy_attr.join_table} j ON j.{join_ref_fk} = r.{lazy_attr.ref_column} "
-                    f"WHERE j.{join_fk} = %s"
-                )
-                rows = self.__class__.db_manager().sync_execute_query(
-                    query, params=(self.id,), cursor=cursor
-                )
-                related_objects = (
-                    [lazy_attr.model.from_db_row(row) for row in rows] if rows else []
-                )
-                lazy_attr.set_preloaded_value(self, related_objects)
+            # Copy the preloaded value from new instance
+            print(new_inst.__dict__)
+            if hasattr(new_inst, preloaded_attr_name):
+                print("COPYING")
+                value = getattr(new_inst, preloaded_attr_name)
+                lazy_attr.set_preloaded_value(self, value)
 
         return self
 
