@@ -16,11 +16,12 @@ class CreateInferenceClientProtocol(Protocol):
 
 
 def create_google_gemini_api_client(
-    model: str, api_key: Optional[str] = None
+    model: str, api_key: Optional[str] = None, reasoning: Optional[int] = None
 ) -> GoogleGenAIInferenceClient:
     return GoogleGenAIInferenceClient(
         model,
         api_key or os.environ["GOOGLE_GEMINI_API_KEY"],
+        reasoning=reasoning,
     )
 
 
@@ -70,7 +71,7 @@ def create_google_anthropic_inference_client(
 
 def create_vertex_gemini_api_client(
     model: str,
-    reasoning: Optional[str] = None,
+    reasoning: Optional[int] = None,
 ) -> GoogleGenAIInferenceClient:
     return GoogleGenAIInferenceClient(
         model=model,
@@ -79,11 +80,16 @@ def create_vertex_gemini_api_client(
         reasoning=reasoning,
     )
 
+
 def create_openai_inference_client(
     model: str,
+    api_url: str = "https://api.openai.com/v1/chat/completions",
     api_key: Optional[str] = None,
+    reasoning: Optional[str] = None,
 ) -> OAIInferenceClient:
     return OAIInferenceClient(
         model=model,
+        api_url=api_url,
         api_key=api_key,
+        reasoning=reasoning,
     )

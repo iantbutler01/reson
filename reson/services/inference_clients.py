@@ -514,7 +514,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
         self,
         model: str,
         api_key: Optional[str] = None,
-        reasoning: Optional[str] = None,
+        reasoning: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -542,12 +542,6 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
-        thinking_budget = None
-        if self.reasoning:
-            # Determine if it's effort or max_tokens
-            if self.reasoning.isdigit():
-                thinking_budget = int(self.reasoning)
-
         try:
             response = await self.client.aio.models.generate_content(
                 model=self.model,
@@ -560,9 +554,9 @@ class GoogleGenAIInferenceClient(InferenceClient):
                     thinking_config=(
                         types.GenerationConfigThinkingConfig(
                             include_thoughts=True,
-                            thinking_budget=thinking_budget,
+                            thinking_budget=self.reasoning,
                         )
-                        if thinking_budget
+                        if self.reasoning is not None
                         else types.GenerationConfigThinkingConfig(
                             include_thoughts=True,
                         )
@@ -618,12 +612,6 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
-        thinking_budget = None
-        if self.reasoning:
-            # Determine if it's effort or max_tokens
-            if self.reasoning.isdigit():
-                thinking_budget = int(self.reasoning)
-
         try:
             response = await self.client.aio.models.generate_content_stream(
                 model=self.model,
@@ -636,9 +624,9 @@ class GoogleGenAIInferenceClient(InferenceClient):
                     thinking_config=(
                         types.GenerationConfigThinkingConfig(
                             include_thoughts=True,
-                            thinking_budget=thinking_budget,
+                            thinking_budget=self.reasoning,
                         )
-                        if thinking_budget
+                        if self.reasoning is not None
                         else types.GenerationConfigThinkingConfig(
                             include_thoughts=True,
                         )
@@ -693,7 +681,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
 class OAIRequest(ResonBase):
     model: str
     messages: List[Dict[str, Any]]
-    max_tokens: int = 4096
+    max_completion_tokens: int = 4096
     temperature: float = 0.5
     top_p: float = 0.9
     stream: bool = False
@@ -734,14 +722,16 @@ class OAIInferenceClient(InferenceClient):
                 }
                 for m in messages
             ],
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             top_p=top_p,
             temperature=temperature,
             stream=False,
         ).model_dump(exclude={"stream_options", "tools", "tool_choice"})
 
-        if self.model in ("o3",):
-            request["max_completion_tokens"] = request.pop("max_tokens")
+        if self.model in (
+            "o3",
+            "gpt-5",
+        ):
             request.pop("temperature", None)
             request.pop("top_p", None)
 
@@ -759,9 +749,13 @@ class OAIInferenceClient(InferenceClient):
                 timeout=180,
                 headers=(
                     {
-                        "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                     }
+                    | (
+                        {"Authorization": f"Bearer {self.api_key}"}
+                        if self.api_key
+                        else {}
+                    )
                     | (
                         {"HTTP-Referer": self.ranking_referer}
                         if self.ranking_referer
@@ -823,7 +817,7 @@ class OAIInferenceClient(InferenceClient):
                 }
                 for msg in messages
             ],
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             top_p=top_p,
             temperature=temperature,
             stream=True,
@@ -837,8 +831,10 @@ class OAIInferenceClient(InferenceClient):
             else:
                 request["reasoning"] = {"effort": self.reasoning}
 
-        if self.model in ("o3",):
-            request["max_completion_tokens"] = request.pop("max_tokens")
+        if self.model in (
+            "o3",
+            "gpt-5",
+        ):
             request.pop("temperature", None)
             request.pop("top_p", None)
 
@@ -848,9 +844,9 @@ class OAIInferenceClient(InferenceClient):
                 self.api_url,
                 json=request,
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 }
+                | ({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})
                 | (
                     {"HTTP-Referer": self.ranking_referer}
                     if self.ranking_referer

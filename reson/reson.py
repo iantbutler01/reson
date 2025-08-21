@@ -546,14 +546,10 @@ def _create_empty_value(output_type):
         return None
 
 
-async def _create_inference_client(
-    model_str, store=None, api_key=None, art_backend=None
-):
+def _create_inference_client(model_str, store=None, api_key=None, art_backend=None):
     """Create an appropriate inference client based on the model string."""
     # Parse model string to get provider and model
-    parts = model_str.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Invalid model string format: {model_str}")
+    parts = model_str.split(":", 1)
 
     provider, model_name = parts
 
@@ -584,19 +580,29 @@ async def _create_inference_client(
         else:
             client = create_openrouter_inference_client(model_name, api_key=api_key)
     elif provider == "anthropic":
-        # Parse out thinking parameter if provided
-        thinking_match = re.match(r"(.+)@thinking=(\d+)", model_name)
-        if thinking_match:
-            model_name, thinking = thinking_match.groups()
+        # Parse out reasoning parameter if provided
+        reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
+        if reasoning_match:
+            model_name, reasoning = reasoning_match.groups()
             client = create_anthropic_inference_client(
-                model_name, thinking=int(thinking), api_key=api_key
+                model_name, thinking=int(reasoning), api_key=api_key
             )
         else:
             client = create_anthropic_inference_client(model_name, api_key=api_key)
     elif provider == "bedrock":
         client = create_bedrock_inference_client(model_name)
     elif provider == "google-gemini":
-        client = create_google_gemini_api_client(model_name, api_key=api_key)
+        reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
+        if not reasoning_match:
+            # Try numeric pattern
+            reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
+        if reasoning_match:
+            model_name, reasoning = reasoning_match.groups()
+            client = create_google_gemini_api_client(
+                model_name, api_key=api_key, reasoning=int(reasoning)
+            )
+        else:
+            client = create_google_gemini_api_client(model_name, api_key=api_key)
     elif provider == "vertex-gemini":
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
         if not reasoning_match:
@@ -604,13 +610,30 @@ async def _create_inference_client(
             reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
         if reasoning_match:
             model_name, reasoning = reasoning_match.groups()
-            client = create_vertex_gemini_api_client(model_name, reasoning=reasoning)
+            client = create_vertex_gemini_api_client(
+                model_name, reasoning=int(reasoning)
+            )
         else:
             client = create_vertex_gemini_api_client(model_name)
     elif provider == "openai":
         # Strip reasoning= from model name if present
         model_name = re.sub(r"@reasoning=.*$", "", model_name)
         client = create_openai_inference_client(model_name, api_key=api_key)
+    elif provider == "custom-openai":
+        if "@server_url=" not in model_name:
+            raise ValueError(
+                "Custom OpenAI model must include @server_url=<url> parameter"
+            )
+        server_url = re.match(r".+@server_url=([^@]+)", model_name).group(1)
+        reasoning_match = re.match(r".+@reasoning=([^@]+)", model_name)
+        model_name = re.sub(r"@.*$", "", model_name)
+        client = create_openai_inference_client(
+            model_name,
+            api_url=server_url,
+            api_key=api_key,
+            reasoning=reasoning_match.group(1) if reasoning_match else None,
+        )
+
     else:
         raise ValueError(f"Unsupported provider: {provider}")
 
@@ -641,9 +664,7 @@ async def _call_llm(
     art_backend=None,
 ):
     """Execute a non-streaming LLM call, possibly with tool use."""
-    client = await _create_inference_client(
-        model, store, api_key, art_backend=art_backend
-    )
+    client = _create_inference_client(model, store, api_key, art_backend=art_backend)
 
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
@@ -750,7 +771,7 @@ async def _call_llm_stream(
     art_backend=None,
 ):
     """Execute a streaming LLM call, possibly with tool use."""
-    client = await _create_inference_client(
+    client = _create_inference_client(
         model, store, api_key=api_key, art_backend=art_backend
     )
 
