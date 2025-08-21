@@ -572,13 +572,10 @@ class DBModel:
 
         alias_counter = 1
 
-        print(paths_by_root)
         # Process each root attribute and its nested paths
         for root_attr, paths in paths_by_root.items():
             # Check if this is a simple preload or nested
             is_nested = any(len(path) > 1 for path in paths)
-
-            print(is_nested)
 
             if not is_nested:
                 # Simple preload - use existing logic
@@ -644,7 +641,6 @@ class DBModel:
             else:
                 # Nested preload - build chain of JOINs
                 for path in paths:
-                    print(path)
                     if len(path) == 1:
                         continue  # Skip simple paths in this iteration
 
@@ -729,8 +725,6 @@ class DBModel:
             query += " " + " ".join(join_parts)
         query += " WHERE t0.id = %s"
 
-        print(query)
-
         rows = await cls.db_manager().execute_query(query, params=(id,), cursor=cursor)
 
         if not rows:
@@ -782,8 +776,6 @@ class DBModel:
         for root_attr, paths in paths_by_root.items():
             # Check if this is a simple preload or nested
             is_nested = any(len(path) > 1 for path in paths)
-
-            print(paths_by_root)
 
             if not is_nested:
                 # Simple preload - use existing logic
@@ -1036,14 +1028,6 @@ class DBModel:
         nested_preload_info: Dict[str, Dict[str, Any]],
     ) -> Optional[T]:
         """Parse JOINed query results with support for nested preloading."""
-        print(
-            f"DEBUG _parse_joined_results_single_with_nested: Starting with {len(rows)} rows"
-        )
-        print(f"DEBUG _parse_joined_results_single_with_nested: join_info={join_info}")
-        print(
-            f"DEBUG _parse_joined_results_single_with_nested: nested_preload_info keys={list(nested_preload_info.keys())}"
-        )
-
         if not rows:
             return None
 
@@ -1055,15 +1039,9 @@ class DBModel:
             elif not any(k.startswith(f"{alias}.") for _, alias, _ in join_info):
                 main_cols[k] = v
         instance = cls.from_db_row(main_cols)
-        print(
-            f"DEBUG _parse_joined_results_single_with_nested: Created main instance {instance.__class__.__name__}"
-        )
 
         # Process each first-level relationship
         for attr_name, alias, rel_type in join_info:
-            print(
-                f"DEBUG _parse_joined_results_single_with_nested: Processing {attr_name} (alias={alias}, rel_type={rel_type})"
-            )
             if not hasattr(cls, attr_name):
                 continue
 
@@ -1082,44 +1060,11 @@ class DBModel:
                     related_obj = lazy_attr.model.from_db_row(related_cols)
 
                     # Check for nested preloads on this object
-                    print(
-                        f"DEBUG _parse_joined_results_single_with_nested: Checking nested preloads for {attr_name}"
-                    )
                     for nested_path, nested_info in nested_preload_info.items():
                         path_parts = nested_info["path"]
-                        print(
-                            f"DEBUG _parse_joined_results_single_with_nested: Checking nested path {nested_path}, path_parts={path_parts}"
-                        )
                         if len(path_parts) > 1 and path_parts[0] == attr_name:
                             # This is a nested preload starting from this attribute
                             # Apply nested preloads to the related object
-                            print(
-                                f"DEBUG _parse_joined_results_single_with_nested: Found nested preload for {attr_name}, applying to related object"
-                            )
-
-                            # DETAILED DEBUG: Show the issue clearly
-                            original_aliases = nested_info["aliases"]
-                            sliced_aliases = nested_info["aliases"][1:]
-                            print(
-                                f"DEBUG CRITICAL: Original aliases array = {[(a[0], a[1]) for a in original_aliases]}"
-                            )
-                            print(
-                                f"DEBUG CRITICAL: Original aliases length = {len(original_aliases)}"
-                            )
-                            print(
-                                f"DEBUG CRITICAL: Sliced aliases [1:] = {[(a[0], a[1]) for a in sliced_aliases]}"
-                            )
-                            print(
-                                f"DEBUG CRITICAL: Sliced aliases length = {len(sliced_aliases)}"
-                            )
-                            print(f"DEBUG CRITICAL: Passing level = 1")
-                            print(
-                                f"DEBUG CRITICAL: Will the condition 'level >= len(nested_aliases)' be True? {1 >= len(sliced_aliases)}"
-                            )
-                            print(
-                                f"DEBUG CRITICAL: This means _apply_nested_preloads will return early? {1 >= len(sliced_aliases)}"
-                            )
-
                             cls._apply_nested_preloads(
                                 related_obj, rows, nested_info["aliases"][1:], 0
                             )
@@ -1148,45 +1093,10 @@ class DBModel:
                             related_obj = lazy_attr.model.from_db_row(related_cols)
 
                             # Check for nested preloads on this collection item
-                            print(
-                                f"DEBUG _parse_joined_results_single_with_nested: Checking nested preloads for collection item {attr_name}"
-                            )
                             for nested_path, nested_info in nested_preload_info.items():
                                 path_parts = nested_info["path"]
-                                print(
-                                    f"DEBUG _parse_joined_results_single_with_nested: Checking nested path {nested_path} for collection, path_parts={path_parts}"
-                                )
                                 if len(path_parts) > 1 and path_parts[0] == attr_name:
                                     # Apply nested preloads to each item in the collection
-                                    print(
-                                        f"DEBUG _parse_joined_results_single_with_nested: Found nested preload for collection {attr_name}, applying to item"
-                                    )
-
-                                    # DETAILED DEBUG: Show the issue clearly for collections
-                                    original_aliases = nested_info["aliases"]
-                                    sliced_aliases = nested_info["aliases"][1:]
-                                    print(
-                                        f"DEBUG CRITICAL (collection): Original aliases array = {[(a[0], a[1]) for a in original_aliases]}"
-                                    )
-                                    print(
-                                        f"DEBUG CRITICAL (collection): Original aliases length = {len(original_aliases)}"
-                                    )
-                                    print(
-                                        f"DEBUG CRITICAL (collection): Sliced aliases [1:] = {[(a[0], a[1]) for a in sliced_aliases]}"
-                                    )
-                                    print(
-                                        f"DEBUG CRITICAL (collection): Sliced aliases length = {len(sliced_aliases)}"
-                                    )
-                                    print(
-                                        f"DEBUG CRITICAL (collection): Passing level = 1"
-                                    )
-                                    print(
-                                        f"DEBUG CRITICAL (collection): Will the condition 'level >= len(nested_aliases)' be True? {1 >= len(sliced_aliases)}"
-                                    )
-                                    print(
-                                        f"DEBUG CRITICAL (collection): This means _apply_nested_preloads will return early? {1 >= len(sliced_aliases)}"
-                                    )
-
                                     cls._apply_nested_preloads(
                                         related_obj,
                                         [row],
@@ -1209,39 +1119,22 @@ class DBModel:
         level: int,
     ) -> None:
         """Apply nested preloads to an object based on JOIN results."""
-        print(
-            f"DEBUG _apply_nested_preloads: level={level}, parent_obj={parent_obj.__class__.__name__}, nested_aliases length={len(nested_aliases) if nested_aliases else 0}"
-        )
-
         if not nested_aliases or level >= len(nested_aliases):
-            print(
-                f"DEBUG _apply_nested_preloads: Early return - no aliases or level {level} >= {len(nested_aliases) if nested_aliases else 0}"
-            )
             return
 
         attr_name, alias, lazy_attr = nested_aliases[0]
-        print(
-            f"DEBUG _apply_nested_preloads: Processing attr_name={attr_name}, alias={alias}, lazy_attr.model={lazy_attr.model.__name__ if lazy_attr and hasattr(lazy_attr, 'model') else 'None'}"
-        )
 
         # Get the parent model class to find the attribute
         parent_class = parent_obj.__class__
         if not hasattr(parent_class, attr_name):
-            print(
-                f"DEBUG _apply_nested_preloads: Parent class {parent_class.__name__} doesn't have attribute {attr_name}"
-            )
             return
 
         parent_lazy_attr = getattr(parent_class, attr_name)
         if not isinstance(parent_lazy_attr, PreloadAttribute):
-            print(
-                f"DEBUG _apply_nested_preloads: Attribute {attr_name} is not a PreloadAttribute"
-            )
             return
 
         # Check relationship type to determine if we need to collect multiple objects
         rel_type = parent_lazy_attr.relationship_type
-        print(f"DEBUG _apply_nested_preloads: Relationship type = {rel_type}")
 
         if rel_type in ("one_to_many", "many_to_many"):
             # Collect all related objects for one-to-many or many-to-many
@@ -1263,9 +1156,6 @@ class DBModel:
 
                         # Recursively apply deeper nested preloads if any
                         if len(nested_aliases) > 1:
-                            print(
-                                f"DEBUG _apply_nested_preloads: Recursing for collection item with {len(nested_aliases)-1} remaining aliases"
-                            )
                             cls._apply_nested_preloads(
                                 related_obj, [row], nested_aliases[1:], 0
                             )
@@ -1273,9 +1163,6 @@ class DBModel:
                         related_objects.append(related_obj)
 
             parent_lazy_attr.set_preloaded_value(parent_obj, related_objects)
-            print(
-                f"DEBUG _apply_nested_preloads: Set {len(related_objects)} objects for {attr_name} on {parent_obj.__class__.__name__}"
-            )
         else:
             # Single object for many-to-one or one-to-one
             related_cols = {
@@ -1287,27 +1174,15 @@ class DBModel:
             if related_cols and any(v is not None for v in related_cols.values()):
                 # Create the related object
                 related_obj = lazy_attr.model.from_db_row(related_cols)
-                print(
-                    f"DEBUG _apply_nested_preloads: Created related object of type {related_obj.__class__.__name__}"
-                )
 
                 # Recursively apply deeper nested preloads if any
                 if len(nested_aliases) > 1:
-                    print(
-                        f"DEBUG _apply_nested_preloads: Recursing with {len(nested_aliases)-1} remaining aliases"
-                    )
                     cls._apply_nested_preloads(related_obj, rows, nested_aliases[1:], 0)
 
                 # Set the preloaded value on the parent
                 parent_lazy_attr.set_preloaded_value(parent_obj, related_obj)
-                print(
-                    f"DEBUG _apply_nested_preloads: Set preloaded value for {attr_name} on {parent_obj.__class__.__name__}"
-                )
             else:
                 parent_lazy_attr.set_preloaded_value(parent_obj, None)
-                print(
-                    f"DEBUG _apply_nested_preloads: Set None for {attr_name} on {parent_obj.__class__.__name__} (no data)"
-                )
 
     @classmethod
     def _parse_joined_results_list(
