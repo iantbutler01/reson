@@ -1020,3 +1020,62 @@ class TestNestedPreload:
             assert hasattr(project, "_preloaded_tags")
             tags = project.tags
             assert len(tags) > 0
+
+    @pytest.mark.asyncio
+    async def test_many_to_many_parent_with_nested_preload(
+        self, setup_nested_test_data
+    ):
+        """Test nested preloading when parent is many-to-many (user.assigned_projects > organization > subscription)."""
+        data = await setup_nested_test_data
+        user = data["users"][0]  # Alice
+
+        # Test: user > assigned_projects > organization > subscription
+        # This involves: many-to-many > many-to-one > many-to-one
+        user = await User.get(user.id)
+        await user.preload(["assigned_projects > organization > subscription"])
+
+        # Verify projects are loaded
+        assert hasattr(user, "_preloaded_assigned_projects")
+        projects = user.assigned_projects
+        assert len(projects) == 2
+
+        # Check that organization is loaded on each project
+        for project in projects:
+            assert hasattr(project, "_preloaded_organization")
+            org = project.organization
+            assert org is not None
+            assert org.name == "Tech Corp"
+
+            # Check that subscription is loaded on the organization
+            assert hasattr(org, "_preloaded_subscription")
+            subscription = org.subscription
+            assert subscription is not None
+            assert subscription.plan_name == "Enterprise"
+
+    def test_sync_many_to_many_parent_with_nested_preload(self, setup_nested_test_data):
+        """Test synchronous nested preloading when parent is many-to-many."""
+        # Run async setup synchronously
+        data = asyncio.run(setup_nested_test_data)
+        user = data["users"][0]  # Alice
+
+        # Test: user > assigned_projects > organization > subscription (synchronous)
+        user = User.sync_get(user.id)
+        user.sync_preload(["assigned_projects > organization > subscription"])
+
+        # Verify projects are loaded
+        assert hasattr(user, "_preloaded_assigned_projects")
+        projects = user.assigned_projects
+        assert len(projects) == 2
+
+        # Check that organization is loaded on each project
+        for project in projects:
+            assert hasattr(project, "_preloaded_organization")
+            org = project.organization
+            assert org is not None
+            assert org.name == "Tech Corp"
+
+            # Check that subscription is loaded on the organization
+            assert hasattr(org, "_preloaded_subscription")
+            subscription = org.subscription
+            assert subscription is not None
+            assert subscription.plan_name == "Enterprise"
