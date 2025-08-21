@@ -164,6 +164,19 @@ async def setup_test_schema():
             """
             )
 
+            # Create organization_users join table (many-to-many - users in organizations)
+            await cur.execute(
+                """
+                CREATE TABLE organization_users (
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    organization_id INTEGER REFERENCES organizations(id) ON DELETE CASCADE,
+                    role VARCHAR(50),
+                    joined_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (user_id, organization_id)
+                )
+            """
+            )
+
             # Create sequences for the tables
             await cur.execute("CREATE SEQUENCE IF NOT EXISTS subscriptions_seq")
             await cur.execute("CREATE SEQUENCE IF NOT EXISTS organizations_seq")
@@ -207,6 +220,7 @@ def cleanup_model_registry():
     registry.register_model("Tag", Tag)
     registry.register_model("UserProject", UserProject)
     registry.register_model("ProjectTag", ProjectTag)
+    registry.register_model("OrganizationUser", OrganizationUser)
 
     yield  # Run tests
 
@@ -282,6 +296,20 @@ class User(DBModel):
     )
     def assigned_projects(self):
         """Lazy-loaded assigned projects (many-to-many)."""
+        pass
+
+    @PreloadAttribute(
+        preload=True,
+        join_table="organization_users",
+        join_fk="user_id",
+        join_ref_fk="organization_id",
+        references="organizations",
+        ref_column="id",
+        relationship_type="many_to_many",
+        model="Organization",
+    )
+    def organizations(self):
+        """Lazy-loaded organizations (many-to-many)."""
         pass
 
 
@@ -597,6 +625,33 @@ class ProjectTag(JoinTableDBModel):
         return get_test_db_manager()
 
 
+class OrganizationUser(JoinTableDBModel):
+    TABLE_NAME = "organization_users"
+    PRIMARY_KEY_DB_NAMES = ["user_id", "organization_id"]
+    COLUMNS = {
+        "user_id": Column("user_id", "user_id", int),
+        "organization_id": Column("organization_id", "organization_id", int),
+        "role": Column("role", "role", str, nullable=True),
+        "joined_at": Column("joined_at", "joined_at", datetime),
+    }
+
+    def __init__(
+        self,
+        user_id: Optional[int] = None,
+        organization_id: Optional[int] = None,
+        role: Optional[str] = None,
+        joined_at: Optional[datetime] = None,
+    ):
+        self.user_id = user_id
+        self.organization_id = organization_id
+        self.role = role
+        self.joined_at = joined_at or datetime.now()
+
+    @classmethod
+    def db_manager(cls):
+        return get_test_db_manager()
+
+
 # Models will be registered in the cleanup_model_registry fixture
 
 
@@ -707,6 +762,36 @@ async def setup_nested_test_data():
             user_id=user1.id, project_id=project2.id, role="Consultant"
         )
         await user_project3.persist(cursor=cursor)
+
+        # Add Alice to a project from the other organization too
+        user_project4 = UserProject(
+            user_id=user1.id, project_id=project3.id, role="Advisor"
+        )
+        await user_project4.persist(cursor=cursor)
+
+        # Create organization_users relationships (many-to-many)
+        # Alice is in both organizations
+        org_user1 = OrganizationUser(
+            user_id=user1.id, organization_id=org1.id, role="Developer"
+        )
+        await org_user1.persist(cursor=cursor)
+
+        org_user2 = OrganizationUser(
+            user_id=user1.id, organization_id=org2.id, role="Consultant"
+        )
+        await org_user2.persist(cursor=cursor)
+
+        # Bob is only in Tech Corp
+        org_user3 = OrganizationUser(
+            user_id=user2.id, organization_id=org1.id, role="Manager"
+        )
+        await org_user3.persist(cursor=cursor)
+
+        # Charlie is only in Small Startup
+        org_user4 = OrganizationUser(
+            user_id=user3.id, organization_id=org2.id, role="Founder"
+        )
+        await org_user4.persist(cursor=cursor)
 
         await cursor.execute("COMMIT")
 
@@ -1025,32 +1110,38 @@ class TestNestedPreload:
     async def test_many_to_many_parent_with_nested_preload(
         self, setup_nested_test_data
     ):
-        """Test nested preloading when parent is many-to-many (user.assigned_projects > organization > subscription)."""
+        """Test nested preloading when parent is many-to-many (user.organizations > subscription)."""
         data = await setup_nested_test_data
         user = data["users"][0]  # Alice
 
-        # Test: user > assigned_projects > organization > subscription
-        # This involves: many-to-many > many-to-one > many-to-one
+        # Test: user > organizations > subscription
+        # This involves: many-to-many > many-to-one
+        # Alice is in 2 organizations, each with its own subscription
         user = await User.get(user.id)
-        await user.preload(["assigned_projects > organization > subscription"])
+        await user.preload(["organizations > subscription"])
 
-        # Verify projects are loaded
-        assert hasattr(user, "_preloaded_assigned_projects")
-        projects = user.assigned_projects
-        assert len(projects) == 2
+        # Verify organizations are loaded
+        assert hasattr(user, "_preloaded_organizations")
+        organizations = user.organizations
+        assert len(organizations) == 2  # Alice is in 2 organizations
 
-        # Check that organization is loaded on each project
-        for project in projects:
-            assert hasattr(project, "_preloaded_organization")
-            org = project.organization
-            assert org is not None
-            assert org.name == "Tech Corp"
+        # Check that each organization has its subscription loaded
+        org_names = set()
+        subscription_plans = set()
+
+        for org in organizations:
+            org_names.add(org.name)
 
             # Check that subscription is loaded on the organization
             assert hasattr(org, "_preloaded_subscription")
             subscription = org.subscription
             assert subscription is not None
-            assert subscription.plan_name == "Enterprise"
+            subscription_plans.add(subscription.plan_name)
+
+        # Verify we have both organizations
+        assert org_names == {"Tech Corp", "Small Startup"}
+        # Verify each organization has its own subscription loaded
+        assert subscription_plans == {"Enterprise", "Basic"}
 
     def test_sync_many_to_many_parent_with_nested_preload(self, setup_nested_test_data):
         """Test synchronous nested preloading when parent is many-to-many."""
@@ -1058,24 +1149,29 @@ class TestNestedPreload:
         data = asyncio.run(setup_nested_test_data)
         user = data["users"][0]  # Alice
 
-        # Test: user > assigned_projects > organization > subscription (synchronous)
+        # Test: user > organizations > subscription (synchronous)
         user = User.sync_get(user.id)
-        user.sync_preload(["assigned_projects > organization > subscription"])
+        user.sync_preload(["organizations > subscription"])
 
-        # Verify projects are loaded
-        assert hasattr(user, "_preloaded_assigned_projects")
-        projects = user.assigned_projects
-        assert len(projects) == 2
+        # Verify organizations are loaded
+        assert hasattr(user, "_preloaded_organizations")
+        organizations = user.organizations
+        assert len(organizations) == 2  # Alice is in 2 organizations
 
-        # Check that organization is loaded on each project
-        for project in projects:
-            assert hasattr(project, "_preloaded_organization")
-            org = project.organization
-            assert org is not None
-            assert org.name == "Tech Corp"
+        # Check that each organization has its subscription loaded
+        org_names = set()
+        subscription_plans = set()
+
+        for org in organizations:
+            org_names.add(org.name)
 
             # Check that subscription is loaded on the organization
             assert hasattr(org, "_preloaded_subscription")
             subscription = org.subscription
             assert subscription is not None
-            assert subscription.plan_name == "Enterprise"
+            subscription_plans.add(subscription.plan_name)
+
+        # Verify we have both organizations
+        assert org_names == {"Tech Corp", "Small Startup"}
+        # Verify each organization has its own subscription loaded
+        assert subscription_plans == {"Enterprise", "Basic"}
