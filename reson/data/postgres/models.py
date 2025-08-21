@@ -471,6 +471,31 @@ class DBModel:
 
     # ---------- instance-level preloading (async) ----------
 
+    def _merge_preloaded_data(self: T, source_inst: T):
+        """Recursively merge preloaded data from a source instance into this instance."""
+        if not isinstance(source_inst, self.__class__):
+            return
+
+        source_preloaded_attrs = source_inst._get_preloaded_attributes()
+
+        for attr_name, source_value in source_preloaded_attrs.items():
+            target_lazy_attr = getattr(self.__class__, attr_name)
+            preloaded_attr_name = f"_preloaded_{attr_name}"
+
+            if not hasattr(self, preloaded_attr_name):
+                target_lazy_attr.set_preloaded_value(self, source_value)
+            else:
+                target_value = getattr(self, preloaded_attr_name)
+
+                if isinstance(target_value, DBModel) and isinstance(
+                    source_value, DBModel
+                ):
+                    target_value._merge_preloaded_data(source_value)
+                else:
+                    # For lists or other types, the new query is the source of truth,
+                    # as it may contain items with deeper preloads.
+                    target_lazy_attr.set_preloaded_value(self, source_value)
+
     async def preload(
         self,
         attributes: Optional[List[str]] = None,
@@ -480,6 +505,7 @@ class DBModel:
         """Force preload specified attributes or all PreloadAttributes on this instance.
 
         Supports nested preloading with syntax like "organization > subscription".
+        This method is additive; it will merge new preloads with existing ones.
 
         Args:
             attributes: List of attribute names to preload. Supports nested syntax.
@@ -507,33 +533,13 @@ class DBModel:
                 PreloadAttribute.get_preloadable_attributes(self.__class__).keys()
             )
 
-        # Use get_with_preload to fetch with JOINs (avoiding N+1)
+        # Fetch a new instance with the requested relationships preloaded
         new_inst = await self.__class__.get_with_preload(
             self.id, attributes, cursor=cursor
         )
 
-        # Copy preloaded attributes from new instance to self
-        for attr_path in attributes:
-            # Extract just the base attribute name from nested paths like "organization > subscription"
-            attr_name = attr_path.split(">")[0].strip()
-
-            if not hasattr(self.__class__, attr_name):
-                continue
-
-            lazy_attr = getattr(self.__class__, attr_name)
-            if not isinstance(lazy_attr, PreloadAttribute):
-                continue
-
-            preloaded_attr_name = f"_preloaded_{attr_name}"
-
-            # Skip if already loaded and not refreshing
-            if not refresh and hasattr(self, preloaded_attr_name):
-                continue
-
-            # Copy the preloaded value from new instance
-            if hasattr(new_inst, preloaded_attr_name):
-                value = getattr(new_inst, preloaded_attr_name)
-                lazy_attr.set_preloaded_value(self, value)
+        # Recursively merge the preloaded data from the new instance into the current one
+        self._merge_preloaded_data(new_inst)
 
         return self
 
@@ -1430,6 +1436,30 @@ class DBModel:
         return instances[0] if instances else None
 
     # ---------- instance-level preloading (sync) ----------
+    def _sync_merge_preloaded_data(self: T, source_inst: T):
+        """Synchronous version of _merge_preloaded_data."""
+        if not isinstance(source_inst, self.__class__):
+            return
+
+        source_preloaded_attrs = source_inst._get_preloaded_attributes()
+
+        for attr_name, source_value in source_preloaded_attrs.items():
+            target_lazy_attr = getattr(self.__class__, attr_name)
+            preloaded_attr_name = f"_preloaded_{attr_name}"
+
+            if not hasattr(self, preloaded_attr_name):
+                target_lazy_attr.set_preloaded_value(self, source_value)
+            else:
+                target_value = getattr(self, preloaded_attr_name)
+
+                if isinstance(target_value, DBModel) and isinstance(
+                    source_value, DBModel
+                ):
+                    target_value._sync_merge_preloaded_data(source_value)
+                else:
+                    # For lists or other types, the new query is the source of truth.
+                    target_lazy_attr.set_preloaded_value(self, source_value)
+
     def sync_preload(
         self,
         attributes: Optional[List[str]] = None,
@@ -1466,33 +1496,13 @@ class DBModel:
                 PreloadAttribute.get_preloadable_attributes(self.__class__).keys()
             )
 
-        # Use sync_get_with_preload to fetch with JOINs (avoiding N+1)
+        # Fetch a new instance with the requested relationships preloaded
         new_inst = self.__class__.sync_get_with_preload(
             self.id, attributes, cursor=cursor
         )
 
-        # Copy preloaded attributes from new instance to self
-        for attr_path in attributes:
-            # Extract just the base attribute name from nested paths like "organization > subscription"
-            attr_name = attr_path.split(">")[0].strip()
-
-            if not hasattr(self.__class__, attr_name):
-                continue
-
-            lazy_attr = getattr(self.__class__, attr_name)
-            if not isinstance(lazy_attr, PreloadAttribute):
-                continue
-
-            preloaded_attr_name = f"_preloaded_{attr_name}"
-
-            # Skip if already loaded and not refreshing
-            if not refresh and hasattr(self, preloaded_attr_name):
-                continue
-
-            # Copy the preloaded value from new instance
-            if hasattr(new_inst, preloaded_attr_name):
-                value = getattr(new_inst, preloaded_attr_name)
-                lazy_attr.set_preloaded_value(self, value)
+        # Recursively merge the preloaded data
+        self._sync_merge_preloaded_data(new_inst)
 
         return self
 

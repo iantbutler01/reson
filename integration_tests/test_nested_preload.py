@@ -1133,6 +1133,65 @@ class TestNestedPreload:
         # Verify each organization has its own subscription loaded
         assert subscription_plans == {"Enterprise", "Basic"}
 
+    @pytest.mark.asyncio
+    async def test_sequential_nested_preloads_dont_overwrite(
+        self, setup_nested_test_data
+    ):
+        """Test that sequential nested preloads merge correctly and don't overwrite each other."""
+        data = await setup_nested_test_data
+        user = data["users"][0]  # Alice
+
+        # Reload user to ensure a clean state
+        user = await User.get(user.id)
+
+        # First, preload one nested relationship
+        await user.preload(["organization > subscription"])
+
+        # Check that the first relationship is loaded
+        assert hasattr(user, "_preloaded_organization")
+        assert hasattr(user.organization, "_preloaded_subscription")
+        assert not hasattr(user.organization, "_preloaded_projects")
+
+        # Now, preload a second, different nested relationship from the same parent
+        await user.preload(["organization > projects"])
+
+        # Check that BOTH nested attributes are now loaded
+        assert hasattr(user.organization, "_preloaded_subscription")
+        assert hasattr(user.organization, "_preloaded_projects")
+
+        subscription = user.organization.subscription
+        projects = user.organization.projects
+        assert subscription is not None
+        assert subscription.plan_name == "Enterprise"
+        assert len(projects) == 2
+
+    @pytest.mark.asyncio
+    async def test_nested_instance_preload_after_parent_loaded(
+        self, setup_nested_test_data
+    ):
+        """Test that nested preloading works even if the parent object is already loaded."""
+        data = await setup_nested_test_data
+        user = data["users"][0]  # Alice
+
+        # Reload user to ensure a clean state
+        user = await User.get(user.id)
+
+        # First, preload the parent object 'organization'
+        await user.preload(["organization"])
+
+        # Check that organization is loaded
+        assert hasattr(user, "_preloaded_organization")
+        assert not hasattr(user.organization, "_preloaded_subscription")
+
+        # Now, try to preload a nested attribute 'organization > subscription'
+        await user.preload(["organization > subscription"])
+
+        # Check that the nested attribute is now loaded
+        assert hasattr(user.organization, "_preloaded_subscription")
+        subscription = user.organization.subscription
+        assert subscription is not None
+        assert subscription.plan_name == "Enterprise"
+
     def test_sync_many_to_many_parent_with_nested_preload(self, setup_nested_test_data):
         """Test synchronous nested preloading when parent is many-to-many."""
         # Run async setup synchronously
