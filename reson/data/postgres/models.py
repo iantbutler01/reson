@@ -274,98 +274,6 @@ class DBModel:
 
         return tree
 
-    @classmethod
-    async def _apply_nested_preloads(
-        cls,
-        instances: List[T],
-        tree: PreloadTree,
-        cursor: Optional[psycopg.AsyncCursor[DictRow]] = None,
-    ) -> None:
-        """Recursively apply nested preloads to a list of instances.
-
-        Args:
-            instances: List of instances to preload relationships on
-            tree: Nested preload tree structure
-            cursor: Optional database cursor
-        """
-        if not instances or not tree:
-            return
-
-        # Process each root-level attribute in the tree
-        for attr_name, subtree in tree.items():
-            if not hasattr(cls, attr_name):
-                continue
-
-            # Preload the current level attribute for all instances
-            for instance in instances:
-                await instance.preload([attr_name], cursor=cursor, refresh=False)
-
-            # If there are nested preloads, process them recursively
-            if subtree:
-                # Collect all related objects from this level
-                related_objects = []
-                for instance in instances:
-                    preloaded_attr_name = f"_preloaded_{attr_name}"
-                    if hasattr(instance, preloaded_attr_name):
-                        value = getattr(instance, preloaded_attr_name)
-                        if value is not None:
-                            if isinstance(value, list):
-                                related_objects.extend(value)
-                            else:
-                                related_objects.append(value)
-
-                # If we have related objects, recursively preload their relationships
-                if related_objects:
-                    # Get the model class for the related objects
-                    lazy_attr = getattr(cls, attr_name)
-                    if isinstance(lazy_attr, PreloadAttribute) and lazy_attr.model:
-                        await lazy_attr.model._apply_nested_preloads(
-                            related_objects, subtree, cursor
-                        )
-
-    @classmethod
-    def _sync_apply_nested_preloads(
-        cls,
-        instances: List[T],
-        tree: PreloadTree,
-        cursor: Optional[psycopg.Cursor[DictRow]] = None,
-    ) -> None:
-        """Synchronous version of _apply_nested_preloads."""
-        if not instances or not tree:
-            return
-
-        # Process each root-level attribute in the tree
-        for attr_name, subtree in tree.items():
-            if not hasattr(cls, attr_name):
-                continue
-
-            # Preload the current level attribute for all instances
-            for instance in instances:
-                instance.sync_preload([attr_name], cursor=cursor, refresh=False)
-
-            # If there are nested preloads, process them recursively
-            if subtree:
-                # Collect all related objects from this level
-                related_objects = []
-                for instance in instances:
-                    preloaded_attr_name = f"_preloaded_{attr_name}"
-                    if hasattr(instance, preloaded_attr_name):
-                        value = getattr(instance, preloaded_attr_name)
-                        if value is not None:
-                            if isinstance(value, list):
-                                related_objects.extend(value)
-                            else:
-                                related_objects.append(value)
-
-                # If we have related objects, recursively preload their relationships
-                if related_objects:
-                    # Get the model class for the related objects
-                    lazy_attr = getattr(cls, attr_name)
-                    if isinstance(lazy_attr, PreloadAttribute) and lazy_attr.model:
-                        lazy_attr.model._sync_apply_nested_preloads(
-                            related_objects, subtree, cursor
-                        )
-
     # ---------- row helpers ----------
 
     @staticmethod
@@ -602,8 +510,6 @@ class DBModel:
                 PreloadAttribute.get_preloadable_attributes(self.__class__).keys()
             )
 
-        print("ATTRIBUTES", attributes)
-
         # Use get_with_preload to fetch with JOINs (avoiding N+1)
         new_inst = await self.__class__.get_with_preload(
             self.id, attributes, cursor=cursor
@@ -643,82 +549,179 @@ class DBModel:
         preload: Optional[List[str]] = None,
         cursor: Optional[psycopg.AsyncCursor[DictRow]] = None,
     ) -> T:
-        """Get an instance with preloaded relationships using JOINs"""
+        """Get an instance with preloaded relationships using JOINs.
+
+        Supports nested preloading with syntax like "organization > subscription".
+        """
         if not preload:
             return await cls.get(id, cursor=cursor)
+
+        # Parse nested paths
+        paths_by_root = cls._parse_preload_paths(preload)
 
         # Build JOIN query with all requested preloads using column aliases
         select_parts = []
         from_part = f"{cls.TABLE_NAME} t0"
         join_parts = []
         join_info = []
+        nested_preload_info = {}  # Track nested preloading info
 
         # Add main table columns with t0. prefix
         for col in cls.COLUMNS.values():
             select_parts.append(f't0.{col.db_name} AS "t0.{col.db_name}"')
 
-        for i, attr_name in enumerate(preload):
-            if not hasattr(cls, attr_name):
-                continue
+        alias_counter = 1
 
-            lazy_attr = getattr(cls, attr_name)
-            if not isinstance(lazy_attr, PreloadAttribute):
-                continue
+        print(paths_by_root)
+        # Process each root attribute and its nested paths
+        for root_attr, paths in paths_by_root.items():
+            # Check if this is a simple preload or nested
+            is_nested = any(len(path) > 1 for path in paths)
 
-            alias = f"t{i+1}"
+            print(is_nested)
 
-            # Build JOIN based on relationship metadata
-            if lazy_attr.foreign_key and lazy_attr.references:
-                # Many-to-one: this table has FK to other table
-                # Get columns for the referenced table by finding its model class
+            if not is_nested:
+                # Simple preload - use existing logic
+                if not hasattr(cls, root_attr):
+                    continue
 
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                lazy_attr = getattr(cls, root_attr)
+                if not isinstance(lazy_attr, PreloadAttribute):
+                    continue
+
+                alias = f"t{alias_counter}"
+                alias_counter += 1
+
+                # Build JOIN based on relationship metadata
+                if lazy_attr.foreign_key and lazy_attr.references:
+                    # Many-to-one: this table has FK to other table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
+
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
                     )
+                    join_info.append((root_attr, alias, "many_to_one"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
-                )
-                join_info.append((attr_name, alias, "many_to_one"))
+                elif lazy_attr.reverse_fk and lazy_attr.references:
+                    # One-to-many or One-to-one: other table has FK to this table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
 
-            elif lazy_attr.reverse_fk and lazy_attr.references:
-                # One-to-many or One-to-one: other table has FK to this table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
                     )
+                    # Check if this is a one-to-one relationship
+                    if lazy_attr.relationship_type == "one_to_one":
+                        join_info.append((root_attr, alias, "one_to_one"))
+                    else:
+                        join_info.append((root_attr, alias, "one_to_many"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
-                )
-                # Check if this is a one-to-one relationship
-                if lazy_attr.relationship_type == "one_to_one":
-                    join_info.append((attr_name, alias, "one_to_one"))
-                else:
-                    join_info.append((attr_name, alias, "one_to_many"))
+                elif lazy_attr.join_table and lazy_attr.references:
+                    # Many-to-many: relationship through join table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
 
-            elif lazy_attr.join_table and lazy_attr.references:
-                # Many-to-many: relationship through join table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                    join_alias = f"j{alias_counter}"
+                    alias_counter += 1
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                        f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = t0.id"
                     )
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                    )
+                    join_info.append((root_attr, alias, "many_to_many"))
+            else:
+                # Nested preload - build chain of JOINs
+                for path in paths:
+                    print(path)
+                    if len(path) == 1:
+                        continue  # Skip simple paths in this iteration
 
-                join_alias = f"j{i+1}"
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
-                    f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = t0.id"
-                )
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk or 'target_id'}"
-                )
-                join_info.append((attr_name, alias, "many_to_many"))
+                    current_model = cls
+                    prev_alias = "t0"
+                    path_aliases = []
+
+                    # Build JOINs for each level in the path
+                    for level, attr_name in enumerate(path):
+                        if not hasattr(current_model, attr_name):
+                            break
+
+                        lazy_attr = getattr(current_model, attr_name)
+                        if not isinstance(lazy_attr, PreloadAttribute):
+                            break
+
+                        alias = f"t{alias_counter}"
+                        alias_counter += 1
+                        path_aliases.append((attr_name, alias, lazy_attr))
+
+                        # Add columns for this level
+                        for col in lazy_attr.model.COLUMNS.values():
+                            select_parts.append(
+                                f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                            )
+
+                        # Build JOIN for this level
+                        if lazy_attr.foreign_key and lazy_attr.references:
+                            # Many-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {prev_alias}.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
+                            )
+
+                        elif lazy_attr.reverse_fk and lazy_attr.references:
+                            # One-to-many or One-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.reverse_fk} = {prev_alias}.id"
+                            )
+
+                        elif lazy_attr.join_table and lazy_attr.references:
+                            # Many-to-many
+                            join_alias = f"j{alias_counter}"
+                            alias_counter += 1
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                                f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = {prev_alias}.id"
+                            )
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                            )
+
+                        # Track for result parsing
+                        if level == 0:
+                            # First level - directly attached to main object
+                            rel_type = "many_to_one"
+                            if lazy_attr.relationship_type == "one_to_one":
+                                rel_type = "one_to_one"
+                            elif lazy_attr.relationship_type == "one_to_many":
+                                rel_type = "one_to_many"
+                            elif lazy_attr.relationship_type == "many_to_many":
+                                rel_type = "many_to_many"
+                            join_info.append((attr_name, alias, rel_type))
+
+                        # Store nested preload info for result parsing
+                        if " > ".join(path[: level + 1]) not in nested_preload_info:
+                            nested_preload_info[" > ".join(path[: level + 1])] = {
+                                "path": path[: level + 1],
+                                "aliases": path_aliases[: level + 1],
+                                "model": lazy_attr.model,
+                            }
+
+                        # Move to next level
+                        current_model = lazy_attr.model
+                        prev_alias = alias
 
         # Build final query
         query = f"SELECT {', '.join(select_parts)} FROM {from_part}"
@@ -726,13 +729,17 @@ class DBModel:
             query += " " + " ".join(join_parts)
         query += " WHERE t0.id = %s"
 
+        print(query)
+
         rows = await cls.db_manager().execute_query(query, params=(id,), cursor=cursor)
 
         if not rows:
             raise ValueError(f"No {cls.__name__} found with id {id}")
 
-        # Parse results
-        result = cls._parse_joined_results_single(rows, join_info)
+        # Parse results with nested preload support
+        result = cls._parse_joined_results_single_with_nested(
+            rows, join_info, nested_preload_info
+        )
         if result is None:
             raise ValueError(f"No {cls.__name__} found with id {id}")
         return result
@@ -746,86 +753,179 @@ class DBModel:
         params: Optional[Sequence[Any]] = None,
         cursor: Optional[psycopg.AsyncCursor[DictRow]] = None,
     ) -> List[T]:
-        """Get a list of instances with preloaded relationships using JOINs"""
+        """Get a list of instances with preloaded relationships using JOINs.
+
+        Supports nested preloading with syntax like "organization > subscription".
+        """
         if not preload:
             return await cls.list(
                 where=where, order=order, params=params, cursor=cursor
             )
+
+        # Parse nested paths
+        paths_by_root = cls._parse_preload_paths(preload)
 
         # Build JOIN query with all requested preloads using column aliases
         select_parts = []
         from_part = f"{cls.TABLE_NAME} t0"
         join_parts = []
         join_info = []
+        nested_preload_info = {}  # Track nested preloading info
 
         # Add main table columns with t0. prefix
         for col in cls.COLUMNS.values():
             select_parts.append(f't0.{col.db_name} AS "t0.{col.db_name}"')
 
-        for i, attr_name in enumerate(preload):
-            if not hasattr(cls, attr_name):
-                continue
+        alias_counter = 1
 
-            lazy_attr = getattr(cls, attr_name)
-            if not isinstance(lazy_attr, PreloadAttribute):
-                continue
+        # Process each root attribute and its nested paths
+        for root_attr, paths in paths_by_root.items():
+            # Check if this is a simple preload or nested
+            is_nested = any(len(path) > 1 for path in paths)
 
-            alias = f"t{i+1}"
+            print(paths_by_root)
 
-            # Build JOIN based on relationship metadata
-            if lazy_attr.foreign_key and lazy_attr.references:
-                # Many-to-one: this table has FK to other table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+            if not is_nested:
+                # Simple preload - use existing logic
+                if not hasattr(cls, root_attr):
+                    continue
+
+                lazy_attr = getattr(cls, root_attr)
+                if not isinstance(lazy_attr, PreloadAttribute):
+                    continue
+
+                alias = f"t{alias_counter}"
+                alias_counter += 1
+
+                # Build JOIN based on relationship metadata
+                if lazy_attr.foreign_key and lazy_attr.references:
+                    # Many-to-one: this table has FK to other table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
+
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
                     )
+                    join_info.append((root_attr, alias, "many_to_one"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
-                )
-                join_info.append((attr_name, alias, "many_to_one"))
+                elif lazy_attr.reverse_fk and lazy_attr.references:
+                    # One-to-many or One-to-one: other table has FK to this table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
 
-            elif lazy_attr.reverse_fk and lazy_attr.references:
-                # One-to-many: other table has FK to this table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
                     )
+                    # Check if this is a one-to-one relationship
+                    if lazy_attr.relationship_type == "one_to_one":
+                        join_info.append((root_attr, alias, "one_to_one"))
+                    else:
+                        join_info.append((root_attr, alias, "one_to_many"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
-                )
+                elif lazy_attr.join_table and lazy_attr.references:
+                    # Many-to-many: relationship through join table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
 
-                if lazy_attr.relationship_type == "one_to_many":
-                    join_info.append((attr_name, alias, "one_to_many"))
-                elif lazy_attr.relationship_type == "one_to_one":
-                    join_info.append((attr_name, alias, "one_to_one"))
-                else:
-                    raise ValueError(
-                        f"Invalid relationship type: {lazy_attr.relationship_type}"
+                    join_alias = f"j{alias_counter}"
+                    alias_counter += 1
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                        f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = t0.id"
                     )
-
-            elif lazy_attr.join_table and lazy_attr.references:
-                # Many-to-many: relationship through join table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
                     )
+                    join_info.append((root_attr, alias, "many_to_many"))
+            else:
+                # Nested preload - build chain of JOINs
+                for path in paths:
+                    if len(path) == 1:
+                        continue  # Skip simple paths in this iteration
 
-                join_alias = f"j{i+1}"
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
-                    f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = t0.id"
-                )
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk or 'target_id'}"
-                )
-                join_info.append((attr_name, alias, "many_to_many"))
+                    current_model = cls
+                    prev_alias = "t0"
+                    path_aliases = []
+
+                    # Build JOINs for each level in the path
+                    for level, attr_name in enumerate(path):
+                        if not hasattr(current_model, attr_name):
+                            break
+
+                        lazy_attr = getattr(current_model, attr_name)
+                        if not isinstance(lazy_attr, PreloadAttribute):
+                            break
+
+                        alias = f"t{alias_counter}"
+                        alias_counter += 1
+                        path_aliases.append((attr_name, alias, lazy_attr))
+
+                        # Add columns for this level
+                        for col in lazy_attr.model.COLUMNS.values():
+                            select_parts.append(
+                                f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                            )
+
+                        # Build JOIN for this level
+                        if lazy_attr.foreign_key and lazy_attr.references:
+                            # Many-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {prev_alias}.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
+                            )
+
+                        elif lazy_attr.reverse_fk and lazy_attr.references:
+                            # One-to-many or One-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.reverse_fk} = {prev_alias}.id"
+                            )
+
+                        elif lazy_attr.join_table and lazy_attr.references:
+                            # Many-to-many
+                            join_alias = f"j{alias_counter}"
+                            alias_counter += 1
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                                f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = {prev_alias}.id"
+                            )
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                            )
+
+                        # Track for result parsing
+                        if level == 0:
+                            # First level - directly attached to main object
+                            rel_type = "many_to_one"
+                            if lazy_attr.relationship_type == "one_to_one":
+                                rel_type = "one_to_one"
+                            elif lazy_attr.relationship_type == "one_to_many":
+                                rel_type = "one_to_many"
+                            elif lazy_attr.relationship_type == "many_to_many":
+                                rel_type = "many_to_many"
+                            join_info.append((attr_name, alias, rel_type))
+
+                        # Store nested preload info for result parsing
+                        if " > ".join(path[: level + 1]) not in nested_preload_info:
+                            nested_preload_info[" > ".join(path[: level + 1])] = {
+                                "path": path[: level + 1],
+                                "aliases": path_aliases[: level + 1],
+                                "model": lazy_attr.model,
+                            }
+
+                        # Move to next level
+                        current_model = lazy_attr.model
+                        prev_alias = alias
 
         # Build final query
         query = f"SELECT {', '.join(select_parts)} FROM {from_part}"
@@ -852,8 +952,10 @@ class DBModel:
         if not rows:
             return []
 
-        # Parse results
-        return cls._parse_joined_results_list(rows, join_info)
+        # Parse results with nested preload support
+        return cls._parse_joined_results_list_with_nested(
+            rows, join_info, nested_preload_info
+        )
 
     @classmethod
     def _parse_joined_results_single(
@@ -927,6 +1029,287 @@ class DBModel:
         return instance
 
     @classmethod
+    def _parse_joined_results_single_with_nested(
+        cls: Type[T],
+        rows: Sequence[Mapping[str, Any]],
+        join_info: List[tuple[str, str, str]],
+        nested_preload_info: Dict[str, Dict[str, Any]],
+    ) -> Optional[T]:
+        """Parse JOINed query results with support for nested preloading."""
+        print(
+            f"DEBUG _parse_joined_results_single_with_nested: Starting with {len(rows)} rows"
+        )
+        print(f"DEBUG _parse_joined_results_single_with_nested: join_info={join_info}")
+        print(
+            f"DEBUG _parse_joined_results_single_with_nested: nested_preload_info keys={list(nested_preload_info.keys())}"
+        )
+
+        if not rows:
+            return None
+
+        # Create main instance from first row's t0 columns
+        main_cols = {}
+        for k, v in rows[0].items():
+            if k.startswith("t0."):
+                main_cols[k[3:]] = v
+            elif not any(k.startswith(f"{alias}.") for _, alias, _ in join_info):
+                main_cols[k] = v
+        instance = cls.from_db_row(main_cols)
+        print(
+            f"DEBUG _parse_joined_results_single_with_nested: Created main instance {instance.__class__.__name__}"
+        )
+
+        # Process each first-level relationship
+        for attr_name, alias, rel_type in join_info:
+            print(
+                f"DEBUG _parse_joined_results_single_with_nested: Processing {attr_name} (alias={alias}, rel_type={rel_type})"
+            )
+            if not hasattr(cls, attr_name):
+                continue
+
+            lazy_attr = getattr(cls, attr_name)
+            if not isinstance(lazy_attr, PreloadAttribute):
+                continue
+
+            if rel_type == "many_to_one" or rel_type == "one_to_one":
+                # Single related object
+                related_cols = {
+                    k.replace(f"{alias}.", ""): v
+                    for k, v in rows[0].items()
+                    if k.startswith(f"{alias}.")
+                }
+                if related_cols and any(v is not None for v in related_cols.values()):
+                    related_obj = lazy_attr.model.from_db_row(related_cols)
+
+                    # Check for nested preloads on this object
+                    print(
+                        f"DEBUG _parse_joined_results_single_with_nested: Checking nested preloads for {attr_name}"
+                    )
+                    for nested_path, nested_info in nested_preload_info.items():
+                        path_parts = nested_info["path"]
+                        print(
+                            f"DEBUG _parse_joined_results_single_with_nested: Checking nested path {nested_path}, path_parts={path_parts}"
+                        )
+                        if len(path_parts) > 1 and path_parts[0] == attr_name:
+                            # This is a nested preload starting from this attribute
+                            # Apply nested preloads to the related object
+                            print(
+                                f"DEBUG _parse_joined_results_single_with_nested: Found nested preload for {attr_name}, applying to related object"
+                            )
+
+                            # DETAILED DEBUG: Show the issue clearly
+                            original_aliases = nested_info["aliases"]
+                            sliced_aliases = nested_info["aliases"][1:]
+                            print(
+                                f"DEBUG CRITICAL: Original aliases array = {[(a[0], a[1]) for a in original_aliases]}"
+                            )
+                            print(
+                                f"DEBUG CRITICAL: Original aliases length = {len(original_aliases)}"
+                            )
+                            print(
+                                f"DEBUG CRITICAL: Sliced aliases [1:] = {[(a[0], a[1]) for a in sliced_aliases]}"
+                            )
+                            print(
+                                f"DEBUG CRITICAL: Sliced aliases length = {len(sliced_aliases)}"
+                            )
+                            print(f"DEBUG CRITICAL: Passing level = 1")
+                            print(
+                                f"DEBUG CRITICAL: Will the condition 'level >= len(nested_aliases)' be True? {1 >= len(sliced_aliases)}"
+                            )
+                            print(
+                                f"DEBUG CRITICAL: This means _apply_nested_preloads will return early? {1 >= len(sliced_aliases)}"
+                            )
+
+                            cls._apply_nested_preloads(
+                                related_obj, rows, nested_info["aliases"][1:], 0
+                            )
+
+                    lazy_attr.set_preloaded_value(instance, related_obj)
+                else:
+                    lazy_attr.set_preloaded_value(instance, None)
+
+            elif rel_type in ("one_to_many", "many_to_many"):
+                # Multiple related objects
+                related_objects = []
+                seen_ids = set()
+
+                for row in rows:
+                    related_cols = {
+                        k.replace(f"{alias}.", ""): v
+                        for k, v in row.items()
+                        if k.startswith(f"{alias}.")
+                    }
+                    if related_cols and any(
+                        v is not None for v in related_cols.values()
+                    ):
+                        obj_id = related_cols.get("id")
+                        if obj_id and obj_id not in seen_ids:
+                            seen_ids.add(obj_id)
+                            related_obj = lazy_attr.model.from_db_row(related_cols)
+
+                            # Check for nested preloads on this collection item
+                            print(
+                                f"DEBUG _parse_joined_results_single_with_nested: Checking nested preloads for collection item {attr_name}"
+                            )
+                            for nested_path, nested_info in nested_preload_info.items():
+                                path_parts = nested_info["path"]
+                                print(
+                                    f"DEBUG _parse_joined_results_single_with_nested: Checking nested path {nested_path} for collection, path_parts={path_parts}"
+                                )
+                                if len(path_parts) > 1 and path_parts[0] == attr_name:
+                                    # Apply nested preloads to each item in the collection
+                                    print(
+                                        f"DEBUG _parse_joined_results_single_with_nested: Found nested preload for collection {attr_name}, applying to item"
+                                    )
+
+                                    # DETAILED DEBUG: Show the issue clearly for collections
+                                    original_aliases = nested_info["aliases"]
+                                    sliced_aliases = nested_info["aliases"][1:]
+                                    print(
+                                        f"DEBUG CRITICAL (collection): Original aliases array = {[(a[0], a[1]) for a in original_aliases]}"
+                                    )
+                                    print(
+                                        f"DEBUG CRITICAL (collection): Original aliases length = {len(original_aliases)}"
+                                    )
+                                    print(
+                                        f"DEBUG CRITICAL (collection): Sliced aliases [1:] = {[(a[0], a[1]) for a in sliced_aliases]}"
+                                    )
+                                    print(
+                                        f"DEBUG CRITICAL (collection): Sliced aliases length = {len(sliced_aliases)}"
+                                    )
+                                    print(
+                                        f"DEBUG CRITICAL (collection): Passing level = 1"
+                                    )
+                                    print(
+                                        f"DEBUG CRITICAL (collection): Will the condition 'level >= len(nested_aliases)' be True? {1 >= len(sliced_aliases)}"
+                                    )
+                                    print(
+                                        f"DEBUG CRITICAL (collection): This means _apply_nested_preloads will return early? {1 >= len(sliced_aliases)}"
+                                    )
+
+                                    cls._apply_nested_preloads(
+                                        related_obj,
+                                        [row],
+                                        nested_info["aliases"][1:],
+                                        0,
+                                    )
+
+                            related_objects.append(related_obj)
+
+                lazy_attr.set_preloaded_value(instance, related_objects)
+
+        return instance
+
+    @classmethod
+    def _apply_nested_preloads(
+        cls,
+        parent_obj: Any,
+        rows: Sequence[Mapping[str, Any]],
+        nested_aliases: List[Tuple[str, str, Any]],
+        level: int,
+    ) -> None:
+        """Apply nested preloads to an object based on JOIN results."""
+        print(
+            f"DEBUG _apply_nested_preloads: level={level}, parent_obj={parent_obj.__class__.__name__}, nested_aliases length={len(nested_aliases) if nested_aliases else 0}"
+        )
+
+        if not nested_aliases or level >= len(nested_aliases):
+            print(
+                f"DEBUG _apply_nested_preloads: Early return - no aliases or level {level} >= {len(nested_aliases) if nested_aliases else 0}"
+            )
+            return
+
+        attr_name, alias, lazy_attr = nested_aliases[0]
+        print(
+            f"DEBUG _apply_nested_preloads: Processing attr_name={attr_name}, alias={alias}, lazy_attr.model={lazy_attr.model.__name__ if lazy_attr and hasattr(lazy_attr, 'model') else 'None'}"
+        )
+
+        # Get the parent model class to find the attribute
+        parent_class = parent_obj.__class__
+        if not hasattr(parent_class, attr_name):
+            print(
+                f"DEBUG _apply_nested_preloads: Parent class {parent_class.__name__} doesn't have attribute {attr_name}"
+            )
+            return
+
+        parent_lazy_attr = getattr(parent_class, attr_name)
+        if not isinstance(parent_lazy_attr, PreloadAttribute):
+            print(
+                f"DEBUG _apply_nested_preloads: Attribute {attr_name} is not a PreloadAttribute"
+            )
+            return
+
+        # Check relationship type to determine if we need to collect multiple objects
+        rel_type = parent_lazy_attr.relationship_type
+        print(f"DEBUG _apply_nested_preloads: Relationship type = {rel_type}")
+
+        if rel_type in ("one_to_many", "many_to_many"):
+            # Collect all related objects for one-to-many or many-to-many
+            related_objects = []
+            seen_ids = set()
+
+            for row in rows:
+                related_cols = {
+                    k.replace(f"{alias}.", ""): v
+                    for k, v in row.items()
+                    if k.startswith(f"{alias}.")
+                }
+
+                if related_cols and any(v is not None for v in related_cols.values()):
+                    obj_id = related_cols.get("id")
+                    if obj_id and obj_id not in seen_ids:
+                        seen_ids.add(obj_id)
+                        related_obj = lazy_attr.model.from_db_row(related_cols)
+
+                        # Recursively apply deeper nested preloads if any
+                        if len(nested_aliases) > 1:
+                            print(
+                                f"DEBUG _apply_nested_preloads: Recursing for collection item with {len(nested_aliases)-1} remaining aliases"
+                            )
+                            cls._apply_nested_preloads(
+                                related_obj, [row], nested_aliases[1:], 0
+                            )
+
+                        related_objects.append(related_obj)
+
+            parent_lazy_attr.set_preloaded_value(parent_obj, related_objects)
+            print(
+                f"DEBUG _apply_nested_preloads: Set {len(related_objects)} objects for {attr_name} on {parent_obj.__class__.__name__}"
+            )
+        else:
+            # Single object for many-to-one or one-to-one
+            related_cols = {
+                k.replace(f"{alias}.", ""): v
+                for k, v in rows[0].items()
+                if k.startswith(f"{alias}.")
+            }
+
+            if related_cols and any(v is not None for v in related_cols.values()):
+                # Create the related object
+                related_obj = lazy_attr.model.from_db_row(related_cols)
+                print(
+                    f"DEBUG _apply_nested_preloads: Created related object of type {related_obj.__class__.__name__}"
+                )
+
+                # Recursively apply deeper nested preloads if any
+                if len(nested_aliases) > 1:
+                    print(
+                        f"DEBUG _apply_nested_preloads: Recursing with {len(nested_aliases)-1} remaining aliases"
+                    )
+                    cls._apply_nested_preloads(related_obj, rows, nested_aliases[1:], 0)
+
+                # Set the preloaded value on the parent
+                parent_lazy_attr.set_preloaded_value(parent_obj, related_obj)
+                print(
+                    f"DEBUG _apply_nested_preloads: Set preloaded value for {attr_name} on {parent_obj.__class__.__name__}"
+                )
+            else:
+                parent_lazy_attr.set_preloaded_value(parent_obj, None)
+                print(
+                    f"DEBUG _apply_nested_preloads: Set None for {attr_name} on {parent_obj.__class__.__name__} (no data)"
+                )
+
+    @classmethod
     def _parse_joined_results_list(
         cls: Type[T],
         rows: Sequence[Mapping[str, Any]],
@@ -997,6 +1380,113 @@ class DBModel:
                             relationships_map[main_id][attr_name].append(
                                 lazy_attr.model.from_db_row(related_cols)
                             )
+
+        # Set all preloaded values
+        for main_id, instance in instances_map.items():
+            for attr_name, _, _ in join_info:
+                if hasattr(cls, attr_name):
+                    lazy_attr = getattr(cls, attr_name)
+                    if isinstance(lazy_attr, PreloadAttribute):
+                        value = relationships_map[main_id].get(attr_name)
+                        if value is not None or attr_name in relationships_map[main_id]:
+                            lazy_attr.set_preloaded_value(instance, value)
+
+        return list(instances_map.values())
+
+    @classmethod
+    def _parse_joined_results_list_with_nested(
+        cls: Type[T],
+        rows: Sequence[Mapping[str, Any]],
+        join_info: List[tuple[str, str, str]],
+        nested_preload_info: Dict[str, Dict[str, Any]],
+    ) -> List[T]:
+        """Parse JOINed query results with support for nested preloading."""
+        if not rows:
+            return []
+
+        instances_map: Dict[Any, T] = {}
+        relationships_map: Dict[Any, Dict[str, Any]] = {}
+
+        for row in rows:
+            # Extract main instance columns
+            main_cols = {}
+            for k, v in row.items():
+                if k.startswith("t0."):
+                    main_cols[k[3:]] = v
+                elif not any(k.startswith(f"{alias}.") for _, alias, _ in join_info):
+                    main_cols[k] = v
+            main_id = main_cols.get("id")
+
+            if main_id not in instances_map:
+                instances_map[main_id] = cls.from_db_row(main_cols)
+                relationships_map[main_id] = {
+                    attr_name: (
+                        [] if rel_type in ("one_to_many", "many_to_many") else None
+                    )
+                    for attr_name, _, rel_type in join_info
+                }
+
+            instance = instances_map[main_id]
+
+            # Process each first-level relationship
+            for attr_name, alias, rel_type in join_info:
+                if not hasattr(cls, attr_name):
+                    continue
+
+                lazy_attr = getattr(cls, attr_name)
+                if not isinstance(lazy_attr, PreloadAttribute):
+                    continue
+
+                related_cols = {
+                    k.replace(f"{alias}.", ""): v
+                    for k, v in row.items()
+                    if k.startswith(f"{alias}.")
+                }
+
+                if related_cols and any(v is not None for v in related_cols.values()):
+                    if rel_type == "many_to_one" or rel_type == "one_to_one":
+                        # Single related object
+                        if relationships_map[main_id][attr_name] is None:
+                            related_obj = lazy_attr.model.from_db_row(related_cols)
+
+                            # Check for nested preloads on this object
+                            for nested_path, nested_info in nested_preload_info.items():
+                                path_parts = nested_info["path"]
+                                if len(path_parts) > 1 and path_parts[0] == attr_name:
+                                    # This is a nested preload starting from this attribute
+                                    # Apply nested preloads to the related object
+                                    cls._apply_nested_preloads(
+                                        related_obj,
+                                        [row],
+                                        nested_info["aliases"][1:],
+                                        0,
+                                    )
+
+                            relationships_map[main_id][attr_name] = related_obj
+
+                    elif rel_type in ("one_to_many", "many_to_many"):
+                        # Multiple related objects
+                        obj_id = related_cols.get("id")
+                        existing_ids = {
+                            getattr(o, "id", None)
+                            for o in relationships_map[main_id][attr_name]
+                        }
+                        if obj_id and obj_id not in existing_ids:
+                            related_obj = lazy_attr.model.from_db_row(related_cols)
+
+                            # Check for nested preloads on this collection item
+                            for nested_path, nested_info in nested_preload_info.items():
+                                path_parts = nested_info["path"]
+                                if len(path_parts) > 1 and path_parts[0] == attr_name:
+                                    # Apply nested preloads to each item in the collection
+                                    cls._apply_nested_preloads(
+                                        related_obj,
+                                        [row],
+                                        nested_info["aliases"][1:],
+                                        0,
+                                    )
+
+                            relationships_map[main_id][attr_name].append(related_obj)
 
         # Set all preloaded values
         for main_id, instance in instances_map.items():
@@ -1084,8 +1574,6 @@ class DBModel:
                 PreloadAttribute.get_preloadable_attributes(self.__class__).keys()
             )
 
-        print("SYNC_ATTRS", attributes)
-
         # Use sync_get_with_preload to fetch with JOINs (avoiding N+1)
         new_inst = self.__class__.sync_get_with_preload(
             self.id, attributes, cursor=cursor
@@ -1096,17 +1584,12 @@ class DBModel:
             # Extract just the base attribute name from nested paths like "organization > subscription"
             attr_name = attr_path.split(">")[0].strip()
 
-            print(attr_name)
-
             if not hasattr(self.__class__, attr_name):
-                print("CONITNUING")
                 continue
 
             lazy_attr = getattr(self.__class__, attr_name)
             if not isinstance(lazy_attr, PreloadAttribute):
                 continue
-
-            print("CHECK3")
 
             preloaded_attr_name = f"_preloaded_{attr_name}"
 
@@ -1114,12 +1597,8 @@ class DBModel:
             if not refresh and hasattr(self, preloaded_attr_name):
                 continue
 
-            print("CHECK 4")
-
             # Copy the preloaded value from new instance
-            print(new_inst.__dict__)
             if hasattr(new_inst, preloaded_attr_name):
-                print("COPYING")
                 value = getattr(new_inst, preloaded_attr_name)
                 lazy_attr.set_preloaded_value(self, value)
 
@@ -1134,62 +1613,175 @@ class DBModel:
         preload: Optional[List[str]] = None,
         cursor: Optional[psycopg.Cursor[DictRow]] = None,
     ) -> T:
-        """Synchronous version of get_with_preload()"""
+        """Synchronous version of get_with_preload().
+
+        Supports nested preloading with syntax like "organization > subscription".
+        """
         if not preload:
             return cls.sync_get(id, cursor=cursor)
+
+        # Parse nested paths
+        paths_by_root = cls._parse_preload_paths(preload)
 
         # Build JOIN query with all requested preloads using column aliases
         select_parts = []
         from_part = f"{cls.TABLE_NAME} t0"
         join_parts = []
         join_info = []
+        nested_preload_info = {}  # Track nested preloading info
 
         # Add main table columns with t0. prefix
         for col in cls.COLUMNS.values():
             select_parts.append(f't0.{col.db_name} AS "t0.{col.db_name}"')
 
-        for i, attr_name in enumerate(preload):
-            if not hasattr(cls, attr_name):
-                continue
+        alias_counter = 1
 
-            lazy_attr = getattr(cls, attr_name)
-            if not isinstance(lazy_attr, PreloadAttribute):
-                continue
+        # Process each root attribute and its nested paths
+        for root_attr, paths in paths_by_root.items():
+            # Check if this is a simple preload or nested
+            is_nested = any(len(path) > 1 for path in paths)
 
-            alias = f"t{i+1}"
+            if not is_nested:
+                # Simple preload - use existing logic
+                if not hasattr(cls, root_attr):
+                    continue
 
-            # Build JOIN based on relationship metadata
-            if lazy_attr.foreign_key and lazy_attr.references:
-                # Many-to-one: this table has FK to other table
-                # Get columns for the referenced table by finding its model class
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                lazy_attr = getattr(cls, root_attr)
+                if not isinstance(lazy_attr, PreloadAttribute):
+                    continue
+
+                alias = f"t{alias_counter}"
+                alias_counter += 1
+
+                # Build JOIN based on relationship metadata
+                if lazy_attr.foreign_key and lazy_attr.references:
+                    # Many-to-one: this table has FK to other table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
+
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
                     )
+                    join_info.append((root_attr, alias, "many_to_one"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
-                )
-                join_info.append((attr_name, alias, "many_to_one"))
+                elif lazy_attr.reverse_fk and lazy_attr.references:
+                    # One-to-many or One-to-one: other table has FK to this table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
 
-            elif lazy_attr.reverse_fk and lazy_attr.references:
-                # One-to-many or One-to-one: other table has FK to this table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
                     )
+                    # Check if this is a one-to-one relationship
+                    if lazy_attr.relationship_type == "one_to_one":
+                        join_info.append((root_attr, alias, "one_to_one"))
+                    else:
+                        join_info.append((root_attr, alias, "one_to_many"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
-                )
-                # Check if this is a one-to-one relationship
-                if lazy_attr.relationship_type == "one_to_one":
-                    join_info.append((attr_name, alias, "one_to_one"))
-                else:
-                    join_info.append((attr_name, alias, "one_to_many"))
+                elif lazy_attr.join_table and lazy_attr.references:
+                    # Many-to-many: relationship through join table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
+
+                    join_alias = f"j{alias_counter}"
+                    alias_counter += 1
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                        f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = t0.id"
+                    )
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                    )
+                    join_info.append((root_attr, alias, "many_to_many"))
+            else:
+                # Nested preload - build chain of JOINs
+                for path in paths:
+                    if len(path) == 1:
+                        continue  # Skip simple paths in this iteration
+
+                    current_model = cls
+                    prev_alias = "t0"
+                    path_aliases = []
+
+                    # Build JOINs for each level in the path
+                    for level, attr_name in enumerate(path):
+                        if not hasattr(current_model, attr_name):
+                            break
+
+                        lazy_attr = getattr(current_model, attr_name)
+                        if not isinstance(lazy_attr, PreloadAttribute):
+                            break
+
+                        alias = f"t{alias_counter}"
+                        alias_counter += 1
+                        path_aliases.append((attr_name, alias, lazy_attr))
+
+                        # Add columns for this level
+                        for col in lazy_attr.model.COLUMNS.values():
+                            select_parts.append(
+                                f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                            )
+
+                        # Build JOIN for this level
+                        if lazy_attr.foreign_key and lazy_attr.references:
+                            # Many-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {prev_alias}.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
+                            )
+
+                        elif lazy_attr.reverse_fk and lazy_attr.references:
+                            # One-to-many or One-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.reverse_fk} = {prev_alias}.id"
+                            )
+
+                        elif lazy_attr.join_table and lazy_attr.references:
+                            # Many-to-many
+                            join_alias = f"j{alias_counter}"
+                            alias_counter += 1
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                                f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = {prev_alias}.id"
+                            )
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                            )
+
+                        # Track for result parsing
+                        if level == 0:
+                            # First level - directly attached to main object
+                            rel_type = "many_to_one"
+                            if lazy_attr.relationship_type == "one_to_one":
+                                rel_type = "one_to_one"
+                            elif lazy_attr.relationship_type == "one_to_many":
+                                rel_type = "one_to_many"
+                            elif lazy_attr.relationship_type == "many_to_many":
+                                rel_type = "many_to_many"
+                            join_info.append((attr_name, alias, rel_type))
+
+                        # Store nested preload info for result parsing
+                        if " > ".join(path[: level + 1]) not in nested_preload_info:
+                            nested_preload_info[" > ".join(path[: level + 1])] = {
+                                "path": path[: level + 1],
+                                "aliases": path_aliases[: level + 1],
+                                "model": lazy_attr.model,
+                            }
+
+                        # Move to next level
+                        current_model = lazy_attr.model
+                        prev_alias = alias
 
         # Build final query
         query = f"SELECT {', '.join(select_parts)} FROM {from_part}"
@@ -1202,8 +1794,10 @@ class DBModel:
         if not rows:
             raise ValueError(f"No {cls.__name__} found with id {id}")
 
-        # Parse results
-        result = cls._parse_joined_results_single(rows, join_info)
+        # Parse results with nested preload support
+        result = cls._parse_joined_results_single_with_nested(
+            rows, join_info, nested_preload_info
+        )
         if result is None:
             raise ValueError(f"No {cls.__name__} found with id {id}")
         return result
@@ -1217,62 +1811,175 @@ class DBModel:
         params: Optional[Sequence[Any]] = None,
         cursor: Optional[psycopg.Cursor[DictRow]] = None,
     ) -> List[T]:
-        """Synchronous version of list_with_preload()"""
+        """Synchronous version of list_with_preload().
+
+        Supports nested preloading with syntax like "organization > subscription".
+        """
         if not preload:
             return cls.sync_list(where=where, order=order, params=params, cursor=cursor)
+
+        # Parse nested paths
+        paths_by_root = cls._parse_preload_paths(preload)
 
         # Build JOIN query with all requested preloads using column aliases
         select_parts = []
         from_part = f"{cls.TABLE_NAME} t0"
         join_parts = []
         join_info = []
+        nested_preload_info = {}  # Track nested preloading info
 
         # Add main table columns with t0. prefix
         for col in cls.COLUMNS.values():
             select_parts.append(f't0.{col.db_name} AS "t0.{col.db_name}"')
 
-        for i, attr_name in enumerate(preload):
-            if not hasattr(cls, attr_name):
-                continue
+        alias_counter = 1
 
-            lazy_attr = getattr(cls, attr_name)
-            if not isinstance(lazy_attr, PreloadAttribute):
-                continue
+        # Process each root attribute and its nested paths
+        for root_attr, paths in paths_by_root.items():
+            # Check if this is a simple preload or nested
+            is_nested = any(len(path) > 1 for path in paths)
 
-            alias = f"t{i+1}"
+            if not is_nested:
+                # Simple preload - use existing logic
+                if not hasattr(cls, root_attr):
+                    continue
 
-            # Build JOIN based on relationship metadata
-            if lazy_attr.foreign_key and lazy_attr.references:
-                # Many-to-one: this table has FK to other table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                lazy_attr = getattr(cls, root_attr)
+                if not isinstance(lazy_attr, PreloadAttribute):
+                    continue
+
+                alias = f"t{alias_counter}"
+                alias_counter += 1
+
+                # Build JOIN based on relationship metadata
+                if lazy_attr.foreign_key and lazy_attr.references:
+                    # Many-to-one: this table has FK to other table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
+
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
                     )
+                    join_info.append((root_attr, alias, "many_to_one"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON t0.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
-                )
-                join_info.append((attr_name, alias, "many_to_one"))
+                elif lazy_attr.reverse_fk and lazy_attr.references:
+                    # One-to-many or One-to-one: other table has FK to this table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
 
-            elif lazy_attr.reverse_fk and lazy_attr.references:
-                # One-to-many or One-to-one: other table has FK to this table
-                # Get columns for the referenced table
-                for col in lazy_attr.model.COLUMNS.values():
-                    select_parts.append(
-                        f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
                     )
+                    # Check if this is a one-to-one relationship
+                    if lazy_attr.relationship_type == "one_to_one":
+                        join_info.append((root_attr, alias, "one_to_one"))
+                    else:
+                        join_info.append((root_attr, alias, "one_to_many"))
 
-                join_parts.append(
-                    f"LEFT JOIN {lazy_attr.references} {alias} "
-                    f"ON {alias}.{lazy_attr.reverse_fk} = t0.id"
-                )
-                # Check if this is a one-to-one relationship
-                if lazy_attr.relationship_type == "one_to_one":
-                    join_info.append((attr_name, alias, "one_to_one"))
-                else:
-                    join_info.append((attr_name, alias, "one_to_many"))
+                elif lazy_attr.join_table and lazy_attr.references:
+                    # Many-to-many: relationship through join table
+                    for col in lazy_attr.model.COLUMNS.values():
+                        select_parts.append(
+                            f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                        )
+
+                    join_alias = f"j{alias_counter}"
+                    alias_counter += 1
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                        f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = t0.id"
+                    )
+                    join_parts.append(
+                        f"LEFT JOIN {lazy_attr.references} {alias} "
+                        f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                    )
+                    join_info.append((root_attr, alias, "many_to_many"))
+            else:
+                # Nested preload - build chain of JOINs
+                for path in paths:
+                    if len(path) == 1:
+                        continue  # Skip simple paths in this iteration
+
+                    current_model = cls
+                    prev_alias = "t0"
+                    path_aliases = []
+
+                    # Build JOINs for each level in the path
+                    for level, attr_name in enumerate(path):
+                        if not hasattr(current_model, attr_name):
+                            break
+
+                        lazy_attr = getattr(current_model, attr_name)
+                        if not isinstance(lazy_attr, PreloadAttribute):
+                            break
+
+                        alias = f"t{alias_counter}"
+                        alias_counter += 1
+                        path_aliases.append((attr_name, alias, lazy_attr))
+
+                        # Add columns for this level
+                        for col in lazy_attr.model.COLUMNS.values():
+                            select_parts.append(
+                                f'{alias}.{col.db_name} AS "{alias}.{col.db_name}"'
+                            )
+
+                        # Build JOIN for this level
+                        if lazy_attr.foreign_key and lazy_attr.references:
+                            # Many-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {prev_alias}.{lazy_attr.foreign_key} = {alias}.{lazy_attr.ref_column}"
+                            )
+
+                        elif lazy_attr.reverse_fk and lazy_attr.references:
+                            # One-to-many or One-to-one
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.reverse_fk} = {prev_alias}.id"
+                            )
+
+                        elif lazy_attr.join_table and lazy_attr.references:
+                            # Many-to-many
+                            join_alias = f"j{alias_counter}"
+                            alias_counter += 1
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.join_table} {join_alias} "
+                                f"ON {join_alias}.{lazy_attr.join_fk or 'source_id'} = {prev_alias}.id"
+                            )
+                            join_parts.append(
+                                f"LEFT JOIN {lazy_attr.references} {alias} "
+                                f"ON {alias}.{lazy_attr.ref_column} = {join_alias}.{lazy_attr.join_ref_fk}"
+                            )
+
+                        # Track for result parsing
+                        if level == 0:
+                            # First level - directly attached to main object
+                            rel_type = "many_to_one"
+                            if lazy_attr.relationship_type == "one_to_one":
+                                rel_type = "one_to_one"
+                            elif lazy_attr.relationship_type == "one_to_many":
+                                rel_type = "one_to_many"
+                            elif lazy_attr.relationship_type == "many_to_many":
+                                rel_type = "many_to_many"
+                            join_info.append((attr_name, alias, rel_type))
+
+                        # Store nested preload info for result parsing
+                        if " > ".join(path[: level + 1]) not in nested_preload_info:
+                            nested_preload_info[" > ".join(path[: level + 1])] = {
+                                "path": path[: level + 1],
+                                "aliases": path_aliases[: level + 1],
+                                "model": lazy_attr.model,
+                            }
+
+                        # Move to next level
+                        current_model = lazy_attr.model
+                        prev_alias = alias
 
         # Build final query
         query = f"SELECT {', '.join(select_parts)} FROM {from_part}"
@@ -1299,8 +2006,10 @@ class DBModel:
         if not rows:
             return []
 
-        # Parse results
-        return cls._parse_joined_results_list(rows, join_info)
+        # Parse results with nested preload support
+        return cls._parse_joined_results_list_with_nested(
+            rows, join_info, nested_preload_info
+        )
 
     @classmethod
     def sync_find_by_with_preload(
