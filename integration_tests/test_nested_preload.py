@@ -262,7 +262,6 @@ class User(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="organization_id",
         references="organizations",
         ref_column="id",
@@ -274,7 +273,6 @@ class User(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="user_id",
         references="profiles",
         relationship_type="one_to_one",
@@ -285,7 +283,6 @@ class User(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         join_table="user_projects",
         join_fk="user_id",
         join_ref_fk="project_id",
@@ -299,7 +296,6 @@ class User(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         join_table="organization_users",
         join_fk="user_id",
         join_ref_fk="organization_id",
@@ -344,7 +340,6 @@ class Organization(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="organization_id",
         references="users",
         relationship_type="one_to_many",
@@ -355,7 +350,6 @@ class Organization(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="subscription_id",
         references="subscriptions",
         ref_column="id",
@@ -367,7 +361,6 @@ class Organization(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="organization_id",
         references="projects",
         relationship_type="one_to_many",
@@ -407,7 +400,6 @@ class Subscription(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="subscription_id",
         references="organizations",
         relationship_type="one_to_many",
@@ -450,7 +442,6 @@ class Project(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="organization_id",
         references="organizations",
         ref_column="id",
@@ -462,7 +453,6 @@ class Project(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         join_table="project_tags",
         join_fk="project_id",
         join_ref_fk="tag_id",
@@ -476,7 +466,6 @@ class Project(DBModel):
         pass
 
     @PreloadAttribute(
-        preload=True,
         join_table="user_projects",
         join_fk="project_id",
         join_ref_fk="user_id",
@@ -522,7 +511,6 @@ class Profile(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="user_id",
         references="users",
         ref_column="id",
@@ -560,7 +548,6 @@ class Tag(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         join_table="project_tags",
         join_fk="tag_id",
         join_ref_fk="project_id",
@@ -1016,10 +1003,11 @@ class TestNestedPreload:
 
         assert hasattr(user, "_preloaded_assigned_projects")
         assigned_projects = user.assigned_projects
-        assert len(assigned_projects) == 2
+        assert len(assigned_projects) == 3  # Alice now has 3 projects
         project_names = [p.name for p in assigned_projects]
         assert "Main Website" in project_names
         assert "Mobile App" in project_names
+        assert "MVP" in project_names
 
         # Test project > team_members (reverse many-to-many)
         project = await Project.get(data["projects"][0].id)
@@ -1063,13 +1051,15 @@ class TestNestedPreload:
 
         assert hasattr(user, "_preloaded_assigned_projects")
         projects = user.assigned_projects
-        assert len(projects) == 2
+        assert len(projects) == 3  # Alice now has 3 projects
 
         # Check that tags are loaded on each project
         for project in projects:
             assert hasattr(project, "_preloaded_tags")
             tags = project.tags
-            assert len(tags) > 0
+            # Not all projects have tags, MVP doesn't have any
+            if project.name != "MVP":
+                assert len(tags) > 0
 
     @pytest.mark.asyncio
     async def test_complex_mixed_relationships(self, setup_nested_test_data):

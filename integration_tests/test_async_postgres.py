@@ -51,9 +51,7 @@ class AsyncUser(DBModel):
     def db_manager(cls):
         return get_test_db_manager()
 
-    @PreloadAttribute(
-        preload=True, reverse_fk="user_id", references="posts", model="AsyncPost"
-    )
+    @PreloadAttribute(reverse_fk="user_id", references="posts", model="AsyncPost")
     async def posts(self) -> List["AsyncPost"]:
         """Lazy load posts asynchronously."""
         return await AsyncPost.list(where="user_id = %s", params=(self.id,))
@@ -87,9 +85,7 @@ class AsyncPost(DBModel):
     def db_manager(cls):
         return get_test_db_manager()
 
-    @PreloadAttribute(
-        preload=True, foreign_key="user_id", references="users", model="AsyncUser"
-    )
+    @PreloadAttribute(foreign_key="user_id", references="users", model="AsyncUser")
     async def user(self) -> Optional[AsyncUser]:
         """Lazy load user asynchronously."""
         if self.user_id:

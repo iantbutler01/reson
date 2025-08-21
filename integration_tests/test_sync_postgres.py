@@ -50,9 +50,7 @@ class Post(DBModel):
     def db_manager(cls):
         return get_test_db_manager()
 
-    @PreloadAttribute(
-        preload=True, foreign_key="user_id", references="users", model="User"
-    )
+    @PreloadAttribute(foreign_key="user_id", references="users", model="User")
     def user(self):
         """User relationship."""
         ...  # PreloadAttribute handles everything
@@ -86,9 +84,7 @@ class User(DBModel):
     def db_manager(cls):
         return get_test_db_manager()
 
-    @PreloadAttribute(
-        preload=True, reverse_fk="user_id", references="posts", model="Post"
-    )
+    @PreloadAttribute(reverse_fk="user_id", references="posts", model="Post")
     def posts(self):
         """Posts relationship."""
         ...  # PreloadAttribute handles everything

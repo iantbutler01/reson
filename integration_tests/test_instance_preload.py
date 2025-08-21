@@ -56,7 +56,6 @@ class Organization(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="organization_id",
         references="users",
         relationship_type="one_to_many",
@@ -120,7 +119,6 @@ class User(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="organization_id",
         references="organizations",
         ref_column="id",
@@ -131,7 +129,6 @@ class User(DBModel):
         return None  # Descriptor - never actually called
 
     @PreloadAttribute(
-        preload=True,
         join_table="user_projects",
         join_fk="user_id",
         join_ref_fk="project_id",

@@ -74,7 +74,6 @@ class Organization(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="organization_id",
         references="users",
         relationship_type="one_to_many",
@@ -85,7 +84,6 @@ class Organization(DBModel):
         return []  # Handled by PreloadAttribute
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="organization_id",
         references="subscriptions",
         relationship_type="one_to_one",
@@ -128,7 +126,6 @@ class User(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="organization_id",
         references="organizations",
         ref_column="id",
@@ -139,7 +136,6 @@ class User(DBModel):
         return None  # Handled by PreloadAttribute
 
     @PreloadAttribute(
-        preload=True,
         reverse_fk="user_id",
         references="posts",
         relationship_type="one_to_many",
@@ -150,7 +146,6 @@ class User(DBModel):
         return []  # Handled by PreloadAttribute
 
     @PreloadAttribute(
-        preload=True,
         join_table="user_tags",
         references="tags",
         join_fk="user_id",
@@ -191,7 +186,6 @@ class Post(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="user_id",
         references="users",
         ref_column="id",
@@ -231,7 +225,6 @@ class Subscription(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         foreign_key="organization_id",
         references="organizations",
         ref_column="id",
@@ -265,7 +258,6 @@ class Tag(DBModel):
         return get_test_db_manager()
 
     @PreloadAttribute(
-        preload=True,
         join_table="user_tags",
         references="users",
         join_fk="tag_id",

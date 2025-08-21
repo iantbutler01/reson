@@ -71,7 +71,6 @@ class PreloadAttribute(Generic[R]):
         self,
         func: Optional[Callable[[Any], R]] = None,
         *,
-        preload: bool = False,
         foreign_key: Optional[str] = None,  # FK column in this table
         references: Optional[str] = None,  # Referenced table name
         ref_column: Optional[str] = "id",  # Column in referenced table
@@ -86,7 +85,6 @@ class PreloadAttribute(Generic[R]):
             str
         ] = None,  # FK in join table pointing to referenced table
     ):
-        self.preload = preload
         self.lock = threading.Lock()  # Always initialize lock
         self.foreign_key = foreign_key
         self.references = references
@@ -122,7 +120,6 @@ class PreloadAttribute(Generic[R]):
 
         return PreloadAttribute(
             func,
-            preload=self.preload,
             foreign_key=self.foreign_key,
             references=self.references,
             ref_column=self.ref_column,
@@ -183,7 +180,7 @@ class PreloadAttribute(Generic[R]):
             if attr_name.startswith("_"):
                 continue
             attr_value = getattr(model_cls, attr_name)
-            if isinstance(attr_value, PreloadAttribute) and attr_value.preload:
+            if isinstance(attr_value, PreloadAttribute):
                 preloadable[attr_name] = attr_value
         return preloadable
 
@@ -1028,6 +1025,10 @@ class DBModel:
         nested_preload_info: Dict[str, Dict[str, Any]],
     ) -> Optional[T]:
         """Parse JOINed query results with support for nested preloading."""
+        print(f"\n[DEBUG] _parse_joined_results_single_with_nested called")
+        print(f"[DEBUG]   join_info: {join_info}")
+        print(f"[DEBUG]   nested_preload_info keys: {list(nested_preload_info.keys())}")
+
         if not rows:
             return None
 
@@ -1096,6 +1097,9 @@ class DBModel:
                             for nested_path, nested_info in nested_preload_info.items():
                                 path_parts = nested_info["path"]
                                 if len(path_parts) > 1 and path_parts[0] == attr_name:
+                                    print(
+                                        f"[DEBUG] Applying nested preload for {nested_path} on collection item {obj_id}"
+                                    )
                                     # Apply nested preloads to each item in the collection
                                     cls._apply_nested_preloads(
                                         related_obj,
@@ -1106,6 +1110,9 @@ class DBModel:
 
                             related_objects.append(related_obj)
 
+                print(
+                    f"[DEBUG] Setting preloaded {attr_name} with {len(related_objects)} items"
+                )
                 lazy_attr.set_preloaded_value(instance, related_objects)
 
         return instance
@@ -1119,7 +1126,14 @@ class DBModel:
         level: int,
     ) -> None:
         """Apply nested preloads to an object based on JOIN results."""
+        print(
+            f"[DEBUG] _apply_nested_preloads on {parent_obj.__class__.__name__} id={parent_obj.id}"
+        )
+        print(f"[DEBUG]   nested_aliases: {[(a[0], a[1]) for a in nested_aliases]}")
+        print(f"[DEBUG]   level: {level}")
+
         if not nested_aliases or level >= len(nested_aliases):
+            print(f"[DEBUG]   Returning early - no more aliases")
             return
 
         attr_name, alias, lazy_attr = nested_aliases[0]
@@ -1180,8 +1194,14 @@ class DBModel:
                     cls._apply_nested_preloads(related_obj, rows, nested_aliases[1:], 0)
 
                 # Set the preloaded value on the parent
+                print(
+                    f"[DEBUG] Setting _preloaded_{attr_name} on {parent_obj.__class__.__name__} to {related_obj.__class__.__name__}"
+                )
                 parent_lazy_attr.set_preloaded_value(parent_obj, related_obj)
             else:
+                print(
+                    f"[DEBUG] Setting _preloaded_{attr_name} on {parent_obj.__class__.__name__} to None"
+                )
                 parent_lazy_attr.set_preloaded_value(parent_obj, None)
 
     @classmethod
@@ -1495,10 +1515,13 @@ class DBModel:
         if not preload:
             return cls.sync_get(id, cursor=cursor)
 
+        print(
+            f"[DEBUG] sync_get_with_preload called on {cls.__name__} with preload: {preload}"
+        )
+
         # Parse nested paths
         paths_by_root = cls._parse_preload_paths(preload)
-
-        # Build JOIN query with all requested preloads using column aliases
+        print(f"[DEBUG] paths_by_root: {paths_by_root}")
         select_parts = []
         from_part = f"{cls.TABLE_NAME} t0"
         join_parts = []
@@ -1664,7 +1687,12 @@ class DBModel:
             query += " " + " ".join(join_parts)
         query += " WHERE t0.id = %s"
 
+        print(f"[DEBUG] Final query: {query[:500]}...")  # First 500 chars
+        print(f"[DEBUG] Join info: {join_info}")
+        print(f"[DEBUG] Nested preload info: {nested_preload_info}")
+
         rows = cls.db_manager().sync_execute_query(query, params=(id,), cursor=cursor)
+        print(f"[DEBUG] Got {len(rows)} rows from query")
 
         if not rows:
             raise ValueError(f"No {cls.__name__} found with id {id}")
@@ -1673,6 +1701,32 @@ class DBModel:
         result = cls._parse_joined_results_single_with_nested(
             rows, join_info, nested_preload_info
         )
+
+        # Debug what's preloaded on the result
+        print(f"[DEBUG] Result: {result.__class__.__name__} id={result.id}")
+        for attr_name in dir(result):
+            if attr_name.startswith("_preloaded_"):
+                value = getattr(result, attr_name)
+                if isinstance(value, list):
+                    print(f"[DEBUG]   {attr_name}: list with {len(value)} items")
+                    for item in value:
+                        print(f"[DEBUG]     - {item.__class__.__name__} id={item.id}")
+                        # Check nested preloaded attributes
+                        for nested_attr in dir(item):
+                            if nested_attr.startswith("_preloaded_"):
+                                nested_val = getattr(item, nested_attr)
+                                if hasattr(nested_val, "__class__"):
+                                    print(
+                                        f"[DEBUG]       {nested_attr}: {nested_val.__class__.__name__}"
+                                    )
+                                else:
+                                    print(f"[DEBUG]       {nested_attr}: {nested_val}")
+                elif value is not None:
+                    print(
+                        f"[DEBUG]   {attr_name}: {value.__class__.__name__ if hasattr(value, '__class__') else value}"
+                    )
+                else:
+                    print(f"[DEBUG]   {attr_name}: None")
         if result is None:
             raise ValueError(f"No {cls.__name__} found with id {id}")
         return result
