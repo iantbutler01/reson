@@ -39,7 +39,9 @@ def create_openrouter_inference_client(
 ) -> OpenRouterInferenceClient:
     return OpenRouterInferenceClient(
         model=model,
-        api_key=api_key or os.environ["OPENROUTER_KEY"],
+        api_key=api_key
+        or os.environ.get("OPENROUTER_API_KEY")
+        or os.environ["OPENROUTER_KEY"],
         reasoning=reasoning,
     )
 

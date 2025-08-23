@@ -153,11 +153,16 @@ class TracingInferenceClient(InferenceClient):
 
     @with_fallback
     async def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=8192, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=8192,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         full_output = ""
         async for token in self.client.connect_and_listen(
-            messages, max_tokens, top_p, temperature
+            messages, max_tokens, top_p, temperature, tools=tools
         ):
             # Handle both tuple and string formats
             if isinstance(token, tuple):
@@ -174,9 +179,16 @@ class TracingInferenceClient(InferenceClient):
 
     @with_fallback
     async def get_generation(
-        self, messages: List[ChatMessage], max_tokens=8192, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=8192,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
-        res = await self.client.get_generation(messages, max_tokens, top_p, temperature)
+        res = await self.client.get_generation(
+            messages, max_tokens, top_p, temperature, tools=tools
+        )
         id = random.randrange(1000000)
         await trace_output([m.model_dump() for m in messages], f"gen_input_{id}")
         await trace_output(res, f"gen_output_{id}")

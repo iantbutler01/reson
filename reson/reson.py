@@ -17,6 +17,7 @@ from typing import (
     TypeVar,
     get_origin,
     get_args,
+    get_type_hints,
     Callable,
     ParamSpec,
     Union,
@@ -65,6 +66,7 @@ from reson.utils.inference import (
     create_vertex_gemini_api_client,
     create_openai_inference_client,
 )
+from reson.utils.schema_generators import get_schema_generator, supports_native_tools
 from reson.tracing_inference_client import TracingInferenceClient
 
 P = ParamSpec("P")
@@ -229,6 +231,7 @@ class Runtime(ResonBase):
     store: Store
     used: bool = Field(default=False)
     api_key: Optional[str] = Field(default=None, exclude=True)
+    native_tools: bool = Field(default=False)
 
     # ───── private runtime fields ─────
     _tools: dict[str, Callable] = PrivateAttr(default_factory=dict)
@@ -243,6 +246,14 @@ class Runtime(ResonBase):
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
         self._context = _Ctx(self.store)
+
+        # Validate native tools support if enabled
+        if self.native_tools and self.model:
+            if not supports_native_tools(self.model):
+                raise ValueError(
+                    f"Native tools not supported for model: {self.model}. "
+                    f"Set native_tools=False or use a supported provider."
+                )
 
     # ───── public API ─────
     @property
@@ -298,7 +309,7 @@ class Runtime(ResonBase):
         prompt: Optional[str] = None,
         system: Optional[str] = None,
         history: Optional[List[ChatMessage]] = None,
-        output_type: Optional[Type[R]] = None,
+        output_type: Optional[Type[R] | UnionType] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -341,6 +352,7 @@ class Runtime(ResonBase):
             max_tokens=max_tokens,
             call_context=self._current_call_args,  # MODIFIED: Use instance attr
             art_backend=art_backend,
+            native_tools=self.native_tools,  # Pass native tools flag
         )
 
         parsed_value, raw_response_str, reasoning_str = result
@@ -358,7 +370,7 @@ class Runtime(ResonBase):
         prompt: str | None = None,
         system: Optional[str] = None,
         history: Optional[List[ChatMessage]] = None,
-        output_type: Any | None = None,
+        output_type: Optional[Type[R] | UnionType] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -407,6 +419,7 @@ class Runtime(ResonBase):
             max_tokens=max_tokens,
             call_context=self._current_call_args,  # MODIFIED: Use instance attr
             art_backend=art_backend,
+            native_tools=self.native_tools,  # Pass native tools flag
         ):
             # Handle tuple format with chunk type
             if isinstance(chunk_data, tuple) and len(chunk_data) == 3:
@@ -479,6 +492,65 @@ class Runtime(ResonBase):
             return await func(**kwargs)
         else:
             return func(**kwargs)
+
+    def create_tool_result_message(
+        self, tool_call_obj: Any, result: str
+    ) -> ChatMessage:
+        """Create properly formatted tool result message for conversation continuation.
+
+        Works for both XML tools (returns simple text message) and native tools
+        (returns provider-specific formatted message).
+        """
+        if not self.native_tools:
+            # XML approach: simple text message (existing behavior)
+            return ChatMessage(role=ChatRole.USER, content=result)
+
+        # Native tools: provider-specific formatting
+        if not hasattr(tool_call_obj, "_tool_id"):
+            # Fallback for tools without ID preservation
+            return ChatMessage(role=ChatRole.USER, content=result)
+
+        provider = (
+            self.model.split(":", 1)[0]
+            if self.model and ":" in self.model
+            else self.model
+        )
+
+        if provider in ["openai", "openrouter", "custom-openai"]:
+            # OpenAI format
+            content = json.dumps(
+                {
+                    "type": "function_call_output",
+                    "call_id": tool_call_obj._tool_id,
+                    "output": result,
+                }
+            )
+        elif provider in ["anthropic", "bedrock"]:
+            # Anthropic format (requires array format for tool_result)
+            content = json.dumps(
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_obj._tool_id,
+                        "content": result,
+                    }
+                ]
+            )
+        elif provider and provider.startswith("google"):
+            # Google format
+            content = json.dumps(
+                {
+                    "functionResponse": {
+                        "name": tool_call_obj._tool_name,
+                        "response": {"result": result},
+                    }
+                }
+            )
+        else:
+            # Fallback for unknown providers
+            content = result
+
+        return ChatMessage(role=ChatRole.USER, content=content)
 
 
 def _create_empty_value(output_type):
@@ -624,7 +696,10 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             raise ValueError(
                 "Custom OpenAI model must include @server_url=<url> parameter"
             )
-        server_url = re.match(r".+@server_url=([^@]+)", model_name).group(1)
+        server_url_match = re.match(r".+@server_url=([^@]+)", model_name)
+        if not server_url_match:
+            raise ValueError("Could not parse server_url from model name")
+        server_url = server_url_match.group(1)
         reasoning_match = re.match(r".+@reasoning=([^@]+)", model_name)
         model_name = re.sub(r"@.*$", "", model_name)
         client = create_openai_inference_client(
@@ -648,6 +723,204 @@ def _get_parser_for_type(output_type=None) -> OutputParser:
     return get_default_parser()
 
 
+def _generate_native_tool_schemas(
+    tools: Dict[str, Callable], model: str
+) -> List[Dict[str, Any]]:
+    """Generate native tool schemas for the given model/provider."""
+    if not tools:
+        return []
+
+    schema_generator = get_schema_generator(model)
+    return schema_generator.generate_tool_schemas(tools)
+
+
+def _parse_native_tool_calls(
+    response_data: Any, tools: Dict[str, Callable], provider: str
+) -> List[Any]:
+    """Parse native tool calls from provider response into Deserializable objects."""
+    tool_calls = []
+
+    # Extract tool calls based on provider format
+    if (
+        provider.startswith("openai")
+        or provider == "openrouter"
+        or provider == "custom-openai"
+    ):
+        # OpenAI format: Handle both dict and object responses
+        choices = None
+        if isinstance(response_data, dict) and "choices" in response_data:
+            choices = response_data["choices"]
+        elif hasattr(response_data, "choices"):
+            choices = response_data.choices
+
+        if choices and len(choices) > 0:
+            choice = choices[0]
+            message = (
+                choice.get("message")
+                if isinstance(choice, dict)
+                else getattr(choice, "message", None)
+            )
+
+            if message:
+                tool_calls_data = (
+                    message.get("tool_calls")
+                    if isinstance(message, dict)
+                    else getattr(message, "tool_calls", None)
+                )
+
+                if tool_calls_data:
+                    for tool_call in tool_calls_data:
+                        function_data = (
+                            tool_call.get("function")
+                            if isinstance(tool_call, dict)
+                            else getattr(tool_call, "function", None)
+                        )
+                        if function_data:
+                            func_name = (
+                                function_data.get("name")
+                                if isinstance(function_data, dict)
+                                else getattr(function_data, "name", None)
+                            )
+                            if func_name in tools:
+                                tool_func = tools[func_name]
+                                arguments_str = (
+                                    function_data.get("arguments")
+                                    if isinstance(function_data, dict)
+                                    else getattr(function_data, "arguments", "{}")
+                                )
+                                arguments = (
+                                    json.loads(arguments_str) if arguments_str else {}
+                                )
+                                tool_id = (
+                                    tool_call.get("id", "")
+                                    if isinstance(tool_call, dict)
+                                    else getattr(tool_call, "id", "")
+                                )
+
+                                # Create Deserializable object from arguments with ID
+                                tool_instance = _create_tool_instance(
+                                    tool_func, arguments, func_name, tool_id
+                                )
+                                tool_calls.append(tool_instance)
+
+    elif provider == "anthropic" or provider == "bedrock":
+        # Anthropic format: response.content with tool_use blocks
+        if hasattr(response_data, "content"):
+            for block in response_data.content:
+                if hasattr(block, "type") and block.type == "tool_use":
+                    if block.name in tools:
+                        tool_func = tools[block.name]
+                        arguments = block.input
+                        tool_id = getattr(block, "id", "")
+
+                        tool_instance = _create_tool_instance(
+                            tool_func, arguments, block.name, tool_id
+                        )
+                        tool_calls.append(tool_instance)
+
+    elif provider.startswith("google"):
+        # Google format: response.candidates[0].content.parts with function_call
+        if hasattr(response_data, "candidates") and response_data.candidates:
+            candidate = response_data.candidates[0]
+            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                for part in candidate.content.parts:
+                    if hasattr(part, "function_call"):
+                        func_call = part.function_call
+                        if func_call.name in tools:
+                            tool_func = tools[func_call.name]
+                            arguments = dict(func_call.args)
+                            # Google doesn't have explicit tool IDs, use function name
+                            tool_id = func_call.name
+
+                            tool_instance = _create_tool_instance(
+                                tool_func, arguments, func_call.name, tool_id
+                            )
+                            tool_calls.append(tool_instance)
+
+    return tool_calls
+
+
+def _create_tool_instance(
+    tool_func: Callable, arguments: Dict[str, Any], tool_name: str, tool_id: str = ""
+) -> Any:
+    """Create a Deserializable tool instance from function and arguments."""
+    # Get the function signature to understand expected types
+    sig = inspect.signature(tool_func)
+    type_hints = get_type_hints(tool_func)
+
+    # Convert dict arguments to proper Deserializable objects where needed
+    converted_args = {}
+    for param_name, param in sig.parameters.items():
+        if param_name == "self":
+            continue
+
+        if param_name in arguments:
+            param_type = type_hints.get(param_name, str)
+            param_value = arguments[param_name]
+
+            # If the parameter type is a Deserializable and the value is a dict, convert it
+            if (
+                hasattr(param_type, "__mro__")
+                and any("Deserializable" in cls.__name__ for cls in param_type.__mro__)
+                and isinstance(param_value, dict)
+            ):
+                # Convert dict to Deserializable instance
+                converted_args[param_name] = param_type(**param_value)
+            else:
+                converted_args[param_name] = param_value
+
+    # Create a simple wrapper that can be executed
+    class ToolCallInstance:
+        def __init__(
+            self, name: str, func: Callable, args: Dict[str, Any], tool_id: str
+        ):
+            self._tool_name = name
+            self._tool_func = func
+            self._tool_id = tool_id  # Store tool ID for multi-turn conversations
+            for key, value in args.items():
+                setattr(self, key, value)
+
+    return ToolCallInstance(tool_name, tool_func, converted_args, tool_id)
+
+
+def _extract_content_from_response(response: Any, provider: str) -> Optional[str]:
+    """Extract text content from provider response when no tool calls made."""
+    if (
+        provider.startswith("openai")
+        or provider == "openrouter"
+        or provider == "custom-openai"
+    ):
+        # Handle both dict and object responses
+        if isinstance(response, dict) and "choices" in response:
+            choices = response["choices"]
+            if choices and len(choices) > 0:
+                choice = choices[0]
+                if isinstance(choice, dict) and "message" in choice:
+                    message = choice["message"]
+                    if isinstance(message, dict) and "content" in message:
+                        return message["content"]
+        elif hasattr(response, "choices") and response.choices:
+            choice = response.choices[0]
+            if hasattr(choice, "message") and hasattr(choice.message, "content"):
+                return choice.message.content
+
+    elif provider == "anthropic" or provider == "bedrock":
+        if hasattr(response, "content"):
+            for block in response.content:
+                if hasattr(block, "type") and block.type == "text":
+                    return block.text
+
+    elif provider.startswith("google"):
+        if hasattr(response, "candidates") and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                for part in candidate.content.parts:
+                    if hasattr(part, "text"):
+                        return part.text
+
+    return None
+
+
 async def _call_llm(
     prompt: Optional[str],
     model: str,
@@ -662,14 +935,19 @@ async def _call_llm(
     max_tokens: Optional[int] = None,
     call_context: Optional[Dict[str, Any]] = None,  # ADDED
     art_backend=None,
+    native_tools: bool = False,  # NEW PARAMETER
 ):
-    """Execute a non-streaming LLM call, possibly with tool use."""
+    """Execute a non-streaming LLM call with optional native tool support."""
     client = _create_inference_client(model, store, api_key, art_backend=art_backend)
 
-    # Determine effective output type (with tools if applicable)
-    effective_output_type = output_type
+    # Handle native tools
+    native_tool_schemas = None
+    if native_tools and tools:
+        native_tool_schemas = _generate_native_tool_schemas(tools, model)
 
-    if tools and output_type:
+    # Standard approach for non-native tools
+    effective_output_type = output_type
+    if not native_tools and tools and output_type:
         # Validate all callables have typed parameters
         for name, func in tools.items():
             _validate_callable_params(func, name)
@@ -691,12 +969,12 @@ async def _call_llm(
             # Create Union type including tools and output
             effective_output_type = Union[*(tool_models + [output_type])]
 
-    # Get the appropriate parser
-    parser = _get_parser_for_type(effective_output_type)
+    # Get parser (skip if using native tools)
+    parser = None if native_tools else _get_parser_for_type(effective_output_type)
 
-    # Enhance the prompt string if a prompt is provided
+    # Enhance prompt (skip if using native tools)
     enhanced_prompt_content = prompt
-    if prompt is not None and effective_output_type:
+    if prompt is not None and not native_tools and effective_output_type and parser:
         enhanced_prompt_content = parser.enhance_prompt(
             prompt, effective_output_type, call_context=call_context  # type: ignore
         )  # MODIFIED
@@ -717,42 +995,67 @@ async def _call_llm(
             "LLM call attempted with no system message, history, or current prompt."
         )
 
-    # Standard LLM call (now includes tool types in effective_output_type)
+    # Make API call with native tools if enabled
     call_kwargs = {
         "messages": messages,
         "max_tokens": max_tokens if max_tokens is not None else 8192,
         "top_p": top_p if top_p is not None else 0.9,
         "temperature": temperature if temperature is not None else 0.01,
     }
+
+    if native_tools and native_tool_schemas:
+        call_kwargs["tools"] = native_tool_schemas
+
     result = await client.get_generation(**call_kwargs)
 
-    if isinstance(result, tuple) and len(result) == 2:
-        content, reasoning = result
-        # Parse the content if output_type is provided
-        if effective_output_type and content is not None:
-            parsed_result = parser.parse(content, effective_output_type)  # type: ignore
-            print(parsed_result)
-            if parsed_result.success:
-                return parsed_result.value, content, reasoning
-            else:
-                # Parsing failed, return None for parsed value
-                return None, content, reasoning
+    # Handle response based on native tools usage
+    if native_tools and tools:
+        # Parse native tool calls
+        provider = model.split(":", 1)[0] if ":" in model else model
+        tool_calls = _parse_native_tool_calls(result, tools, provider)
+
+        if tool_calls:
+            # Return first tool call (or could return all)
+            return tool_calls[0], None, None  # No raw content for tool calls
         else:
-            # No output_type specified, return content as-is
-            return content, content, reasoning
+            # No tool calls, return text response and honor output_type
+            content = _extract_content_from_response(result, provider)
+            if output_type and content:
+                # Honor output_type for non-tool responses in native mode
+                parser = _get_parser_for_type(output_type)
+                parsed_result = parser.parse(content, output_type)  # type: ignore
+                if parsed_result.success:
+                    return parsed_result.value, content, None
+            return content, content, None
     else:
-        # Legacy format - just content
-        if effective_output_type and result is not None:
-            parsed_result = parser.parse(result, effective_output_type)  # type: ignore
-            print(parsed_result)
-            if parsed_result.success:
-                return parsed_result.value, result, None
+        # Handle traditional XML parsing approach
+        if isinstance(result, tuple) and len(result) == 2:
+            content, reasoning = result
+            # Parse the content if output_type is provided
+            if effective_output_type and content is not None:
+                parsed_result = parser.parse(content, effective_output_type)  # type: ignore
+                print(parsed_result)
+                if parsed_result.success:
+                    return parsed_result.value, content, reasoning
+                else:
+                    # Parsing failed, return None for parsed value
+                    return None, content, reasoning
             else:
-                # Parsing failed, return None for parsed value
-                return None, result, None
+                # No output_type specified, return content as-is
+                return content, content, reasoning
         else:
-            # No output_type specified, return result as-is
-            return result, result, None
+            # Legacy format - just content
+            if effective_output_type and result is not None:
+                parsed_result = parser.parse(result, effective_output_type)  # type: ignore
+                print(parsed_result)
+                if parsed_result.success:
+                    return parsed_result.value, result, None
+                else:
+                    # Parsing failed, return None for parsed value
+                    return None, result, None
+            else:
+                # No output_type specified, return result as-is
+                return result, result, None
 
 
 async def _call_llm_stream(
@@ -769,8 +1072,9 @@ async def _call_llm_stream(
     max_tokens: Optional[int] = None,
     call_context: Optional[Dict[str, Any]] = None,  # ADDED
     art_backend=None,
+    native_tools: bool = False,  # NEW PARAMETER
 ):
-    """Execute a streaming LLM call, possibly with tool use."""
+    """Execute a streaming LLM call with optional native tool support."""
     client = _create_inference_client(
         model, store, api_key=api_key, art_backend=art_backend
     )
@@ -902,6 +1206,7 @@ def agentic(
     api_key: str | None = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
+    native_tools: bool = False,
 ) -> Any:  # Temporarily cast to Any to isolate Pylance issue
     """Decorator for *awaitable* agentic functions."""
     return cast(
@@ -911,6 +1216,7 @@ def agentic(
             api_key=api_key,
             store_cfg=store_cfg,
             autobind=autobind,
+            native_tools=native_tools,
         ),
     )
 
@@ -921,6 +1227,7 @@ def agentic_generator(
     api_key: str | None = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
+    native_tools: bool = False,
 ) -> Any:  # Temporarily cast to Any to isolate Pylance issue
     """Decorator for *async-generator* agentic functions."""
     return cast(
@@ -930,6 +1237,7 @@ def agentic_generator(
             api_key=api_key,
             store_cfg=store_cfg,
             autobind=autobind,
+            native_tools=native_tools,
         ),
     )
 
@@ -941,6 +1249,7 @@ def _agentic_core(
     api_key: Optional[str] = None,
     store_cfg: StoreConfigBase = MemoryStoreConfig(),
     autobind: bool = True,
+    native_tools: bool = False,
 ):
     """
     Decorator factory for agentic functions that interact with LLMs.
@@ -1013,6 +1322,7 @@ def _agentic_core(
                     model=model,
                     store=store_obj,
                     api_key=api_key,
+                    native_tools=native_tools,
                 )
                 rt._default_prompt = default_prompt  # Set raw docstring
                 # Set the return type from the function's signature
@@ -1060,6 +1370,7 @@ def _agentic_core(
                     model=model,
                     store=store_obj,
                     api_key=api_key,
+                    native_tools=native_tools,
                 )
                 rt._default_prompt = default_prompt  # Set raw docstring
                 # Set the return type from the function's signature

@@ -134,13 +134,23 @@ class InferenceClient(ABC):
 
     @abstractmethod
     def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=4096,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[str, None]:
         pass
 
     @abstractmethod
     async def get_generation(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=4096,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         pass
 
@@ -161,6 +171,7 @@ class BedrockInferenceClient(InferenceClient):
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
 
         system = ""
@@ -215,6 +226,7 @@ class BedrockInferenceClient(InferenceClient):
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system = ""
         if messages[0].role == ChatRole.SYSTEM:
@@ -320,7 +332,12 @@ class AnthropicInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="AnthropicInferenceClient.get_generation")
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
-        self, messages: List[ChatMessage], max_tokens=1024, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=1024,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system = None
         if messages[0].role == ChatRole.SYSTEM:
@@ -348,6 +365,11 @@ class AnthropicInferenceClient(InferenceClient):
             ],
             "stream": False,
         }
+
+        # Add tools if provided
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = {"type": "auto"}
 
         if system:
             request.update(system)
@@ -382,11 +404,20 @@ class AnthropicInferenceClient(InferenceClient):
 
         await self._trace(request["messages"], body["content"])
 
-        return next(block["text"] for block in body["content"] if "text" in block)
+        # Return full response for tool extraction, or just content for traditional approach
+        if tools:
+            return body  # Return full response so tool calls can be extracted
+        else:
+            return next(block["text"] for block in body["content"] if "text" in block)
 
     @tracer.start_as_current_span(name="AnthropicInferenceClient.connect_and_listen")
     async def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=1024, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=1024,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
 
         system = None
@@ -424,6 +455,11 @@ class AnthropicInferenceClient(InferenceClient):
             ],
             "stream": True,
         }
+
+        # Add tools if provided
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = {"type": "auto"}
 
         if system:
             request.update(system)
@@ -528,7 +564,12 @@ class GoogleGenAIInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.get_generation")
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=4096,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system_instruction = None
 
@@ -542,26 +583,48 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
+        # Prepare config with optional tools
+        config_kwargs = {
+            "temperature": temperature,
+            "system_instruction": system_instruction,
+            "top_p": top_p,
+            "max_output_tokens": max_tokens,
+            "thinking_config": (
+                types.GenerationConfigThinkingConfig(
+                    include_thoughts=True,
+                    thinking_budget=self.reasoning,
+                )
+                if self.reasoning is not None
+                else types.GenerationConfigThinkingConfig(
+                    include_thoughts=True,
+                )
+            ),
+        }
+
+        # Add tools if provided (Google uses function_declarations)
+        if tools and len(tools) > 0 and "function_declarations" in tools[0]:
+            # Convert function declarations to Google Tool objects
+            function_declarations = tools[0]["function_declarations"]
+            google_tools = []
+            for func_decl in function_declarations:
+                # Create Google Tool object from function declaration
+                tool = types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=func_decl["name"],
+                            description=func_decl["description"],
+                            parameters=func_decl["parameters"],
+                        )
+                    ]
+                )
+                google_tools.append(tool)
+            config_kwargs["tools"] = google_tools
+
         try:
             response = await self.client.aio.models.generate_content(
                 model=self.model,
                 contents=processed_messages,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    system_instruction=system_instruction,
-                    top_p=top_p,
-                    max_output_tokens=max_tokens,
-                    thinking_config=(
-                        types.GenerationConfigThinkingConfig(
-                            include_thoughts=True,
-                            thinking_budget=self.reasoning,
-                        )
-                        if self.reasoning is not None
-                        else types.GenerationConfigThinkingConfig(
-                            include_thoughts=True,
-                        )
-                    ),
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
         except google.genai.errors.ClientError as e:
             if e.code == 400:
@@ -595,11 +658,20 @@ class GoogleGenAIInferenceClient(InferenceClient):
             [{"text": out_text}],
         )
 
-        return (out_text, reasoning)
+        # Return full response for tool extraction, or processed content for traditional approach
+        if tools:
+            return response  # Return full response so tool calls can be extracted
+        else:
+            return (out_text, reasoning)
 
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=0.9, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=4096,
+        top_p=0.9,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system_instruction = None
 
@@ -612,26 +684,33 @@ class GoogleGenAIInferenceClient(InferenceClient):
             for msg in messages
         ]
 
+        # Prepare config with optional tools
+        config_kwargs = {
+            "temperature": temperature,
+            "system_instruction": system_instruction,
+            "top_p": top_p,
+            "max_output_tokens": max_tokens,
+            "thinking_config": (
+                types.GenerationConfigThinkingConfig(
+                    include_thoughts=True,
+                    thinking_budget=self.reasoning,
+                )
+                if self.reasoning is not None
+                else types.GenerationConfigThinkingConfig(
+                    include_thoughts=True,
+                )
+            ),
+        }
+
+        # Add tools if provided (Google uses function_declarations)
+        if tools and len(tools) > 0 and "function_declarations" in tools[0]:
+            config_kwargs["tools"] = tools[0]["function_declarations"]
+
         try:
             response = await self.client.aio.models.generate_content_stream(
                 model=self.model,
                 contents=processed_messages,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    system_instruction=system_instruction,
-                    top_p=top_p,
-                    max_output_tokens=max_tokens,
-                    thinking_config=(
-                        types.GenerationConfigThinkingConfig(
-                            include_thoughts=True,
-                            thinking_budget=self.reasoning,
-                        )
-                        if self.reasoning is not None
-                        else types.GenerationConfigThinkingConfig(
-                            include_thoughts=True,
-                        )
-                    ),
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
         except google.genai.errors.ClientError as e:
             if e.code == 400:
@@ -711,7 +790,12 @@ class OAIInferenceClient(InferenceClient):
         backoff.expo, (InferenceException, httpx.HTTPError), max_time=60
     )
     async def get_generation(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=1.0, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=4096,
+        top_p=1.0,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         request = OAIRequest(
             model=self.model,
@@ -726,7 +810,17 @@ class OAIInferenceClient(InferenceClient):
             top_p=top_p,
             temperature=temperature,
             stream=False,
-        ).model_dump(exclude={"stream_options", "tools", "tool_choice"})
+        ).model_dump(exclude={"stream_options"})
+
+        # Add tools if provided
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
+        else:
+            # Remove tools-related fields for non-tool calls
+            request = {
+                k: v for k, v in request.items() if k not in ["tools", "tool_choice"]
+            }
 
         if self.model in (
             "o3",
@@ -796,17 +890,26 @@ class OAIInferenceClient(InferenceClient):
                 [{"text": body["choices"][0]["message"]["content"]}],
             )
 
-            # Check for reasoning in the response
-            content = body["choices"][0]["message"]["content"]
-            reasoning = body["choices"][0]["message"].get("reasoning")
+            # Return full response for tool extraction, or just content for traditional approach
+            if tools:
+                return body  # Return full response so tool calls can be extracted
+            else:
+                # Check for reasoning in the response
+                content = body["choices"][0]["message"]["content"]
+                reasoning = body["choices"][0]["message"].get("reasoning")
 
-            if reasoning:
-                return (content, reasoning)
-            return content
+                if reasoning:
+                    return (content, reasoning)
+                return content
 
     @tracer.start_as_current_span(name="OAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
-        self, messages: List[ChatMessage], max_tokens=4096, top_p=1.0, temperature=0.5
+        self,
+        messages: List[ChatMessage],
+        max_tokens=4096,
+        top_p=1.0,
+        temperature=0.5,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ):
         request = OAIRequest(
             model=self.model,
@@ -822,7 +925,17 @@ class OAIInferenceClient(InferenceClient):
             temperature=temperature,
             stream=True,
             stream_options={"include_usage": True},
-        ).model_dump(exclude={"tools", "tool_choice"})
+        ).model_dump()
+
+        # Add tools if provided
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
+        else:
+            # Remove tools-related fields for non-tool calls
+            request = {
+                k: v for k, v in request.items() if k not in ["tools", "tool_choice"]
+            }
 
         if self.reasoning:
             # Determine if it's effort or max_tokens
@@ -862,6 +975,8 @@ class OAIInferenceClient(InferenceClient):
 
                 out = ""
                 reasoning_out = ""
+                current_tool_call = None
+
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         if line.strip() == "data: [DONE]":
@@ -880,7 +995,32 @@ class OAIInferenceClient(InferenceClient):
                             # Check for content
                             if delta.get("content"):
                                 out += delta["content"]
-                                yield ("content", delta["content"])
+                                if tools:
+                                    yield ("content", delta["content"])
+                                else:
+                                    yield delta["content"]
+
+                            # Handle tool calls for native tools
+                            if tools and delta.get("tool_calls"):
+                                for tool_call_delta in delta["tool_calls"]:
+                                    if current_tool_call is None:
+                                        current_tool_call = {
+                                            "id": tool_call_delta.get("id", ""),
+                                            "function": {
+                                                "name": tool_call_delta.get(
+                                                    "function", {}
+                                                ).get("name", ""),
+                                                "arguments": "",
+                                            },
+                                        }
+
+                                    if tool_call_delta.get("function", {}).get(
+                                        "arguments"
+                                    ):
+                                        current_tool_call["function"][
+                                            "arguments"
+                                        ] += tool_call_delta["function"]["arguments"]
+                                        yield ("tool_call_delta", tool_call_delta)
                         elif data.get("usage"):
                             self._cost.input_tokens += data["usage"]["prompt_tokens"]
                             # No reference to cached tokens in the docs for the streaming API response objects...
@@ -895,6 +1035,10 @@ class OAIInferenceClient(InferenceClient):
                                 ]
                             except AttributeError as e:
                                 logger.warning(f"Malformed usage? {repr(data)}")
+
+                # Final tool call if streaming
+                if tools and current_tool_call:
+                    yield ("tool_call_complete", current_tool_call)
 
                 await self._trace(
                     request["messages"],
