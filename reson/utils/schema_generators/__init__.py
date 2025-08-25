@@ -12,6 +12,7 @@ SCHEMA_GENERATORS = {
     "anthropic": AnthropicSchemaGenerator,
     "google-gemini": GoogleSchemaGenerator,
     "vertex-gemini": GoogleSchemaGenerator,
+    "google-anthropic": AnthropicSchemaGenerator,  # Anthropic models on Google Vertex
     "openrouter": OpenRouterSchemaGenerator,
     "bedrock": AnthropicSchemaGenerator,  # Uses Anthropic format
     "custom-openai": OpenAISchemaGenerator,

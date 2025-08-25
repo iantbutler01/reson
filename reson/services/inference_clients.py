@@ -140,7 +140,7 @@ class InferenceClient(ABC):
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[Tuple[str, Any], None]:
         pass
 
     @abstractmethod
@@ -278,7 +278,7 @@ class BedrockInferenceClient(InferenceClient):
                         else ""
                     )
                     out += text
-                    yield text
+                    yield ("content", text)
                 elif chunk_type == "message_start":
                     self._cost.input_tokens += chunk_json["message"]["usage"][
                         "input_tokens"
@@ -370,6 +370,8 @@ class AnthropicInferenceClient(InferenceClient):
         if tools:
             request["tools"] = tools
             request["tool_choice"] = {"type": "auto"}
+            # Enable parallel tool calling (Anthropic default is disabled)
+            request["disable_parallel_tool_use"] = False
 
         if system:
             request.update(system)
@@ -495,7 +497,20 @@ class AnthropicInferenceClient(InferenceClient):
                                 else ""
                             )
                             out += text
-                            yield text
+                            yield ("content", text)
+                        elif chunk_type == "content_block_start":
+                            # Check if this is a tool_use block
+                            content_block = chunk_json.get("content_block", {})
+                            if content_block.get("type") == "tool_use":
+                                # This is the start of a tool use block - store for completion
+                                pass  # We'll handle the complete tool in content_block_stop
+                        elif chunk_type == "content_block_stop":
+                            # Check if we completed a tool_use block
+                            content_block = chunk_json.get("content_block", {})
+                            if tools and content_block.get("type") == "tool_use":
+                                # Create a mock response object for tool parsing
+                                mock_anthropic_response = {"content": [content_block]}
+                                yield ("tool_call_complete", mock_anthropic_response)
                         elif chunk_type == "message_start":
                             self._cost.input_tokens += chunk_json["message"]["usage"][
                                 "input_tokens"
@@ -704,7 +719,22 @@ class GoogleGenAIInferenceClient(InferenceClient):
 
         # Add tools if provided (Google uses function_declarations)
         if tools and len(tools) > 0 and "function_declarations" in tools[0]:
-            config_kwargs["tools"] = tools[0]["function_declarations"]
+            # Convert function declarations to proper Google Tool objects for streaming
+            function_declarations = tools[0]["function_declarations"]
+            google_tools = []
+            for func_decl in function_declarations:
+                # Create Google Tool object from function declaration
+                tool = types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=func_decl["name"],
+                            description=func_decl["description"],
+                            parameters=func_decl["parameters"],
+                        )
+                    ]
+                )
+                google_tools.append(tool)
+            config_kwargs["tools"] = google_tools
 
         try:
             response = await self.client.aio.models.generate_content_stream(
@@ -729,21 +759,32 @@ class GoogleGenAIInferenceClient(InferenceClient):
                 # Sometimes seeing this where we only get a bunch of citation_metadata back and no actual content
                 continue
 
-            reasoning = "\n".join(
-                p.text
-                for p in chunk.candidates[0].content.parts
-                if p.text and p.thought
-            )
-            out_text = "\n".join(
-                p.text
-                for p in chunk.candidates[0].content.parts
-                if p.text and not p.thought
-            )
-            if reasoning:
-                yield ("reasoning", reasoning)
-            else:
-                yield ("content", out_text)
-            out += reasoning + out_text
+            # Check for function calls in this chunk (Google buffers complete tool calls)
+            tool_calls_detected = False
+            for part in chunk.candidates[0].content.parts:
+                if hasattr(part, "function_call") and part.function_call:
+                    # Found a buffered tool call, yield each function call separately
+                    yield ("tool_call_complete", chunk)
+                    tool_calls_detected = True
+                    # Don't break - process all function calls in the chunk
+
+            # Only process text if no tool calls were detected
+            if not tool_calls_detected:
+                reasoning = "\n".join(
+                    p.text
+                    for p in chunk.candidates[0].content.parts
+                    if p.text and p.thought
+                )
+                out_text = "\n".join(
+                    p.text
+                    for p in chunk.candidates[0].content.parts
+                    if p.text and not p.thought
+                )
+                if reasoning:
+                    yield ("reasoning", reasoning)
+                elif out_text:  # Only yield content if there's actual text
+                    yield ("content", out_text)
+                out += reasoning + out_text
 
         await self._trace(
             [
@@ -975,7 +1016,7 @@ class OAIInferenceClient(InferenceClient):
 
                 out = ""
                 reasoning_out = ""
-                current_tool_call = None
+                current_tool_calls = {}  # Index-based accumulation for parallel tools
 
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
@@ -995,16 +1036,15 @@ class OAIInferenceClient(InferenceClient):
                             # Check for content
                             if delta.get("content"):
                                 out += delta["content"]
-                                if tools:
-                                    yield ("content", delta["content"])
-                                else:
-                                    yield delta["content"]
+                                yield ("content", delta["content"])
 
                             # Handle tool calls for native tools
                             if tools and delta.get("tool_calls"):
                                 for tool_call_delta in delta["tool_calls"]:
-                                    if current_tool_call is None:
-                                        current_tool_call = {
+                                    index = tool_call_delta.get("index", 0)
+
+                                    if index not in current_tool_calls:
+                                        current_tool_calls[index] = {
                                             "id": tool_call_delta.get("id", ""),
                                             "function": {
                                                 "name": tool_call_delta.get(
@@ -1017,7 +1057,7 @@ class OAIInferenceClient(InferenceClient):
                                     if tool_call_delta.get("function", {}).get(
                                         "arguments"
                                     ):
-                                        current_tool_call["function"][
+                                        current_tool_calls[index]["function"][
                                             "arguments"
                                         ] += tool_call_delta["function"]["arguments"]
                                         yield ("tool_call_delta", tool_call_delta)
@@ -1036,9 +1076,10 @@ class OAIInferenceClient(InferenceClient):
                             except AttributeError as e:
                                 logger.warning(f"Malformed usage? {repr(data)}")
 
-                # Final tool call if streaming
-                if tools and current_tool_call:
-                    yield ("tool_call_complete", current_tool_call)
+                # Final tool calls if streaming - emit each accumulated tool
+                if tools and current_tool_calls:
+                    for index in sorted(current_tool_calls.keys()):
+                        yield ("tool_call_complete", current_tool_calls[index])
 
                 await self._trace(
                     request["messages"],

@@ -7,10 +7,25 @@ and non-streaming contexts, with support for type inference.
 
 from .base import OutputParser, ParserResult, get_default_parser
 from .type_parser import TypeParser
+from .native_tool_parser import NativeToolParser
 
 # Conditionally import BAML parser if BAML is installed
 try:
     from .baml_parser import BAMLParser
-    __all__ = ["OutputParser", "ParserResult", "get_default_parser", "TypeParser", "BAMLParser"]
+
+    __all__ = [
+        "OutputParser",
+        "ParserResult",
+        "get_default_parser",
+        "TypeParser",
+        "NativeToolParser",
+        "BAMLParser",
+    ]
 except ImportError:
-    __all__ = ["OutputParser", "ParserResult", "get_default_parser", "TypeParser"]
+    __all__ = [
+        "OutputParser",
+        "ParserResult",
+        "get_default_parser",
+        "TypeParser",
+        "NativeToolParser",
+    ]

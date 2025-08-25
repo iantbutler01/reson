@@ -49,7 +49,7 @@ import json
 from reson.services.inference_clients import ChatMessage, ChatRole
 from gasp.jinja_helpers import create_type_environment  # Added import
 
-from reson.utils.parsers import OutputParser, get_default_parser
+from reson.utils.parsers import OutputParser, get_default_parser, NativeToolParser
 
 try:
     from reson.utils.parsers.baml_parser import BamlParser  # type: ignore[import-untyped]
@@ -238,6 +238,9 @@ class Runtime(ResonBase):
 
     # ───── private runtime fields ─────
     _tools: dict[str, Callable] = PrivateAttr(default_factory=dict)
+    _tool_types: dict[str, Type[Deserializable]] = PrivateAttr(
+        default_factory=dict
+    )  # NEW: tool type mappings
     _default_prompt: str = PrivateAttr(default="")
     _context: Optional[_Ctx] = PrivateAttr(default=None)
     _return_type: Optional[Type[Any]] = PrivateAttr(default=None)
@@ -287,9 +290,26 @@ class Runtime(ResonBase):
         """Clears the accumulated reasoning tokens."""
         self._reasoning_accumulator = []
 
-    def tool(self, fn: Callable, *, name: str | None = None):
-        """Register a callable so the LLM can invoke it as a tool."""
-        self._tools[name or fn.__name__] = fn
+    def tool(
+        self,
+        fn: Callable,
+        *,
+        name: str | None = None,
+        tool_type: Type[Deserializable] | None = None,
+    ):
+        """Register a callable so the LLM can invoke it as a tool.
+
+        Args:
+            fn: The callable function to register
+            name: Optional name override for the tool
+            tool_type: Optional Deserializable type for automatic marshalling of tool call deltas/complete events
+        """
+        tool_name = name or fn.__name__
+        self._tools[tool_name] = fn
+
+        # Store tool type mapping if provided
+        if tool_type is not None:
+            self._tool_types[tool_name] = tool_type
 
     def load_training_manager(self, path: Path | str):
         from reson.training import TrainingManager
@@ -427,6 +447,7 @@ class Runtime(ResonBase):
             call_context=self._current_call_args,  # MODIFIED: Use instance attr
             art_backend=art_backend,
             native_tools=self.native_tools,  # Pass native tools flag
+            tool_types=self._tool_types,  # Pass tool types for Deserializable parsing
         ):
             # Handle tuple format with chunk type
             if isinstance(chunk_data, tuple) and len(chunk_data) == 3:
@@ -435,6 +456,12 @@ class Runtime(ResonBase):
                     self._reasoning_accumulator.append(raw_chunk_str)
                     # Yield reasoning progress
                     yield ("reasoning", self.reasoning)
+                elif chunk_type == "tool_call_complete":
+                    # Yield tool call directly for processing
+                    yield ("tool_call_complete", parsed_chunk)
+                elif chunk_type == "tool_call_delta":
+                    # Yield tool call delta for OpenAI incremental streaming
+                    yield ("tool_call_delta", parsed_chunk)
                 elif raw_chunk_str is not None:
                     self._raw_response_accumulator.append(raw_chunk_str)
                     if parsed_chunk is not None:
@@ -480,20 +507,8 @@ class Runtime(ResonBase):
         if func is None:
             raise ValueError(f"Tool '{tool_name}' not found in runtime tools")
 
-        # Convert the tool model instance to kwargs
-        if hasattr(tool_result, "model_dump"):  # Pydantic
-            # Get all fields excluding private attributes
-            all_fields = tool_result.model_dump()
-            # Remove any fields that start with underscore or are class-level attributes
-            kwargs = {
-                k: v
-                for k, v in all_fields.items()
-                if not k.startswith("_") and k not in ["_tool_func", "_tool_name"]
-            }
-        else:  # Deserializable
-            kwargs = {
-                k: v for k, v in tool_result.__dict__.items() if not k.startswith("_")
-            }
+        # Smart marshalling: convert tool result to function's expected parameter types
+        kwargs = self._marshall_arguments_to_function_signature(func, tool_result)
 
         if inspect.iscoroutinefunction(func):
             return await func(**kwargs)
@@ -544,13 +559,19 @@ class Runtime(ResonBase):
                 ]
             )
         elif provider and provider.startswith("google"):
-            # Google format
+            # Google format - preserve original response with thought signatures
+            # Store the original response and tool result separately for proper conversation formatting
+            # Note: The calling code must handle Google's special requirement to append both
+            # the original function_call_content and the function_response_part
             content = json.dumps(
                 {
                     "functionResponse": {
                         "name": tool_call_obj._tool_name,
                         "response": {"result": result},
-                    }
+                    },
+                    # Add metadata to help calling code identify Google's special handling needs
+                    "_google_thought_signature_required": True,
+                    "_original_response_required": True,
                 }
             )
         else:
@@ -558,6 +579,74 @@ class Runtime(ResonBase):
             content = result
 
         return ChatMessage(role=ChatRole.USER, content=content)
+
+    def _marshall_arguments_to_function_signature(
+        self, func: Callable, tool_result: Any
+    ) -> Dict[str, Any]:
+        """Convert tool result to function's expected parameter types with Deserializable priority."""
+        sig = inspect.signature(func)
+        type_hints = get_type_hints(func)
+        marshalled_kwargs = {}
+
+        # Get raw arguments from tool result
+        if hasattr(tool_result, "model_dump"):  # Pydantic
+            raw_args = tool_result.model_dump()
+        else:  # Deserializable or ToolCallInstance
+            raw_args = {
+                k: v for k, v in tool_result.__dict__.items() if not k.startswith("_")
+            }
+
+        for param_name, param in sig.parameters.items():
+            if param_name == "self":
+                continue
+
+            param_type = type_hints.get(param_name, str)
+            raw_value = raw_args.get(param_name)
+
+            if raw_value is None:
+                # Parameter not provided - use default if available
+                if param.default != inspect.Parameter.empty:
+                    marshalled_kwargs[param_name] = param.default
+                continue
+
+            if isinstance(raw_value, dict):
+                # Priority 1: Deserializable classes (your core type system)
+                try:
+                    if hasattr(param_type, "__mro__") and any(
+                        "Deserializable" in cls.__name__ for cls in param_type.__mro__
+                    ):
+                        marshalled_kwargs[param_name] = param_type(**raw_value)
+                        continue
+                except Exception:
+                    pass
+
+                # Priority 2: Pydantic models
+                try:
+                    if hasattr(param_type, "model_validate"):
+                        marshalled_kwargs[param_name] = param_type.model_validate(
+                            raw_value
+                        )
+                        continue
+                except Exception:
+                    pass
+
+                # Priority 3: Dataclasses
+                try:
+                    if hasattr(param_type, "__dataclass_fields__"):
+                        marshalled_kwargs[param_name] = param_type(**raw_value)
+                        continue
+                except Exception:
+                    pass
+
+                # Priority 4: Try direct instantiation
+                try:
+                    marshalled_kwargs[param_name] = param_type(**raw_value)
+                except Exception:
+                    marshalled_kwargs[param_name] = raw_value
+            else:
+                # Primitive value - use directly
+                marshalled_kwargs[param_name] = raw_value
+        return marshalled_kwargs
 
 
 def _create_empty_value(output_type):
@@ -694,6 +783,21 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             )
         else:
             client = create_vertex_gemini_api_client(model_name)
+    elif provider == "google-anthropic":
+        # Parse out reasoning parameter if provided for Google Anthropic
+        reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
+        if reasoning_match:
+            model_name, reasoning = reasoning_match.groups()
+            # Google Anthropic client needs to be created differently - it inherits from Anthropic
+            from reson.utils.inference import create_google_anthropic_inference_client
+
+            client = create_google_anthropic_inference_client(
+                model_name, thinking=int(reasoning)
+            )
+        else:
+            from reson.utils.inference import create_google_anthropic_inference_client
+
+            client = create_google_anthropic_inference_client(model_name)
     elif provider == "openai":
         # Strip reasoning= from model name if present
         model_name = re.sub(r"@reasoning=.*$", "", model_name)
@@ -1022,8 +1126,9 @@ async def _call_llm(
         tool_calls = _parse_native_tool_calls(result, tools, provider)
 
         if tool_calls:
-            # Return first tool call (or could return all)
-            return tool_calls[0], None, None  # No raw content for tool calls
+            # For parallel tool calling: return first tool for backwards compatibility in non-streaming
+            # Streaming mode will handle multiple tools through separate events
+            return tool_calls[0], None, None
         else:
             # No tool calls, return text response and honor output_type
             content = _extract_content_from_response(result, provider)
@@ -1080,16 +1185,25 @@ async def _call_llm_stream(
     call_context: Optional[Dict[str, Any]] = None,  # ADDED
     art_backend=None,
     native_tools: bool = False,  # NEW PARAMETER
+    tool_types: Optional[
+        Dict[str, Type[Deserializable]]
+    ] = None,  # NEW: tool type mappings
 ):
     """Execute a streaming LLM call with optional native tool support."""
     client = _create_inference_client(
         model, store, api_key=api_key, art_backend=art_backend
     )
 
+    # Handle native tools
+    native_tool_schemas = None
+    if native_tools and tools:
+        native_tool_schemas = _generate_native_tool_schemas(tools, model)
+
     # Determine effective output type (with tools if applicable)
     effective_output_type = output_type
 
-    if tools and output_type:
+    # Only use XML tool approach if NOT using native tools
+    if not native_tools and tools and output_type:
         # Validate all callables have typed parameters
         for name, func in tools.items():
             _validate_callable_params(func, name)
@@ -1141,17 +1255,150 @@ async def _call_llm_stream(
             "LLM call attempted with no system message, history, or current prompt."
         )
 
-    if (
+    # Prepare call arguments
+    call_kwargs = {
+        "messages": messages,
+        "max_tokens": max_tokens if max_tokens is not None else 8192,
+        "top_p": top_p if top_p is not None else 0.9,
+        "temperature": temperature if temperature is not None else 0.5,
+    }
+
+    # Add native tool schemas if using native tools
+    if native_tools and native_tool_schemas:
+        call_kwargs["tools"] = native_tool_schemas
+
+    # Handle native tool streaming
+    if native_tools and tools:
+        provider = model.split(":", 1)[0] if ":" in model else model
+        accumulated_tool_calls = {}  # For OpenAI delta aggregation
+
+        # Create NativeToolParser if we have tool types
+        native_tool_parser = None
+        if tool_types:
+            native_tool_parser = NativeToolParser(tool_types)
+
+        async for chunk in client.connect_and_listen(**call_kwargs):
+            if isinstance(chunk, tuple) and len(chunk) == 2:
+                chunk_type, chunk_content = chunk
+
+                if chunk_type == "reasoning":
+                    yield None, chunk_content, "reasoning"
+                elif chunk_type == "content":
+                    yield chunk_content, chunk_content, "content"
+                elif chunk_type == "tool_call_delta":
+                    # Handle tool call deltas with potential Deserializable parsing
+                    if native_tool_parser:
+                        # Extract tool name and arguments from delta
+                        tool_name = native_tool_parser.extract_tool_name_from_delta(
+                            chunk_content
+                        )
+                        if tool_types and tool_name in tool_types:
+                            # Tool has registered type - parse to Deserializable
+                            args_json = native_tool_parser.extract_arguments_from_delta(
+                                chunk_content
+                            )
+                            delta_result = native_tool_parser.parse_tool_delta(
+                                tool_name, args_json
+                            )
+                            if delta_result.success:
+                                yield delta_result.value, chunk_content, "tool_call_delta"
+                            else:
+                                # Parsing failed, yield raw delta
+                                yield chunk_content, chunk_content, "tool_call_delta"
+                        else:
+                            # Tool has no registered type - yield raw delta
+                            yield chunk_content, chunk_content, "tool_call_delta"
+                    else:
+                        # No tool types - yield raw delta
+                        yield chunk_content, chunk_content, "tool_call_delta"
+                elif chunk_type == "tool_call_complete":
+                    # Handle complete tool calls with potential Deserializable parsing
+                    if native_tool_parser:
+                        # Try to extract tool name and parse with registered type
+                        if (
+                            isinstance(chunk_content, dict)
+                            and "function" in chunk_content
+                        ):
+                            tool_name = chunk_content["function"].get("name", "")
+                            if tool_types and tool_name in tool_types:
+                                # Tool has registered type - parse to Deserializable
+                                args_json = chunk_content["function"].get(
+                                    "arguments", "{}"
+                                )
+                                complete_result = (
+                                    native_tool_parser.parse_tool_complete(
+                                        tool_name, args_json
+                                    )
+                                )
+                                if complete_result.success:
+                                    # Add tool ID for execution compatibility
+                                    setattr(
+                                        complete_result.value,
+                                        "_tool_id",
+                                        chunk_content.get("id", tool_name),
+                                    )
+                                    yield complete_result.value, None, "tool_call_complete"
+                                else:
+                                    # Parsing failed, fall back to normal parsing
+                                    tool_calls = _parse_native_tool_calls(
+                                        chunk_content, tools, provider
+                                    )
+                                    for tool_call in tool_calls:
+                                        yield tool_call, None, "tool_call_complete"
+                            else:
+                                # Tool has no registered type - use normal parsing
+                                tool_calls = _parse_native_tool_calls(
+                                    chunk_content, tools, provider
+                                )
+                                for tool_call in tool_calls:
+                                    yield tool_call, None, "tool_call_complete"
+                        else:
+                            # Not OpenAI format - use normal parsing
+                            tool_calls = _parse_native_tool_calls(
+                                chunk_content, tools, provider
+                            )
+                            for tool_call in tool_calls:
+                                yield tool_call, None, "tool_call_complete"
+                    else:
+                        # No tool types - use normal parsing
+                        tool_calls = _parse_native_tool_calls(
+                            chunk_content, tools, provider
+                        )
+                        for tool_call in tool_calls:
+                            yield tool_call, None, "tool_call_complete"
+                else:
+                    # Default content handling
+                    yield chunk_content, chunk_content, "content"
+            else:
+                # Handle single value chunks - could be content or complete response
+                if (
+                    hasattr(chunk, "candidates")
+                    or hasattr(chunk, "content")
+                    or (
+                        isinstance(chunk, dict)
+                        and ("choices" in chunk or "candidates" in chunk)
+                    )
+                ):
+                    # This might be a complete response with tool calls (Google/Anthropic buffered)
+                    tool_calls = _parse_native_tool_calls(chunk, tools, provider)
+                    if tool_calls:
+                        for tool_call in tool_calls:
+                            yield tool_call, None, "tool_call_complete"
+                    else:
+                        # Extract content from response
+                        content = _extract_content_from_response(chunk, provider)
+                        if content:
+                            yield content, content, "content"
+                else:
+                    # Regular text chunk
+                    yield chunk, chunk, "content"
+
+    # Handle XML tool approach (non-native tools)
+    elif (
         tools
         and not _is_pydantic_type(output_type)
         and not _is_deserializable_type(output_type)
     ):
-        call_kwargs = {
-            "messages": messages,
-            "max_tokens": max_tokens if max_tokens is not None else 8192,
-            "top_p": top_p if top_p is not None else 0.9,
-            "temperature": temperature if temperature is not None else 0.5,
-        }
         async for ctype, chunk in client.connect_and_listen(**call_kwargs):
             if ctype == "reasoning":
                 yield None, chunk, "reasoning"
@@ -1166,13 +1413,9 @@ async def _call_llm_stream(
             final_result = parser.validate_final(stream_parser)
             if final_result.success and final_result.value is not None:
                 yield final_result.value, ""
+
+    # Handle regular streaming (no tools)
     else:
-        call_kwargs = {
-            "messages": messages,
-            "max_tokens": max_tokens if max_tokens is not None else 8192,
-            "top_p": top_p if top_p is not None else 0.9,
-            "temperature": temperature if temperature is not None else 0.5,
-        }
         async for chunk in client.connect_and_listen(**call_kwargs):
             if isinstance(chunk, tuple) and len(chunk) == 2:
                 chunk_type, chunk_content = chunk

@@ -64,10 +64,11 @@ def create_bedrock_inference_client(
 
 
 def create_google_anthropic_inference_client(
-    model: str,
+    model: str, thinking: Optional[int] = None
 ) -> GoogleAnthropicInferenceClient:
     return GoogleAnthropicInferenceClient(
         model=model,
+        thinking=thinking,
     )
 
 

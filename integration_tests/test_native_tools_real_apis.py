@@ -143,6 +143,112 @@ async def test_vertex_gemini_native_tools():
         return False
 
 
+async def test_vertex_gemini_with_tools():
+    """Test Vertex AI Gemini with native tool calling and tool execution."""
+    print("\n🧪 Testing Vertex AI Gemini with tool calling + native tools")
+
+    @agentic(model="vertex-gemini:gemini-2.5-flash", native_tools=True)
+    async def vertex_tool_assistant(query: str, runtime: Runtime) -> str:
+        runtime.tool(search_database)
+        runtime.tool(add_numbers)
+        return await runtime.run(prompt=query)
+
+    try:
+        # Test tool calling
+        result = await vertex_tool_assistant("Use add_numbers to calculate 15 + 25")
+        print(f"✅ Vertex Tool result: {result}")
+
+        if hasattr(result, "_tool_name"):
+            print(f"🔧 Tool call detected: {result._tool_name}")
+            if hasattr(result, "_tool_id"):
+                print(f"🆔 Tool ID preserved: {result._tool_id}")
+            else:
+                print("❌ Tool ID missing!")
+
+            # Test tool execution
+            rt = Runtime(
+                model="vertex-gemini:gemini-2.5-flash",
+                store=MemoryStore(),
+                native_tools=True,
+            )
+            rt.tool(search_database)
+            rt.tool(add_numbers)
+
+            if rt.is_tool_call(result):
+                tool_result = await rt.execute_tool(result)
+                print(f"🔧 Tool execution result: {tool_result}")
+
+                # Test unified helper
+                tool_msg = rt.create_tool_result_message(result, str(tool_result))
+                print(f"📝 Tool result message: {tool_msg.content}")
+
+            return True
+        else:
+            print(f"📝 Non-tool response: {result}")
+            return True
+
+    except Exception as e:
+        print(f"❌ Vertex Tool test failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
+async def test_google_anthropic_native_tools():
+    """Test Google Anthropic with claude-3-5-sonnet + native tools."""
+    print("\n🧪 Testing Google Anthropic with claude-3-5-sonnet + native tools")
+
+    @agentic(model="google-anthropic:claude-3-5-sonnet", native_tools=True)
+    async def google_anthropic_assistant(query: str, runtime: Runtime) -> str:
+        runtime.tool(get_weather)
+        runtime.tool(search_database)
+        return await runtime.run(prompt=query)
+
+    try:
+        # Test tool calling
+        result = await google_anthropic_assistant(
+            "Search for 'AI trends' with max 3 results"
+        )
+        print(f"✅ Google Anthropic result: {result}")
+
+        if hasattr(result, "_tool_name"):
+            print(f"🔧 Tool call detected: {result._tool_name}")
+            if hasattr(result, "_tool_id"):
+                print(f"🆔 Tool ID preserved: {result._tool_id}")
+            else:
+                print("❌ Tool ID missing!")
+
+            # Test tool execution
+            rt = Runtime(
+                model="google-anthropic:claude-3-5-sonnet",
+                store=MemoryStore(),
+                native_tools=True,
+            )
+            rt.tool(get_weather)
+            rt.tool(search_database)
+
+            if rt.is_tool_call(result):
+                tool_result = await rt.execute_tool(result)
+                print(f"🔧 Tool execution result: {tool_result}")
+
+                # Test unified helper
+                tool_msg = rt.create_tool_result_message(result, str(tool_result))
+                print(f"📝 Tool result message: {tool_msg.content}")
+
+            return True
+        else:
+            print(f"📝 Non-tool response: {result}")
+            return True
+
+    except Exception as e:
+        print(f"❌ Google Anthropic test failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
 async def test_multi_turn_conversation():
     """Test multi-turn conversation with tool results - handles multiple tool calls."""
     print("\n🔄 Testing multi-turn conversation with OpenRouter")
@@ -221,6 +327,8 @@ async def main():
     tests = [
         test_openrouter_native_tools(),
         test_vertex_gemini_native_tools(),
+        test_vertex_gemini_with_tools(),
+        test_google_anthropic_native_tools(),
         test_multi_turn_conversation(),
     ]
 

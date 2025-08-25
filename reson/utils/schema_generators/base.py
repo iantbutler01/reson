@@ -44,8 +44,19 @@ class SchemaGenerator(ABC):
             param_info = self._python_type_to_schema(param_type)
 
             # Add description from parameter annotation if available
-            if hasattr(param, "annotation") and hasattr(param.annotation, "__doc__"):
+            if (
+                hasattr(param, "annotation")
+                and hasattr(param.annotation, "__doc__")
+                and param.annotation.__doc__ is not None
+            ):
                 param_info["description"] = param.annotation.__doc__
+            elif (
+                "description" not in param_info or param_info.get("description") is None
+            ):
+                # Ensure description is never null for JSON Schema 2020-12 compliance
+                param_info["description"] = (
+                    f"Parameter {param_name} of type {param_type.__name__ if hasattr(param_type, '__name__') else str(param_type)}"
+                )
 
             parameters[param_name] = param_info
 
@@ -81,13 +92,45 @@ class SchemaGenerator(ABC):
 
         # Handle Dict/Object types
         if origin in (dict, Dict):
-            return {"type": "object"}
+            if len(args) >= 2:
+                # Dict[str, T] - add proper additionalProperties
+                value_type = args[1]
+                return {
+                    "type": "object",
+                    "additionalProperties": self._python_type_to_schema(value_type),
+                }
+            return {"type": "object", "additionalProperties": True}
 
-        # Handle Deserializable types
-        if hasattr(python_type, "__mro__") and any(
-            "Deserializable" in cls.__name__ for cls in python_type.__mro__
+        # Handle Deserializable types first (your core type system)
+        if (
+            hasattr(python_type, "__mro__")
+            and inspect.isclass(python_type)
+            and any("Deserializable" in cls.__name__ for cls in python_type.__mro__)
         ):
             return self._deserializable_to_schema(python_type)
+
+        # Handle Pydantic models (check for actual BaseModel inheritance)
+        if (
+            inspect.isclass(python_type)
+            and hasattr(python_type, "__mro__")
+            and any("BaseModel" in cls.__name__ for cls in python_type.__mro__)
+        ):
+            return self._pydantic_to_schema(python_type)
+
+        # Handle Dataclasses (check for dataclass decorator)
+        if inspect.isclass(python_type) and hasattr(
+            python_type, "__dataclass_fields__"
+        ):
+            return self._dataclass_to_schema(python_type)
+
+        # Handle regular Python classes (only if not builtin and has custom __init__)
+        if (
+            inspect.isclass(python_type)
+            and hasattr(python_type, "__init__")
+            and python_type.__module__ != "builtins"
+            and python_type not in (str, int, float, bool, list, dict, tuple, set)
+        ):
+            return self._regular_class_to_schema(python_type)
 
         # Handle primitive types
         type_mapping = {
@@ -110,10 +153,140 @@ class SchemaGenerator(ABC):
             if field_name.startswith("_"):
                 continue
 
-            properties[field_name] = self._python_type_to_schema(field_type)
+            field_schema = self._python_type_to_schema(field_type)
+            # Ensure description is never null for JSON Schema 2020-12 compliance
+            if "description" not in field_schema or field_schema["description"] is None:
+                field_schema["description"] = (
+                    f"Field {field_name} of type {field_type.__name__ if hasattr(field_type, '__name__') else str(field_type)}"
+                )
+
+            properties[field_name] = field_schema
 
             # Check if field has default value
             if not hasattr(deserializable_class, field_name):
                 required.append(field_name)
+
+        schema = {"type": "object", "properties": properties, "required": required}
+        # Ensure the object itself has a description
+        if "description" not in schema:
+            schema["description"] = f"Object of type {deserializable_class.__name__}"
+
+        return schema
+
+    def _pydantic_to_schema(self, pydantic_class: Type) -> Dict[str, Any]:
+        """Convert Pydantic model to JSON schema object."""
+        properties = {}
+        required = []
+
+        # Pydantic v2
+        if hasattr(pydantic_class, "model_fields"):
+            for field_name, field_info in pydantic_class.model_fields.items():
+                field_type = field_info.annotation
+                field_schema = self._python_type_to_schema(field_type)
+                # Ensure description is never null
+                if (
+                    "description" not in field_schema
+                    or field_schema["description"] is None
+                ):
+                    field_schema["description"] = (
+                        f"Field {field_name} of type {field_type.__name__ if hasattr(field_type, '__name__') else str(field_type)}"
+                    )
+                properties[field_name] = field_schema
+
+                if field_info.is_required():
+                    required.append(field_name)
+        # Pydantic v1
+        elif hasattr(pydantic_class, "__fields__"):
+            for field_name, field_info in pydantic_class.__fields__.items():
+                field_type = field_info.type_
+                field_schema = self._python_type_to_schema(field_type)
+                # Ensure description is never null
+                if (
+                    "description" not in field_schema
+                    or field_schema["description"] is None
+                ):
+                    field_schema["description"] = (
+                        f"Field {field_name} of type {field_type.__name__ if hasattr(field_type, '__name__') else str(field_type)}"
+                    )
+                properties[field_name] = field_schema
+
+                if field_info.is_required():
+                    required.append(field_name)
+        else:
+            # Fallback to annotations
+            type_hints = get_type_hints(pydantic_class)
+            for field_name, field_type in type_hints.items():
+                if field_name.startswith("_"):
+                    continue
+                field_schema = self._python_type_to_schema(field_type)
+                # Ensure description is never null
+                if (
+                    "description" not in field_schema
+                    or field_schema["description"] is None
+                ):
+                    field_schema["description"] = (
+                        f"Field {field_name} of type {field_type.__name__ if hasattr(field_type, '__name__') else str(field_type)}"
+                    )
+                properties[field_name] = field_schema
+                if not hasattr(pydantic_class, field_name):
+                    required.append(field_name)
+
+        return {"type": "object", "properties": properties, "required": required}
+
+    def _dataclass_to_schema(self, dataclass_type: Type) -> Dict[str, Any]:
+        """Convert dataclass to JSON schema object."""
+        properties = {}
+        required = []
+
+        # Get field information from dataclass fields
+        for field_name, field_info in dataclass_type.__dataclass_fields__.items():
+            field_type = field_info.type
+            field_schema = self._python_type_to_schema(field_type)
+            # Ensure description is never null
+            if "description" not in field_schema or field_schema["description"] is None:
+                field_schema["description"] = (
+                    f"Field {field_name} of type {field_type.__name__ if hasattr(field_type, '__name__') else str(field_type)}"
+                )
+            properties[field_name] = field_schema
+
+            # Check if field has no default value
+            import dataclasses
+
+            if (
+                field_info.default is dataclasses.MISSING
+                and field_info.default_factory is dataclasses.MISSING
+            ):
+                required.append(field_name)
+
+        return {"type": "object", "properties": properties, "required": required}
+
+    def _regular_class_to_schema(self, class_type: Type) -> Dict[str, Any]:
+        """Convert regular Python class to JSON schema object using __init__ signature."""
+        properties = {}
+        required = []
+
+        # Get the __init__ method signature
+        init_method = class_type.__init__
+        signature = inspect.signature(init_method)
+        type_hints = get_type_hints(init_method)
+
+        for param_name, param in signature.parameters.items():
+            if param_name in ("self", "cls"):
+                continue
+
+            param_type = type_hints.get(param_name, str)
+            field_schema = self._python_type_to_schema(param_type)
+
+            # Ensure description is never null
+            if "description" not in field_schema or field_schema["description"] is None:
+                field_schema["description"] = (
+                    f"Field {param_name} of type {param_type.__name__ if hasattr(param_type, '__name__') else str(param_type)}"
+                )
+
+            properties[param_name] = field_schema
+
+            # Check if parameter has no default value
+            if param.default == inspect.Parameter.empty:
+                required.append(param_name)
 
         return {"type": "object", "properties": properties, "required": required}

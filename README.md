@@ -99,6 +99,26 @@ async def plan_trip(destination: str, weather_tool: Callable, runtime: Runtime) 
     return await runtime.run(prompt=f"Plan a trip to {destination}")
 ```
 
+### Native Tool Calling
+
+For improved performance and reduced token overhead, enable native tool calling with provider APIs:
+
+```python
+@agentic(model="openrouter:anthropic/claude-sonnet-4", native_tools=True)
+async def efficient_agent(query: str, runtime: Runtime) -> str:
+    runtime.tool(get_weather)
+    result = await runtime.run(prompt=query)
+    
+    # Handle tool calls when using native mode
+    if runtime.is_tool_call(result):
+        tool_result = await runtime.execute_tool(result)
+        return f"Tool executed: {tool_result}"
+    
+    return result
+```
+
+Native tool calling uses provider-specific APIs instead of XML parsing for better performance. See [docs/native-tool-calling.md](docs/native-tool-calling.md) for detailed usage patterns.
+
 ### Streaming Support
 
 Get results as they come in:
