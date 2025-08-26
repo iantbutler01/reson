@@ -38,16 +38,16 @@ class NativeToolParser(TypeParser):
 ### 3. Streaming Integration
 **In `_call_llm_stream` when handling tool_call_delta:**
 ```python
-if chunk_type == "tool_call_delta":
+if chunk_type == "tool_call_partial":
     tool_name = extract_tool_name(chunk_content)
     if tool_name in runtime._tool_types:
         # Tool has registered Deserializable type - parse to typed object
         tool_parser = NativeToolParser(runtime._tool_types)
         partial_result = tool_parser.parse_tool_delta(tool_name, delta_json)
-        yield partial_result.value, chunk_content, "tool_call_delta"
+        yield partial_result.value, chunk_content, "tool_call_partial"
     else:
         # Tool has NO registered type - yield raw delta for current behavior
-        yield chunk_content, chunk_content, "tool_call_delta"
+        yield chunk_content, chunk_content, "tool_call_partial"
 
 if chunk_type == "tool_call_complete":
     tool_name = extract_tool_name(chunk_content)

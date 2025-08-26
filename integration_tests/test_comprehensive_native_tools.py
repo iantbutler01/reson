@@ -2,6 +2,7 @@
 """Comprehensive tests for native tool calling including regression tests and advanced scenarios."""
 
 import asyncio
+import pytest
 import os
 from typing import List, Dict, Union
 from reson import agentic, Runtime
@@ -59,6 +60,7 @@ def factorial(n: int) -> int:
     return n * factorial(n - 1)
 
 
+@pytest.mark.asyncio
 async def test_xml_regression_single_turn():
     """Test that XML tool calling still works (regression test)."""
     print("🧪 Testing XML tool calling - Deserializable output type")
@@ -111,6 +113,7 @@ async def test_xml_regression_single_turn():
         return False
 
 
+@pytest.mark.asyncio
 async def test_xml_regression_multi_turn():
     """Test that XML multi-turn tool calling still works (regression test)."""
     print("\n🧪 Testing XML tool calling - Multi-turn (regression)")
@@ -165,6 +168,7 @@ async def test_xml_regression_multi_turn():
         return False
 
 
+@pytest.mark.asyncio
 async def test_native_5_turn_conversation():
     """Test a 5-turn conversation with native tools."""
     print("\n🧪 Testing Native Tools - 5-turn conversation")
@@ -215,6 +219,7 @@ async def test_native_5_turn_conversation():
         return False
 
 
+@pytest.mark.asyncio
 async def test_output_type_termination():
     """Test that producing an output type terminates the conversation properly."""
     print("\n🧪 Testing Output Type Termination")
@@ -251,6 +256,7 @@ async def test_output_type_termination():
         return False
 
 
+@pytest.mark.asyncio
 async def test_native_vs_xml_comparison():
     """Compare native vs XML tool calling side by side."""
     print("\n🧪 Testing Native vs XML comparison")

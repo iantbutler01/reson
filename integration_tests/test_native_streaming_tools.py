@@ -2,6 +2,7 @@
 """Test streaming native tool calls."""
 
 import asyncio
+import pytest
 import os
 from typing import AsyncGenerator
 from reson import agentic_generator, Runtime
@@ -33,6 +34,7 @@ def get_info(topic: str) -> str:
     )
 
 
+@pytest.mark.asyncio
 async def test_streaming_native_tools():
     """Test streaming with native tool calls."""
     print("🧪 Testing Streaming Native Tool Calls")
@@ -82,6 +84,7 @@ async def test_streaming_native_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_google_streaming_tool_detection():
     """Test Google streaming tool call detection."""
     print("\n🧪 Testing Google Streaming Tool Detection")
@@ -129,6 +132,7 @@ async def test_google_streaming_tool_detection():
         return False
 
 
+@pytest.mark.asyncio
 async def test_google_anthropic_streaming_tools():
     """Test Google Anthropic streaming tool calls."""
     print("\n🧪 Testing Google Anthropic Streaming Tool Calls")
@@ -178,6 +182,7 @@ async def test_google_anthropic_streaming_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_streaming_tool_execution():
     """Test streaming with actual tool execution."""
     print("\n🧪 Testing Streaming with Tool Execution")

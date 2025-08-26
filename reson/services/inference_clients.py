@@ -483,6 +483,7 @@ class AnthropicInferenceClient(InferenceClient):
                     raise InferenceException(await response.aread())
 
                 out = ""
+                current_tool_blocks = {}  # Track tool building by index like OpenAI
 
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
@@ -491,26 +492,72 @@ class AnthropicInferenceClient(InferenceClient):
 
                         if chunk_type == "content_block_delta":
                             content_type = chunk_json["delta"]["type"]
-                            text = (
-                                chunk_json["delta"]["text"]
-                                if content_type == "text_delta"
-                                else ""
-                            )
-                            out += text
-                            yield ("content", text)
+
+                            if content_type == "text_delta":
+                                text = chunk_json["delta"]["text"]
+                                out += text
+                                yield ("content", text)
+                            elif content_type == "input_json_delta" and tools:
+                                # Progressive tool input accumulation (like OpenAI)
+                                index = chunk_json["index"]
+                                if index in current_tool_blocks:
+                                    # Accumulate partial JSON
+                                    current_tool_blocks[index]["input"] += chunk_json[
+                                        "delta"
+                                    ]["partial_json"]
+
+                                    # Yield accumulated state (like OpenAI pattern)
+                                    mock_partial_response = {
+                                        "content": [
+                                            {
+                                                "type": "tool_use",
+                                                "id": current_tool_blocks[index]["id"],
+                                                "name": current_tool_blocks[index][
+                                                    "name"
+                                                ],
+                                                "input": current_tool_blocks[index][
+                                                    "input"
+                                                ],  # Accumulated JSON string
+                                            }
+                                        ]
+                                    }
+                                    yield ("tool_call_partial", mock_partial_response)
+
                         elif chunk_type == "content_block_start":
-                            # Check if this is a tool_use block
+                            # Initialize tool tracking
                             content_block = chunk_json.get("content_block", {})
                             if content_block.get("type") == "tool_use":
-                                # This is the start of a tool use block - store for completion
-                                pass  # We'll handle the complete tool in content_block_stop
+                                index = chunk_json["index"]
+                                current_tool_blocks[index] = {
+                                    "id": content_block["id"],
+                                    "name": content_block["name"],
+                                    "input": "",  # Start accumulating JSON
+                                }
+
                         elif chunk_type == "content_block_stop":
-                            # Check if we completed a tool_use block
-                            content_block = chunk_json.get("content_block", {})
-                            if tools and content_block.get("type") == "tool_use":
-                                # Create a mock response object for tool parsing
-                                mock_anthropic_response = {"content": [content_block]}
-                                yield ("tool_call_complete", mock_anthropic_response)
+                            # Tool completion
+                            index = chunk_json["index"]
+                            if tools and index in current_tool_blocks:
+                                # Create final complete tool response
+                                mock_complete_response = {
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "id": current_tool_blocks[index]["id"],
+                                            "name": current_tool_blocks[index]["name"],
+                                            "input": (
+                                                json.loads(
+                                                    current_tool_blocks[index]["input"]
+                                                )
+                                                if current_tool_blocks[index]["input"]
+                                                else {}
+                                            ),
+                                        }
+                                    ]
+                                }
+                                yield ("tool_call_complete", mock_complete_response)
+                                # Clean up completed tool
+                                del current_tool_blocks[index]
                         elif chunk_type == "message_start":
                             self._cost.input_tokens += chunk_json["message"]["usage"][
                                 "input_tokens"
@@ -763,8 +810,18 @@ class GoogleGenAIInferenceClient(InferenceClient):
             tool_calls_detected = False
             for part in chunk.candidates[0].content.parts:
                 if hasattr(part, "function_call") and part.function_call:
-                    # Found a buffered tool call, yield each function call separately
-                    yield ("tool_call_complete", chunk)
+                    # Create mock response with individual function call for proper parsing
+                    mock_response = {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "role": "model",
+                                    "parts": [{"function_call": part.function_call}],
+                                }
+                            }
+                        ]
+                    }
+                    yield ("tool_call_complete", mock_response)
                     tool_calls_detected = True
                     # Don't break - process all function calls in the chunk
 
@@ -1060,7 +1117,10 @@ class OAIInferenceClient(InferenceClient):
                                         current_tool_calls[index]["function"][
                                             "arguments"
                                         ] += tool_call_delta["function"]["arguments"]
-                                        yield ("tool_call_delta", tool_call_delta)
+                                        yield (
+                                            "tool_call_partial",
+                                            current_tool_calls[index],
+                                        )
                         elif data.get("usage"):
                             self._cost.input_tokens += data["usage"]["prompt_tokens"]
                             # No reference to cached tokens in the docs for the streaming API response objects...

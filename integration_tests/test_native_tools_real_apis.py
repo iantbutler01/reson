@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import pytest
 from typing import List, Dict
 from reson import agentic, Runtime
 from reson.types import Deserializable
@@ -39,6 +40,7 @@ def add_numbers(a: int, b: int) -> int:
     return a + b
 
 
+@pytest.mark.asyncio
 async def test_openrouter_native_tools():
     """Test OpenRouter with native tool calling."""
     print("🧪 Testing OpenRouter with anthropic/claude-sonnet-4 + native tools")
@@ -91,6 +93,7 @@ async def test_openrouter_native_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_vertex_gemini_native_tools():
     """Test Vertex AI Gemini with native tool calling."""
     print("\n🧪 Testing Vertex AI with gemini-2.5-flash + native tools")
@@ -143,6 +146,7 @@ async def test_vertex_gemini_native_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_vertex_gemini_with_tools():
     """Test Vertex AI Gemini with native tool calling and tool execution."""
     print("\n🧪 Testing Vertex AI Gemini with tool calling + native tools")
@@ -195,6 +199,7 @@ async def test_vertex_gemini_with_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_google_anthropic_native_tools():
     """Test Google Anthropic with claude-3-5-sonnet + native tools."""
     print("\n🧪 Testing Google Anthropic with claude-3-5-sonnet + native tools")
@@ -249,6 +254,7 @@ async def test_google_anthropic_native_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_multi_turn_conversation():
     """Test multi-turn conversation with tool results - handles multiple tool calls."""
     print("\n🔄 Testing multi-turn conversation with OpenRouter")

@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import pytest
 from typing import AsyncGenerator, List, Dict
 from dataclasses import dataclass
 from reson import agentic, agentic_generator, Runtime
@@ -65,6 +66,7 @@ def convert_currency(amount: float, from_currency: str, to_currency: str) -> flo
     return usd_amount * rates.get(to_currency, 1.0)
 
 
+@pytest.mark.asyncio
 async def test_openai_parallel_tool_calling():
     """Test OpenAI parallel tool calling - multiple tools in single response."""
     print("🧪 Testing OpenAI Parallel Tool Calling")
@@ -134,6 +136,7 @@ async def test_openai_parallel_tool_calling():
         return False
 
 
+@pytest.mark.asyncio
 async def test_anthropic_parallel_tool_calling():
     """Test Anthropic parallel tool calling - multiple tool_use blocks."""
     print("\n🧪 Testing Anthropic Parallel Tool Calling")
@@ -202,6 +205,7 @@ async def test_anthropic_parallel_tool_calling():
         return False
 
 
+@pytest.mark.asyncio
 async def test_google_parallel_tool_calling():
     """Test Google parallel/compositional tool calling - buffered tools."""
     print("\n🧪 Testing Google Parallel Tool Calling")
@@ -272,6 +276,7 @@ async def test_google_parallel_tool_calling():
         return False
 
 
+@pytest.mark.asyncio
 async def test_backwards_compatibility():
     """Test that existing single tool patterns still work."""
     print("\n🧪 Testing Backwards Compatibility")
@@ -314,6 +319,7 @@ async def test_backwards_compatibility():
         return False
 
 
+@pytest.mark.asyncio
 async def test_parallel_execution_pattern():
     """Test user pattern for handling parallel tools with async tasks."""
     print("\n🧪 Testing Parallel Execution Pattern")
@@ -389,6 +395,7 @@ async def test_parallel_execution_pattern():
         return False
 
 
+@pytest.mark.asyncio
 async def test_google_compositional_chaining():
     """Test Google compositional tool calling - tool results feed into next tool."""
     print("\n🧪 Testing Google Compositional Tool Chaining")
@@ -460,6 +467,7 @@ async def test_google_compositional_chaining():
         return False
 
 
+@pytest.mark.asyncio
 async def test_mixed_parallel_tool_types():
     """Test parallel tools with mixed registration types."""
     print("\n🧪 Testing Mixed Parallel Tool Types")

@@ -3,10 +3,12 @@
 
 import os
 import asyncio
+import pytest
 from google.genai import types
 from google import genai
 
 
+@pytest.mark.asyncio
 async def test_schema_with_real_client():
     """Test schemas by actually using them with the Google GenAI client."""
 

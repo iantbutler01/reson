@@ -2,6 +2,7 @@
 """Test native tool calling with Deserializable type marshalling."""
 
 import asyncio
+import pytest
 import os
 from typing import AsyncGenerator, List, Dict
 from dataclasses import dataclass
@@ -108,6 +109,7 @@ def add_numbers(a: int, b: int) -> int:
     return a + b
 
 
+@pytest.mark.asyncio
 async def test_tool_type_registration():
     """Test that tool types are properly registered."""
     print("🧪 Testing Tool Type Registration")
@@ -134,6 +136,7 @@ async def test_tool_type_registration():
     return True
 
 
+@pytest.mark.asyncio
 async def test_deserializable_streaming():
     """Test streaming with Deserializable tool types."""
     print("\n🧪 Testing Deserializable Streaming Tool Calls")
@@ -153,7 +156,7 @@ async def test_deserializable_streaming():
                     yield f"🧠 Thinking: {chunk_content}"
                 elif chunk_type == "content":
                     yield f"📝 Content: {chunk_content}"
-                elif chunk_type == "tool_call_delta":
+                elif chunk_type == "tool_call_partial":
                     # Check if we got a Deserializable object
                     if hasattr(chunk_content, "_tool_name"):
                         yield f"🔧 Partial Tool: {chunk_content._tool_name} - {type(chunk_content).__name__}({chunk_content.model_dump()})"
@@ -199,6 +202,7 @@ async def test_deserializable_streaming():
         return False
 
 
+@pytest.mark.asyncio
 async def test_mixed_tool_types():
     """Test mixing tools with and without types."""
     print("\n🧪 Testing Mixed Tool Types")
@@ -236,6 +240,7 @@ async def test_mixed_tool_types():
         return False
 
 
+@pytest.mark.asyncio
 async def test_typed_output_with_tools():
     """Test streaming with both tool types and output type."""
     print("\n🧪 Testing Typed Output + Tool Types")
@@ -252,7 +257,7 @@ async def test_typed_output_with_tools():
         async for chunk_type, content in runtime.run_stream(
             prompt=query, output_type=List[AgentAction]
         ):
-            if chunk_type == "tool_call_delta":
+            if chunk_type == "tool_call_partial":
                 if hasattr(content, "_tool_name"):
                     yield f"🔧 Building {content._tool_name}: {content.model_dump()}"
                 else:
@@ -297,6 +302,7 @@ async def test_typed_output_with_tools():
         return False
 
 
+@pytest.mark.asyncio
 async def test_pydantic_marshalling():
     """Test Pydantic model marshalling."""
     print("\n🧪 Testing Pydantic Model Marshalling")
@@ -337,6 +343,7 @@ async def test_pydantic_marshalling():
         return False
 
 
+@pytest.mark.asyncio
 async def test_dataclass_marshalling():
     """Test dataclass marshalling."""
     print("\n🧪 Testing Dataclass Marshalling")
@@ -377,6 +384,7 @@ async def test_dataclass_marshalling():
         return False
 
 
+@pytest.mark.asyncio
 async def test_regular_class_marshalling():
     """Test regular class marshalling."""
     print("\n🧪 Testing Regular Class Marshalling")
@@ -417,6 +425,7 @@ async def test_regular_class_marshalling():
         return False
 
 
+@pytest.mark.asyncio
 async def test_collection_types():
     """Test dict and list parameter marshalling."""
     print("\n🧪 Testing Collection Types (Dict, List)")
@@ -461,6 +470,7 @@ async def test_collection_types():
         return False
 
 
+@pytest.mark.asyncio
 async def test_primitive_types():
     """Test primitive parameter marshalling."""
     print("\n🧪 Testing Primitive Types")

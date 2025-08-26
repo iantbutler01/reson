@@ -7,6 +7,7 @@ from typing import Any, Dict, Type
 from .type_parser import TypeParser
 from .base import ParserResult
 from reson.types import Deserializable
+from json_repair import repair_json
 
 
 class NativeToolParser(TypeParser):
@@ -40,18 +41,25 @@ class NativeToolParser(TypeParser):
                     is_partial=True,
                 )
 
-            # Parse partial JSON data
-            partial_data = json.loads(delta_json)
+            partial_data = {}
+            try:
+                partial_data = json.loads(repair_json(delta_json))
+                partial_tool = tool_type.__gasp_from_partial__(partial_data)
 
-            # Use GASP's partial building capability
-            partial_tool = tool_type.__gasp_from_partial__(partial_data)
+                # Add tool name for identification
+                setattr(partial_tool, "_tool_name", tool_name)
 
-            # Add tool name for identification
-            setattr(partial_tool, "_tool_name", tool_name)
+                return ParserResult(
+                    value=partial_tool, is_partial=True, raw_output=delta_json
+                )
+            except Exception as e:
+                print(e)
 
-            return ParserResult(
-                value=partial_tool, is_partial=True, raw_output=delta_json
-            )
+                return ParserResult(
+                    value=tool_type.__gasp_from_partial__({}),
+                    is_partial=True,
+                    raw_output=delta_json,
+                )
 
         except json.JSONDecodeError as e:
             # Invalid JSON - likely still building up

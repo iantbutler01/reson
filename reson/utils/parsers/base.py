@@ -155,9 +155,6 @@ class OutputParser(Generic[T], abc.ABC):
             error=getattr(parser, "error", None),
         )
 
-    # Type information handling is delegated to the specific parser implementations
-    # since GASP and BAML both have built-in type handling capabilities
-
 
 def get_default_parser() -> OutputParser:
     """
