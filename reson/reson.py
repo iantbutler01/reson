@@ -3,10 +3,10 @@ from __future__ import annotations
 from types import UnionType
 import uuid
 
-from reson.training import TrainingManager
 from reson.services.inference_clients import ChatMessage, ChatRole
 import os
 from typing import (
+    TYPE_CHECKING,
     Union,
     List,
     Dict,
@@ -68,6 +68,9 @@ from reson.utils.inference import (
 )
 from reson.utils.schema_generators import get_schema_generator, supports_native_tools
 from reson.tracing_inference_client import TracingInferenceClient
+
+if TYPE_CHECKING:
+    from reson.training import TrainingManager
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -241,7 +244,7 @@ class Runtime(ResonBase):
     _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
     _reasoning_accumulator: List[str] = PrivateAttr(default_factory=list)
     _current_call_args: Optional[Dict[str, Any]] = PrivateAttr(default=None)  # ADDED
-    _training_manager: Optional[TrainingManager] = PrivateAttr(default=None)
+    _training_manager: Optional["TrainingManager"] = PrivateAttr(default=None)
 
     def model_post_init(self, __context):
         """Initialize private attributes after model fields are set."""
@@ -289,9 +292,13 @@ class Runtime(ResonBase):
         self._tools[name or fn.__name__] = fn
 
     def load_training_manager(self, path: Path | str):
+        from reson.training import TrainingManager
+
         self._training_manager = TrainingManager.load(path)
 
     def init_training_manager(self, name: str):
+        from reson.training import TrainingManager
+
         self._training_manager = TrainingManager(name=name)
 
         return self._training_manager
