@@ -20,10 +20,9 @@ dependencies = [
   "jsonpickle>=3.0.0",
   "redis>=5.0.0",
   "opentelemetry-api>=1.27.0",
-  "google-cloud-aiplatform==1.111.0",
+  "google-cloud-aiplatform==1.69.0",
   "backoff>=2.2.0",
   "google-genai",
-  "openpipe-art[backend]",
   "skypilot",
 ]
 
