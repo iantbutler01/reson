@@ -22,7 +22,7 @@ class NativeToolParser(TypeParser):
         super().__init__()
         self.tools_registry = tools_registry
 
-    def parse_tool_delta(self, tool_name: str, delta_json: str) -> ParserResult:
+    def parse_tool(self, tool_name: str, delta_json: str, tool_id: str) -> ParserResult:
         """Parse partial tool call JSON into partial Deserializable.
 
         Args:
@@ -48,6 +48,7 @@ class NativeToolParser(TypeParser):
 
                 # Add tool name for identification
                 setattr(partial_tool, "_tool_name", tool_name)
+                setattr(partial_tool, "_tool_use_id", tool_id)
 
                 return ParserResult(
                     value=partial_tool, is_partial=True, raw_output=delta_json
@@ -67,42 +68,7 @@ class NativeToolParser(TypeParser):
         except Exception as e:
             return ParserResult(error=e, is_partial=True, raw_output=delta_json)
 
-    def parse_tool_complete(self, tool_name: str, complete_json: str) -> ParserResult:
-        """Parse complete tool call JSON into complete Deserializable.
-
-        Args:
-            tool_name: Name of the tool being called
-            complete_json: Complete JSON string for the tool arguments
-
-        Returns:
-            ParserResult with complete Deserializable object
-        """
-        try:
-            # Get the tool type
-            tool_type = self.tools_registry.get(tool_name)
-            if not tool_type:
-                return ParserResult(
-                    error=ValueError(f"Tool '{tool_name}' not found in registry"),
-                    is_partial=False,
-                )
-
-            # Parse complete JSON data
-            complete_data = json.loads(complete_json)
-
-            # Use GASP's partial building capability (works for complete data too)
-            complete_tool = tool_type.__gasp_from_partial__(complete_data)
-
-            # Add tool name for identification
-            setattr(complete_tool, "_tool_name", tool_name)
-
-            return ParserResult(
-                value=complete_tool, is_partial=False, raw_output=complete_json
-            )
-
-        except Exception as e:
-            return ParserResult(error=e, is_partial=False, raw_output=complete_json)
-
-    def extract_tool_name_from_delta(self, tool_call_data: Any) -> str:
+    def extract_tool_name(self, tool_call_data: Any) -> str:
         """Extract tool name from OpenAI tool call delta format.
 
         Args:
@@ -121,21 +87,22 @@ class NativeToolParser(TypeParser):
 
         return ""
 
-    def extract_arguments_from_delta(self, tool_call_data: Any) -> str:
+    def extract_tool_id(self, tool_call_data: Any) -> str | None:
+        return tool_call_data.get("id")
+
+    def extract_arguments(self, tool_call_data: Any) -> str:
         """Extract arguments JSON from OpenAI tool call delta format.
 
         Args:
-            tool_call_data: Tool call delta object from OpenAI/OpenRouter
+            tool_call_data: Tool call delta object in OpenAI format.
 
         Returns:
             Arguments JSON string
         """
         if isinstance(tool_call_data, dict):
-            # OpenAI format: {"function": {"arguments": "{\"a\": 5}"}}
             function_data = tool_call_data.get("function", {})
             return function_data.get("arguments", "{}")
         elif hasattr(tool_call_data, "function"):
-            # Object format
             return getattr(tool_call_data.function, "arguments", "{}")
 
         return "{}"

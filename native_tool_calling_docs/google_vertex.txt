@@ -365,3 +365,51 @@ Function calling
 Was this helpful?
 
 Send feedback
+
+When calling functions with thinking enabled, you'll need to get the thought_signature from the model response object and return it when you send the result of the function execution back to the model. For example:
+
+Python
+
+
+# Call the model with function declarations
+# ...Generation config, Configure the client, and Define user prompt (No changes)
+
+# Send request with declarations (using a thinking model)
+response = client.models.generate_content(
+  model="gemini-2.5-flash", config=config, contents=contents)
+
+# See thought signatures
+for part in response.candidates[0].content.parts:
+  if not part.text:
+    continue
+  if part.thought and part.thought_signature:
+    print("Thought signature:")
+    print(part.thought_signature)
+Viewing thought signatures isn't required, but you will need to adjust Step 2 to return them along with the result of the function execution so it can incorporate the thoughts into its final response:
+
+Python
+
+
+# Create user friendly response with function result and call the model again
+# ...Create a function response part (No change)
+
+# Append thought signatures, function call and result of the function execution to contents
+function_call_content = response.candidates[0].content
+# Append the model's function call message, which includes thought signatures
+contents.append(function_call_content)
+contents.append(types.Content(role="user", parts=[function_response_part])) # Append the function response
+
+final_response = client.models.generate_content(
+    model="gemini-2.5-flash",
+    config=config,
+    contents=contents,
+)
+
+print(final_response.text)
+When returning thought signatures, follow these guidelines:
+
+The model returns signatures within other parts in the response, for example function calling or text, text, or thought summaries parts. Return the entire response with all parts back to the model in subsequent turns.
+Don't merge part with one signature with another part which also contains a signature. Signatures can't be concatenated together.
+Don't merge one part with a signature with another part without a signature. This breaks the correct positioning of the thought represented by the signature.
+Learn more about limitations and usage of thought signatures, and about thinking models in general, on the Thinking page.
+

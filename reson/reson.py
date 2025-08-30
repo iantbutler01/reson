@@ -3,7 +3,8 @@ from __future__ import annotations
 from types import UnionType
 import uuid
 
-from reson.services.inference_clients import ChatMessage, ChatRole
+from reson.training import TrainingManager
+from reson.services.inference_clients import ChatMessage, ChatRole, ToolResult
 import os
 from typing import (
     TYPE_CHECKING,
@@ -233,7 +234,7 @@ class Runtime(ResonBase):
 
     # ───── private runtime fields ─────
     _tools: dict[str, Callable] = PrivateAttr(default_factory=dict)
-    _tool_types: dict[str, Type[Deserializable]] = PrivateAttr(
+    _tool_types: dict[str, Any] = PrivateAttr(
         default_factory=dict
     )  # NEW: tool type mappings
     _default_prompt: str = PrivateAttr(default="")
@@ -510,171 +511,6 @@ class Runtime(ResonBase):
         else:
             return func(**kwargs)
 
-    def create_tool_result_message(
-        self,
-        tool_call_obj_or_list: Union[Any, Tuple[Any, str], List[Tuple[Any, str]]],
-        result: Optional[str] = None,
-    ) -> ChatMessage:
-        """Create properly formatted tool result message for conversation continuation.
-
-        Works for both XML tools (returns simple text message) and native tools
-        (returns provider-specific formatted message).
-
-        Args:
-            tool_call_obj_or_list: Either tool_obj (old API), (tool_obj, result), or [(tool1, result1), (tool2, result2), ...]
-            result: Result string (old API) - ignored if tool_call_obj_or_list contains results
-        """
-        # Handle backwards compatibility - detect old API usage
-        if result is not None:
-            # Old API: create_tool_result_message(tool_obj, result)
-            tool_calls_and_results = [(tool_call_obj_or_list, result)]
-        elif isinstance(tool_call_obj_or_list, tuple):
-            # New API with single tuple: (tool_obj, result)
-            tool_calls_and_results = [tool_call_obj_or_list]
-        elif isinstance(tool_call_obj_or_list, list):
-            # New API with list: [(tool1, result1), (tool2, result2), ...]
-            tool_calls_and_results = tool_call_obj_or_list
-        else:
-            raise ValueError(
-                "Invalid arguments - need either (tool_obj, result) or [(tool1, result1), ...]"
-            )
-
-        if not tool_calls_and_results:
-            raise ValueError("No tool calls and results provided")
-
-        # For XML tools, just return simple text message with first result
-        if not self.native_tools:
-            return ChatMessage(role=ChatRole.USER, content=tool_calls_and_results[0][1])
-
-        # For single tool, maintain existing behavior
-        if len(tool_calls_and_results) == 1:
-            tool_call_obj, result = tool_calls_and_results[0]
-            return self._create_single_tool_result_message(tool_call_obj, result)
-
-        # For multiple tools, create consolidated message
-        return self._create_parallel_tool_result_message(tool_calls_and_results)
-
-    def _create_single_tool_result_message(
-        self, tool_call_obj: Any, result: str
-    ) -> ChatMessage:
-        """Create message for single tool result (backwards compatibility)."""
-        if not self.native_tools:
-            # XML approach: simple text message (existing behavior)
-            return ChatMessage(role=ChatRole.USER, content=result)
-
-        # Native tools: provider-specific formatting
-        if not hasattr(tool_call_obj, "_tool_id"):
-            # Fallback for tools without ID preservation
-            return ChatMessage(role=ChatRole.USER, content=result)
-
-        provider = (
-            self.model.split(":", 1)[0]
-            if self.model and ":" in self.model
-            else self.model
-        )
-
-        if provider in ["openai", "openrouter", "custom-openai"]:
-            # OpenAI format
-            content = json.dumps(
-                {
-                    "type": "function_call_output",
-                    "call_id": tool_call_obj._tool_id,
-                    "output": result,
-                }
-            )
-        elif provider in ["anthropic", "bedrock"]:
-            # Anthropic format (requires array format for tool_result)
-            content = json.dumps(
-                [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_obj._tool_id,
-                        "content": result,
-                    }
-                ]
-            )
-        elif provider and provider.startswith("google"):
-            # Google format - preserve original response with thought signatures
-            content = json.dumps(
-                {
-                    "functionResponse": {
-                        "name": tool_call_obj._tool_name,
-                        "response": {"result": result},
-                    },
-                    "_google_thought_signature_required": True,
-                    "_original_response_required": True,
-                }
-            )
-        else:
-            # Fallback for unknown providers
-            content = result
-
-        return ChatMessage(role=ChatRole.USER, content=content)
-
-    def _create_parallel_tool_result_message(
-        self, tool_calls_and_results: List[Tuple[Any, str]]
-    ) -> ChatMessage:
-        """Create message for multiple tool results."""
-        if not self.native_tools:
-            # XML approach: concatenate all results
-            all_results = "\n".join([result for _, result in tool_calls_and_results])
-            return ChatMessage(role=ChatRole.USER, content=all_results)
-
-        provider = (
-            self.model.split(":", 1)[0]
-            if self.model and ":" in self.model
-            else self.model
-        )
-
-        if provider in ["openai", "openrouter", "custom-openai"]:
-            # OpenAI format: multiple function_call_output objects
-            tool_results = []
-            for tool_call_obj, result in tool_calls_and_results:
-                if hasattr(tool_call_obj, "_tool_id"):
-                    tool_results.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": tool_call_obj._tool_id,
-                            "output": result,
-                        }
-                    )
-            content = json.dumps(tool_results)
-
-        elif provider in ["anthropic", "bedrock"]:
-            # Anthropic format: array of tool_result objects
-            tool_results = []
-            for tool_call_obj, result in tool_calls_and_results:
-                if hasattr(tool_call_obj, "_tool_id"):
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_obj._tool_id,
-                            "content": result,
-                        }
-                    )
-            content = json.dumps(tool_results)
-
-        elif provider and provider.startswith("google"):
-            # Google format: multiple functionResponse objects
-            tool_results = []
-            for tool_call_obj, result in tool_calls_and_results:
-                tool_results.append(
-                    {
-                        "functionResponse": {
-                            "name": tool_call_obj._tool_name,
-                            "response": {"result": result},
-                        }
-                    }
-                )
-            content = json.dumps(tool_results)
-
-        else:
-            # Fallback: concatenate results
-            all_results = "\n".join([result for _, result in tool_calls_and_results])
-            content = all_results
-
-        return ChatMessage(role=ChatRole.USER, content=content)
-
     def _marshall_arguments_to_function_signature(
         self, func: Callable, tool_result: Any
     ) -> Dict[str, Any]:
@@ -940,153 +776,21 @@ def _generate_native_tool_schemas(
     return schema_generator.generate_tool_schemas(tools)
 
 
-def _parse_native_tool_calls(
-    response_data: Any, tools: Dict[str, Callable], provider: str
+def _parse_list_of_complete_tools(
+    tool_calls: List[dict], parser: NativeToolParser, registry: dict[str, Any]
 ) -> List[Any]:
-    """Parse native tool calls from provider response into Deserializable objects."""
-    tool_calls = []
+    tools = []
 
-    # Extract tool calls based on provider format
-    if (
-        provider.startswith("openai")
-        or provider == "openrouter"
-        or provider == "custom-openai"
-    ):
-        # OpenAI format: Handle both dict and object responses
-        choices = None
-        if isinstance(response_data, dict) and "choices" in response_data:
-            choices = response_data["choices"]
-        elif hasattr(response_data, "choices"):
-            choices = response_data.choices
+    for call in tool_calls:
+        tool_name = parser.extract_tool_name_from_delta(call)
+        args_json = parser.extract_arguments_from_delta(call)
+        delta_result = parser.parse_tool_delta(tool_name, args_json)
+        if delta_result.success:
+            tools.append(delta_result.value)
+        else:
+            tools.append(call)
 
-        if choices and len(choices) > 0:
-            choice = choices[0]
-            message = (
-                choice.get("message")
-                if isinstance(choice, dict)
-                else getattr(choice, "message", None)
-            )
-
-            if message:
-                tool_calls_data = (
-                    message.get("tool_calls")
-                    if isinstance(message, dict)
-                    else getattr(message, "tool_calls", None)
-                )
-
-                if tool_calls_data:
-                    for tool_call in tool_calls_data:
-                        function_data = (
-                            tool_call.get("function")
-                            if isinstance(tool_call, dict)
-                            else getattr(tool_call, "function", None)
-                        )
-                        if function_data:
-                            func_name = (
-                                function_data.get("name")
-                                if isinstance(function_data, dict)
-                                else getattr(function_data, "name", None)
-                            )
-                            if func_name in tools:
-                                tool_func = tools[func_name]
-                                arguments_str = (
-                                    function_data.get("arguments")
-                                    if isinstance(function_data, dict)
-                                    else getattr(function_data, "arguments", "{}")
-                                )
-                                arguments = (
-                                    json.loads(arguments_str) if arguments_str else {}
-                                )
-                                tool_id = (
-                                    tool_call.get("id", "")
-                                    if isinstance(tool_call, dict)
-                                    else getattr(tool_call, "id", "")
-                                )
-
-                                # Create Deserializable object from arguments with ID
-                                tool_instance = _create_tool_instance(
-                                    tool_func, arguments, func_name, tool_id
-                                )
-                                tool_calls.append(tool_instance)
-
-    elif provider == "anthropic" or provider == "bedrock":
-        # Anthropic format: response.content with tool_use blocks
-        if hasattr(response_data, "content"):
-            for block in response_data.content:
-                if hasattr(block, "type") and block.type == "tool_use":
-                    if block.name in tools:
-                        tool_func = tools[block.name]
-                        arguments = block.input
-                        tool_id = getattr(block, "id", "")
-
-                        tool_instance = _create_tool_instance(
-                            tool_func, arguments, block.name, tool_id
-                        )
-                        tool_calls.append(tool_instance)
-
-    elif provider.startswith("google"):
-        # Google format: response.candidates[0].content.parts with function_call
-        if hasattr(response_data, "candidates") and response_data.candidates:
-            candidate = response_data.candidates[0]
-            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
-                for part in candidate.content.parts:
-                    if hasattr(part, "function_call"):
-                        func_call = part.function_call
-                        if func_call.name in tools:
-                            tool_func = tools[func_call.name]
-                            arguments = dict(func_call.args)
-                            # Google doesn't have explicit tool IDs, use function name
-                            tool_id = func_call.name
-
-                            tool_instance = _create_tool_instance(
-                                tool_func, arguments, func_call.name, tool_id
-                            )
-                            tool_calls.append(tool_instance)
-
-    return tool_calls
-
-
-def _create_tool_instance(
-    tool_func: Callable, arguments: Dict[str, Any], tool_name: str, tool_id: str = ""
-) -> Any:
-    """Create a Deserializable tool instance from function and arguments."""
-    # Get the function signature to understand expected types
-    sig = inspect.signature(tool_func)
-    type_hints = get_type_hints(tool_func)
-
-    # Convert dict arguments to proper Deserializable objects where needed
-    converted_args = {}
-    for param_name, param in sig.parameters.items():
-        if param_name == "self":
-            continue
-
-        if param_name in arguments:
-            param_type = type_hints.get(param_name, str)
-            param_value = arguments[param_name]
-
-            # If the parameter type is a Deserializable and the value is a dict, convert it
-            if (
-                hasattr(param_type, "__mro__")
-                and any("Deserializable" in cls.__name__ for cls in param_type.__mro__)
-                and isinstance(param_value, dict)
-            ):
-                # Convert dict to Deserializable instance
-                converted_args[param_name] = param_type(**param_value)
-            else:
-                converted_args[param_name] = param_value
-
-    # Create a simple wrapper that can be executed
-    class ToolCallInstance:
-        def __init__(
-            self, name: str, func: Callable, args: Dict[str, Any], tool_id: str
-        ):
-            self._tool_name = name
-            self._tool_func = func
-            self._tool_id = tool_id  # Store tool ID for multi-turn conversations
-            for key, value in args.items():
-                setattr(self, key, value)
-
-    return ToolCallInstance(tool_name, tool_func, converted_args, tool_id)
+    return tools
 
 
 def _extract_content_from_response(response: Any, provider: str) -> Optional[str]:
@@ -1141,7 +845,8 @@ async def _call_llm(
     max_tokens: Optional[int] = None,
     call_context: Optional[Dict[str, Any]] = None,  # ADDED
     art_backend=None,
-    native_tools: bool = False,  # NEW PARAMETER
+    native_tools: bool = False,
+    tool_types: Dict[str, Type[Deserializable]] = {},
 ):
     """Execute a non-streaming LLM call with optional native tool support."""
     client = _create_inference_client(model, store, api_key, art_backend=art_backend)
@@ -1216,14 +921,15 @@ async def _call_llm(
 
     # Handle response based on native tools usage
     if native_tools and tools:
-        # Parse native tool calls
         provider = model.split(":", 1)[0] if ":" in model else model
-        tool_calls = _parse_native_tool_calls(result, tools, provider)
+        native_tool_parser = NativeToolParser(tool_types)
+
+        tool_calls = _parse_list_of_complete_tools(
+            result["tool_calls"], native_tool_parser, tool_types
+        )
 
         if tool_calls:
-            # For parallel tool calling: return first tool for backwards compatibility in non-streaming
-            # Streaming mode will handle multiple tools through separate events
-            return tool_calls[0], None, None
+            return tool_calls, None, "tool_calls"
         else:
             # No tool calls, return text response and honor output_type
             content = _extract_content_from_response(result, provider)
@@ -1277,12 +983,10 @@ async def _call_llm_stream(
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     max_tokens: Optional[int] = None,
-    call_context: Optional[Dict[str, Any]] = None,  # ADDED
+    call_context: Optional[Dict[str, Any]] = None,
     art_backend=None,
-    native_tools: bool = False,  # NEW PARAMETER
-    tool_types: Optional[
-        Dict[str, Type[Deserializable]]
-    ] = None,  # NEW: tool type mappings
+    native_tools: bool = False,
+    tool_types: Dict[str, Type[Deserializable]] = {},
 ):
     """Execute a streaming LLM call with optional native tool support."""
     client = _create_inference_client(
@@ -1358,133 +1062,49 @@ async def _call_llm_stream(
         "temperature": temperature if temperature is not None else 0.5,
     }
 
-    # Add native tool schemas if using native tools
     if native_tools and native_tool_schemas:
         call_kwargs["tools"] = native_tool_schemas
 
-    # Handle native tool streaming
     if native_tools and tools:
-        provider = model.split(":", 1)[0] if ":" in model else model
-
-        # Create NativeToolParser if we have tool types
         native_tool_parser = None
         if tool_types:
             native_tool_parser = NativeToolParser(tool_types)
 
         async for chunk in client.connect_and_listen(**call_kwargs):
-            if isinstance(chunk, tuple) and len(chunk) == 2:
-                chunk_type, chunk_content = chunk
+            chunk_type, chunk_content = chunk
 
-                if chunk_type == "reasoning":
-                    yield None, chunk_content, "reasoning"
-                elif chunk_type == "content":
-                    yield chunk_content, chunk_content, "content"
-                elif chunk_type == "tool_call_partial":
-                    # Handle tool call deltas with potential Deserializable parsing
-                    if native_tool_parser:
-                        # Extract tool name and arguments from delta
-                        tool_name = native_tool_parser.extract_tool_name_from_delta(
-                            chunk_content
-                        )
-
-                        print("TN", tool_name)
-                        print("CC", chunk_content)
-                        if tool_types and tool_name in tool_types:
-                            args_json = native_tool_parser.extract_arguments_from_delta(
-                                chunk_content
-                            )
-                            delta_result = native_tool_parser.parse_tool_delta(
-                                tool_name, args_json
-                            )
-                            if delta_result.success:
-                                yield delta_result.value, chunk_content, "tool_call_partial"
-                            else:
-                                yield None, chunk_content, "tool_call_partial"
-                        else:
-                            yield None, chunk_content, "tool_call_partial"
-                    else:
-                        yield chunk_content, chunk_content, "tool_call_partial"
-                elif chunk_type == "tool_call_complete":
-                    # Handle complete tool calls with potential Deserializable parsing
-                    if native_tool_parser:
-                        # Try to extract tool name and parse with registered type
-                        if (
-                            isinstance(chunk_content, dict)
-                            and "function" in chunk_content
-                        ):
-                            tool_name = chunk_content["function"].get("name", "")
-                            if tool_types and tool_name in tool_types:
-                                # Tool has registered type - parse to Deserializable
-                                args_json = chunk_content["function"].get(
-                                    "arguments", "{}"
-                                )
-                                complete_result = (
-                                    native_tool_parser.parse_tool_complete(
-                                        tool_name, args_json
-                                    )
-                                )
-                                if complete_result.success:
-                                    # Add tool ID for execution compatibility
-                                    setattr(
-                                        complete_result.value,
-                                        "_tool_id",
-                                        chunk_content.get("id", tool_name),
-                                    )
-                                    yield complete_result.value, None, "tool_call_complete"
-                                else:
-                                    # Parsing failed, fall back to normal parsing
-                                    tool_calls = _parse_native_tool_calls(
-                                        chunk_content, tools, provider
-                                    )
-                                    for tool_call in tool_calls:
-                                        yield tool_call, None, "tool_call_complete"
-                            else:
-                                # Tool has no registered type - use normal parsing
-                                tool_calls = _parse_native_tool_calls(
-                                    chunk_content, tools, provider
-                                )
-                                for tool_call in tool_calls:
-                                    yield tool_call, None, "tool_call_complete"
-                        else:
-                            # Not OpenAI format - use normal parsing
-                            tool_calls = _parse_native_tool_calls(
-                                chunk_content, tools, provider
-                            )
-                            for tool_call in tool_calls:
-                                yield tool_call, None, "tool_call_complete"
-                    else:
-                        # No tool types - use normal parsing
-                        tool_calls = _parse_native_tool_calls(
-                            chunk_content, tools, provider
-                        )
-                        for tool_call in tool_calls:
-                            yield tool_call, None, "tool_call_complete"
-                else:
-                    # Default content handling
-                    yield chunk_content, chunk_content, "content"
-            else:
-                # Handle single value chunks - could be content or complete response
+            if chunk_type == "reasoning":
+                yield None, chunk_content, "reasoning"
+            elif chunk_type == "content":
+                yield chunk_content, chunk_content, "content"
+            elif (
+                chunk_type == "tool_call_partial" or chunk_type == "tool_call_complete"
+            ):
                 if (
-                    hasattr(chunk, "candidates")
-                    or hasattr(chunk, "content")
-                    or (
-                        isinstance(chunk, dict)
-                        and ("choices" in chunk or "candidates" in chunk)
+                    native_tool_parser
+                    and (
+                        tool_name := native_tool_parser.extract_tool_name(chunk_content)
                     )
+                    in tool_types
                 ):
-                    # This might be a complete response with tool calls (Google/Anthropic buffered)
-                    tool_calls = _parse_native_tool_calls(chunk, tools, provider)
-                    if tool_calls:
-                        for tool_call in tool_calls:
-                            yield tool_call, None, "tool_call_complete"
+                    args_json = native_tool_parser.extract_arguments(chunk_content)
+                    tool_id = native_tool_parser.extract_tool_id(chunk_content)
+
+                    if not tool_id:
+                        yield None, chunk_content, chunk_type
                     else:
-                        # Extract content from response
-                        content = _extract_content_from_response(chunk, provider)
-                        if content:
-                            yield content, content, "content"
+                        result = native_tool_parser.parse_tool(
+                            tool_name, args_json, tool_id
+                        )
+
+                        if result.success:
+                            yield result.value, chunk_content, chunk_type
+                        else:
+                            yield None, chunk_content, chunk_type
                 else:
-                    # Regular text chunk
-                    yield chunk, chunk, "content"
+                    yield chunk_content, chunk_content, chunk_type
+            else:
+                yield chunk_content, chunk_content, "content"
 
     # Handle XML tool approach (non-native tools)
     elif (

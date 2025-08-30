@@ -118,28 +118,6 @@ class TestNativeToolsIntegration:
             == "string"
         )
 
-    def test_tool_instance_creation(self):
-        """Test creation of tool instances from arguments."""
-        from reson.reson import _create_tool_instance
-
-        # Test simple function
-        arguments = {"name": "Alice"}
-        tool_instance = _create_tool_instance(
-            simple_greeting, arguments, "simple_greeting"
-        )
-
-        assert tool_instance._tool_name == "simple_greeting"
-        assert tool_instance._tool_func == simple_greeting
-        assert tool_instance.name == "Alice"
-
-        # Test function with Deserializable parameter
-        calc_args = {"calc": {"operation": "add", "a": 5.0, "b": 3.0}}
-        calc_instance = _create_tool_instance(calculate, calc_args, "calculate")
-
-        assert calc_instance._tool_name == "calculate"
-        assert calc_instance._tool_func == calculate
-        assert hasattr(calc_instance, "calc")
-
     @pytest.mark.parametrize(
         "provider", ["openai", "anthropic", "google-gemini", "openrouter"]
     )

@@ -2811,3 +2811,9 @@ The above request should, on average, use fewer input and output tokens than a n
 <Tip>
   To keep the benefits of prompt caching, use the beta header consistently for requests you’d like to cache. If you selectively use it, prompt caching will fail.
 </Tip>
+
+
+Thinking delta
+When using extended thinking with streaming enabled, you’ll receive thinking content via thinking_delta events. These deltas correspond to the thinking field of the thinking content blocks.
+
+For thinking content, a special signature_delta event is sent just before the content_block_stop event. This signature is used to verify the integrity of the thinking block.

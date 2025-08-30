@@ -3,7 +3,17 @@ from collections.abc import Hashable
 import botocore.exceptions
 from pydantic import Field
 import json
-from typing import Awaitable, Callable, List, Dict, Any, Optional, Tuple, AsyncGenerator
+from typing import (
+    Awaitable,
+    Callable,
+    List,
+    Dict,
+    Any,
+    Optional,
+    Tuple,
+    AsyncGenerator,
+    Union,
+)
 from enum import Enum
 from abc import ABC, abstractmethod
 import logging
@@ -74,6 +84,136 @@ class ChatMessage(ResonBase):
     content: str
     cache_marker: bool = False
     model_families: List[str] = Field(default_factory=list)
+    signature: Optional[str] = Field(default=None)
+
+
+class ToolResult(ResonBase):
+    """Encapsulates tool result content for conversation history."""
+
+    tool_use_id: str
+    content: str
+    is_error: bool = False
+    signature: Optional[str] = Field(
+        default=None
+    )  # For signature/thought_signature handling
+    tool_obj: Optional[Any] = Field(
+        default=None
+    )  # Original tool call object (dict or marshalled Deserializable)
+
+    def to_provider_format(self, provider: str) -> Dict[str, Any]:
+        """Convert to provider-specific format for API calls."""
+        if provider in ["openai", "openrouter", "custom-openai"]:
+            return self._format_openai_content()
+        elif provider in ["anthropic", "bedrock"]:
+            return self._format_anthropic_content()
+        elif provider and provider.startswith("google"):
+            return self._format_google_content()
+        else:
+            # Fallback format
+            return {"content": self.content}
+
+    def to_chat_message(self) -> "ChatMessage":
+        """Convert to ChatMessage for backward compatibility."""
+        return ChatMessage(
+            role=ChatRole.USER, content=self.content, signature=self.signature
+        )
+
+    @classmethod
+    def create(
+        cls,
+        tool_call_obj_or_list: Union[Any, Tuple[Any, str], List[Tuple[Any, str]]],
+        signature: Optional[str] = None,
+    ) -> Union["ToolResult", List["ToolResult"]]:
+        """Factory method to create ToolResult(s) from tool call objects."""
+
+        if isinstance(tool_call_obj_or_list, tuple):
+            tool_calls_and_results = [tool_call_obj_or_list]
+        elif isinstance(tool_call_obj_or_list, list):
+            tool_calls_and_results = tool_call_obj_or_list
+        else:
+            raise ValueError(
+                "Invalid arguments - need either (tool_obj, result) or [(tool1, result1), ...]"
+            )
+
+        if not tool_calls_and_results:
+            raise ValueError("No tool calls and results provided")
+
+        # Create ToolResult objects
+        results = []
+        for tool_call_obj, result_content in tool_calls_and_results:
+            # Extract tool_use_id from the tool call object
+            tool_use_id = cls._extract_tool_use_id(tool_call_obj)
+
+            tool_result = cls(
+                tool_use_id=tool_use_id,
+                content=result_content,
+                signature=signature,
+                tool_obj=tool_call_obj,
+            )
+            results.append(tool_result)
+
+        # Return single result or list based on input
+        if len(results) == 1:
+            return results[0]
+        else:
+            return results
+
+    @classmethod
+    def _extract_tool_use_id(cls, tool_call_obj: Any) -> str:
+        """Extract tool_use_id from tool call object."""
+        if hasattr(tool_call_obj, "_tool_use_id"):
+            return tool_call_obj._tool_use_id
+        elif isinstance(tool_call_obj, dict):
+            return tool_call_obj.get("id", "")
+        else:
+            return ""
+
+    @classmethod
+    def _extract_signature(cls, tool_call_obj: Any) -> Optional[str]:
+        """Extract signature/thought_signature from tool call objects."""
+        if hasattr(tool_call_obj, "signature"):
+            return tool_call_obj.signature
+        elif hasattr(tool_call_obj, "thought_signature"):
+            return tool_call_obj.thought_signature
+        elif isinstance(tool_call_obj, dict):
+            return tool_call_obj.get("signature") or tool_call_obj.get(
+                "thought_signature"
+            )
+        return None
+
+    def _format_openai_content(self) -> Dict[str, Any]:
+        """Format content for OpenAI/OpenRouter API calls."""
+        return {
+            "type": "function_call_output",
+            "call_id": self.tool_use_id,
+            "output": self.content,
+        }
+
+    def _format_anthropic_content(self) -> Dict[str, Any]:
+        """Format content for Anthropic API calls."""
+        return {
+            "type": "tool_result",
+            "tool_use_id": self.tool_use_id,
+            "content": self.content,
+        }
+
+    def _format_google_content(self) -> Dict[str, Any]:
+        """Format content for Google API calls."""
+        result = {
+            "functionResponse": {
+                "name": (
+                    getattr(self.tool_obj, "_tool_name", "") if self.tool_obj else ""
+                ),
+                "response": {"result": self.content},
+            }
+        }
+
+        # Add thought signature preservation for Google
+        if self.signature:
+            result["_google_thought_signature_required"] = True
+            result["_original_response_required"] = True
+
+        return result
 
 
 class AnthropicRequest(ResonBase):
@@ -135,7 +275,7 @@ class InferenceClient(ABC):
     @abstractmethod
     def connect_and_listen(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
@@ -146,13 +286,41 @@ class InferenceClient(ABC):
     @abstractmethod
     async def get_generation(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
         pass
+
+    def _convert_messages_to_provider_format(
+        self, messages: List[Union[ChatMessage, "ToolResult"]], provider: str
+    ) -> List[Dict[str, Any]]:
+        """Convert mixed ChatMessage/ToolResult list to provider-specific format."""
+        converted_messages = []
+
+        for msg in messages:
+            if isinstance(msg, ChatMessage):
+                # Handle ChatMessage
+                converted_messages.append(
+                    {"role": msg.role.value, "content": msg.content}
+                )
+            else:  # ToolResult
+                # Convert ToolResult to provider format
+                provider_content = msg.to_provider_format(provider)
+                converted_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            provider_content
+                            if isinstance(provider_content, str)
+                            else json.dumps(provider_content)
+                        ),
+                    }
+                )
+
+        return converted_messages
 
 
 class BedrockInferenceClient(InferenceClient):
@@ -167,17 +335,24 @@ class BedrockInferenceClient(InferenceClient):
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult"]],
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
+        # Convert messages to ChatMessage format
+        processed_messages = []
+        for msg in messages:
+            if hasattr(msg, "to_chat_message"):  # ToolResult
+                processed_messages.append(msg.to_chat_message())
+            else:  # ChatMessage
+                processed_messages.append(msg)
 
         system = ""
-        if messages[0].role == ChatRole.SYSTEM:
-            system = messages[0].content
-            messages = messages[1:]
+        if processed_messages[0].role == ChatRole.SYSTEM:
+            system = processed_messages[0].content
+            processed_messages = processed_messages[1:]
 
         request = AnthropicRequest(
             anthropic_version=self.anthropic_version,
@@ -190,7 +365,7 @@ class BedrockInferenceClient(InferenceClient):
                     "role": msg.role.value,
                     "content": [{"type": "text", "text": msg.content}],
                 }
-                for msg in messages
+                for msg in processed_messages
             ],
         )
 
@@ -265,6 +440,7 @@ class BedrockInferenceClient(InferenceClient):
                 raise InferenceException(str(e))
 
             out = ""
+            current_tool_blocks = {}  # Track tool building by index like OpenAI
 
             async for chunk in response["body"]:
                 chunk_json = json.loads(chunk["chunk"]["bytes"].decode())
@@ -272,13 +448,64 @@ class BedrockInferenceClient(InferenceClient):
 
                 if chunk_type == "content_block_delta":
                     content_type = chunk_json["delta"]["type"]
-                    text = (
-                        chunk_json["delta"]["text"]
-                        if content_type == "text_delta"
-                        else ""
-                    )
-                    out += text
-                    yield ("content", text)
+
+                    if content_type == "text_delta":
+                        text = chunk_json["delta"]["text"]
+                        out += text
+                        yield ("content", text)
+                    elif content_type == "input_json_delta" and tools:
+                        # Progressive tool input accumulation (like OpenAI)
+                        index = chunk_json["index"]
+                        if index in current_tool_blocks:
+                            # Accumulate partial JSON
+                            current_tool_blocks[index]["input"] += chunk_json["delta"][
+                                "partial_json"
+                            ]
+
+                            # Convert to OpenAI format
+                            openai_format = {
+                                "id": current_tool_blocks[index]["id"],
+                                "function": {
+                                    "name": current_tool_blocks[index]["name"],
+                                    "arguments": current_tool_blocks[index][
+                                        "input"
+                                    ],  # JSON string
+                                },
+                            }
+                            yield ("tool_call_partial", openai_format)
+
+                elif chunk_type == "content_block_start":
+                    # Initialize tool tracking
+                    content_block = chunk_json.get("content_block", {})
+                    if content_block.get("type") == "tool_use":
+                        index = chunk_json["index"]
+                        current_tool_blocks[index] = {
+                            "id": content_block["id"],
+                            "name": content_block["name"],
+                            "input": "",  # Start accumulating JSON
+                        }
+
+                elif chunk_type == "content_block_stop":
+                    # Tool completion
+                    index = chunk_json["index"]
+                    if tools and index in current_tool_blocks:
+                        # Convert to OpenAI format
+                        openai_format = {
+                            "id": current_tool_blocks[index]["id"],
+                            "function": {
+                                "name": current_tool_blocks[index]["name"],
+                                "arguments": (
+                                    json.dumps(
+                                        json.loads(current_tool_blocks[index]["input"])
+                                    )
+                                    if current_tool_blocks[index]["input"]
+                                    else "{}"
+                                ),
+                            },
+                        }
+                        yield ("tool_call_complete", openai_format)
+                        # Clean up completed tool
+                        del current_tool_blocks[index]
                 elif chunk_type == "message_start":
                     self._cost.input_tokens += chunk_json["message"]["usage"][
                         "input_tokens"
@@ -506,22 +733,17 @@ class AnthropicInferenceClient(InferenceClient):
                                         "delta"
                                     ]["partial_json"]
 
-                                    # Yield accumulated state (like OpenAI pattern)
-                                    mock_partial_response = {
-                                        "content": [
-                                            {
-                                                "type": "tool_use",
-                                                "id": current_tool_blocks[index]["id"],
-                                                "name": current_tool_blocks[index][
-                                                    "name"
-                                                ],
-                                                "input": current_tool_blocks[index][
-                                                    "input"
-                                                ],  # Accumulated JSON string
-                                            }
-                                        ]
+                                    # Convert to OpenAI format
+                                    openai_format = {
+                                        "id": current_tool_blocks[index]["id"],
+                                        "function": {
+                                            "name": current_tool_blocks[index]["name"],
+                                            "arguments": current_tool_blocks[index][
+                                                "input"
+                                            ],  # JSON string
+                                        },
                                     }
-                                    yield ("tool_call_partial", mock_partial_response)
+                                    yield ("tool_call_partial", openai_format)
 
                         elif chunk_type == "content_block_start":
                             # Initialize tool tracking
@@ -538,24 +760,23 @@ class AnthropicInferenceClient(InferenceClient):
                             # Tool completion
                             index = chunk_json["index"]
                             if tools and index in current_tool_blocks:
-                                # Create final complete tool response
-                                mock_complete_response = {
-                                    "content": [
-                                        {
-                                            "type": "tool_use",
-                                            "id": current_tool_blocks[index]["id"],
-                                            "name": current_tool_blocks[index]["name"],
-                                            "input": (
+                                # Convert to OpenAI format
+                                openai_format = {
+                                    "id": current_tool_blocks[index]["id"],
+                                    "function": {
+                                        "name": current_tool_blocks[index]["name"],
+                                        "arguments": (
+                                            json.dumps(
                                                 json.loads(
                                                     current_tool_blocks[index]["input"]
                                                 )
-                                                if current_tool_blocks[index]["input"]
-                                                else {}
-                                            ),
-                                        }
-                                    ]
+                                            )
+                                            if current_tool_blocks[index]["input"]
+                                            else "{}"
+                                        ),
+                                    },
                                 }
-                                yield ("tool_call_complete", mock_complete_response)
+                                yield ("tool_call_complete", openai_format)
                                 # Clean up completed tool
                                 del current_tool_blocks[index]
                         elif chunk_type == "message_start":
@@ -627,7 +848,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
@@ -635,15 +856,32 @@ class GoogleGenAIInferenceClient(InferenceClient):
     ):
         system_instruction = None
 
-        if messages[0].role.value == "system":
+        if (
+            len(messages) > 0
+            and hasattr(messages[0], "role")
+            and messages[0].role.value == "system"
+        ):
             system_instruction = messages[0].content
             messages = messages[1:]
 
-        # Convert messages to Google's format
-        processed_messages = [
-            types.Content(role=msg.role.value, parts=[types.Part(text=msg.content)])
-            for msg in messages
-        ]
+        # Convert messages to Google's format - handle both ChatMessage and ToolResult
+        processed_messages = []
+        for msg in messages:
+            try:
+                # ChatMessage
+                processed_messages.append(
+                    types.Content(
+                        role=msg.role.value, parts=[types.Part(text=msg.content)]
+                    )
+                )
+            except AttributeError:
+                # ToolResult - convert to Google format
+                google_content = msg.to_provider_format("google")
+                processed_messages.append(
+                    types.Content(
+                        role="user", parts=[types.Part(text=json.dumps(google_content))]
+                    )
+                )
 
         # Prepare config with optional tools
         config_kwargs = {
@@ -709,16 +947,32 @@ class GoogleGenAIInferenceClient(InferenceClient):
             if p.text and not p.thought
         )
 
-        await self._trace(
-            [
-                {
-                    "role": msg.role.value,
-                    "content": [{"type": "text", "text": msg.content}],
-                }
-                for msg in messages
-            ],
-            [{"text": out_text}],
-        )
+        # Convert messages for tracing (handle both ChatMessage and ToolResult)
+        trace_messages = []
+        for msg in messages:
+            try:
+                # ChatMessage
+                trace_messages.append(
+                    {
+                        "role": msg.role.value,
+                        "content": [{"type": "text", "text": msg.content}],
+                    }
+                )
+            except AttributeError:
+                # ToolResult - convert to simple format for tracing
+                trace_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"[ToolResult: {msg.content[:100]}...]",
+                            }
+                        ],
+                    }
+                )
+
+        await self._trace(trace_messages, [{"text": out_text}])
 
         # Return full response for tool extraction, or processed content for traditional approach
         if tools:
@@ -729,7 +983,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
@@ -737,14 +991,32 @@ class GoogleGenAIInferenceClient(InferenceClient):
     ):
         system_instruction = None
 
-        if messages[0].role.value == "system":
+        if (
+            len(messages) > 0
+            and hasattr(messages[0], "role")
+            and messages[0].role.value == "system"
+        ):
             system_instruction = messages[0].content
             messages = messages[1:]
 
-        processed_messages = [
-            types.Content(role=msg.role.value, parts=[types.Part(text=msg.content)])
-            for msg in messages
-        ]
+        # Convert messages to Google's format - handle both ChatMessage and ToolResult
+        processed_messages = []
+        for msg in messages:
+            try:
+                # ChatMessage
+                processed_messages.append(
+                    types.Content(
+                        role=msg.role.value, parts=[types.Part(text=msg.content)]
+                    )
+                )
+            except AttributeError:
+                # ToolResult - convert to Google format
+                google_content = msg.to_provider_format("google")
+                processed_messages.append(
+                    types.Content(
+                        role="user", parts=[types.Part(text=json.dumps(google_content))]
+                    )
+                )
 
         # Prepare config with optional tools
         config_kwargs = {
@@ -810,18 +1082,16 @@ class GoogleGenAIInferenceClient(InferenceClient):
             tool_calls_detected = False
             for part in chunk.candidates[0].content.parts:
                 if hasattr(part, "function_call") and part.function_call:
-                    # Create mock response with individual function call for proper parsing
-                    mock_response = {
-                        "candidates": [
-                            {
-                                "content": {
-                                    "role": "model",
-                                    "parts": [{"function_call": part.function_call}],
-                                }
-                            }
-                        ]
+                    # Convert Google function call to OpenAI format
+                    func_call = part.function_call
+                    openai_format = {
+                        "id": f"google_{func_call.name}_{hash(str(func_call.args))}",  # Generate ID since Google doesn't provide one
+                        "function": {
+                            "name": func_call.name,
+                            "arguments": json.dumps(dict(func_call.args)),
+                        },
                     }
-                    yield ("tool_call_complete", mock_response)
+                    yield ("tool_call_complete", openai_format)
                     tool_calls_detected = True
                     # Don't break - process all function calls in the chunk
 
@@ -843,16 +1113,32 @@ class GoogleGenAIInferenceClient(InferenceClient):
                     yield ("content", out_text)
                 out += reasoning + out_text
 
-        await self._trace(
-            [
-                {
-                    "role": msg.role.value,
-                    "content": [{"type": "text", "text": msg.content}],
-                }
-                for msg in messages
-            ],
-            [{"text": out}],
-        )
+        # Convert messages for tracing (handle both ChatMessage and ToolResult)
+        trace_messages = []
+        for msg in messages:
+            try:
+                # ChatMessage
+                trace_messages.append(
+                    {
+                        "role": msg.role.value,
+                        "content": [{"type": "text", "text": msg.content}],
+                    }
+                )
+            except AttributeError:
+                # ToolResult - convert to simple format for tracing
+                trace_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"[ToolResult: {msg.content[:100]}...]",
+                            }
+                        ],
+                    }
+                )
+
+        await self._trace(trace_messages, [{"text": out}])
 
 
 class OAIRequest(ResonBase):
@@ -882,6 +1168,7 @@ class OAIInferenceClient(InferenceClient):
         self.reasoning = reasoning
         self.ranking_referer = None
         self.ranking_title = None
+        self.provider = "openai"
 
     @tracer.start_as_current_span(name="OAIInferenceClient.get_generation")
     @backoff.on_exception(
@@ -889,21 +1176,31 @@ class OAIInferenceClient(InferenceClient):
     )
     async def get_generation(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult"]],
         max_tokens=4096,
         top_p=1.0,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
+        # Convert ToolResult objects to ChatMessage format
+        formatted_messages = []
+
+        for message in messages:
+            try:
+                msg = {
+                    "role": message.role.value,
+                    "content": message.content,
+                }
+
+                formatted_messages.append(msg)
+            except AttributeError as e:
+                msg = message.to_provider_format(self.provider)
+
+                formatted_messages.append(msg)
+
         request = OAIRequest(
             model=self.model,
-            messages=[
-                {
-                    "role": m.role.value,
-                    "content": m.content,
-                }
-                for m in messages
-            ],
+            messages=formatted_messages,
             max_completion_tokens=max_tokens,
             top_p=top_p,
             temperature=temperature,
@@ -1003,21 +1300,30 @@ class OAIInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="OAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
         self,
-        messages: List[ChatMessage],
+        messages: List[ChatMessage | ToolResult],
         max_tokens=4096,
         top_p=1.0,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
+        formatted_messages = []
+
+        for message in messages:
+            try:
+                msg = {
+                    "role": message.role.value,
+                    "content": message.content,
+                }
+
+                formatted_messages.append(msg)
+            except AttributeError as e:
+                msg = message.to_provider_format(self.provider)
+
+                formatted_messages.append(msg)
+
         request = OAIRequest(
             model=self.model,
-            messages=[
-                {
-                    "role": msg.role.value,
-                    "content": msg.content,
-                }
-                for msg in messages
-            ],
+            messages=formatted_messages,
             max_completion_tokens=max_tokens,
             top_p=top_p,
             temperature=temperature,
@@ -1078,6 +1384,11 @@ class OAIInferenceClient(InferenceClient):
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         if line.strip() == "data: [DONE]":
+                            if current_tool_calls:
+                                print("HERE")
+                                index = len(current_tool_calls) - 1
+                                yield ("tool_call_complete", current_tool_calls[index])
+
                             break
                         data = json.loads(line[6:])
                         if "error" in data:
@@ -1101,6 +1412,15 @@ class OAIInferenceClient(InferenceClient):
                                     index = tool_call_delta.get("index", 0)
 
                                     if index not in current_tool_calls:
+                                        if index - 1 >= 0 and current_tool_calls.get(
+                                            index - 1, None
+                                        ):
+                                            print("HERE")
+                                            yield (
+                                                "tool_call_complete",
+                                                current_tool_calls[index - 1],
+                                            )
+
                                         current_tool_calls[index] = {
                                             "id": tool_call_delta.get("id", ""),
                                             "function": {
@@ -1136,11 +1456,6 @@ class OAIInferenceClient(InferenceClient):
                             except AttributeError as e:
                                 logger.warning(f"Malformed usage? {repr(data)}")
 
-                # Final tool calls if streaming - emit each accumulated tool
-                if tools and current_tool_calls:
-                    for index in sorted(current_tool_calls.keys()):
-                        yield ("tool_call_complete", current_tool_calls[index])
-
                 await self._trace(
                     request["messages"],
                     [{"text": out}],
@@ -1168,6 +1483,7 @@ class OpenRouterInferenceClient(OAIInferenceClient):
         )
         self.ranking_referer = ranking_referer
         self.ranking_title = ranking_title
+        self.provider = "openrouter"
 
     async def _populate_cost(self, id: str):
         await asyncio.sleep(0.5)

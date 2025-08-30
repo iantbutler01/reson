@@ -81,7 +81,12 @@ async def test_openrouter_native_tools():
 
                 # Test unified helper
                 tool_msg = rt.create_tool_result_message(result, str(tool_result))
-                print(f"📝 Tool result message: {tool_msg.content}")
+                if isinstance(tool_msg, list):
+                    print(
+                        f"📝 Tool result message: {[msg.content for msg in tool_msg]}"
+                    )
+                else:
+                    print(f"📝 Tool result message: {tool_msg.content}")
 
             return True
         else:
@@ -131,7 +136,12 @@ async def test_vertex_gemini_native_tools():
 
                 # Test unified helper
                 tool_msg = rt.create_tool_result_message(result, str(tool_result))
-                print(f"📝 Tool result message: {tool_msg.content}")
+                if isinstance(tool_msg, list):
+                    print(
+                        f"📝 Tool result message: {[msg.content for msg in tool_msg]}"
+                    )
+                else:
+                    print(f"📝 Tool result message: {tool_msg.content}")
 
             return True
         else:
@@ -184,7 +194,12 @@ async def test_vertex_gemini_with_tools():
 
                 # Test unified helper
                 tool_msg = rt.create_tool_result_message(result, str(tool_result))
-                print(f"📝 Tool result message: {tool_msg.content}")
+                if isinstance(tool_msg, list):
+                    print(
+                        f"📝 Tool result message: {[msg.content for msg in tool_msg]}"
+                    )
+                else:
+                    print(f"📝 Tool result message: {tool_msg.content}")
 
             return True
         else:
@@ -239,7 +254,12 @@ async def test_google_anthropic_native_tools():
 
                 # Test unified helper
                 tool_msg = rt.create_tool_result_message(result, str(tool_result))
-                print(f"📝 Tool result message: {tool_msg.content}")
+                if isinstance(tool_msg, list):
+                    print(
+                        f"📝 Tool result message: {[msg.content for msg in tool_msg]}"
+                    )
+                else:
+                    print(f"📝 Tool result message: {tool_msg.content}")
 
             return True
         else:
@@ -290,7 +310,10 @@ async def test_multi_turn_conversation():
 
             # Create tool result message
             tool_msg = rt.create_tool_result_message(result, str(tool_result))
-            history.append(tool_msg)
+            if isinstance(tool_msg, list):
+                history.extend(tool_msg)
+            else:
+                history.append(tool_msg)
 
             # Continue conversation
             result = await rt.run(
