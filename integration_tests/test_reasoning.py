@@ -28,7 +28,7 @@ async def test_reasoning():
     if result is None:
         print("⚠️  Got None result - this can happen with reasoning models")
         # For reasoning models, check if reasoning was captured
-        # Note: We'd need to access runtime.reasoning here if available
+        assert len(reasoning_agent.runtime.reasoning) > 0
         return  # Don't fail the test for None
     elif isinstance(result, tuple):
         content, reasoning = result
@@ -63,6 +63,7 @@ async def test_anthropic_reasoning():
     # Modern test - handle whatever we get back
     if result is None:
         print("⚠️  Got None result - this can happen with reasoning models")
+        assert len(anthropic_reasoning_agent.runtime.reasoning) > 0
         return  # Don't fail the test for None
     elif isinstance(result, tuple):
         content, reasoning = result

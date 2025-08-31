@@ -651,8 +651,8 @@ async def test_multi_turn_toolresult_conversation():
     try:
         results = []
         models = [
-            # "vertex-gemini:gemini-2.5-pro",
-            # "openrouter:anthropic/claude-sonnet-4",
+            "vertex-gemini:gemini-2.5-pro",
+            "openrouter:anthropic/claude-sonnet-4",
             "anthropic:claude-sonnet-4-20250514",
         ]
 
@@ -690,15 +690,15 @@ async def main():
     print("✅ API key configured")
 
     tests = [
-        # ("Unregistered Tool → Dict Format", test_unregistered_tool_returns_dict()),
-        # ("Partial Parsing → None", test_partial_parsing_returns_none()),
-        # (
-        #     "Registered Type → Deserializable",
-        #     test_registered_tool_returns_type_instance(),
-        # ),
-        # ("Mixed Registration → Different Formats", test_mixed_tool_registration()),
-        # ("Cross-Provider Format Consistency", test_cross_provider_format_consistency()),
-        # ("Edge Cases", test_tool_call_format_edge_cases()),
+        ("Unregistered Tool → Dict Format", test_unregistered_tool_returns_dict()),
+        ("Partial Parsing → None", test_partial_parsing_returns_none()),
+        (
+            "Registered Type → Deserializable",
+            test_registered_tool_returns_type_instance(),
+        ),
+        ("Mixed Registration → Different Formats", test_mixed_tool_registration()),
+        ("Cross-Provider Format Consistency", test_cross_provider_format_consistency()),
+        ("Edge Cases", test_tool_call_format_edge_cases()),
         (
             "Multi-Turn ToolResult Conversation",
             test_multi_turn_toolresult_conversation(),

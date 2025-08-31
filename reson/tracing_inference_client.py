@@ -190,6 +190,9 @@ class TracingInferenceClient(InferenceClient):
             messages, max_tokens, top_p, temperature, tools=tools
         )
         id = random.randrange(1000000)
-        await trace_output([m.model_dump() for m in messages], f"gen_input_{id}")
+        await trace_output(
+            [m.model_dump() if hasattr(m, "model_dump") else m for m in messages],
+            f"gen_input_{id}",
+        )
         await trace_output(res, f"gen_output_{id}")
         return res

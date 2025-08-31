@@ -4,7 +4,13 @@ from types import UnionType
 import uuid
 
 from reson.training import TrainingManager
-from reson.services.inference_clients import ChatMessage, ChatRole, ToolResult
+from reson.services.inference_clients import (
+    ChatMessage,
+    ChatRole,
+    ToolResult,
+    ReasoningSegment,
+    InferenceProvider,
+)
 import os
 from typing import (
     TYPE_CHECKING,
@@ -242,6 +248,8 @@ class Runtime(ResonBase):
     _return_type: Optional[Type[Any]] = PrivateAttr(default=None)
     _raw_response_accumulator: List[str] = PrivateAttr(default_factory=list)
     _reasoning_accumulator: List[str] = PrivateAttr(default_factory=list)
+    _reasoning_segments: List["ReasoningSegment"] = PrivateAttr(default_factory=list)
+    _current_reasoning_segment: Optional["ReasoningSegment"] = PrivateAttr(default=None)
     _current_call_args: Optional[Dict[str, Any]] = PrivateAttr(default=None)  # ADDED
     _training_manager: Optional["TrainingManager"] = PrivateAttr(default=None)
 
@@ -285,6 +293,18 @@ class Runtime(ResonBase):
     def clear_reasoning(self) -> None:
         """Clears the accumulated reasoning tokens."""
         self._reasoning_accumulator = []
+
+    @property
+    def reasoning_segments(self) -> List[ReasoningSegment]:
+        """
+        Returns the list of reasoning segments from the LLM
+        for the last run() or run_stream() call.
+        """
+        return self._reasoning_segments
+
+    def clear_reasoning_segments(self) -> None:
+        """Clears the accumulated reasoning segments."""
+        self._reasoning_segments = []
 
     def tool(
         self,
@@ -411,6 +431,7 @@ class Runtime(ResonBase):
         self.used = True
         self.clear_raw_response()  # Clear accumulator for new call
         self.clear_reasoning()  # Clear reasoning for new call
+        self.clear_reasoning_segments()  # Clear segments for new call
         prompt = prompt or self._default_prompt
         # Use _return_type if output_type is not provided
         effective_output_type = (
@@ -428,11 +449,12 @@ class Runtime(ResonBase):
         effective_api_key = api_key if api_key is not None else self.api_key
 
         # _call_llm_stream will be modified to yield (parsed_chunk, raw_chunk_str, chunk_type)
+        last_chunk_type = None
         async for chunk_data in _call_llm_stream(
             prompt,
             effective_model,
             self._tools,
-            effective_output_type,
+            effective_output_type,  # type: ignore
             self.store,
             effective_api_key,
             system=system,
@@ -448,7 +470,33 @@ class Runtime(ResonBase):
             # Handle tuple format with chunk type
             if isinstance(chunk_data, tuple) and len(chunk_data) == 3:
                 parsed_chunk, raw_chunk_str, chunk_type = chunk_data
+
+                if last_chunk_type == "reasoning" and chunk_type not in (
+                    "reasoning",
+                    "signature",
+                ):
+                    if self._current_reasoning_segment:
+                        self._reasoning_segments.append(self._current_reasoning_segment)
+                        self._current_reasoning_segment = None
+
                 if chunk_type == "reasoning" and raw_chunk_str:
+                    if not self._current_reasoning_segment:
+                        self._current_reasoning_segment = ReasoningSegment(
+                            content="", segment_index=len(self._reasoning_segments)
+                        )
+                    self._current_reasoning_segment.content += raw_chunk_str
+                    self._reasoning_accumulator.append(raw_chunk_str)
+                    # Yield reasoning progress
+                    yield ("reasoning", self.reasoning)
+                elif chunk_type == "signature":
+                    if self._current_reasoning_segment:
+                        self._current_reasoning_segment.signature = parsed_chunk
+                elif chunk_type == "reasoning" and raw_chunk_str:
+                    if not self._current_reasoning_segment:
+                        self._current_reasoning_segment = ReasoningSegment(
+                            content="", segment_index=len(self._reasoning_segments)
+                        )
+                    self._current_reasoning_segment.content += raw_chunk_str
                     self._reasoning_accumulator.append(raw_chunk_str)
                     # Yield reasoning progress
                     yield ("reasoning", self.reasoning)
@@ -463,6 +511,7 @@ class Runtime(ResonBase):
                     if parsed_chunk is not None:
                         # Yield content with type indicator
                         yield ("content", parsed_chunk)
+                last_chunk_type = chunk_type
             else:
                 parsed_chunk, raw_chunk_str = chunk_data
                 if raw_chunk_str is not None:
@@ -470,6 +519,10 @@ class Runtime(ResonBase):
                 if parsed_chunk is not None:
                     # Always yield as tuple for consistency
                     yield ("content", parsed_chunk)
+
+        if self._current_reasoning_segment:
+            self._reasoning_segments.append(self._current_reasoning_segment)
+            self._current_reasoning_segment = None
 
     @property
     def context(self):
@@ -652,7 +705,7 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
 
     provider, model_name = parts
 
-    if provider == "art" and os.environ.get("ART_ENABLED"):
+    if provider == InferenceProvider.ART.value and os.environ.get("ART_ENABLED"):
         from reson.utils.inference import create_art_inference_client
 
         name_project_match = re.match(
@@ -666,7 +719,7 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
 
         return create_art_inference_client(model, name, project, art_backend)
 
-    if provider == "openrouter":
+    if provider == InferenceProvider.OPENROUTER.value:
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
         if not reasoning_match:
             # Try numeric pattern
@@ -678,7 +731,7 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             )
         else:
             client = create_openrouter_inference_client(model_name, api_key=api_key)
-    elif provider == "anthropic":
+    elif provider == InferenceProvider.ANTHROPIC.value:
         # Parse out reasoning parameter if provided
         reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
         if reasoning_match:
@@ -688,9 +741,9 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             )
         else:
             client = create_anthropic_inference_client(model_name, api_key=api_key)
-    elif provider == "bedrock":
+    elif provider == InferenceProvider.BEDROCK.value:
         client = create_bedrock_inference_client(model_name)
-    elif provider == "google-gemini":
+    elif provider == InferenceProvider.GOOGLE_GEMINI.value:
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
         if not reasoning_match:
             # Try numeric pattern
@@ -702,7 +755,7 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             )
         else:
             client = create_google_gemini_api_client(model_name, api_key=api_key)
-    elif provider == "vertex-gemini":
+    elif provider == InferenceProvider.VERTEX_GEMINI.value:
         reasoning_match = re.match(r"(.+)@reasoning=([a-z].*)", model_name)
         if not reasoning_match:
             # Try numeric pattern
@@ -714,7 +767,7 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             )
         else:
             client = create_vertex_gemini_api_client(model_name)
-    elif provider == "google-anthropic":
+    elif provider == InferenceProvider.GOOGLE_ANTHROPIC.value:
         # Parse out reasoning parameter if provided for Google Anthropic
         reasoning_match = re.match(r"(.+)@reasoning=(\d+)", model_name)
         if reasoning_match:
@@ -729,11 +782,11 @@ def _create_inference_client(model_str, store=None, api_key=None, art_backend=No
             from reson.utils.inference import create_google_anthropic_inference_client
 
             client = create_google_anthropic_inference_client(model_name)
-    elif provider == "openai":
+    elif provider == InferenceProvider.OPENAI.value:
         # Strip reasoning= from model name if present
         model_name = re.sub(r"@reasoning=.*$", "", model_name)
         client = create_openai_inference_client(model_name, api_key=api_key)
-    elif provider == "custom-openai":
+    elif provider == InferenceProvider.CUSTOM_OPENAI.value:
         if "@server_url=" not in model_name:
             raise ValueError(
                 "Custom OpenAI model must include @server_url=<url> parameter"
@@ -782,9 +835,10 @@ def _parse_list_of_complete_tools(
     tools = []
 
     for call in tool_calls:
-        tool_name = parser.extract_tool_name_from_delta(call)
-        args_json = parser.extract_arguments_from_delta(call)
-        delta_result = parser.parse_tool_delta(tool_name, args_json)
+        tool_name = parser.extract_tool_name(call)
+        args_json = parser.extract_arguments(call)
+        tool_id = parser.extract_tool_id(call) or ""
+        delta_result = parser.parse_tool(tool_name, args_json, tool_id)
         if delta_result.success:
             tools.append(delta_result.value)
         else:
@@ -796,9 +850,9 @@ def _parse_list_of_complete_tools(
 def _extract_content_from_response(response: Any, provider: str) -> Optional[str]:
     """Extract text content from provider response when no tool calls made."""
     if (
-        provider.startswith("openai")
-        or provider == "openrouter"
-        or provider == "custom-openai"
+        provider.startswith(InferenceProvider.OPENAI.value)
+        or provider == InferenceProvider.OPENROUTER.value
+        or provider == InferenceProvider.CUSTOM_OPENAI.value
     ):
         # Handle both dict and object responses
         if isinstance(response, dict) and "choices" in response:
@@ -809,18 +863,25 @@ def _extract_content_from_response(response: Any, provider: str) -> Optional[str
                     message = choice["message"]
                     if isinstance(message, dict) and "content" in message:
                         return message["content"]
-        elif hasattr(response, "choices") and response.choices:
-            choice = response.choices[0]
+        elif hasattr(response, "choices") and response.choices:  # type: ignore
+            choice = response.choices[0]  # type: ignore
             if hasattr(choice, "message") and hasattr(choice.message, "content"):
                 return choice.message.content
 
-    elif provider == "anthropic" or provider == "bedrock":
+    elif (
+        provider == InferenceProvider.ANTHROPIC.value
+        or provider == InferenceProvider.BEDROCK.value
+    ):
         if hasattr(response, "content"):
             for block in response.content:
                 if hasattr(block, "type") and block.type == "text":
                     return block.text
 
-    elif provider.startswith("google"):
+    elif (
+        provider == InferenceProvider.GOOGLE_GENAI.value
+        or provider == InferenceProvider.GOOGLE_ANTHROPIC.value
+        or provider.startswith("google")
+    ):
         if hasattr(response, "candidates") and response.candidates:
             candidate = response.candidates[0]
             if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
@@ -891,11 +952,12 @@ async def _call_llm(
         )  # MODIFIED
 
     # Construct messages list
-    messages: List[ChatMessage] = []
+    messages: List[Union[ChatMessage, ToolResult, ReasoningSegment, dict]] = []
     if system:
         messages.append(ChatMessage(role=ChatRole.SYSTEM, content=system))
     if history:
         messages.extend(history)
+
     if enhanced_prompt_content is not None:  # Add the current prompt as a user message
         messages.append(
             ChatMessage(role=ChatRole.USER, content=enhanced_prompt_content)
@@ -925,7 +987,7 @@ async def _call_llm(
         native_tool_parser = NativeToolParser(tool_types)
 
         tool_calls = _parse_list_of_complete_tools(
-            result["tool_calls"], native_tool_parser, tool_types
+            result[1]["tool_calls"], native_tool_parser, tool_types
         )
 
         if tool_calls:
@@ -951,7 +1013,7 @@ async def _call_llm(
                 if parsed_result.success:
                     return parsed_result.value, content, reasoning
                 else:
-                    # Parsing failed, return None for parsed value
+                    # Parsing failed, return the content as-is
                     return None, content, reasoning
             else:
                 # No output_type specified, return content as-is
@@ -964,8 +1026,8 @@ async def _call_llm(
                 if parsed_result.success:
                     return parsed_result.value, result, None
                 else:
-                    # Parsing failed, return None for parsed value
-                    return None, result, None
+                    # Parsing failed, return the content as-is
+                    return result, result, None
             else:
                 # No output_type specified, return result as-is
                 return result, result, None

@@ -11,10 +11,14 @@ async def test_reasoning_stream():
     if not os.getenv("OPENROUTER_API_KEY"):
         pytest.skip("OPENROUTER_API_KEY not set")
 
-    @agentic_generator(model="openrouter:openai/o3-mini@reasoning=high")
+    runtime_instance = None
+
+    @agentic_generator(model="openrouter:openai/gpt-5-mini@reasoning=high")
     async def reasoning_stream_agent(query: str, runtime: Runtime):
+        nonlocal runtime_instance
+        runtime_instance = runtime
         # Use modern streaming API without forcing output_type
-        async for chunk in runtime.run_stream(prompt=query):
+        async for chunk in runtime.run_stream(prompt=query, max_tokens=5000):
             yield chunk
 
     print("Testing streaming with reasoning...")
@@ -43,10 +47,16 @@ async def test_reasoning_stream():
     print(f"Content chunks: {len(content_chunks)}")
     print(f"Reasoning chunks: {len(reasoning_chunks)}")
     print(f"Full content: {''.join(str(c) for c in content_chunks)}")
+    if runtime_instance:
+        print(f"Reasoning: {runtime_instance.reasoning}")
     print("-" * 80)
 
     # Modern test - ensure we get some output
     assert len(chunks) > 0
+    if runtime_instance:
+        assert len(runtime_instance.reasoning) > 0
+    else:
+        assert len(reasoning_chunks) > 0
 
 
 @pytest.mark.asyncio
@@ -55,10 +65,14 @@ async def test_anthropic_reasoning_stream():
     if not os.getenv("OPENROUTER_API_KEY"):
         pytest.skip("OPENROUTER_API_KEY not set")
 
-    @agentic_generator(model="openrouter:anthropic/claude-3-5-sonnet@reasoning=2000")
+    runtime_instance = None
+
+    @agentic_generator(model="openrouter:anthropic/claude-sonnet-4@reasoning=2000")
     async def anthropic_stream_agent(query: str, runtime: Runtime):
+        nonlocal runtime_instance
+        runtime_instance = runtime
         # Use modern streaming API
-        async for chunk in runtime.run_stream(prompt=query):
+        async for chunk in runtime.run_stream(prompt=query, max_tokens=5000):
             yield chunk
 
     print("\nTesting Anthropic streaming with max_tokens reasoning...")
@@ -86,7 +100,8 @@ async def test_anthropic_reasoning_stream():
     print(f"Content chunks: {len(content_chunks)}")
     print(f"Reasoning chunks: {len(reasoning_chunks)}")
     print(f"Full content: {''.join(str(c) for c in content_chunks)}")
-    print(f"Reasoning: Available in runtime.reasoning after streaming")
+    print(f"Reasoning: {runtime_instance.reasoning}")
 
     # Modern test - ensure we get some output
     assert len(chunks) > 0
+    assert len(runtime_instance.reasoning) > 0

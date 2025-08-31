@@ -3,13 +3,14 @@
 from typing import Dict, Any, Callable, List
 
 from .base import SchemaGenerator
+from reson.services.inference_clients import InferenceProvider
 
 
 class OpenAISchemaGenerator(SchemaGenerator):
     """Generate OpenAI-format tool schemas."""
 
     def get_provider_name(self) -> str:
-        return "openai"
+        return InferenceProvider.OPENAI.value
 
     def generate_tool_schemas(self, tools: Dict[str, Callable]) -> List[Dict[str, Any]]:
         """Generate OpenAI tools format: [{"type": "function", "function": {...}}]"""

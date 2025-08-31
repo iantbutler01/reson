@@ -5,17 +5,19 @@ from .openai import OpenAISchemaGenerator
 from .anthropic import AnthropicSchemaGenerator
 from .google import GoogleSchemaGenerator
 from .openrouter import OpenRouterSchemaGenerator
+from reson.services.inference_clients import InferenceProvider
 
 # Provider mapping
 SCHEMA_GENERATORS = {
-    "openai": OpenAISchemaGenerator,
-    "anthropic": AnthropicSchemaGenerator,
-    "google-gemini": GoogleSchemaGenerator,
-    "vertex-gemini": GoogleSchemaGenerator,
-    "google-anthropic": AnthropicSchemaGenerator,  # Anthropic models on Google Vertex
-    "openrouter": OpenRouterSchemaGenerator,
-    "bedrock": AnthropicSchemaGenerator,  # Uses Anthropic format
-    "custom-openai": OpenAISchemaGenerator,
+    InferenceProvider.OPENAI.value: OpenAISchemaGenerator,
+    InferenceProvider.ANTHROPIC.value: AnthropicSchemaGenerator,
+    InferenceProvider.GOOGLE_GENAI.value: GoogleSchemaGenerator,
+    InferenceProvider.GOOGLE_GEMINI.value: GoogleSchemaGenerator,
+    InferenceProvider.VERTEX_GEMINI.value: GoogleSchemaGenerator,
+    InferenceProvider.GOOGLE_ANTHROPIC.value: AnthropicSchemaGenerator,  # Anthropic models on Google Vertex
+    InferenceProvider.OPENROUTER.value: OpenRouterSchemaGenerator,
+    InferenceProvider.BEDROCK.value: AnthropicSchemaGenerator,  # Uses Anthropic format
+    InferenceProvider.CUSTOM_OPENAI.value: OpenAISchemaGenerator,
 }
 
 

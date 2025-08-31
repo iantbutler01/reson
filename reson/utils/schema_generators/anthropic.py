@@ -3,13 +3,14 @@
 from typing import Dict, Any, Callable, List
 
 from .base import SchemaGenerator
+from reson.services.inference_clients import InferenceProvider
 
 
 class AnthropicSchemaGenerator(SchemaGenerator):
     """Generate Anthropic-format tool schemas."""
 
     def get_provider_name(self) -> str:
-        return "anthropic"
+        return InferenceProvider.ANTHROPIC.value
 
     def generate_tool_schemas(self, tools: Dict[str, Callable]) -> List[Dict[str, Any]]:
         """Generate Anthropic tools format: [{"name": "...", "description": "...", "input_schema": {...}}]"""

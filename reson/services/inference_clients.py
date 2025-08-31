@@ -100,13 +100,16 @@ class ToolResult(ResonBase):
         default=None
     )  # Original tool call object (dict or marshalled Deserializable)
 
-    def to_provider_format(self, provider: str) -> Dict[str, Any]:
+    def to_provider_format(self, provider: "InferenceProvider") -> Dict[str, Any]:
         """Convert to provider-specific format for API calls."""
-        if provider in ["openai", "openrouter", "custom-openai"]:
+        if provider in [InferenceProvider.OPENAI, InferenceProvider.OPENROUTER]:
             return self._format_openai_content()
-        elif provider in ["anthropic", "bedrock"]:
+        elif provider in [InferenceProvider.ANTHROPIC, InferenceProvider.BEDROCK]:
             return self._format_anthropic_content()
-        elif provider and provider.startswith("google"):
+        elif provider in [
+            InferenceProvider.GOOGLE_GENAI,
+            InferenceProvider.GOOGLE_ANTHROPIC,
+        ]:
             return self._format_google_content()
         else:
             # Fallback format
@@ -199,7 +202,7 @@ class ToolResult(ResonBase):
 
     def _format_google_content(self) -> Dict[str, Any]:
         """Format content for Google API calls."""
-        result = {
+        result: dict = {
             "functionResponse": {
                 "name": (
                     getattr(self.tool_obj, "_tool_name", "") if self.tool_obj else ""
@@ -213,6 +216,75 @@ class ToolResult(ResonBase):
             result["_google_thought_signature_required"] = True
             result["_original_response_required"] = True
 
+        return result
+
+
+class ReasoningSegment(ResonBase):
+    """Encapsulates reasoning content with signatures for conversation history."""
+
+    content: str = Field(description="The reasoning content/text")
+    signature: Optional[str] = Field(
+        default=None, description="Provider signature for reasoning preservation"
+    )
+    provider_metadata: Dict[str, Any] = Field(
+        default_factory=dict, description="Provider-specific metadata"
+    )
+    segment_index: int = Field(
+        default=0, description="Index of this segment in the reasoning sequence"
+    )
+
+    def to_provider_format(self, provider: "InferenceProvider") -> Dict[str, Any]:
+        """Convert to provider-specific format for API calls."""
+        if provider in [InferenceProvider.OPENAI, InferenceProvider.OPENROUTER]:
+            return self._format_openai_content()
+        elif provider in [
+            InferenceProvider.ANTHROPIC,
+            InferenceProvider.BEDROCK,
+            InferenceProvider.GOOGLE_ANTHROPIC,
+        ]:
+            return self._format_anthropic_content()
+        elif provider in [
+            InferenceProvider.GOOGLE_GENAI,
+        ]:
+            return self._format_google_content()
+        else:
+            # Fallback format
+            return {"content": self.content}
+
+    def _format_openai_content(self) -> Dict[str, Any]:
+        """Format content for OpenAI/OpenRouter API calls."""
+        result = {
+            "type": "reasoning",
+            "content": self.content,
+        }
+        if self.signature:
+            result["signature"] = self.signature
+        if self.provider_metadata:
+            result.update(self.provider_metadata)
+        return result
+
+    def _format_anthropic_content(self) -> Dict[str, Any]:
+        """Format content for Anthropic API calls."""
+        result = {
+            "type": "thinking",
+            "thinking": self.content,
+        }
+        if self.signature:
+            result["signature"] = self.signature
+        if self.provider_metadata:
+            result.update(self.provider_metadata)
+        return result
+
+    def _format_google_content(self) -> Dict[str, Any]:
+        """Format content for Google API calls."""
+        result = {
+            "thought": True,
+            "text": self.content,
+        }
+        if self.signature:
+            result["thought_signature"] = self.signature
+        if self.provider_metadata:
+            result.update(self.provider_metadata)
         return result
 
 
@@ -237,6 +309,19 @@ class InferenceCost(ResonBase):
     dollar_adjust: float = 0.0
 
 
+class InferenceProvider(Enum):
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+    BEDROCK = "bedrock"
+    GOOGLE_GENAI = "google-genai"
+    GOOGLE_GEMINI = "google-gemini"
+    VERTEX_GEMINI = "vertex-gemini"
+    OPENROUTER = "openrouter"
+    ART = "art"
+    GOOGLE_ANTHROPIC = "google-anthropic"
+    CUSTOM_OPENAI = "custom-openai"
+
+
 class InferenceClient(ABC):
     model: str
     _trace_id: int = 0
@@ -248,6 +333,7 @@ class InferenceClient(ABC):
     ] = None
     _cost: InferenceCost
     _last_cost: InferenceCost
+    provider: InferenceProvider
 
     def __init__(self):
         self._cost = InferenceCost()
@@ -275,7 +361,7 @@ class InferenceClient(ABC):
     @abstractmethod
     def connect_and_listen(
         self,
-        messages: List[Union[ChatMessage, "ToolResult"]],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
@@ -286,28 +372,39 @@ class InferenceClient(ABC):
     @abstractmethod
     async def get_generation(
         self,
-        messages: List[Union[ChatMessage, "ToolResult"]],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
-    ):
+    ) -> Any:
         pass
 
     def _convert_messages_to_provider_format(
-        self, messages: List[Union[ChatMessage, "ToolResult"]], provider: str
+        self,
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
+        provider: InferenceProvider,
     ) -> List[Dict[str, Any]]:
-        """Convert mixed ChatMessage/ToolResult list to provider-specific format."""
+        """Convert mixed ChatMessage/ToolResult/ReasoningSegment list to provider-specific format."""
         converted_messages = []
 
         for msg in messages:
             if isinstance(msg, ChatMessage):
-                # Handle ChatMessage
-                converted_messages.append(
-                    {"role": msg.role.value, "content": msg.content}
-                )
+                message_dict: dict = {"role": msg.role.value, "content": msg.content}
+                if (
+                    provider
+                    in [
+                        InferenceProvider.ANTHROPIC,
+                        InferenceProvider.GOOGLE_ANTHROPIC,
+                    ]
+                    and msg.cache_marker
+                ):
+                    message_dict["cache_control"] = {"type": "ephemeral"}
+                converted_messages.append(message_dict)
+            elif isinstance(msg, ReasoningSegment):
+                reasoning_content = msg.to_provider_format(provider)
+                converted_messages.append(reasoning_content)
             else:  # ToolResult
-                # Convert ToolResult to provider format
                 provider_content = msg.to_provider_format(provider)
                 converted_messages.append(
                     {
@@ -330,29 +427,34 @@ class BedrockInferenceClient(InferenceClient):
         self.region_name = region_name
         self.session = aioboto3.Session()
         self.anthropic_version = "bedrock-2023-05-31"
+        self.provider = InferenceProvider.BEDROCK
 
     @tracer.start_as_current_span(name="BedrockInferenceClient.get_generation")
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
         self,
-        messages: List[Union[ChatMessage, "ToolResult"]],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
-        # Convert messages to ChatMessage format
-        processed_messages = []
-        for msg in messages:
-            if hasattr(msg, "to_chat_message"):  # ToolResult
-                processed_messages.append(msg.to_chat_message())
-            else:  # ChatMessage
-                processed_messages.append(msg)
-
         system = ""
-        if processed_messages[0].role == ChatRole.SYSTEM:
-            system = processed_messages[0].content
-            processed_messages = processed_messages[1:]
+        if (
+            messages
+            and isinstance(messages[0], ChatMessage)
+            and messages[0].role == ChatRole.SYSTEM
+        ):
+            system = messages[0].content
+            messages = messages[1:]
+
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
+
+        for msg in formatted_messages:
+            if "content" in msg and isinstance(msg["content"], str):
+                msg["content"] = [{"type": "text", "text": msg["content"]}]
 
         request = AnthropicRequest(
             anthropic_version=self.anthropic_version,
@@ -360,16 +462,10 @@ class BedrockInferenceClient(InferenceClient):
             top_p=top_p,
             temperature=temperature,
             max_tokens=max_tokens,
-            messages=[
-                {
-                    "role": msg.role.value,
-                    "content": [{"type": "text", "text": msg.content}],
-                }
-                for msg in processed_messages
-            ],
+            messages=formatted_messages,
         )
 
-        async with self.session.client(
+        async with self.session.client(  # type: ignore
             service_name="bedrock-runtime",
             region_name=self.region_name,
         ) as client:
@@ -397,16 +493,28 @@ class BedrockInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="BedrockInferenceClient.connect_and_listen")
     async def connect_and_listen(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system = ""
-        if messages[0].role == ChatRole.SYSTEM:
+        if (
+            messages
+            and isinstance(messages[0], ChatMessage)
+            and messages[0].role == ChatRole.SYSTEM
+        ):
             system = messages[0].content
             messages = messages[1:]
+
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
+
+        for msg in formatted_messages:
+            if "content" in msg and isinstance(msg["content"], str):
+                msg["content"] = [{"type": "text", "text": msg["content"]}]
 
         request = AnthropicRequest(
             anthropic_version=self.anthropic_version,
@@ -414,16 +522,10 @@ class BedrockInferenceClient(InferenceClient):
             top_p=top_p,
             temperature=temperature,
             max_tokens=max_tokens,
-            messages=[
-                {
-                    "role": msg.role.value,
-                    "content": [{"type": "text", "text": msg.content}],
-                }
-                for msg in messages
-            ],
+            messages=formatted_messages,
         )
 
-        async with self.session.client(
+        async with self.session.client(  # type: ignore
             service_name="bedrock-runtime",
             region_name=self.region_name,
         ) as client:
@@ -529,6 +631,7 @@ class AnthropicInferenceClient(InferenceClient):
         self.api_url = api_url
         self.api_key = api_key
         self.thinking = thinking
+        self.provider = InferenceProvider.ANTHROPIC
 
     async def _post(self, request: dict):
         async with httpx.AsyncClient() as client:
@@ -560,36 +663,34 @@ class AnthropicInferenceClient(InferenceClient):
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system = None
-        if messages[0].role == ChatRole.SYSTEM:
-            system = {
-                "system": [
-                    {"type": "text", "text": messages[0].content}
-                    | (
-                        {"cache_control": {"type": "ephemeral"}}
-                        if messages[0].cache_marker
-                        else {}
-                    )
-                ]
-            }
+        if (
+            messages
+            and isinstance(messages[0], ChatMessage)
+            and messages[0].role == ChatRole.SYSTEM
+        ):
+            system_dict: dict = {"type": "text", "text": messages[0].content}
+            if messages[0].cache_marker:
+                system_dict["cache_control"] = {"type": "ephemeral"}
+            system = {"system": [system_dict]}
             messages = messages[1:]
+
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
 
         request = {
             "model": self.model,
             "top_p": top_p,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "messages": [
-                {"role": msg.role.value, "content": msg.content}
-                | ({"cache_control": {"type": "ephemeral"}} if msg.cache_marker else {})
-                for msg in messages
-            ],
+            "messages": formatted_messages,
             "stream": False,
         }
 
@@ -642,46 +743,41 @@ class AnthropicInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="AnthropicInferenceClient.connect_and_listen")
     async def connect_and_listen(
         self,
-        messages: List[ChatMessage],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=1024,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
-
         system = None
-        if messages[0].role == ChatRole.SYSTEM:
-            system = {
-                "system": [
-                    {"type": "text", "text": messages[0].content}
-                    | (
-                        {"cache_control": {"type": "ephemeral"}}
-                        if messages[0].cache_marker
-                        else {}
-                    )
-                ]
-            }
+        if (
+            messages
+            and isinstance(messages[0], ChatMessage)
+            and messages[0].role == ChatRole.SYSTEM
+        ):
+            system_dict: dict = {"type": "text", "text": messages[0].content}
+            if messages[0].cache_marker:
+                system_dict["cache_control"] = {"type": "ephemeral"}
+            system = {"system": [system_dict]}
             messages = messages[1:]
+
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
+
+        for msg in formatted_messages:
+            if "content" in msg and isinstance(msg["content"], str):
+                content_block = {"type": "text", "text": msg["content"]}
+                if "cache_control" in msg:
+                    content_block["cache_control"] = msg.pop("cache_control")
+                msg["content"] = [content_block]
 
         request = {
             "model": self.model,
             "top_p": top_p,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "messages": [
-                {
-                    "role": msg.role.value,
-                    "content": [
-                        {"type": "text", "text": msg.content}
-                        | (
-                            {"cache_control": {"type": "ephemeral"}}
-                            if msg.cache_marker
-                            else {}
-                        )
-                    ],
-                }
-                for msg in messages
-            ],
+            "messages": formatted_messages,
             "stream": True,
         }
 
@@ -744,6 +840,9 @@ class AnthropicInferenceClient(InferenceClient):
                                         },
                                     }
                                     yield ("tool_call_partial", openai_format)
+                            elif content_type == "signature_delta":
+                                signature = chunk_json["delta"]["signature"]
+                                yield ("signature", signature)
 
                         elif chunk_type == "content_block_start":
                             # Initialize tool tracking
@@ -843,46 +942,37 @@ class GoogleGenAIInferenceClient(InferenceClient):
             self.client = genai.Client(**kwargs)
         self.model = model
         self.reasoning = reasoning
+        self.provider = InferenceProvider.GOOGLE_GENAI
 
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.get_generation")
     @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
     async def get_generation(
         self,
-        messages: List[Union[ChatMessage, "ToolResult"]],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system_instruction = None
-
         if (
-            len(messages) > 0
-            and hasattr(messages[0], "role")
-            and messages[0].role.value == "system"
+            messages
+            and isinstance(messages[0], ChatMessage)
+            and messages[0].role == ChatRole.SYSTEM
         ):
             system_instruction = messages[0].content
             messages = messages[1:]
 
-        # Convert messages to Google's format - handle both ChatMessage and ToolResult
-        processed_messages = []
-        for msg in messages:
-            try:
-                # ChatMessage
-                processed_messages.append(
-                    types.Content(
-                        role=msg.role.value, parts=[types.Part(text=msg.content)]
-                    )
-                )
-            except AttributeError:
-                # ToolResult - convert to Google format
-                google_content = msg.to_provider_format("google")
-                processed_messages.append(
-                    types.Content(
-                        role="user", parts=[types.Part(text=json.dumps(google_content))]
-                    )
-                )
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
 
+        processed_messages = []
+        for msg in formatted_messages:
+            role = "model" if msg.get("role") == "assistant" else "user"
+            processed_messages.append(
+                types.Content(role=role, parts=[types.Part(text=msg["content"])])
+            )
         # Prepare config with optional tools
         config_kwargs = {
             "temperature": temperature,
@@ -934,43 +1024,23 @@ class GoogleGenAIInferenceClient(InferenceClient):
         if not response.candidates:
             return ""
 
-        if not response.candidates[0].content.parts:
+        if not response.candidates[0].content.parts:  # type: ignore
             # Sometimes seeing this where we only get a bunch of citation_metadata back and no actual content
             return ""
 
         reasoning = "\n".join(
-            p.text for p in response.candidates[0].content.parts if p.text and p.thought
+            p.text for p in response.candidates[0].content.parts if p.text and p.thought  # type: ignore
         )
         out_text = "\n".join(
             p.text
-            for p in response.candidates[0].content.parts
+            for p in response.candidates[0].content.parts  # type: ignore
             if p.text and not p.thought
         )
 
         # Convert messages for tracing (handle both ChatMessage and ToolResult)
-        trace_messages = []
-        for msg in messages:
-            try:
-                # ChatMessage
-                trace_messages.append(
-                    {
-                        "role": msg.role.value,
-                        "content": [{"type": "text", "text": msg.content}],
-                    }
-                )
-            except AttributeError:
-                # ToolResult - convert to simple format for tracing
-                trace_messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"[ToolResult: {msg.content[:100]}...]",
-                            }
-                        ],
-                    }
-                )
+        trace_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
 
         await self._trace(trace_messages, [{"text": out_text}])
 
@@ -983,40 +1053,31 @@ class GoogleGenAIInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="GoogleGenAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
         self,
-        messages: List[Union[ChatMessage, "ToolResult"]],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=4096,
         top_p=0.9,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
         system_instruction = None
-
         if (
-            len(messages) > 0
-            and hasattr(messages[0], "role")
-            and messages[0].role.value == "system"
+            messages
+            and isinstance(messages[0], ChatMessage)
+            and messages[0].role == ChatRole.SYSTEM
         ):
             system_instruction = messages[0].content
             messages = messages[1:]
 
-        # Convert messages to Google's format - handle both ChatMessage and ToolResult
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
+
         processed_messages = []
-        for msg in messages:
-            try:
-                # ChatMessage
-                processed_messages.append(
-                    types.Content(
-                        role=msg.role.value, parts=[types.Part(text=msg.content)]
-                    )
-                )
-            except AttributeError:
-                # ToolResult - convert to Google format
-                google_content = msg.to_provider_format("google")
-                processed_messages.append(
-                    types.Content(
-                        role="user", parts=[types.Part(text=json.dumps(google_content))]
-                    )
-                )
+        for msg in formatted_messages:
+            role = "model" if msg.get("role") == "assistant" else "user"
+            processed_messages.append(
+                types.Content(role=role, parts=[types.Part(text=msg["content"])])
+            )
 
         # Prepare config with optional tools
         config_kwargs = {
@@ -1088,7 +1149,7 @@ class GoogleGenAIInferenceClient(InferenceClient):
                         "id": f"google_{func_call.name}_{hash(str(func_call.args))}",  # Generate ID since Google doesn't provide one
                         "function": {
                             "name": func_call.name,
-                            "arguments": json.dumps(dict(func_call.args)),
+                            "arguments": json.dumps(func_call.args),
                         },
                     }
                     yield ("tool_call_complete", openai_format)
@@ -1111,32 +1172,16 @@ class GoogleGenAIInferenceClient(InferenceClient):
                     yield ("reasoning", reasoning)
                 elif out_text:  # Only yield content if there's actual text
                     yield ("content", out_text)
+
+                # Handle thought signatures
+                for part in chunk.candidates[0].content.parts:
+                    if hasattr(part, "thought_signature") and part.thought_signature:
+                        yield ("signature", part.thought_signature)
+
                 out += reasoning + out_text
 
         # Convert messages for tracing (handle both ChatMessage and ToolResult)
         trace_messages = []
-        for msg in messages:
-            try:
-                # ChatMessage
-                trace_messages.append(
-                    {
-                        "role": msg.role.value,
-                        "content": [{"type": "text", "text": msg.content}],
-                    }
-                )
-            except AttributeError:
-                # ToolResult - convert to simple format for tracing
-                trace_messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"[ToolResult: {msg.content[:100]}...]",
-                            }
-                        ],
-                    }
-                )
 
         await self._trace(trace_messages, [{"text": out}])
 
@@ -1159,7 +1204,7 @@ class OAIInferenceClient(InferenceClient):
         model: str,
         api_key: str,
         api_url: str = "https://api.openai.com/v1/chat/completions",
-        reasoning: str = None,
+        reasoning: Optional[str] = None,
     ):
         super().__init__()
         self.model = model
@@ -1168,7 +1213,7 @@ class OAIInferenceClient(InferenceClient):
         self.reasoning = reasoning
         self.ranking_referer = None
         self.ranking_title = None
-        self.provider = "openai"
+        self.provider = InferenceProvider.OPENAI
 
     @tracer.start_as_current_span(name="OAIInferenceClient.get_generation")
     @backoff.on_exception(
@@ -1176,27 +1221,16 @@ class OAIInferenceClient(InferenceClient):
     )
     async def get_generation(
         self,
-        messages: List[Union[ChatMessage, "ToolResult"]],
+        messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         max_tokens=4096,
         top_p=1.0,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
-        # Convert ToolResult objects to ChatMessage format
-        formatted_messages = []
-
-        for message in messages:
-            try:
-                msg = {
-                    "role": message.role.value,
-                    "content": message.content,
-                }
-
-                formatted_messages.append(msg)
-            except AttributeError as e:
-                msg = message.to_provider_format(self.provider)
-
-                formatted_messages.append(msg)
+        # Use the generic conversion method
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
 
         request = OAIRequest(
             model=self.model,
@@ -1300,26 +1334,16 @@ class OAIInferenceClient(InferenceClient):
     @tracer.start_as_current_span(name="OAIInferenceClient.connect_and_listen")
     async def connect_and_listen(
         self,
-        messages: List[ChatMessage | ToolResult],
+        messages: List[ChatMessage | ToolResult | ReasoningSegment],
         max_tokens=4096,
         top_p=1.0,
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
-        formatted_messages = []
-
-        for message in messages:
-            try:
-                msg = {
-                    "role": message.role.value,
-                    "content": message.content,
-                }
-
-                formatted_messages.append(msg)
-            except AttributeError as e:
-                msg = message.to_provider_format(self.provider)
-
-                formatted_messages.append(msg)
+        # Use the generic conversion method
+        formatted_messages = self._convert_messages_to_provider_format(
+            messages, self.provider
+        )
 
         request = OAIRequest(
             model=self.model,
@@ -1401,6 +1425,8 @@ class OAIInferenceClient(InferenceClient):
                             if delta.get("reasoning"):
                                 reasoning_out += delta["reasoning"]
                                 yield ("reasoning", delta["reasoning"])
+                            if "signature" in delta:
+                                yield ("signature", delta["signature"])
                             # Check for content
                             if delta.get("content"):
                                 out += delta["content"]
@@ -1471,7 +1497,7 @@ class OpenRouterInferenceClient(OAIInferenceClient):
         self,
         model: str,
         api_key: str,
-        reasoning: str = None,
+        reasoning: Optional[str] = None,
         ranking_referer: Optional[str] = None,
         ranking_title: Optional[str] = None,
     ):
@@ -1483,7 +1509,7 @@ class OpenRouterInferenceClient(OAIInferenceClient):
         )
         self.ranking_referer = ranking_referer
         self.ranking_title = ranking_title
-        self.provider = "openrouter"
+        self.provider = InferenceProvider.OPENROUTER
 
     async def _populate_cost(self, id: str):
         await asyncio.sleep(0.5)
@@ -1533,10 +1559,10 @@ if os.environ.get("ART_ENABLED"):
                 base_model=model,
             )
             self.backend = backend
-
             self.reasoning = reasoning
             self.openai_client: Any = None
             self._initialize_lock = asyncio.Lock()
+            self.provider = InferenceProvider.ART
 
         async def _initialize(self):
             async with self._initialize_lock:
@@ -1550,22 +1576,23 @@ if os.environ.get("ART_ENABLED"):
         @backoff.on_exception(backoff.expo, InferenceException, max_time=60)
         async def get_generation(
             self,
-            messages: List[ChatMessage],
+            messages: List[ChatMessage | ToolResult | ReasoningSegment],
             max_tokens=4096,
             top_p=1.0,
             temperature=0.5,
+            tools=None,
         ):
             if not self.openai_client:
                 await self._initialize()
 
             processed_messages = [
-                {"role": m.role.value, "content": m.content} for m in messages
+                {"role": m.role.value, "content": m.content} for m in messages  # type: ignore
             ]
 
             request = OAIRequest(
                 model=self.model,
                 messages=processed_messages,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
                 top_p=top_p,
                 temperature=temperature,
                 stream=False,
@@ -1601,22 +1628,23 @@ if os.environ.get("ART_ENABLED"):
         @tracer.start_as_current_span(name="ARTInferenceClient.connect_and_listen")
         async def connect_and_listen(
             self,
-            messages: List[ChatMessage],
+            messages: List[ChatMessage | ToolResult | ReasoningSegment],
             max_tokens=4096,
             top_p=1.0,
             temperature=0.5,
+            tools=None,
         ):
             if not self.openai_client:
                 await self._initialize()
 
             processed_messages = [
-                {"role": msg.role.value, "content": msg.content} for msg in messages
+                {"role": msg.role.value, "content": msg.content} for msg in messages  # type: ignore
             ]
 
             request = OAIRequest(
                 model=self.model,
                 messages=processed_messages,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
                 top_p=top_p,
                 temperature=temperature,
                 stream=True,
@@ -1665,6 +1693,7 @@ class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
         self.model = model
         self.region = region
         self.thinking = thinking
+        self.provider = InferenceProvider.GOOGLE_ANTHROPIC
         self._get_token()
 
     def _get_token(self):
@@ -1677,10 +1706,10 @@ class GoogleAnthropicInferenceClient(AnthropicInferenceClient):
             )
 
         if not self.creds.token or self.creds.expired:
-            request = google.auth.transport.requests.Request()
-            self.creds.refresh(request)
+            request = google.auth.transport.requests.Request()  # type: ignore
+            self.creds.refresh(request)  # type: ignore
 
-        return self.creds.token
+        return self.creds.token  # type: ignore
 
     async def _post(self, request: dict):
         request.pop("model", None)

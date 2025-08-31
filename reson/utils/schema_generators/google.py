@@ -8,13 +8,14 @@ except ImportError:
     types = None
 
 from .base import SchemaGenerator
+from reson.services.inference_clients import InferenceProvider
 
 
 class GoogleSchemaGenerator(SchemaGenerator):
     """Generate Google Vertex AI function declaration format."""
 
     def get_provider_name(self) -> str:
-        return "google"
+        return InferenceProvider.GOOGLE_GENAI.value
 
     def generate_tool_schemas(self, tools: Dict[str, Callable]) -> List[Dict[str, Any]]:
         """Generate Google format: [{"function_declarations": [...]}]"""
