@@ -351,7 +351,7 @@ class Runtime(ResonBase):
         *,
         prompt: Optional[str] = None,
         system: Optional[str] = None,
-        history: Optional[List[ChatMessage]] = None,
+        history: Optional[List[ChatMessage | ToolResult | ReasoningSegment]] = None,
         output_type: Optional[Type[R] | UnionType] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -412,7 +412,7 @@ class Runtime(ResonBase):
         *,
         prompt: str | None = None,
         system: Optional[str] = None,
-        history: Optional[List[ChatMessage]] = None,
+        history: Optional[List[ChatMessage | ToolResult | ReasoningSegment]] = None,
         output_type: Optional[Type[R] | UnionType] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -900,7 +900,7 @@ async def _call_llm(
     store: Optional[Store] = None,
     api_key: Optional[str] = None,
     system: Optional[str] = None,
-    history: Optional[List[ChatMessage]] = None,
+    history: Optional[List[ChatMessage | ReasoningSegment | ToolResult]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     max_tokens: Optional[int] = None,
@@ -1041,7 +1041,7 @@ async def _call_llm_stream(
     store: Optional[Store] = None,
     api_key: Optional[str] = None,
     system: Optional[str] = None,
-    history: Optional[List[ChatMessage]] = None,
+    history: Optional[List[ChatMessage | ToolResult | ReasoningSegment]] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     max_tokens: Optional[int] = None,
@@ -1101,7 +1101,7 @@ async def _call_llm_stream(
         stream_parser = parser.create_stream_parser(effective_output_type)
 
     # Construct messages list
-    messages: List[ChatMessage] = []
+    messages: List[ChatMessage | ToolResult | ReasoningSegment] = []
     if system:
         messages.append(ChatMessage(role=ChatRole.SYSTEM, content=system))
     if history:
