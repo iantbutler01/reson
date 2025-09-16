@@ -327,6 +327,32 @@ class Runtime(ResonBase):
         if tool_type is not None:
             self._tool_types[tool_name] = tool_type
 
+        # If a Deserializable tool_type is provided and it has a class docstring,
+        # wrap the function and set the wrapper's docstring so schema generators pick it up
+        # without mutating the original function (safe for multiple registrations)
+        if tool_type is not None and getattr(tool_type, "__doc__", None):
+            try:
+                if inspect.iscoroutinefunction(fn):
+
+                    async def wrapper_async(*args, **kwargs):
+                        return await fn(*args, **kwargs)
+
+                    base_wrapper = wrapper_async
+                else:
+
+                    def wrapper_sync(*args, **kwargs):
+                        return fn(*args, **kwargs)
+
+                    base_wrapper = wrapper_sync
+
+                wrapped = functools.wraps(fn)(base_wrapper)
+                wrapped.__doc__ = tool_type.__doc__
+                # Override the stored function with the wrapped version
+                self._tools[tool_name] = wrapped
+            except Exception:
+                # If wrapping fails, leave original function unchanged
+                pass
+
     def load_training_manager(self, path: Path | str):
         from reson.training import TrainingManager
 

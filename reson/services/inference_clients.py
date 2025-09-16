@@ -1355,6 +1355,8 @@ class OAIInferenceClient(InferenceClient):
             stream_options={"include_usage": True},
         ).model_dump()
 
+        print(tools)
+
         # Add tools if provided
         if tools:
             request["tools"] = tools
