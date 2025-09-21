@@ -8,7 +8,7 @@ from typing import List, Dict, Union
 from reson import agentic, Runtime
 from reson.types import Deserializable
 from reson.stores import MemoryStore
-from reson.services.inference_clients import ChatMessage, ChatRole
+from reson.services.inference_clients import ChatMessage, ChatRole, ToolResult
 
 
 class SearchQuery(Deserializable):
@@ -144,7 +144,7 @@ async def test_xml_regression_multi_turn():
             print(f"🔧 XML Tool result {iterations}: {tool_result}")
 
             # Create tool result message
-            tool_msg = runtime.create_tool_result_message(result, str(tool_result))
+            tool_msg = ToolResult.create((result, str(tool_result)))
             history.append(tool_msg)
 
             # Continue conversation
@@ -196,7 +196,7 @@ async def test_native_5_turn_conversation():
             print(f"🔧 Native tool result {turn_count}: {tool_result}")
 
             # Create tool result message
-            tool_msg = runtime.create_tool_result_message(result, str(tool_result))
+            tool_msg = ToolResult.create((result, str(tool_result)))
             history.append(tool_msg)
 
             # Continue conversation

@@ -13,6 +13,8 @@ from typing import (
     Union,
 )
 import inspect
+from types import UnionType
+import warnings
 
 
 class SchemaGenerator(ABC):
@@ -30,6 +32,29 @@ class SchemaGenerator(ABC):
 
     def _extract_function_info(self, func: Callable) -> Dict[str, Any]:
         """Extract function signature, parameters, and docstring info."""
+        # Prefer an attached tool_type (if any) as the source of truth for schema/description
+        tool_type = getattr(func, "__reson_tool_type__", None)
+        if tool_type is not None:
+            object_schema = self._python_type_to_schema(tool_type)
+            if (
+                not isinstance(object_schema, dict)
+                or object_schema.get("type") != "object"
+            ):
+                raise ValueError(
+                    f"tool_type for {func.__name__} must resolve to an object schema"
+                )
+            description = (
+                getattr(tool_type, "__doc__", None)
+                or func.__doc__
+                or f"Execute {func.__name__}"
+            )
+            return {
+                "name": func.__name__,
+                "description": description,
+                "parameters": object_schema.get("properties", {}),
+                "required": object_schema.get("required", []),
+            }
+
         signature = inspect.signature(func)
         type_hints = get_type_hints(func)
 
@@ -75,14 +100,26 @@ class SchemaGenerator(ABC):
         origin = get_origin(python_type)
         args = get_args(python_type)
 
-        # Handle Union types (including Optional)
-        if origin is Union:
+        # Handle Union types (including Optional and PEP 604 unions)
+        if origin in (Union, UnionType):
             non_none_types = [arg for arg in args if arg is not type(None)]
             if len(non_none_types) == 1:
                 # Optional[T] case
                 return self._python_type_to_schema(non_none_types[0])
             else:
-                # Union[A, B, ...] case - use first type as primary
+                # Union[A, B, ...] case - providers generally don't support oneOf;
+                # collapse to the first non-None type but warn to aid debugging.
+                try:
+                    type_names = ", ".join(
+                        getattr(t, "__name__", str(t)) for t in non_none_types
+                    )
+                except Exception:
+                    type_names = str(non_none_types)
+                warnings.warn(
+                    f"[reson.schema] Collapsing Union[{type_names}] to first type "
+                    f"{getattr(non_none_types[0], '__name__', str(non_none_types[0]))} for schema generation",
+                    UserWarning,
+                )
                 return self._python_type_to_schema(non_none_types[0])
 
         # Handle List/Array types

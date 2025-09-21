@@ -53,6 +53,7 @@ import inspect, functools
 from typing import Callable, ParamSpec, TypeVar, Awaitable, Any, AsyncIterator, Union
 import re
 import json
+import warnings
 from reson.services.inference_clients import ChatMessage, ChatRole
 from gasp.jinja_helpers import create_type_environment  # Added import
 
@@ -351,6 +352,85 @@ class Runtime(ResonBase):
                 self._tools[tool_name] = wrapped
             except Exception:
                 # If wrapping fails, leave original function unchanged
+                pass
+
+        # Attach tool_type metadata and validate alignment (names/count/types)
+        if tool_type is not None:
+            # Attach metadata so schema generators can prefer the tool type
+            try:
+                setattr(self._tools[tool_name], "__reson_tool_type__", tool_type)
+            except Exception:
+                pass
+
+            # Registration-time validation – warn on mismatches (non-fatal)
+            try:
+                func = self._tools[tool_name]
+                sig = inspect.signature(func)
+                func_hints = get_type_hints(func)
+                # Collect function params excluding 'self'
+                func_params: dict[str, Any] = {
+                    pname: func_hints.get(pname, Any)
+                    for pname, p in sig.parameters.items()
+                    if pname != "self"
+                }
+
+                # Collect tool_type fields (prefer annotations; fallback to pydantic metadata)
+                try:
+                    type_hints = get_type_hints(tool_type)
+                except Exception:
+                    type_hints = {}
+                if not type_hints:
+                    if hasattr(tool_type, "model_fields"):  # Pydantic v2
+                        type_hints = {
+                            fname: finfo.annotation
+                            for fname, finfo in tool_type.model_fields.items()
+                        }
+                    elif hasattr(tool_type, "__fields__"):  # Pydantic v1
+                        type_hints = {
+                            fname: finfo.type_
+                            for fname, finfo in tool_type.__fields__.items()  # type: ignore[attr-defined]
+                        }
+                tool_fields: dict[str, Any] = {
+                    k: v for k, v in type_hints.items() if not str(k).startswith("_")
+                }
+
+                func_only = set(func_params) - set(tool_fields)
+                type_only = set(tool_fields) - set(func_params)
+                if func_only:
+                    warnings.warn(
+                        f"[reson.tools] Tool '{tool_name}': function has params not in tool_type: {sorted(func_only)}",
+                        UserWarning,
+                    )
+                if type_only:
+                    warnings.warn(
+                        f"[reson.tools] Tool '{tool_name}': tool_type has fields not in function signature: {sorted(type_only)}",
+                        UserWarning,
+                    )
+
+                # Normalize types for comparison: unwrap Optional/Union; accept Any on function side
+                import types as _types  # local alias to detect PEP 604 unions
+
+                def _normalize(t: Any) -> Any:
+                    origin = get_origin(t)
+                    # Support typing.Union and PEP 604 unions
+                    if origin in (Union, getattr(_types, "UnionType", Union)):
+                        args = [a for a in get_args(t) if a is not type(None)]
+                        t = args[0] if args else Any
+                        origin = get_origin(t)
+                    return t
+
+                for pname in set(func_params).intersection(tool_fields):
+                    f_t = _normalize(func_params[pname])
+                    tt_t = _normalize(tool_fields[pname])
+                    if f_t is Any:
+                        continue
+                    if f_t != tt_t:
+                        warnings.warn(
+                            f"[reson.tools] Tool '{tool_name}': type mismatch for param '{pname}' (function: {f_t}, tool_type: {tt_t})",
+                            UserWarning,
+                        )
+            except Exception:
+                # Best-effort validation; never block registration
                 pass
 
     def load_training_manager(self, path: Path | str):
@@ -947,20 +1027,24 @@ async def _call_llm(
     effective_output_type = output_type
     if not native_tools and tools and output_type:
         # Validate all callables have typed parameters
-        for name, func in tools.items():
+        if isinstance(tools, dict):
+            _iter_tools = tools.items()
+        else:
+            _iter_tools = []
+        for name, func in _iter_tools:
             _validate_callable_params(func, name)
 
         # Determine which type system to use based on output_type
         tool_models = []
         if _is_pydantic_type(output_type):
             tool_models = [
-                _create_pydantic_tool_model(func, name) for name, func in tools.items()
+                _create_pydantic_tool_model(func, name) for name, func in _iter_tools
             ]
 
         elif _is_deserializable_type(output_type):
             tool_models = [
                 _create_deserializable_tool_class(func, name)
-                for name, func in tools.items()
+                for name, func in _iter_tools
             ]
 
         if tool_models:
@@ -1092,19 +1176,23 @@ async def _call_llm_stream(
     # Only use XML tool approach if NOT using native tools
     if not native_tools and tools and output_type:
         # Validate all callables have typed parameters
-        for name, func in tools.items():
+        if isinstance(tools, dict):
+            _iter_tools = tools.items()
+        else:
+            _iter_tools = []
+        for name, func in _iter_tools:
             _validate_callable_params(func, name)
 
         # Determine which type system to use based on output_type
         tool_models = []
         if _is_pydantic_type(output_type):
             tool_models = [
-                _create_pydantic_tool_model(func, name) for name, func in tools.items()
+                _create_pydantic_tool_model(func, name) for name, func in _iter_tools
             ]
         elif _is_deserializable_type(output_type):
             tool_models = [
                 _create_deserializable_tool_class(func, name)
-                for name, func in tools.items()
+                for name, func in _iter_tools
             ]
 
         if tool_models:

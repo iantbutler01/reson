@@ -9,11 +9,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Callable
 
 from gasp import Deserializable
-from reson.services.inference_clients import ToolResult, ChatMessage, ReasoningSegment
+from reson.services.inference_clients import (
+    ToolResult,
+    ToolCall,
+    ChatMessage,
+    ReasoningSegment,
+)
 
 __all__ = [
     "Deserializable",
     "ToolResult",
+    "ToolCall",
     "ChatMessage",
     "ReasoningSegment",
 ]

@@ -167,7 +167,10 @@ class ToolResult(ResonBase):
         if hasattr(tool_call_obj, "_tool_use_id"):
             return tool_call_obj._tool_use_id
         elif isinstance(tool_call_obj, dict):
-            return tool_call_obj.get("id", "")
+            id = tool_call_obj.get("id", None)
+            if not id:
+                id = tool_call_obj.get("_tool_use_id", "")
+            return id
         else:
             return ""
 
@@ -217,6 +220,306 @@ class ToolResult(ResonBase):
             result["_original_response_required"] = True
 
         return result
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert ToolResult to dict format for serialization/storage."""
+        result = {
+            "tool_call_id": self.tool_use_id,  # Map to expected field name
+            "content": self.content,
+            "is_error": self.is_error,
+            "signature": self.signature,
+        }
+
+        # Handle tool_obj serialization
+        if self.tool_obj is not None:
+            if hasattr(self.tool_obj, "model_dump"):
+                # Pydantic object
+                result["tool_obj"] = self.tool_obj.model_dump(include_underscore=True)
+            elif hasattr(self.tool_obj, "__dict__"):
+                # Deserializable or other object with __dict__
+                result["tool_obj"] = dict(self.tool_obj.__dict__)
+            elif isinstance(self.tool_obj, dict):
+                # Already a dict
+                result["tool_obj"] = self.tool_obj
+            else:
+                # Fallback to string representation
+                result["tool_obj"] = str(self.tool_obj)
+        else:
+            result["tool_obj"] = None
+
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ToolResult":
+        """Create ToolResult from dict format (reverse of to_dict)."""
+        return cls(
+            tool_use_id=data.get("tool_call_id", data.get("tool_use_id", "")),
+            content=data.get("content", ""),
+            is_error=data.get("is_error", False),
+            signature=data.get("signature"),
+            tool_obj=data.get("tool_obj"),
+        )
+
+
+class ToolCall(ResonBase):
+    """Represents an assistant tool call for conversation history."""
+
+    tool_use_id: str = Field(description="Unique identifier for the tool call")
+    tool_name: str = Field(description="Name of the tool being called")
+    args: Optional[Dict[str, Any]] = Field(
+        default=None, description="Tool arguments as dict"
+    )
+    raw_arguments: Optional[str] = Field(
+        default=None, description="Tool arguments as JSON string"
+    )
+    signature: Optional[str] = Field(
+        default=None, description="Provider signature for preservation"
+    )
+    tool_obj: Optional[Any] = Field(
+        default=None, description="Original typed tool call object"
+    )
+
+    def to_provider_assistant_message(
+        self, provider: "InferenceProvider"
+    ) -> Dict[str, Any]:
+        """Convert to provider-specific assistant message format."""
+        # Import here to avoid circular import
+        from reson.services.inference_clients import InferenceProvider
+
+        if provider in [
+            InferenceProvider.ANTHROPIC,
+            InferenceProvider.BEDROCK,
+            InferenceProvider.GOOGLE_ANTHROPIC,
+        ]:
+            return self._format_anthropic_assistant_message()
+        elif provider in [
+            InferenceProvider.OPENAI,
+            InferenceProvider.OPENROUTER,
+            InferenceProvider.CUSTOM_OPENAI,
+        ]:
+            return self._format_openai_assistant_message()
+        elif provider in [InferenceProvider.GOOGLE_GENAI]:
+            return self._format_google_assistant_message()
+        else:
+            # Fallback to OpenAI format
+            return self._format_openai_assistant_message()
+
+    def _format_anthropic_assistant_message(self) -> Dict[str, Any]:
+        """Format as Anthropic assistant message with tool_use content block."""
+        return {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": self.tool_use_id,
+                    "name": self.tool_name,
+                    "input": self.args or {},
+                }
+            ],
+        }
+
+    def _format_openai_assistant_message(self) -> Dict[str, Any]:
+        """Format as OpenAI assistant message with tool_calls."""
+        return {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": self.tool_use_id,
+                    "type": "function",
+                    "function": {
+                        "name": self.tool_name,
+                        "arguments": self.raw_arguments or json.dumps(self.args or {}),
+                    },
+                }
+            ],
+        }
+
+    def _format_google_assistant_message(self) -> Dict[str, Any]:
+        """Format as Google GenAI assistant message with functionCall content."""
+        return {
+            "role": "model",
+            "content": [
+                {"functionCall": {"name": self.tool_name, "args": self.args or {}}}
+            ],
+        }
+
+    @classmethod
+    def create(
+        cls,
+        tool_call_obj_or_list: Union[Any, List[Any]],
+        signature: Optional[str] = None,
+    ) -> Union["ToolCall", List["ToolCall"]]:
+        """Factory method to create ToolCall(s) from provider-format tool call objects."""
+
+        if isinstance(tool_call_obj_or_list, list):
+            tool_calls = tool_call_obj_or_list
+        else:
+            tool_calls = [tool_call_obj_or_list]
+
+        if not tool_calls:
+            raise ValueError("No tool calls provided")
+
+        # Create ToolCall objects
+        results = []
+        for tool_call_obj in tool_calls:
+            tool_call = cls._create_single(tool_call_obj, signature)
+            results.append(tool_call)
+
+        # Return single result or list based on input
+        if len(results) == 1:
+            return results[0]
+        else:
+            return results
+
+    @classmethod
+    def _create_single(
+        cls, tool_call_obj: Any, signature: Optional[str] = None
+    ) -> "ToolCall":
+        """Create single ToolCall from various provider formats."""
+
+        # Handle Deserializable objects (from NativeToolParser)
+        if hasattr(tool_call_obj, "_tool_name") and hasattr(
+            tool_call_obj, "_tool_use_id"
+        ):
+            # Extract arguments from the object's fields
+            args = {}
+            if hasattr(tool_call_obj, "__dict__"):
+                for key, value in tool_call_obj.__dict__.items():
+                    if not key.startswith("_") and key not in [
+                        "signature",
+                        "thought_signature",
+                    ]:
+                        args[key] = value
+
+            return cls(
+                tool_use_id=tool_call_obj._tool_use_id,
+                tool_name=tool_call_obj._tool_name,
+                args=args,
+                signature=signature
+                or getattr(tool_call_obj, "signature", None)
+                or getattr(tool_call_obj, "thought_signature", None),
+                tool_obj=tool_call_obj,
+            )
+
+        # Handle dict formats from various providers
+        elif isinstance(tool_call_obj, dict):
+            # Deserializable model dump format: {"location": "SF", "_tool_name": "get_weather", "_tool_use_id": "toolu_123"}
+            if "_tool_name" in tool_call_obj and "_tool_use_id" in tool_call_obj:
+                # Extract args (everything except underscore fields and signature fields)
+                args = {}
+                for key, value in tool_call_obj.items():
+                    if not key.startswith("_") and key not in [
+                        "signature",
+                        "thought_signature",
+                    ]:
+                        args[key] = value
+
+                return cls(
+                    tool_use_id=tool_call_obj["_tool_use_id"],
+                    tool_name=tool_call_obj["_tool_name"],
+                    args=args,
+                    signature=signature
+                    or tool_call_obj.get("signature")
+                    or tool_call_obj.get("thought_signature"),
+                    tool_obj=tool_call_obj,
+                )
+
+            # Anthropic format: {"id": "toolu_01", "name": "get_weather", "input": {"location": "SF"}}
+            elif (
+                "id" in tool_call_obj
+                and "name" in tool_call_obj
+                and "input" in tool_call_obj
+            ):
+                return cls(
+                    tool_use_id=tool_call_obj["id"],
+                    tool_name=tool_call_obj["name"],
+                    args=tool_call_obj["input"],
+                    signature=signature,
+                    tool_obj=tool_call_obj,
+                )
+
+            # OpenAI/OpenRouter format: {"id": "call_abc", "function": {"name": "get_weather", "arguments": '{"location":"SF"}'}}
+            elif "id" in tool_call_obj and "function" in tool_call_obj:
+                function = tool_call_obj["function"]
+                raw_args = function.get("arguments", "{}")
+                try:
+                    parsed_args = (
+                        json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    )
+                except json.JSONDecodeError:
+                    parsed_args = {}
+
+                return cls(
+                    tool_use_id=tool_call_obj["id"],
+                    tool_name=function["name"],
+                    args=parsed_args,
+                    raw_arguments=(
+                        raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+                    ),
+                    signature=signature,
+                    tool_obj=tool_call_obj,
+                )
+
+            # Google GenAI format: {"functionCall": {"name": "get_weather", "args": {"location": "SF"}}}
+            elif "functionCall" in tool_call_obj:
+                func_call = tool_call_obj["functionCall"]
+                # Generate ID since Google doesn't provide one
+                tool_use_id = (
+                    f"google_{func_call['name']}_{hash(str(func_call.get('args', {})))}"
+                )
+
+                return cls(
+                    tool_use_id=tool_use_id,
+                    tool_name=func_call["name"],
+                    args=func_call.get("args", {}),
+                    signature=signature,
+                    tool_obj=tool_call_obj,
+                )
+
+        raise ValueError(
+            f"Unsupported tool call format: {type(tool_call_obj)} - {tool_call_obj}"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert ToolCall to dict format for serialization/storage."""
+        result = {
+            "tool_call_id": self.tool_use_id,  # Map to expected field name
+            "tool_name": self.tool_name,
+            "args": self.args,
+            "raw_arguments": self.raw_arguments,
+            "signature": self.signature,
+        }
+
+        # Handle tool_obj serialization
+        if self.tool_obj is not None:
+            if hasattr(self.tool_obj, "model_dump"):
+                # Pydantic/Deserializable object
+                result["tool_obj"] = self.tool_obj.model_dump(include_underscore=True)
+            elif hasattr(self.tool_obj, "__dict__"):
+                # Object with __dict__
+                result["tool_obj"] = dict(self.tool_obj.__dict__)
+            elif isinstance(self.tool_obj, dict):
+                # Already a dict
+                result["tool_obj"] = self.tool_obj
+            else:
+                # Fallback to string representation
+                result["tool_obj"] = str(self.tool_obj)
+        else:
+            result["tool_obj"] = None
+
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ToolCall":
+        """Create ToolCall from dict format (reverse of to_dict)."""
+        return cls(
+            tool_use_id=data.get("tool_call_id", data.get("tool_use_id", "")),
+            tool_name=data.get("tool_name", ""),
+            args=data.get("args"),
+            raw_arguments=data.get("raw_arguments"),
+            signature=data.get("signature"),
+            tool_obj=data.get("tool_obj"),
+        )
 
 
 class ReasoningSegment(ResonBase):
@@ -385,12 +688,78 @@ class InferenceClient(ABC):
         messages: List[Union[ChatMessage, "ToolResult", "ReasoningSegment"]],
         provider: InferenceProvider,
     ) -> List[Dict[str, Any]]:
-        """Convert mixed ChatMessage/ToolResult/ReasoningSegment list to provider-specific format."""
-        converted_messages = []
+        """Convert mixed ChatMessage/ToolResult/ReasoningSegment list to provider-specific format.
+        Provider-aware behavior:
+          - Anthropic/Bedrock/Google-Anthropic: coalesce consecutive ToolResults into a single user turn
+            with a content array of tool_result blocks; if the immediate next user ChatMessage exists,
+            append it as a trailing {"type":"text","text": "..."} block in the same message.
+          - Google GenAI: coalesce consecutive ToolResults into a single user turn where 'content' is a list
+            of {"functionResponse": {...}} dicts; if the immediate next user ChatMessage exists, append
+            {"text": "..."} as a trailing entry. Downstream Google clients will map these dicts into Parts.
+          - OpenAI/OpenRouter: map each ToolResult to a proper tool-role message:
+              {"role":"tool","tool_call_id": tool_use_id, "content": result}
+            and keep subsequent user messages separate (no coalescing).
+          - Fallback: previous behavior.
+        """
+        converted_messages: list[dict[str, Any]] = []
 
-        for msg in messages:
+        # Buffers for coalescing depending on provider
+        pending_anthropic_blocks: list[dict[str, Any]] = []
+        pending_google_parts: list[dict[str, Any]] = []
+
+        def flush_pending():
+            nonlocal pending_anthropic_blocks, pending_google_parts, converted_messages
+            if provider in (
+                InferenceProvider.ANTHROPIC,
+                InferenceProvider.BEDROCK,
+                InferenceProvider.GOOGLE_ANTHROPIC,
+            ):
+                if pending_anthropic_blocks:
+                    converted_messages.append(
+                        {"role": "user", "content": pending_anthropic_blocks}
+                    )
+                    pending_anthropic_blocks = []
+            elif provider in (InferenceProvider.GOOGLE_GENAI,):
+                if pending_google_parts:
+                    converted_messages.append(
+                        {"role": "user", "content": pending_google_parts}
+                    )
+                    pending_google_parts = []
+
+        for idx, msg in enumerate(messages):
+            # Handle ChatMessage
             if isinstance(msg, ChatMessage):
-                message_dict: dict = {"role": msg.role.value, "content": msg.content}
+                # If we have pending tool results and the immediate next user message should be merged
+                if (
+                    msg.role == ChatRole.USER
+                    and provider
+                    in (
+                        InferenceProvider.ANTHROPIC,
+                        InferenceProvider.BEDROCK,
+                        InferenceProvider.GOOGLE_ANTHROPIC,
+                    )
+                    and pending_anthropic_blocks
+                ):
+                    # Append trailing text to same user turn, then flush
+                    pending_anthropic_blocks.append(
+                        {"type": "text", "text": msg.content}
+                    )
+                    flush_pending()
+                    continue
+                if (
+                    msg.role == ChatRole.USER
+                    and provider in (InferenceProvider.GOOGLE_GENAI,)
+                    and pending_google_parts
+                ):
+                    pending_google_parts.append({"text": msg.content})
+                    flush_pending()
+                    continue
+
+                # Normal ChatMessage handling
+                message_dict: dict[str, Any] = {
+                    "role": msg.role.value,
+                    "content": msg.content,
+                }
                 if (
                     provider
                     in [
@@ -400,22 +769,78 @@ class InferenceClient(ABC):
                     and msg.cache_marker
                 ):
                     message_dict["cache_control"] = {"type": "ephemeral"}
+                flush_pending()
                 converted_messages.append(message_dict)
-            elif isinstance(msg, ReasoningSegment):
+                continue
+
+            # Handle ToolCall
+            if isinstance(msg, ToolCall):
+                flush_pending()
+                assistant_message = msg.to_provider_assistant_message(provider)
+                converted_messages.append(assistant_message)
+                continue
+
+            # Handle ReasoningSegment
+            if isinstance(msg, ReasoningSegment):
+                flush_pending()
                 reasoning_content = msg.to_provider_format(provider)
                 converted_messages.append(reasoning_content)
-            else:  # ToolResult
-                provider_content = msg.to_provider_format(provider)
+                continue
+
+            # Handle ToolResult
+            # OpenAI/OpenRouter (Chat Completions) expect tool role messages, not user JSON
+            if provider in (
+                InferenceProvider.OPENAI,
+                InferenceProvider.OPENROUTER,
+                InferenceProvider.CUSTOM_OPENAI,
+            ):
+                flush_pending()
                 converted_messages.append(
                     {
-                        "role": "user",
-                        "content": (
-                            provider_content
-                            if isinstance(provider_content, str)
-                            else json.dumps(provider_content)
-                        ),
+                        "role": "tool",
+                        "tool_call_id": msg.tool_use_id,
+                        "content": msg.content,
                     }
                 )
+                continue
+
+            # Anthropic/Bedrock/Google-Anthropic: coalesce tool_result blocks
+            if provider in (
+                InferenceProvider.ANTHROPIC,
+                InferenceProvider.BEDROCK,
+                InferenceProvider.GOOGLE_ANTHROPIC,
+            ):
+                provider_block = msg.to_provider_format(
+                    provider
+                )  # dict with {"type":"tool_result",...}
+                pending_anthropic_blocks.append(provider_block)
+                # If next item is NOT a ToolResult, we may merge an immediate user text (handled above), else defer flush
+                continue
+
+            # Google GenAI: coalesce as list of functionResponse dicts
+            if provider in (InferenceProvider.GOOGLE_GENAI,):
+                provider_part = msg.to_provider_format(
+                    provider
+                )  # dict with {"functionResponse": {...}}
+                pending_google_parts.append(provider_part)
+                continue
+
+            # Fallback: previous behavior (single user message, JSON/text content)
+            provider_content = msg.to_provider_format(provider)
+            flush_pending()
+            converted_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        provider_content
+                        if isinstance(provider_content, str)
+                        else json.dumps(provider_content)
+                    ),
+                }
+            )
+
+        # Flush any trailing pending tool results
+        flush_pending()
 
         return converted_messages
 
@@ -967,11 +1392,43 @@ class GoogleGenAIInferenceClient(InferenceClient):
             messages, self.provider
         )
 
+        # Build Contents with proper Parts (functionResponse vs text) and support merged lists
+        def _build_parts(content: Any) -> list[types.Part]:
+            parts: list[types.Part] = []
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "functionResponse" in item:
+                        fr = item["functionResponse"]
+                        parts.append(
+                            types.Part.from_function_response(
+                                name=fr.get("name", ""), response=fr.get("response", {})
+                            )
+                        )
+                    elif isinstance(item, dict) and "text" in item:
+                        parts.append(types.Part(text=item.get("text", "")))
+                    elif isinstance(item, str):
+                        parts.append(types.Part(text=item))
+            elif isinstance(content, dict):
+                if "functionResponse" in content:
+                    fr = content["functionResponse"]
+                    parts.append(
+                        types.Part.from_function_response(
+                            name=fr.get("name", ""), response=fr.get("response", {})
+                        )
+                    )
+                elif "text" in content:
+                    parts.append(types.Part(text=content.get("text", "")))
+                else:
+                    parts.append(types.Part(text=json.dumps(content)))
+            else:
+                parts.append(types.Part(text=str(content)))
+            return parts
+
         processed_messages = []
         for msg in formatted_messages:
             role = "model" if msg.get("role") == "assistant" else "user"
             processed_messages.append(
-                types.Content(role=role, parts=[types.Part(text=msg["content"])])
+                types.Content(role=role, parts=_build_parts(msg.get("content")))
             )
         # Prepare config with optional tools
         config_kwargs = {
@@ -1072,11 +1529,43 @@ class GoogleGenAIInferenceClient(InferenceClient):
             messages, self.provider
         )
 
+        # Build Contents with proper Parts (functionResponse vs text) and support merged lists
+        def _build_parts(content: Any) -> list[types.Part]:
+            parts: list[types.Part] = []
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and "functionResponse" in item:
+                        fr = item["functionResponse"]
+                        parts.append(
+                            types.Part.from_function_response(
+                                name=fr.get("name", ""), response=fr.get("response", {})
+                            )
+                        )
+                    elif isinstance(item, dict) and "text" in item:
+                        parts.append(types.Part(text=item.get("text", "")))
+                    elif isinstance(item, str):
+                        parts.append(types.Part(text=item))
+            elif isinstance(content, dict):
+                if "functionResponse" in content:
+                    fr = content["functionResponse"]
+                    parts.append(
+                        types.Part.from_function_response(
+                            name=fr.get("name", ""), response=fr.get("response", {})
+                        )
+                    )
+                elif "text" in content:
+                    parts.append(types.Part(text=content.get("text", "")))
+                else:
+                    parts.append(types.Part(text=json.dumps(content)))
+            else:
+                parts.append(types.Part(text=str(content)))
+            return parts
+
         processed_messages = []
         for msg in formatted_messages:
             role = "model" if msg.get("role") == "assistant" else "user"
             processed_messages.append(
-                types.Content(role=role, parts=[types.Part(text=msg["content"])])
+                types.Content(role=role, parts=_build_parts(msg.get("content")))
             )
 
         # Prepare config with optional tools
@@ -1345,6 +1834,10 @@ class OAIInferenceClient(InferenceClient):
             messages, self.provider
         )
 
+        from pprint import pprint
+
+        pprint(formatted_messages)
+
         request = OAIRequest(
             model=self.model,
             messages=formatted_messages,
@@ -1354,8 +1847,6 @@ class OAIInferenceClient(InferenceClient):
             stream=True,
             stream_options={"include_usage": True},
         ).model_dump()
-
-        print(tools)
 
         # Add tools if provided
         if tools:

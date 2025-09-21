@@ -81,6 +81,15 @@ class GoogleSchemaGenerator(SchemaGenerator):
                         )
                     google_prop_kwargs["properties"] = nested_properties
                     google_prop_kwargs["required"] = prop_schema.get("required", [])
+                # Handle dictionary-like objects via additionalProperties
+                if "additionalProperties" in prop_schema:
+                    ap = prop_schema["additionalProperties"]
+                    if isinstance(ap, bool):
+                        google_prop_kwargs["additional_properties"] = ap
+                    elif isinstance(ap, dict):
+                        google_prop_kwargs["additional_properties"] = (
+                            self._convert_single_property_to_google_schema(ap)
+                        )
 
             if "description" in prop_schema:
                 google_prop_kwargs["description"] = prop_schema["description"]
@@ -130,6 +139,15 @@ class GoogleSchemaGenerator(SchemaGenerator):
                     )
                 google_prop_kwargs["properties"] = nested_properties
                 google_prop_kwargs["required"] = prop_schema.get("required", [])
+            # Handle dictionary-like objects via additionalProperties
+            if "additionalProperties" in prop_schema:
+                ap = prop_schema["additionalProperties"]
+                if isinstance(ap, bool):
+                    google_prop_kwargs["additional_properties"] = ap
+                elif isinstance(ap, dict):
+                    google_prop_kwargs["additional_properties"] = (
+                        self._convert_single_property_to_google_schema(ap)
+                    )
 
         if "description" in prop_schema:
             google_prop_kwargs["description"] = prop_schema["description"]
