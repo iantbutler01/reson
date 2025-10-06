@@ -205,16 +205,24 @@ class ToolResult(ResonBase):
 
     def _format_google_content(self) -> Dict[str, Any]:
         """Format content for Google API calls."""
+        tool_name = ""
+
+        if self.tool_obj:
+            try:
+                tool_name = self.tool_obj._tool_name
+            except AttributeError:
+                try:
+                    tool_name = self.tool_obj["_tool_name"]
+                except (KeyError, TypeError):
+                    tool_name = ""
+
         result: dict = {
             "functionResponse": {
-                "name": (
-                    getattr(self.tool_obj, "_tool_name", "") if self.tool_obj else ""
-                ),
+                "name": tool_name,
                 "response": {"result": self.content},
             }
         }
 
-        # Add thought signature preservation for Google
         if self.signature:
             result["_google_thought_signature_required"] = True
             result["_original_response_required"] = True
@@ -1486,10 +1494,12 @@ class GoogleGenAIInferenceClient(InferenceClient):
             return ""
 
         reasoning = "\n".join(
-            p.text for p in response.candidates[0].content.parts if p.text and p.thought  # type: ignore
+            str(p.text) if isinstance(p.text, bytes) else p.text
+            for p in response.candidates[0].content.parts
+            if p.text and p.thought  # type: ignore
         )
         out_text = "\n".join(
-            p.text
+            str(p.text) if isinstance(p.text, bytes) else p.text
             for p in response.candidates[0].content.parts  # type: ignore
             if p.text and not p.thought
         )
@@ -1516,6 +1526,22 @@ class GoogleGenAIInferenceClient(InferenceClient):
         temperature=0.5,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
+
+        for i, msg in enumerate(messages):
+            if isinstance(msg, ChatMessage):
+                content_preview = (
+                    str(msg.content)[:100] + "..."
+                    if len(str(msg.content)) > 100
+                    else str(msg.content)
+                )
+            elif hasattr(msg, "tool_use_id"):
+                if hasattr(msg, "content"):
+                    content_preview = (
+                        str(msg.content)[:50] + "..."
+                        if len(str(msg.content)) > 50
+                        else str(msg.content)
+                    )
+
         system_instruction = None
         if (
             messages
@@ -1541,6 +1567,13 @@ class GoogleGenAIInferenceClient(InferenceClient):
                                 name=fr.get("name", ""), response=fr.get("response", {})
                             )
                         )
+                    elif isinstance(item, dict) and "functionCall" in item:
+                        fc = item["functionCall"]
+                        parts.append(
+                            types.Part.from_function_call(
+                                name=fc.get("name", ""), args=fc.get("args")
+                            )
+                        )
                     elif isinstance(item, dict) and "text" in item:
                         parts.append(types.Part(text=item.get("text", "")))
                     elif isinstance(item, str):
@@ -1553,12 +1586,20 @@ class GoogleGenAIInferenceClient(InferenceClient):
                             name=fr.get("name", ""), response=fr.get("response", {})
                         )
                     )
+                elif "functionCall" in content:
+                    fc = content["functionCall"]
+                    parts.append(
+                        types.Part.from_function_call(
+                            name=fc.get("name", ""), args=fc.get("args")
+                        )
+                    )
                 elif "text" in content:
                     parts.append(types.Part(text=content.get("text", "")))
                 else:
                     parts.append(types.Part(text=json.dumps(content)))
             else:
                 parts.append(types.Part(text=str(content)))
+
             return parts
 
         processed_messages = []
@@ -1648,12 +1689,12 @@ class GoogleGenAIInferenceClient(InferenceClient):
             # Only process text if no tool calls were detected
             if not tool_calls_detected:
                 reasoning = "\n".join(
-                    p.text
+                    str(p.text) if isinstance(p.text, bytes) else p.text
                     for p in chunk.candidates[0].content.parts
                     if p.text and p.thought
                 )
                 out_text = "\n".join(
-                    p.text
+                    str(p.text) if isinstance(p.text, bytes) else p.text
                     for p in chunk.candidates[0].content.parts
                     if p.text and not p.thought
                 )
@@ -1834,10 +1875,6 @@ class OAIInferenceClient(InferenceClient):
             messages, self.provider
         )
 
-        from pprint import pprint
-
-        pprint(formatted_messages)
-
         request = OAIRequest(
             model=self.model,
             messages=formatted_messages,
@@ -1902,7 +1939,6 @@ class OAIInferenceClient(InferenceClient):
                     if line.startswith("data: "):
                         if line.strip() == "data: [DONE]":
                             if current_tool_calls:
-                                print("HERE")
                                 index = len(current_tool_calls) - 1
                                 yield ("tool_call_complete", current_tool_calls[index])
 
@@ -1934,7 +1970,6 @@ class OAIInferenceClient(InferenceClient):
                                         if index - 1 >= 0 and current_tool_calls.get(
                                             index - 1, None
                                         ):
-                                            print("HERE")
                                             yield (
                                                 "tool_call_complete",
                                                 current_tool_calls[index - 1],

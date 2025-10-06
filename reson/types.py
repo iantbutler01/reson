@@ -14,6 +14,7 @@ from reson.services.inference_clients import (
     ToolCall,
     ChatMessage,
     ReasoningSegment,
+    ChatRole,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "ToolCall",
     "ChatMessage",
     "ReasoningSegment",
+    "ChatRole",
 ]

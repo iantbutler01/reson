@@ -89,17 +89,27 @@ class TypeParser(OutputParser[T]):
         # Use parser's id as a key in our buffer dictionary
         parser_id = id(parser)
 
+        print(f"🔍 PARSER DEBUG: feed_chunk called")
+        print(f"🔍 PARSER DEBUG: chunk='{chunk}' (len={len(chunk)})")
+        print(f"🔍 PARSER DEBUG: output_type={output_type}")
+        print(f"🔍 PARSER DEBUG: parser_id={parser_id}")
+
         # Initialize buffers if they don't exist
         if parser_id not in self._parser_buffers:
             self._parser_buffers[parser_id] = {"chunk_buffer": "", "debug_buffer": ""}
+            print(f"🔍 PARSER DEBUG: Initialized new parser buffer")
 
         # Update debug buffer (for diagnostic purposes)
         self._parser_buffers[parser_id]["debug_buffer"] += chunk
+        print(
+            f"🔍 PARSER DEBUG: debug_buffer now: '{self._parser_buffers[parser_id]['debug_buffer']}'"
+        )
 
         try:
             # Accumulate the chunk in our buffer
             self._parser_buffers[parser_id]["chunk_buffer"] += chunk
             current_buffer = self._parser_buffers[parser_id]["chunk_buffer"]
+            print(f"🔍 PARSER DEBUG: chunk_buffer now: '{current_buffer}'")
 
             def truncate_to_valid_utf8(data: str) -> str:
                 encoded = data.encode("utf-8", errors="ignore")
@@ -110,16 +120,20 @@ class TypeParser(OutputParser[T]):
             try:
                 # Feed the accumulated buffer to the parser
                 safe_buffer = truncate_to_valid_utf8(current_buffer)
+                print(f"🔍 PARSER DEBUG: Feeding to parser: '{safe_buffer}'")
                 raw_result = parser.feed(safe_buffer)
+                print(f"🔍 PARSER DEBUG: Parser feed returned: {raw_result}")
                 # If successful, clear chunk buffer
                 self._parser_buffers[parser_id]["chunk_buffer"] = ""
+                print(f"🔍 PARSER DEBUG: Cleared chunk buffer after successful parse")
 
                 # Convert to typed object if needed
                 result = self._convert_to_typed_result(raw_result, output_type)
+                print(f"🔍 PARSER DEBUG: Converted result: {result}")
             except Exception as utf8_err:
                 # In case of UTF-8 boundary errors, keep collecting chunks
                 # We'll try again when more data arrives
-                print(f"Parser chunk error (likely UTF-8 boundary): {utf8_err}")
+                print(f"🔍 PARSER DEBUG: UTF-8 boundary error: {utf8_err}")
                 return ParserResult(
                     value=None,
                     is_partial=True,
@@ -130,9 +144,12 @@ class TypeParser(OutputParser[T]):
             raw_output = self._parser_buffers[parser_id]["debug_buffer"]
 
             # For streaming, we don't validate yet
+            print(
+                f"🔍 PARSER DEBUG: Returning result with value={result}, is_partial=True"
+            )
             return ParserResult(value=result, is_partial=True, raw_output=raw_output)
         except Exception as e:
-            print(f"Parser general error: {e}")
+            print(f"🔍 PARSER DEBUG: General error: {e}")
             return ParserResult(
                 error=e,
                 is_partial=True,
