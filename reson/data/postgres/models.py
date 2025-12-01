@@ -437,6 +437,58 @@ class DBModel:
         return None if row is None else cls.from_db_row(row)
 
     @classmethod
+    async def filter(
+        cls: Type[T],
+        cursor: Optional[psycopg.AsyncCursor[DictRow]] = None,
+        order_by: str = "createdat DESC",
+        limit: Optional[int] = None,
+        **kwargs: Any,
+    ) -> List[T]:
+        """
+        Find all records matching the given criteria.
+
+        Args:
+            cursor: Optional cursor for transaction support
+            order_by: Order clause (default: "createdat DESC")
+            limit: Optional limit on results
+            **kwargs: Column names and values to filter by
+
+        Returns:
+            List of matching entities
+        """
+        where: List[str] = []
+        values: List[Any] = []
+
+        for column, value in kwargs.items():
+            db_column = next(
+                (
+                    col.db_name
+                    for col in cls.COLUMNS.values()
+                    if col.python_name == column
+                ),
+                column,
+            )
+            where.append(f"{db_column} = %s")
+            if isinstance(value, Enum):
+                value = value.value
+            values.append(value)
+
+        where_clause = f"WHERE {' AND '.join(where)}" if where else ""
+        limit_clause = f"LIMIT {limit}" if limit else ""
+
+        query = (
+            f"SELECT * FROM {cls.TABLE_NAME} "
+            f"{where_clause} "
+            f"ORDER BY {order_by} "
+            f"{limit_clause}"
+        )
+
+        rows = await cls.db_manager().execute_query(
+            query, tuple(values), cursor=cursor
+        )
+        return [cls.from_db_row(row) for row in rows] if rows else []
+
+    @classmethod
     def sync_find_by(
         cls: Type[T],
         cursor: Optional[psycopg.Cursor[DictRow]] = None,
