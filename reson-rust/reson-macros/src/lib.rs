@@ -290,15 +290,35 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
             required_fields.push(field_name_str.clone());
         }
 
-        schema_properties.push(quote! {
-            properties.insert(
-                #field_name_str.to_string(),
-                serde_json::json!({
-                    "type": #json_type,
-                    "description": #field_desc
-                })
-            );
-        });
+        // Check if this is an array type and get the item type
+        let array_item_type = get_array_item_type(&field.ty);
+
+        if let Some(item_type) = array_item_type {
+            // Array type - include items property
+            schema_properties.push(quote! {
+                properties.insert(
+                    #field_name_str.to_string(),
+                    serde_json::json!({
+                        "type": #json_type,
+                        "description": #field_desc,
+                        "items": {
+                            "type": #item_type
+                        }
+                    })
+                );
+            });
+        } else {
+            // Non-array type
+            schema_properties.push(quote! {
+                properties.insert(
+                    #field_name_str.to_string(),
+                    serde_json::json!({
+                        "type": #json_type,
+                        "description": #field_desc
+                    })
+                );
+            });
+        }
     }
 
     let required_array = if required_fields.is_empty() {
@@ -527,6 +547,36 @@ fn get_json_type(ty: &syn::Type) -> String {
         }
     }
     "object".to_string()
+}
+
+/// Get the inner type of Vec<T> or Option<Vec<T>>
+fn get_array_item_type(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let ident = segment.ident.to_string();
+
+            // Handle Option<Vec<T>> - extract Vec<T> first
+            if ident == "Option" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return get_array_item_type(inner_ty);
+                    }
+                }
+            }
+
+            // Handle Vec<T> - extract T
+            if ident == "Vec" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return Some(get_json_type(inner_ty));
+                    }
+                }
+                // Default to string if we can't determine the inner type
+                return Some("string".to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
