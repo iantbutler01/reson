@@ -27,7 +27,7 @@ pub use context::ContextApi;
 
 /// Accumulated state during runtime execution
 #[derive(Debug, Default, Clone)]
-struct Accumulators {
+pub struct Accumulators {
     raw_response: Vec<String>,
     reasoning: Vec<String>,
     reasoning_segments: Vec<ReasoningSegment>,

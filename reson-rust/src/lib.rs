@@ -37,7 +37,7 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::runtime::{Runtime, ContextApi};
     pub use crate::types::{
-        CacheMarker, ChatMessage, ChatRole, Provider, ReasoningSegment, TokenUsage, ToolCall,
-        ToolResult,
+        CacheMarker, ChatMessage, ChatRole, CreateResult, Provider, ReasoningSegment, TokenUsage,
+        ToolCall, ToolResult,
     };
 }

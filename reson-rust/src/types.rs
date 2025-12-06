@@ -8,6 +8,28 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
+/// Format JSON to match Python's json.dumps default style (space after colon and comma)
+fn format_json_python_style(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<String> = map.iter()
+                .map(|(k, v)| format!("\"{}\": {}", k, format_json_python_style(v)))
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<String> = arr.iter()
+                .map(format_json_python_style)
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_json::Value::String(s) => format!("\"{}\"", s),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+    }
+}
+
 /// LLM Provider enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Provider {
@@ -176,6 +198,17 @@ impl TokenUsage {
     }
 }
 
+/// Result of ToolCall::create() - handles single, multiple, or empty results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CreateResult {
+    /// Single tool call
+    Single(ToolCall),
+    /// Multiple tool calls
+    Multiple(Vec<ToolCall>),
+    /// Empty input (no tool calls)
+    Empty,
+}
+
 /// A tool call from the LLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -195,6 +228,10 @@ pub struct ToolCall {
     /// Provider signature for reasoning preservation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    /// Original tool call object (for preserving provider format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_obj: Option<serde_json::Value>,
 }
 
 impl ToolCall {
@@ -206,6 +243,83 @@ impl ToolCall {
             args,
             raw_arguments: None,
             signature: None,
+            tool_obj: None,
+        }
+    }
+
+    /// Create from provider-specific format with auto-detection
+    ///
+    /// Detects the provider format automatically based on the structure:
+    /// - OpenAI: has "function" key with "name" and "arguments"
+    /// - Anthropic: has "name" and "input" keys (no "function")
+    /// - Google: has "functionCall" key
+    /// - Deserializable object: has "_tool_name" attribute
+    /// - List: returns Vec of ToolCalls
+    pub fn create(data: serde_json::Value) -> Result<CreateResult> {
+        // Handle list input
+        if let Some(arr) = data.as_array() {
+            if arr.is_empty() {
+                return Ok(CreateResult::Empty);
+            }
+            let mut results = Vec::new();
+            for item in arr {
+                match Self::create(item.clone())? {
+                    CreateResult::Single(tc) => results.push(tc),
+                    CreateResult::Multiple(tcs) => results.extend(tcs),
+                    CreateResult::Empty => {}
+                }
+            }
+            return Ok(CreateResult::Multiple(results));
+        }
+
+        // Detect format and parse
+        if data.get("function").is_some() {
+            // OpenAI format
+            Self::from_provider_format(data, Provider::OpenAI).map(CreateResult::Single)
+        } else if data.get("functionCall").is_some() {
+            // Google format
+            Self::from_provider_format(data, Provider::GoogleGenAI).map(CreateResult::Single)
+        } else if data.get("name").is_some() && data.get("input").is_some() {
+            // Anthropic format
+            Self::from_provider_format(data, Provider::Anthropic).map(CreateResult::Single)
+        } else if data.get("_tool_name").is_some() {
+            // Deserializable object format
+            let tool_name = data["_tool_name"].as_str()
+                .ok_or_else(|| Error::Parse("_tool_name must be a string".to_string()))?
+                .to_string();
+            let tool_use_id = data.get("_tool_use_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let signature = data.get("signature")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    data.get("thought_signature")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+
+            // Extract args by filtering out internal fields
+            let mut args = serde_json::Map::new();
+            if let Some(obj) = data.as_object() {
+                for (k, v) in obj {
+                    if !k.starts_with('_') && k != "signature" && k != "thought_signature" {
+                        args.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            Ok(CreateResult::Single(Self {
+                tool_use_id,
+                tool_name,
+                args: serde_json::Value::Object(args),
+                raw_arguments: None,
+                signature,
+                tool_obj: Some(data),
+            }))
+        } else {
+            Err(Error::Parse("Unknown tool call format".to_string()))
         }
     }
 
@@ -225,6 +339,7 @@ impl ToolCall {
                     args: provider_format["input"].clone(),
                     raw_arguments: None,
                     signature: None,
+                    tool_obj: Some(provider_format),
                 })
             }
             Provider::OpenAI | Provider::OpenRouter => {
@@ -245,18 +360,32 @@ impl ToolCall {
                     args: serde_json::from_str(args_str)?,
                     raw_arguments: Some(args_str.to_string()),
                     signature: None,
+                    tool_obj: Some(provider_format),
                 })
             }
             Provider::GoogleGenAI | Provider::GoogleAnthropic => {
+                // Google format generates tool_use_id based on name + args hash (matches Python)
+                let func_call = &provider_format["functionCall"];
+                let name = func_call["name"]
+                    .as_str()
+                    .ok_or_else(|| Error::Parse("Missing 'name' in functionCall".to_string()))?;
+                let args = func_call.get("args").cloned().unwrap_or(serde_json::json!({}));
+
+                // Generate ID matching Python: google_{name}_{hash}
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                args.to_string().hash(&mut hasher);
+                let hash = hasher.finish();
+                let tool_use_id = format!("google_{}_{}", name, hash);
+
                 Ok(Self {
-                    tool_use_id: Uuid::new_v4().to_string(),
-                    tool_name: provider_format["functionCall"]["name"]
-                        .as_str()
-                        .ok_or_else(|| Error::Parse("Missing 'name' in functionCall".to_string()))?
-                        .to_string(),
-                    args: provider_format["functionCall"]["args"].clone(),
+                    tool_use_id,
+                    tool_name: name.to_string(),
+                    args,
                     raw_arguments: None,
                     signature: None,
+                    tool_obj: Some(provider_format),
                 })
             }
         }
@@ -277,6 +406,11 @@ impl ToolCall {
                 })
             }
             Provider::OpenAI | Provider::OpenRouter => {
+                // Use custom formatting to match Python's json.dumps (space after colon/comma)
+                let args_str = self.raw_arguments.clone().unwrap_or_else(|| {
+                    // Format to match Python's json.dumps with separators=(", ", ": ")
+                    format_json_python_style(&self.args)
+                });
                 serde_json::json!({
                     "role": "assistant",
                     "tool_calls": [{
@@ -284,8 +418,7 @@ impl ToolCall {
                         "type": "function",
                         "function": {
                             "name": self.tool_name,
-                            "arguments": self.raw_arguments.as_ref()
-                                .unwrap_or(&serde_json::to_string(&self.args).unwrap())
+                            "arguments": args_str
                         }
                     }]
                 })
@@ -293,7 +426,7 @@ impl ToolCall {
             Provider::GoogleGenAI | Provider::GoogleAnthropic => {
                 serde_json::json!({
                     "role": "model",
-                    "parts": [{
+                    "content": [{
                         "functionCall": {
                             "name": self.tool_name,
                             "args": self.args

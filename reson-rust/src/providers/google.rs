@@ -14,6 +14,10 @@ use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
 use std::pin::Pin;
+#[cfg(feature = "google-adc")]
+use std::sync::Arc;
+#[cfg(feature = "google-adc")]
+use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::providers::{
