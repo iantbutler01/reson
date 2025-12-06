@@ -3,16 +3,22 @@ members = [".", "reson-macros"]
 resolver = "2"
 
 [package]
-name = "reson"
-version = "0.1.0"
+name = "reson-agentic"
+version = "0.1.2"
 edition = "2021"
 authors = ["Reson Contributors"]
 description = "Agents are just functions - production-grade LLM agent framework"
 license = "MIT"
+repository = "https://github.com/ianhundere/reson"
+homepage = "https://github.com/ianhundere/reson"
+documentation = "https://docs.rs/reson-agentic"
+readme = "README.md"
+keywords = ["llm", "ai", "agents", "gemini", "anthropic"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 # Proc macros
-reson-macros = { path = "reson-macros" }
+resonai-macros = { version = "0.1.0", path = "reson-macros" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }

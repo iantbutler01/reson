@@ -3,19 +3,19 @@
 //! These tests require API keys to be set in environment variables:
 //! - ANTHROPIC_API_KEY: For Anthropic Claude direct API
 //! - OPENAI_API_KEY: For OpenAI models
-//! - GOOGLE_API_KEY: For Google Gemini models
+//! - GOOGLE_GEMINI_API_KEY: For Google Gemini models
 //! - OPENROUTER_API_KEY: For OpenRouter proxy
 //!
 //! Run with: cargo test --test integration_tests -- --ignored
 //! Or specific test: cargo test --test integration_tests test_anthropic_simple -- --ignored
 
-use reson::providers::{
+use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient,
     OAIClient, OpenRouterClient,
 };
-use reson::schema::{AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator};
-use reson::types::{ChatMessage, Provider, ToolCall, ToolResult};
-use reson::utils::ConversationMessage;
+use reson_agentic::schema::{AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator};
+use reson_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -31,7 +31,7 @@ fn get_openai_key() -> Option<String> {
 }
 
 fn get_google_key() -> Option<String> {
-    env::var("GOOGLE_API_KEY").ok()
+    env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
 fn get_openrouter_key() -> Option<String> {
@@ -255,9 +255,9 @@ async fn test_openai_with_tools() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_simple_generation() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![
@@ -277,9 +277,9 @@ async fn test_google_simple_generation() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_with_tools() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -305,9 +305,9 @@ async fn test_google_with_tools() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_with_thinking() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp")
         .with_thinking_budget(1024);
 
@@ -405,15 +405,15 @@ async fn test_openrouter_with_tools_streaming() {
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => match chunk {
-                reson::providers::StreamChunk::Content(text) => {
+                reson_agentic::providers::StreamChunk::Content(text) => {
                     print!("{}", text);
                     content.push_str(&text);
                 }
-                reson::providers::StreamChunk::ToolCallComplete(tc) => {
+                reson_agentic::providers::StreamChunk::ToolCallComplete(tc) => {
                     println!("Tool call complete: {:?}", tc);
                     tool_calls.push(tc);
                 }
-                reson::providers::StreamChunk::Usage { input_tokens, output_tokens, .. } => {
+                reson_agentic::providers::StreamChunk::Usage { input_tokens, output_tokens, .. } => {
                     println!("Usage: {} in, {} out", input_tokens, output_tokens);
                 }
                 _ => {}
@@ -563,11 +563,11 @@ async fn test_anthropic_streaming() {
             Ok(chunk) => {
                 chunk_count += 1;
                 match chunk {
-                    reson::providers::StreamChunk::Content(text) => {
+                    reson_agentic::providers::StreamChunk::Content(text) => {
                         print!("{}", text);
                         full_content.push_str(&text);
                     }
-                    reson::providers::StreamChunk::Usage { input_tokens, output_tokens, .. } => {
+                    reson_agentic::providers::StreamChunk::Usage { input_tokens, output_tokens, .. } => {
                         println!("\nUsage: {} in, {} out", input_tokens, output_tokens);
                     }
                     _ => {}
@@ -586,11 +586,11 @@ async fn test_anthropic_streaming() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_streaming() {
     use futures::StreamExt;
 
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -608,7 +608,7 @@ async fn test_google_streaming() {
         match chunk_result {
             Ok(chunk) => {
                 match chunk {
-                    reson::providers::StreamChunk::Content(text) => {
+                    reson_agentic::providers::StreamChunk::Content(text) => {
                         print!("{}", text);
                         full_content.push_str(&text);
                     }
@@ -694,7 +694,7 @@ fn test_provider_supports_native_tools() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_simple() {
-    use reson::providers::GoogleAnthropicClient;
+    use reson_agentic::providers::GoogleAnthropicClient;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -713,7 +713,7 @@ async fn test_google_anthropic_simple() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_with_tools() {
-    use reson::providers::GoogleAnthropicClient;
+    use reson_agentic::providers::GoogleAnthropicClient;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -740,7 +740,7 @@ async fn test_google_anthropic_with_tools() {
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_streaming() {
     use futures::StreamExt;
-    use reson::providers::GoogleAnthropicClient;
+    use reson_agentic::providers::GoogleAnthropicClient;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -757,11 +757,11 @@ async fn test_google_anthropic_streaming() {
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => match chunk {
-                reson::providers::StreamChunk::Content(text) => {
+                reson_agentic::providers::StreamChunk::Content(text) => {
                     print!("{}", text);
                     full_content.push_str(&text);
                 }
-                reson::providers::StreamChunk::Usage {
+                reson_agentic::providers::StreamChunk::Usage {
                     input_tokens,
                     output_tokens,
                     ..
@@ -787,7 +787,7 @@ async fn test_google_anthropic_streaming() {
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_streaming_with_tools() {
     use futures::StreamExt;
-    use reson::providers::GoogleAnthropicClient;
+    use reson_agentic::providers::GoogleAnthropicClient;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -808,15 +808,15 @@ async fn test_google_anthropic_streaming_with_tools() {
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => match chunk {
-                reson::providers::StreamChunk::Content(text) => {
+                reson_agentic::providers::StreamChunk::Content(text) => {
                     print!("{}", text);
                     content.push_str(&text);
                 }
-                reson::providers::StreamChunk::ToolCallComplete(tc) => {
+                reson_agentic::providers::StreamChunk::ToolCallComplete(tc) => {
                     println!("Tool call complete: {:?}", tc);
                     tool_calls.push(tc);
                 }
-                reson::providers::StreamChunk::Usage {
+                reson_agentic::providers::StreamChunk::Usage {
                     input_tokens,
                     output_tokens,
                     ..

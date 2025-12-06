@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example store_usage
 
-use reson::storage::{Store, MemoryKVStore};
+use reson_agentic::storage::{Store, MemoryKVStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

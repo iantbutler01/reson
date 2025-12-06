@@ -9,6 +9,7 @@
 //! - Streaming via Server-Sent Events
 //! - API key authentication
 //! - Application Default Credentials (ADC) via `google-adc` feature
+//! - File API for uploading large media files (>20MB)
 
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
@@ -26,7 +27,7 @@ use crate::providers::{
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::{Provider, TokenUsage};
 use crate::types::ChatRole;
-use crate::utils::ConversationMessage;
+use crate::utils::{ConversationMessage, media_part_to_google_format};
 
 /// Authentication method for Google GenAI
 #[derive(Clone)]
@@ -38,7 +39,43 @@ pub enum GoogleAuth {
     Adc(Arc<RwLock<Option<Arc<dyn gcp_auth::TokenProvider>>>>),
 }
 
+/// Status of an uploaded file
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FileState {
+    /// File is being processed
+    Processing,
+    /// File is ready to use
+    Active,
+    /// Processing failed
+    Failed,
+}
+
+/// Response from uploading a file to Google's File API
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadedFile {
+    /// The file resource name (e.g., "files/abc123")
+    pub name: String,
+    /// Display name of the file
+    #[serde(default)]
+    pub display_name: String,
+    /// MIME type of the file
+    pub mime_type: String,
+    /// Size of the file in bytes
+    #[serde(default)]
+    pub size_bytes: String,
+    /// The URI to use in generateContent requests
+    pub uri: String,
+    /// Current state of the file
+    pub state: FileState,
+    /// Error details if state is FAILED
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+}
+
 /// Google Generative AI (Gemini) client
+#[derive(Clone)]
 pub struct GoogleGenAIClient {
     model: String,
     auth: GoogleAuth,
@@ -151,6 +188,281 @@ impl GoogleGenAIClient {
         self.api_url = url.into();
         self
     }
+
+    // ==================== File API Methods ====================
+
+    /// Upload a file to Google's File API for use in generateContent requests.
+    ///
+    /// Use this for files larger than 20MB or when you want to reuse the same
+    /// file across multiple requests.
+    ///
+    /// # Arguments
+    /// * `data` - The file bytes to upload
+    /// * `mime_type` - The MIME type of the file (e.g., "video/mp4", "image/png")
+    /// * `display_name` - Optional display name for the file
+    ///
+    /// # Returns
+    /// An `UploadedFile` containing the `uri` to use in requests. Note that video
+    /// files may need processing time - check the `state` field and use
+    /// `wait_for_file_processing` if needed.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let video_bytes = std::fs::read("video.mp4")?;
+    /// let uploaded = client.upload_file(&video_bytes, "video/mp4", Some("my-video")).await?;
+    /// // For videos, wait for processing
+    /// let ready = client.wait_for_file_processing(&uploaded.name, None).await?;
+    /// // Use ready.uri in your generateContent request
+    /// ```
+    pub async fn upload_file(
+        &self,
+        data: &[u8],
+        mime_type: &str,
+        display_name: Option<&str>,
+    ) -> Result<UploadedFile> {
+        let client = reqwest::Client::new();
+        let file_api_base = "https://generativelanguage.googleapis.com";
+
+        // Step 1: Start resumable upload - get upload URL from response headers
+        let start_url = match &self.auth {
+            GoogleAuth::ApiKey(key) => {
+                format!("{}/upload/v1beta/files?key={}", file_api_base, key)
+            }
+            #[cfg(feature = "google-adc")]
+            GoogleAuth::Adc(_) => {
+                format!("{}/upload/v1beta/files", file_api_base)
+            }
+        };
+
+        let metadata = serde_json::json!({
+            "file": {
+                "display_name": display_name.unwrap_or("uploaded_file")
+            }
+        });
+
+        #[allow(unused_mut)]
+        let mut start_request = client
+            .post(&start_url)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header("X-Goog-Upload-Header-Content-Length", data.len().to_string())
+            .header("X-Goog-Upload-Header-Content-Type", mime_type)
+            .header("Content-Type", "application/json");
+
+        // Add authorization header for ADC
+        #[cfg(feature = "google-adc")]
+        if let GoogleAuth::Adc(_) = &self.auth {
+            let token = self.get_adc_token().await?;
+            start_request = start_request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let start_response = start_request
+            .json(&metadata)
+            .send()
+            .await
+            .map_err(|e| Error::NonRetryable(format!("Failed to start file upload: {}", e)))?;
+
+        if !start_response.status().is_success() {
+            let error_body = start_response.text().await.unwrap_or_default();
+            return Err(Error::NonRetryable(format!(
+                "Failed to start file upload: {}",
+                error_body
+            )));
+        }
+
+        // Extract upload URL from response headers
+        let upload_url = start_response
+            .headers()
+            .get("x-goog-upload-url")
+            .ok_or_else(|| {
+                Error::NonRetryable("Missing x-goog-upload-url header in response".to_string())
+            })?
+            .to_str()
+            .map_err(|e| Error::NonRetryable(format!("Invalid upload URL header: {}", e)))?
+            .to_string();
+
+        // Step 2: Upload file bytes to the upload URL
+        let upload_response = client
+            .post(&upload_url)
+            .header("Content-Length", data.len().to_string())
+            .header("X-Goog-Upload-Offset", "0")
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(|e| Error::NonRetryable(format!("Failed to upload file data: {}", e)))?;
+
+        if !upload_response.status().is_success() {
+            let error_body = upload_response.text().await.unwrap_or_default();
+            return Err(Error::NonRetryable(format!(
+                "Failed to upload file data: {}",
+                error_body
+            )));
+        }
+
+        // Parse the response to get the file info
+        let response_json: serde_json::Value = upload_response
+            .json()
+            .await
+            .map_err(|e| Error::NonRetryable(format!("Failed to parse upload response: {}", e)))?;
+
+        // Extract the file object from the response
+        let file_json = response_json
+            .get("file")
+            .ok_or_else(|| {
+                Error::NonRetryable(format!(
+                    "Missing 'file' in upload response: {:?}",
+                    response_json
+                ))
+            })?
+            .clone();
+
+        let uploaded_file: UploadedFile = serde_json::from_value(file_json).map_err(|e| {
+            Error::NonRetryable(format!("Failed to parse UploadedFile: {}", e))
+        })?;
+
+        Ok(uploaded_file)
+    }
+
+    /// Get the current status of an uploaded file.
+    ///
+    /// # Arguments
+    /// * `file_name` - The file resource name (e.g., "files/abc123")
+    pub async fn get_file(&self, file_name: &str) -> Result<UploadedFile> {
+        let client = reqwest::Client::new();
+        let file_api_base = "https://generativelanguage.googleapis.com";
+
+        let url = match &self.auth {
+            GoogleAuth::ApiKey(key) => {
+                format!("{}/v1beta/{}?key={}", file_api_base, file_name, key)
+            }
+            #[cfg(feature = "google-adc")]
+            GoogleAuth::Adc(_) => {
+                format!("{}/v1beta/{}", file_api_base, file_name)
+            }
+        };
+
+        #[allow(unused_mut)]
+        let mut request = client.get(&url);
+
+        #[cfg(feature = "google-adc")]
+        if let GoogleAuth::Adc(_) = &self.auth {
+            let token = self.get_adc_token().await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::NonRetryable(format!("Failed to get file status: {}", e)))?;
+
+        if !response.status().is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            return Err(Error::NonRetryable(format!(
+                "Failed to get file status: {}",
+                error_body
+            )));
+        }
+
+        let file: UploadedFile = response.json().await.map_err(|e| {
+            Error::NonRetryable(format!("Failed to parse file status response: {}", e))
+        })?;
+
+        Ok(file)
+    }
+
+    /// Wait for a file to finish processing and become ACTIVE.
+    ///
+    /// Video files require server-side processing before they can be used.
+    /// This method polls the file status until it becomes ACTIVE or FAILED.
+    ///
+    /// # Arguments
+    /// * `file_name` - The file resource name (e.g., "files/abc123")
+    /// * `timeout_secs` - Maximum time to wait (defaults to 300 seconds / 5 minutes)
+    ///
+    /// # Returns
+    /// The file when it reaches ACTIVE state, or an error if it fails or times out.
+    pub async fn wait_for_file_processing(
+        &self,
+        file_name: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<UploadedFile> {
+        let timeout = timeout_secs.unwrap_or(300);
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_secs(2);
+
+        loop {
+            let file = self.get_file(file_name).await?;
+
+            match file.state {
+                FileState::Active => return Ok(file),
+                FileState::Failed => {
+                    let error_msg = file
+                        .error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    return Err(Error::NonRetryable(format!(
+                        "File processing failed: {}",
+                        error_msg
+                    )));
+                }
+                FileState::Processing => {
+                    if start.elapsed().as_secs() > timeout {
+                        return Err(Error::NonRetryable(format!(
+                            "Timeout waiting for file {} to process",
+                            file_name
+                        )));
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        }
+    }
+
+    /// Delete an uploaded file.
+    ///
+    /// # Arguments
+    /// * `file_name` - The file resource name (e.g., "files/abc123")
+    pub async fn delete_file(&self, file_name: &str) -> Result<()> {
+        let client = reqwest::Client::new();
+        let file_api_base = "https://generativelanguage.googleapis.com";
+
+        let url = match &self.auth {
+            GoogleAuth::ApiKey(key) => {
+                format!("{}/v1beta/{}?key={}", file_api_base, file_name, key)
+            }
+            #[cfg(feature = "google-adc")]
+            GoogleAuth::Adc(_) => {
+                format!("{}/v1beta/{}", file_api_base, file_name)
+            }
+        };
+
+        #[allow(unused_mut)]
+        let mut request = client.delete(&url);
+
+        #[cfg(feature = "google-adc")]
+        if let GoogleAuth::Adc(_) = &self.auth {
+            let token = self.get_adc_token().await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::NonRetryable(format!("Failed to delete file: {}", e)))?;
+
+        if !response.status().is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            return Err(Error::NonRetryable(format!(
+                "Failed to delete file: {}",
+                error_body
+            )));
+        }
+
+        Ok(())
+    }
+
+    // ==================== End File API Methods ====================
 
     /// Get a valid access token for ADC authentication
     #[cfg(feature = "google-adc")]
@@ -315,6 +627,26 @@ impl GoogleGenAIClient {
                         }]
                     }));
                 }
+                ConversationMessage::Multimodal(multimodal_msg) => {
+                    // Convert multimodal message with media parts (images, video, audio)
+                    let role = match multimodal_msg.role {
+                        ChatRole::User => "user",
+                        ChatRole::Assistant => "model",
+                        ChatRole::System => continue, // Skip system messages
+                        ChatRole::Tool => "user",
+                    };
+
+                    let parts: Vec<serde_json::Value> = multimodal_msg
+                        .parts
+                        .iter()
+                        .map(|part| media_part_to_google_format(part, None))
+                        .collect();
+
+                    contents.push(serde_json::json!({
+                        "role": role,
+                        "parts": parts
+                    }));
+                }
             }
         }
 
@@ -472,7 +804,7 @@ impl GoogleGenAIClient {
         stream: bool,
     ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
-        let mut request = client
+        let request = client
             .post(&self.get_endpoint(stream))
             .timeout(std::time::Duration::from_secs(300))
             .header("Content-Type", "application/json");
@@ -531,7 +863,7 @@ impl GoogleGenAIClient {
     }
 }
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 
 #[async_trait]
 impl InferenceClient for GoogleGenAIClient {

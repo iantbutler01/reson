@@ -3,8 +3,8 @@
 //! These tests demonstrate that the #[agentic], #[tool], and #[deserializable]
 //! macros compile and generate correct code.
 
-use reson::Deserializable;
-use reson::parsers::Deserializable as DeserializableTrait;
+use reson_agentic::Deserializable;
+use reson_agentic::parsers::Deserializable as DeserializableTrait;
 use serde::{Deserialize, Serialize};
 
 #[test]
@@ -70,7 +70,7 @@ fn test_deserializable_macro_partial() {
 fn test_tool_macro_snake_case_conversion() {
     // Test that the Tool derive macro generates proper methods
 
-    use reson::Tool;
+    use reson_agentic::Tool;
     use serde::{Serialize, Deserialize};
 
     /// A calculator tool for basic math operations
@@ -122,8 +122,8 @@ fn test_tool_macro_snake_case_conversion() {
 
 #[test]
 fn test_tool_macro_with_schema_generator() {
-    use reson::Tool;
-    use reson::schema::AnthropicSchemaGenerator;
+    use reson_agentic::Tool;
+    use reson_agentic::schema::AnthropicSchemaGenerator;
     use serde::{Serialize, Deserialize};
 
     /// Get current weather for a location
@@ -151,9 +151,9 @@ fn test_tool_macro_with_schema_generator() {
 
 #[cfg(test)]
 mod agentic_macro_tests {
-    use reson::agentic;
-    use reson::runtime::Runtime;
-    use reson::error::Result;
+    use reson_agentic::agentic;
+    use reson_agentic::runtime::Runtime;
+    use reson_agentic::error::Result;
 
     // Test that the macro compiles and generates a function without runtime param
     #[agentic(model = "anthropic:claude-3-5-sonnet-20241022")]

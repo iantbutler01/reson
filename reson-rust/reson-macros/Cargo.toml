@@ -1,7 +1,14 @@
 [package]
-name = "reson-macros"
+name = "resonai-macros"
 version = "0.1.0"
 edition = "2021"
+authors = ["Reson Contributors"]
+description = "Proc macros for the resonai LLM agent framework"
+license = "MIT"
+repository = "https://github.com/ianhundere/reson"
+documentation = "https://docs.rs/resonai-macros"
+keywords = ["llm", "ai", "agents", "macros"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

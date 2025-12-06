@@ -1,4 +1,4 @@
-# PyO3 Bindings Specification for reson-rust
+# PyO3 Bindings Specification for reson_agentic
 
 ## Overview
 
@@ -7,7 +7,7 @@ This document specifies the Python bindings needed to replace the pure-Python re
 ## Architecture
 
 ```
-reson-rust/
+reson_agentic/
 ├── src/                    # Core Rust library
 ├── reson-macros/           # Proc macros (#[agentic], #[tool], etc.)
 └── reson-py/               # NEW: PyO3 bindings crate
@@ -579,7 +579,7 @@ reson = { path = ".." }  # Core Rust library
 2. **Integration Tests**: Run existing Python tests unchanged:
    ```bash
    cd /Users/crow/SoftwareProjects/reson
-   pip install ./reson-rust/reson-py  # Install Rust bindings
+   pip install ./reson_agentic/reson-py  # Install Rust bindings
    pytest integration_tests/          # Run existing tests
    ```
 

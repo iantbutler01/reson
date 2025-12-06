@@ -6,7 +6,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use reson::prelude::*;
+//! use reson_agentic::prelude::*;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
@@ -21,21 +21,21 @@ pub mod runtime;
 pub mod types;
 
 // Module declarations (implementations coming in phases)
-pub mod providers;
 pub mod parsers;
+pub mod providers;
 pub mod schema;
 pub mod storage;
-pub mod tools;
 pub mod templating;
+pub mod tools;
 pub mod utils;
 
-// Re-export proc macros from reson-macros crate
-pub use reson_macros::{agentic, agentic_generator, Deserializable, Tool};
+// Re-export proc macros from resonai-macros crate
+pub use resonai_macros::{agentic, agentic_generator, Deserializable, Tool};
 
 // Prelude for convenient imports
 pub mod prelude {
     pub use crate::error::{Error, Result};
-    pub use crate::runtime::{Runtime, ContextApi};
+    pub use crate::runtime::{ContextApi, Runtime};
     pub use crate::types::{
         CacheMarker, ChatMessage, ChatRole, CreateResult, Provider, ReasoningSegment, TokenUsage,
         ToolCall, ToolResult,

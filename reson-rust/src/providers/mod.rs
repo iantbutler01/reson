@@ -28,7 +28,7 @@ pub mod tracing_client;
 
 pub use anthropic::AnthropicClient;
 pub use bedrock::BedrockClient;
-pub use google::GoogleGenAIClient;
+pub use google::{GoogleGenAIClient, FileState, UploadedFile};
 #[cfg(feature = "google-adc")]
 pub use google_anthropic::GoogleAnthropicClient;
 pub use openai::OAIClient;
@@ -191,8 +191,8 @@ pub enum StreamChunk {
     },
 }
 
-/// Trace callback type for monitoring
-pub type TraceCallback = Box<
+/// Trace callback type for monitoring (wrapped in Arc for Clone support)
+pub type TraceCallback = std::sync::Arc<
     dyn Fn(u64, Vec<serde_json::Value>, &GenerationResponse) -> Pin<Box<dyn futures::Future<Output = ()> + Send>>
         + Send
         + Sync,

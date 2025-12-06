@@ -13,9 +13,8 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
-use crate::providers::{GenerationConfig, InferenceClient};
 use crate::storage::{MemoryStore, Storage};
-use crate::types::{ChatMessage, ChatRole, ReasoningSegment, ToolCall, ToolResult};
+use crate::types::ReasoningSegment;
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;
 
@@ -143,6 +142,96 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    /// Register a tool function with schema information
+    ///
+    /// This method is useful when you have a tool struct that provides its schema
+    /// via `#[derive(Tool)]`, and you want to register it with a handler function.
+    ///
+    /// # Arguments
+    /// * `name` - Tool name for LLM
+    /// * `description` - Tool description
+    /// * `schema` - JSON schema for the tool parameters (from Tool::schema())
+    /// * `tool_fn` - Sync or async function to handle the tool call
+    ///
+    /// # Example
+    /// ```ignore
+    /// runtime.register_tool_with_schema(
+    ///     MyTool::tool_name(),
+    ///     MyTool::description(),
+    ///     MyTool::schema(),
+    ///     ToolFunction::Sync(Box::new(|args| {
+    ///         // Handle the tool call
+    ///         Ok("result".to_string())
+    ///     })),
+    /// ).await?;
+    /// ```
+    pub async fn register_tool_with_schema(
+        &self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        schema: serde_json::Value,
+        tool_fn: ToolFunction,
+    ) -> Result<()> {
+        let name = name.into();
+        let description = description.into();
+
+        // Store tool function
+        let mut tools = self.tools.write().await;
+        if tools.contains_key(&name) {
+            return Err(Error::NonRetryable(format!(
+                "Tool '{}' is already registered",
+                name
+            )));
+        }
+        tools.insert(name.clone(), tool_fn);
+        drop(tools);
+
+        // Extract field info from schema and store schema info
+        let fields = Self::extract_fields_from_schema(&schema);
+        let schema_info = ToolSchemaInfo {
+            name: name.clone(),
+            description,
+            fields,
+        };
+        let mut schemas = self.tool_schemas.write().await;
+        schemas.insert(name, schema_info);
+
+        Ok(())
+    }
+
+    /// Helper to extract field descriptions from a JSON schema
+    fn extract_fields_from_schema(schema: &serde_json::Value) -> Vec<crate::parsers::FieldDescription> {
+        let mut fields = Vec::new();
+
+        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+            let required = schema.get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            for (name, prop) in properties {
+                let field_type = prop.get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("object")
+                    .to_string();
+                let description = prop.get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let is_required = required.contains(&name.as_str());
+
+                fields.push(crate::parsers::FieldDescription {
+                    name: name.clone(),
+                    field_type,
+                    description,
+                    required: is_required,
+                });
+            }
+        }
+
+        fields
     }
 
     /// Register a tool with type and handler (Python: runtime.tool(fn, name=..., tool_type=...))

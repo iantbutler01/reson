@@ -60,7 +60,7 @@ impl ContextApi {
         ));
 
         // Clear existing and store new
-        let mut store_mut = self.store.clone();
+        let store_mut = self.store.clone();
         // Note: Storage trait requires mutable reference, but we have Arc<dyn Storage>
         // We'll need to handle this differently - store the JSON directly
 

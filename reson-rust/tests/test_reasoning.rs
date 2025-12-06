@@ -7,12 +7,12 @@
 //! - integration_tests/test_reasoning_stream.py
 
 use futures::StreamExt;
-use reson::providers::{
+use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use reson::types::{ChatMessage, ReasoningSegment};
-use reson::utils::ConversationMessage;
+use reson_agentic::types::{ChatMessage, ReasoningSegment};
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -24,7 +24,7 @@ fn get_anthropic_key() -> Option<String> {
 }
 
 fn get_google_key() -> Option<String> {
-    env::var("GOOGLE_API_KEY").ok()
+    env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
 fn get_openrouter_key() -> Option<String> {
@@ -106,9 +106,9 @@ async fn test_anthropic_reasoning_via_openrouter() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_thinking_model() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp")
         .with_thinking_budget(1024);
 
@@ -281,9 +281,9 @@ async fn test_anthropic_reasoning_stream() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_thinking_stream() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp")
         .with_thinking_budget(1024);
 
@@ -420,7 +420,7 @@ fn test_reasoning_segment_with_metadata() {
 
 #[test]
 fn test_reasoning_segment_anthropic_format() {
-    use reson::providers::Provider;
+    use reson_agentic::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string())
@@ -441,7 +441,7 @@ fn test_reasoning_segment_anthropic_format() {
 
 #[test]
 fn test_reasoning_segment_openai_format() {
-    use reson::providers::Provider;
+    use reson_agentic::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string());
@@ -461,7 +461,7 @@ fn test_reasoning_segment_openai_format() {
 
 #[test]
 fn test_reasoning_segment_google_format() {
-    use reson::providers::Provider;
+    use reson_agentic::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string());
@@ -481,7 +481,7 @@ fn test_reasoning_segment_google_format() {
 
 #[test]
 fn test_reasoning_segment_openrouter_format() {
-    use reson::providers::Provider;
+    use reson_agentic::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string());

@@ -20,3 +20,5 @@ test = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "reson.reson"

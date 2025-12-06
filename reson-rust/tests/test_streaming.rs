@@ -6,12 +6,12 @@
 //! - integration_tests/test_reasoning_stream.py
 
 use futures::StreamExt;
-use reson::providers::{
+use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use reson::types::ChatMessage;
-use reson::utils::ConversationMessage;
+use reson_agentic::types::ChatMessage;
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -23,7 +23,7 @@ fn get_anthropic_key() -> Option<String> {
 }
 
 fn get_google_key() -> Option<String> {
-    env::var("GOOGLE_API_KEY").ok()
+    env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
 fn get_openrouter_key() -> Option<String> {
@@ -108,9 +108,9 @@ async fn test_anthropic_basic_streaming() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_basic_streaming() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -264,9 +264,9 @@ async fn test_anthropic_streaming_with_tools() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_streaming_tool_detection() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -312,9 +312,9 @@ async fn test_google_streaming_tool_detection() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_streaming_with_thinking() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client =
         GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp").with_thinking_budget(1024);
 
@@ -369,12 +369,7 @@ async fn test_google_streaming_with_thinking() {
 async fn test_openrouter_streaming_with_reasoning() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
     // Note: This requires a model that supports reasoning
-    let client = OpenRouterClient::new(
-        api_key,
-        "anthropic/claude-3-5-sonnet",
-        None,
-        None,
-    );
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What is 15 squared? Show your reasoning.",
@@ -382,8 +377,7 @@ async fn test_openrouter_streaming_with_reasoning() {
 
     // Note: For reasoning mode, would need to use @reasoning parameter in model string
     // This is a basic test that streaming works
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
-        .with_max_tokens(500);
+    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet").with_max_tokens(500);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
 

@@ -8,7 +8,7 @@ Tests are organized by category and mapped to their Python source files.
 ```bash
 ANTHROPIC_API_KEY     # Direct Anthropic API
 OPENAI_API_KEY        # Direct OpenAI API
-GOOGLE_API_KEY        # Google Gemini API
+GOOGLE_GEMINI_API_KEY        # Google Gemini API
 OPENROUTER_API_KEY    # OpenRouter proxy (supports all models)
 # GOOGLE_APPLICATION_CREDENTIALS  # For Vertex AI (optional)
 ```
@@ -280,7 +280,7 @@ cargo test --test integration_tests -- --ignored --nocapture
 ## Test File Organization
 
 ```
-reson-rust/tests/
+reson_agentic/tests/
 ├── integration_tests.rs          # Main integration tests (current)
 ├── test_native_tools.rs          # Native tool calling tests
 ├── test_streaming.rs             # Streaming tests

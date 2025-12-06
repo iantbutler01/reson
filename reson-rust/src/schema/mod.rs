@@ -67,8 +67,11 @@ pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> 
         "anthropic" => Ok(Box::new(AnthropicSchemaGenerator)),
         "openai" => Ok(Box::new(OpenAISchemaGenerator)),
         "openrouter" => Ok(Box::new(OpenAISchemaGenerator)), // OpenRouter uses OpenAI format
-        "google" | "google_gemini" | "vertex_gemini" => Ok(Box::new(GoogleSchemaGenerator)),
+        "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai" | "google-gemini" => {
+            Ok(Box::new(GoogleSchemaGenerator))
+        }
         "bedrock" => Ok(Box::new(AnthropicSchemaGenerator)), // Bedrock uses Anthropic format
+        "google-anthropic" | "vertexai" => Ok(Box::new(AnthropicSchemaGenerator)), // Vertex AI with Claude
         _ => Err(Error::NonRetryable(format!(
             "Native tools not supported for provider: {}",
             provider

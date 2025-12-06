@@ -5,12 +5,12 @@
 //! - integration_tests/test_tool_call_format_validation.py
 
 use futures::StreamExt;
-use reson::prelude::*;
-use reson::providers::{
+use reson_agentic::prelude::*;
+use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use reson::utils::ConversationMessage;
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -22,7 +22,7 @@ fn get_anthropic_key() -> Option<String> {
 }
 
 fn get_google_key() -> Option<String> {
-    env::var("GOOGLE_API_KEY").ok()
+    env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
 fn get_openrouter_key() -> Option<String> {
@@ -264,10 +264,7 @@ fn test_toolcall_to_provider_format_anthropic() {
 
 #[test]
 fn test_toolcall_to_provider_format_google() {
-    let tool_call = ToolCall::new(
-        "get_weather",
-        serde_json::json!({"location": "SF"}),
-    );
+    let tool_call = ToolCall::new("get_weather", serde_json::json!({"location": "SF"}));
 
     let format = tool_call.to_provider_assistant_message(Provider::GoogleGenAI);
 
@@ -337,9 +334,9 @@ async fn test_cross_provider_tool_call_format() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_tool_call_format() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -365,11 +362,7 @@ async fn test_google_tool_call_format() {
                     let name = tool_call
                         .get("name")
                         .or_else(|| tool_call.get("_tool_name"))
-                        .or_else(|| {
-                            tool_call
-                                .get("functionCall")
-                                .and_then(|fc| fc.get("name"))
-                        })
+                        .or_else(|| tool_call.get("functionCall").and_then(|fc| fc.get("name")))
                         .and_then(|v| v.as_str());
 
                     assert!(name.is_some(), "Google tool call should have name");
@@ -447,10 +440,7 @@ async fn test_mixed_tool_registration_formats() {
 
 #[test]
 fn test_tool_call_with_empty_input() {
-    let tool_call = ToolCall::new(
-        "get_time",
-        serde_json::json!({}),
-    );
+    let tool_call = ToolCall::new("get_time", serde_json::json!({}));
 
     assert_eq!(tool_call.args, serde_json::json!({}));
 
@@ -459,7 +449,10 @@ fn test_tool_call_with_empty_input() {
     let anthropic_format = tool_call.to_provider_assistant_message(Provider::Anthropic);
 
     assert!(openai_format["tool_calls"][0]["function"]["arguments"].is_string());
-    assert_eq!(anthropic_format["content"][0]["input"], serde_json::json!({}));
+    assert_eq!(
+        anthropic_format["content"][0]["input"],
+        serde_json::json!({})
+    );
 }
 
 #[test]
@@ -562,11 +555,8 @@ async fn test_multi_turn_toolresult_conversation() {
 
             // Execute and add result
             let result_content = "42"; // 25 + 17 = 42
-            let tool_result = ToolResult::success_with_name(
-                tool_use_id,
-                tool_name,
-                result_content.to_string(),
-            );
+            let tool_result =
+                ToolResult::success_with_name(tool_use_id, tool_name, result_content.to_string());
             conversation.push(ConversationMessage::ToolResult(tool_result));
         }
     }
@@ -577,7 +567,10 @@ async fn test_multi_turn_toolresult_conversation() {
     )));
 
     let client2 = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
-    let result2 = client2.get_generation(&conversation, &config).await.unwrap();
+    let result2 = client2
+        .get_generation(&conversation, &config)
+        .await
+        .unwrap();
 
     println!("Turn 2 response: {}", result2.content);
 

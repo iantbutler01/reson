@@ -30,6 +30,7 @@ use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
 /// This client runs Claude models via Google Cloud's Vertex AI platform.
 /// Authentication is done via Application Default Credentials (ADC).
 #[cfg(feature = "google-adc")]
+#[derive(Clone)]
 pub struct GoogleAnthropicClient {
     model: String,
     project_id: String,

@@ -2379,8 +2379,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "reson"
-version = "0.1.0"
+name = "reson-agentic"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2398,7 +2398,7 @@ dependencies = [
  "proptest",
  "redis",
  "reqwest",
- "reson-macros",
+ "resonai-macros",
  "serde",
  "serde_json",
  "sqlx",
@@ -2411,7 +2411,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "reson-macros"
+name = "resonai-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",

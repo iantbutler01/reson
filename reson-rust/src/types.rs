@@ -23,7 +23,7 @@ fn format_json_python_style(value: &serde_json::Value) -> String {
                 .collect();
             format!("[{}]", items.join(", "))
         }
-        serde_json::Value::String(s) => format!("\"{}\"", s),
+        serde_json::Value::String(_) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Null => "null".to_string(),
@@ -55,7 +55,7 @@ impl Provider {
                 "anthropic" => Provider::Anthropic,
                 "openai" => Provider::OpenAI,
                 "bedrock" => Provider::Bedrock,
-                "google-genai" | "gemini" => Provider::GoogleGenAI,
+                "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
                 "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,
                 "openrouter" => Provider::OpenRouter,
                 _ => return Err(Error::InvalidProvider(provider_str.to_string())),
@@ -197,6 +197,269 @@ impl TokenUsage {
         self.input_tokens + self.output_tokens
     }
 }
+
+// ============================================================================
+// Media Types - for multimodal content (images, audio, video)
+// ============================================================================
+
+/// Source of media content - where the data comes from
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MediaSource {
+    /// Base64-encoded data with MIME type
+    Base64 {
+        data: String,
+        mime_type: String,
+    },
+    /// URL to the media (public URL)
+    Url {
+        url: String,
+    },
+    /// Provider file ID (uploaded via provider's File API)
+    FileId {
+        file_id: String,
+    },
+    /// Provider file URI (Google-style, includes YouTube URLs)
+    FileUri {
+        uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+}
+
+impl MediaSource {
+    /// Create from base64 data
+    pub fn base64(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self::Base64 {
+            data: data.into(),
+            mime_type: mime_type.into(),
+        }
+    }
+
+    /// Create from URL
+    pub fn url(url: impl Into<String>) -> Self {
+        Self::Url { url: url.into() }
+    }
+
+    /// Create from provider file ID
+    pub fn file_id(file_id: impl Into<String>) -> Self {
+        Self::FileId { file_id: file_id.into() }
+    }
+
+    /// Create from provider file URI (Google)
+    pub fn file_uri(uri: impl Into<String>) -> Self {
+        Self::FileUri { uri: uri.into(), mime_type: None }
+    }
+
+    /// Create from YouTube URL (Google)
+    pub fn youtube(url: impl Into<String>) -> Self {
+        Self::FileUri { uri: url.into(), mime_type: Some("video/*".to_string()) }
+    }
+}
+
+/// Video-specific metadata for processing options
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VideoMetadata {
+    /// Start offset for clipping (e.g., "1250s" or "00:30")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_offset: Option<String>,
+
+    /// End offset for clipping
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_offset: Option<String>,
+
+    /// Frames per second for sampling (default 1 FPS)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f32>,
+}
+
+impl VideoMetadata {
+    /// Create new video metadata
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set start offset
+    pub fn with_start(mut self, offset: impl Into<String>) -> Self {
+        self.start_offset = Some(offset.into());
+        self
+    }
+
+    /// Set end offset
+    pub fn with_end(mut self, offset: impl Into<String>) -> Self {
+        self.end_offset = Some(offset.into());
+        self
+    }
+
+    /// Set FPS for video sampling
+    pub fn with_fps(mut self, fps: f32) -> Self {
+        self.fps = Some(fps);
+        self
+    }
+
+    /// Set clipping range
+    pub fn with_clip(mut self, start: impl Into<String>, end: impl Into<String>) -> Self {
+        self.start_offset = Some(start.into());
+        self.end_offset = Some(end.into());
+        self
+    }
+}
+
+/// A media content part that can be attached to messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MediaPart {
+    /// Text content
+    Text {
+        text: String,
+    },
+
+    /// Image content
+    Image {
+        source: MediaSource,
+        /// Detail level for processing (OpenAI: "high", "low", "auto")
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
+    /// Audio content
+    Audio {
+        source: MediaSource,
+        /// Audio format hint (e.g., "wav", "mp3")
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<String>,
+    },
+
+    /// Video content
+    Video {
+        source: MediaSource,
+        /// Video processing metadata (clipping, FPS)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<VideoMetadata>,
+    },
+
+    /// PDF document (Anthropic, Google)
+    Document {
+        source: MediaSource,
+    },
+}
+
+impl MediaPart {
+    /// Create a text part
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    /// Create an image part from a source
+    pub fn image(source: MediaSource) -> Self {
+        Self::Image { source, detail: None }
+    }
+
+    /// Create an image part with detail level
+    pub fn image_with_detail(source: MediaSource, detail: impl Into<String>) -> Self {
+        Self::Image { source, detail: Some(detail.into()) }
+    }
+
+    /// Create an audio part
+    pub fn audio(source: MediaSource) -> Self {
+        Self::Audio { source, format: None }
+    }
+
+    /// Create an audio part with format hint
+    pub fn audio_with_format(source: MediaSource, format: impl Into<String>) -> Self {
+        Self::Audio { source, format: Some(format.into()) }
+    }
+
+    /// Create a video part
+    pub fn video(source: MediaSource) -> Self {
+        Self::Video { source, metadata: None }
+    }
+
+    /// Create a video part with metadata
+    pub fn video_with_metadata(source: MediaSource, metadata: VideoMetadata) -> Self {
+        Self::Video { source, metadata: Some(metadata) }
+    }
+
+    /// Create a video from YouTube URL
+    pub fn youtube(url: impl Into<String>) -> Self {
+        Self::Video {
+            source: MediaSource::youtube(url),
+            metadata: None,
+        }
+    }
+
+    /// Create a video from YouTube URL with clipping
+    pub fn youtube_clip(url: impl Into<String>, start: impl Into<String>, end: impl Into<String>) -> Self {
+        Self::Video {
+            source: MediaSource::youtube(url),
+            metadata: Some(VideoMetadata::new().with_clip(start, end)),
+        }
+    }
+
+    /// Create a document part
+    pub fn document(source: MediaSource) -> Self {
+        Self::Document { source }
+    }
+}
+
+/// A multimodal message containing multiple parts (text, images, video, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultimodalMessage {
+    /// Message role
+    pub role: ChatRole,
+
+    /// Content parts (text, images, video, audio, documents)
+    pub parts: Vec<MediaPart>,
+
+    /// Optional cache marker (for Anthropic caching)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_marker: Option<CacheMarker>,
+}
+
+impl MultimodalMessage {
+    /// Create a new multimodal user message
+    pub fn user(parts: Vec<MediaPart>) -> Self {
+        Self {
+            role: ChatRole::User,
+            parts,
+            cache_marker: None,
+        }
+    }
+
+    /// Create a user message with text and media
+    pub fn user_with_media(text: impl Into<String>, media: MediaPart) -> Self {
+        Self {
+            role: ChatRole::User,
+            parts: vec![media, MediaPart::text(text)],
+            cache_marker: None,
+        }
+    }
+
+    /// Create a user message with text and video
+    pub fn user_with_video(text: impl Into<String>, source: MediaSource) -> Self {
+        Self::user_with_media(text, MediaPart::video(source))
+    }
+
+    /// Create a user message with text and image
+    pub fn user_with_image(text: impl Into<String>, source: MediaSource) -> Self {
+        Self::user_with_media(text, MediaPart::image(source))
+    }
+
+    /// Create a user message with text and YouTube video
+    pub fn user_with_youtube(text: impl Into<String>, url: impl Into<String>) -> Self {
+        Self::user_with_media(text, MediaPart::youtube(url))
+    }
+
+    /// Add a cache marker
+    pub fn with_cache_marker(mut self, marker: CacheMarker) -> Self {
+        self.cache_marker = Some(marker);
+        self
+    }
+}
+
+// ============================================================================
+// Tool Types
+// ============================================================================
 
 /// Result of ToolCall::create() - handles single, multiple, or empty results
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,7 +689,7 @@ impl ToolCall {
             Provider::GoogleGenAI | Provider::GoogleAnthropic => {
                 serde_json::json!({
                     "role": "model",
-                    "content": [{
+                    "parts": [{
                         "functionCall": {
                             "name": self.tool_name,
                             "args": self.args

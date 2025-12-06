@@ -4,11 +4,11 @@
 //! Or: OPENROUTER_API_KEY=xxx cargo test --test test_native_tools -- --nocapture --ignored
 
 use futures::future::BoxFuture;
-use reson::error::Result;
-use reson::parsers::Deserializable;
-use reson::runtime::Runtime;
-use reson::types::{ToolCall, ToolResult};
-use reson::agentic;
+use reson_agentic::agentic;
+use reson_agentic::error::Result;
+use reson_agentic::parsers::Deserializable;
+use reson_agentic::runtime::Runtime;
+use reson_agentic::types::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ fn default_max_results() -> i32 {
 impl Deserializable for SearchQuery {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            reson::error::Error::NonRetryable(format!("Failed to parse SearchQuery: {}", e))
+            reson_agentic::error::Error::NonRetryable(format!("Failed to parse SearchQuery: {}", e))
         })
     }
 
@@ -39,21 +39,21 @@ impl Deserializable for SearchQuery {
         Ok(())
     }
 
-    fn field_descriptions() -> Vec<reson::parsers::FieldDescription> {
+    fn field_descriptions() -> Vec<reson_agentic::parsers::FieldDescription> {
         vec![
-            reson::parsers::FieldDescription {
+            reson_agentic::parsers::FieldDescription {
                 name: "text".to_string(),
                 field_type: "string".to_string(),
                 description: "The search text".to_string(),
                 required: true,
             },
-            reson::parsers::FieldDescription {
+            reson_agentic::parsers::FieldDescription {
                 name: "category".to_string(),
                 field_type: "string".to_string(),
                 description: "Category to search in".to_string(),
                 required: false,
             },
-            reson::parsers::FieldDescription {
+            reson_agentic::parsers::FieldDescription {
                 name: "max_results".to_string(),
                 field_type: "number".to_string(),
                 description: "Maximum number of results".to_string(),
@@ -63,7 +63,7 @@ impl Deserializable for SearchQuery {
     }
 }
 
-fn search_database(parsed_tool: reson::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
+fn search_database(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         let query: SearchQuery = serde_json::from_value(parsed_tool.value)?;
         Ok(format!(
@@ -73,38 +73,38 @@ fn search_database(parsed_tool: reson::parsers::ParsedTool) -> BoxFuture<'static
     })
 }
 
-fn add_numbers(parsed_tool: reson::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
+fn add_numbers(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         let data: serde_json::Value = parsed_tool.value;
         let a = data["a"].as_i64().ok_or_else(|| {
-            reson::error::Error::NonRetryable("Missing parameter 'a'".to_string())
+            reson_agentic::error::Error::NonRetryable("Missing parameter 'a'".to_string())
         })?;
         let b = data["b"].as_i64().ok_or_else(|| {
-            reson::error::Error::NonRetryable("Missing parameter 'b'".to_string())
+            reson_agentic::error::Error::NonRetryable("Missing parameter 'b'".to_string())
         })?;
         Ok((a + b).to_string())
     })
 }
 
-fn multiply_numbers(parsed_tool: reson::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
+fn multiply_numbers(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         let data: serde_json::Value = parsed_tool.value;
         let a = data["a"].as_i64().ok_or_else(|| {
-            reson::error::Error::NonRetryable("Missing parameter 'a'".to_string())
+            reson_agentic::error::Error::NonRetryable("Missing parameter 'a'".to_string())
         })?;
         let b = data["b"].as_i64().ok_or_else(|| {
-            reson::error::Error::NonRetryable("Missing parameter 'b'".to_string())
+            reson_agentic::error::Error::NonRetryable("Missing parameter 'b'".to_string())
         })?;
         Ok((a * b).to_string())
     })
 }
 
-fn factorial(parsed_tool: reson::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
+fn factorial(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         let data: serde_json::Value = parsed_tool.value;
         let n = data["n"]
             .as_i64()
-            .ok_or_else(|| reson::error::Error::NonRetryable("Missing parameter 'n'".to_string()))?
+            .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing parameter 'n'".to_string()))?
             as i32;
 
         fn calc_factorial(n: i32) -> i32 {
@@ -159,7 +159,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
         turn_count += 1;
         let tool_name = runtime
             .get_tool_name(&result)
-            .ok_or_else(|| reson::error::Error::NonRetryable("No tool name".to_string()))?;
+            .ok_or_else(|| reson_agentic::error::Error::NonRetryable("No tool name".to_string()))?;
 
         println!("🔧 Native turn {}: {}", turn_count, tool_name);
 
@@ -178,7 +178,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
         };
 
         // Add to history
-        history.push(reson::utils::ConversationMessage::ToolResult(tool_result));
+        history.push(reson_agentic::utils::ConversationMessage::ToolResult(tool_result));
 
         // Continue conversation
         result = runtime

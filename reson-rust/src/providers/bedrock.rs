@@ -9,15 +9,21 @@
 //! - Same chunk types as Anthropic (content_block_*)
 
 use async_trait::async_trait;
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::types::{Provider, TokenUsage};
+use crate::types::Provider;
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+
+#[cfg(feature = "bedrock")]
+use std::sync::Arc;
+
+#[cfg(feature = "bedrock")]
+use tokio::sync::OnceCell;
 
 #[cfg(feature = "bedrock")]
 use aws_sdk_bedrockruntime::{
@@ -29,10 +35,9 @@ use aws_sdk_bedrockruntime::{
 #[cfg(feature = "bedrock")]
 use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
 
-use std::sync::Arc;
-use tokio::sync::OnceCell;
 
 /// AWS Bedrock client for Claude models
+#[derive(Clone)]
 pub struct BedrockClient {
     model: String,
     region_name: String,

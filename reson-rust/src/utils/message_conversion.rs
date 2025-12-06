@@ -4,7 +4,10 @@
 //! Handles message coalescing for Anthropic/Google providers.
 
 use crate::error::Result;
-use crate::types::{ChatMessage, ChatRole, Provider, ReasoningSegment, ToolCall, ToolResult};
+use crate::types::{
+    ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage, Provider, ReasoningSegment,
+    ToolCall, ToolResult, VideoMetadata,
+};
 use serde_json::{json, Value};
 
 /// Message type that can appear in conversation history
@@ -18,6 +21,8 @@ pub enum ConversationMessage {
     ToolResult(ToolResult),
     /// Reasoning/thinking segment
     Reasoning(ReasoningSegment),
+    /// Multimodal message with media parts (images, video, audio)
+    Multimodal(MultimodalMessage),
 }
 
 impl From<ChatMessage> for ConversationMessage {
@@ -41,6 +46,266 @@ impl From<ToolResult> for ConversationMessage {
 impl From<ReasoningSegment> for ConversationMessage {
     fn from(segment: ReasoningSegment) -> Self {
         ConversationMessage::Reasoning(segment)
+    }
+}
+
+impl From<MultimodalMessage> for ConversationMessage {
+    fn from(msg: MultimodalMessage) -> Self {
+        ConversationMessage::Multimodal(msg)
+    }
+}
+
+/// Convert a MediaPart to Google's parts format
+pub fn media_part_to_google_format(part: &MediaPart, metadata: Option<&VideoMetadata>) -> Value {
+    match part {
+        MediaPart::Text { text } => json!({ "text": text }),
+
+        MediaPart::Image { source, .. } => media_source_to_google_format(source, None),
+
+        MediaPart::Audio { source, .. } => media_source_to_google_format(source, None),
+
+        MediaPart::Video { source, metadata: video_meta } => {
+            let meta = video_meta.as_ref().or(metadata);
+            media_source_to_google_format(source, meta)
+        }
+
+        MediaPart::Document { source } => media_source_to_google_format(source, None),
+    }
+}
+
+/// Convert a MediaSource to Google's format
+fn media_source_to_google_format(source: &MediaSource, metadata: Option<&VideoMetadata>) -> Value {
+    let mut part = match source {
+        MediaSource::Base64 { data, mime_type } => {
+            json!({
+                "inline_data": {
+                    "data": data,
+                    "mime_type": mime_type
+                }
+            })
+        }
+        MediaSource::Url { url } => {
+            // Google doesn't support arbitrary URLs directly - must use file_data
+            // This is a fallback that may not work for all cases
+            json!({
+                "file_data": {
+                    "file_uri": url
+                }
+            })
+        }
+        MediaSource::FileId { file_id } => {
+            json!({
+                "file_data": {
+                    "file_uri": file_id
+                }
+            })
+        }
+        MediaSource::FileUri { uri, mime_type } => {
+            let mut fd = json!({
+                "file_data": {
+                    "file_uri": uri
+                }
+            });
+            if let Some(mt) = mime_type {
+                fd["file_data"]["mime_type"] = json!(mt);
+            }
+            fd
+        }
+    };
+
+    // Add video metadata if present
+    if let Some(meta) = metadata {
+        let mut video_metadata = json!({});
+        if let Some(ref start) = meta.start_offset {
+            video_metadata["start_offset"] = json!(start);
+        }
+        if let Some(ref end) = meta.end_offset {
+            video_metadata["end_offset"] = json!(end);
+        }
+        if let Some(fps) = meta.fps {
+            video_metadata["fps"] = json!(fps);
+        }
+        if video_metadata.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+            part["video_metadata"] = video_metadata;
+        }
+    }
+
+    part
+}
+
+/// Convert a MediaPart to Anthropic's content format
+fn media_part_to_anthropic_format(part: &MediaPart) -> Value {
+    match part {
+        MediaPart::Text { text } => json!({
+            "type": "text",
+            "text": text
+        }),
+
+        MediaPart::Image { source, .. } => {
+            match source {
+                MediaSource::Base64 { data, mime_type } => json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": data
+                    }
+                }),
+                MediaSource::Url { url } => json!({
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": url
+                    }
+                }),
+                MediaSource::FileId { file_id } => json!({
+                    "type": "image",
+                    "source": {
+                        "type": "file",
+                        "file_id": file_id
+                    }
+                }),
+                MediaSource::FileUri { uri, .. } => json!({
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": uri
+                    }
+                }),
+            }
+        }
+
+        MediaPart::Document { source } => {
+            match source {
+                MediaSource::Base64 { data, mime_type } => json!({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": data
+                    }
+                }),
+                MediaSource::FileId { file_id } => json!({
+                    "type": "document",
+                    "source": {
+                        "type": "file",
+                        "file_id": file_id
+                    }
+                }),
+                _ => json!({
+                    "type": "text",
+                    "text": "[Unsupported document source for Anthropic]"
+                }),
+            }
+        }
+
+        // Anthropic doesn't support audio/video directly
+        MediaPart::Audio { .. } | MediaPart::Video { .. } => json!({
+            "type": "text",
+            "text": "[Audio/Video not supported by this provider]"
+        }),
+    }
+}
+
+/// Convert a MediaPart to OpenAI's content format
+fn media_part_to_openai_format(part: &MediaPart) -> Value {
+    match part {
+        MediaPart::Text { text } => json!({
+            "type": "text",
+            "text": text
+        }),
+
+        MediaPart::Image { source, detail } => {
+            let mut img = match source {
+                MediaSource::Base64 { data, mime_type } => json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{}", mime_type, data)
+                    }
+                }),
+                MediaSource::Url { url } => json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": url
+                    }
+                }),
+                MediaSource::FileId { file_id } => json!({
+                    "type": "image_file",
+                    "image_file": {
+                        "file_id": file_id
+                    }
+                }),
+                MediaSource::FileUri { uri, .. } => json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": uri
+                    }
+                }),
+            };
+            if let Some(d) = detail {
+                if let Some(obj) = img.get_mut("image_url") {
+                    obj["detail"] = json!(d);
+                }
+            }
+            img
+        }
+
+        MediaPart::Audio { source, format } => {
+            match source {
+                MediaSource::Base64 { data, .. } => {
+                    let fmt = format.as_deref().unwrap_or("wav");
+                    json!({
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": data,
+                            "format": fmt
+                        }
+                    })
+                }
+                _ => json!({
+                    "type": "text",
+                    "text": "[Unsupported audio source for OpenAI - use base64]"
+                }),
+            }
+        }
+
+        // OpenAI doesn't support video/documents in chat
+        MediaPart::Video { .. } | MediaPart::Document { .. } => json!({
+            "type": "text",
+            "text": "[Video/Document not supported by this provider]"
+        }),
+    }
+}
+
+/// Convert a MultimodalMessage to provider-specific format
+fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) -> Value {
+    let role = match msg.role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    };
+
+    let parts: Vec<Value> = msg.parts.iter().map(|part| {
+        match provider {
+            Provider::GoogleGenAI => media_part_to_google_format(part, None),
+            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                media_part_to_anthropic_format(part)
+            }
+            Provider::OpenAI | Provider::OpenRouter => media_part_to_openai_format(part),
+        }
+    }).collect();
+
+    // Google uses "parts", others use "content" array
+    match provider {
+        Provider::GoogleGenAI => json!({
+            "role": if role == "assistant" { "model" } else { role },
+            "parts": parts
+        }),
+        _ => json!({
+            "role": role,
+            "content": parts
+        }),
     }
 }
 
@@ -207,6 +472,18 @@ pub fn convert_messages_to_provider_format(
 
                 // Add reasoning segment as-is (providers handle differently)
                 converted_messages.push(reasoning_segment.to_provider_format(provider));
+            }
+
+            ConversationMessage::Multimodal(multimodal_msg) => {
+                // Flush pending before adding multimodal message
+                flush_pending(
+                    &mut converted_messages,
+                    &mut pending_anthropic_blocks,
+                    &mut pending_google_parts,
+                );
+
+                // Convert multimodal message to provider format
+                converted_messages.push(multimodal_to_provider_format(multimodal_msg, provider));
             }
         }
     }

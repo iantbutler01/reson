@@ -6,12 +6,12 @@
 //! - integration_tests/test_native_tools_real_apis.py
 //! - integration_tests/test_comprehensive_native_tools.py
 
-use reson::providers::{
+use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenRouterClient,
 };
-use reson::types::{ChatMessage, Provider, ToolCall, ToolResult};
-use reson::utils::ConversationMessage;
+use reson_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -27,7 +27,7 @@ fn get_openai_key() -> Option<String> {
 }
 
 fn get_google_key() -> Option<String> {
-    env::var("GOOGLE_API_KEY").ok()
+    env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
 fn get_openrouter_key() -> Option<String> {
@@ -332,9 +332,9 @@ async fn test_openrouter_multi_turn_tool_conversation() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_native_tools_single_call() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -369,9 +369,9 @@ async fn test_google_native_tools_single_call() {
 }
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_multi_turn_tool_conversation() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let config = GenerationConfig::new("gemini-1.5-flash")
@@ -639,6 +639,7 @@ fn test_toolcall_to_anthropic_format() {
         args: serde_json::json!({"location": "Paris"}),
         raw_arguments: None,
         signature: None,
+        tool_obj: None,
     };
 
     let format = tool_call.to_provider_assistant_message(Provider::Anthropic);
@@ -658,6 +659,7 @@ fn test_toolcall_to_openai_format() {
         args: serde_json::json!({"location": "London"}),
         raw_arguments: None,
         signature: None,
+        tool_obj: None,
     };
 
     let format = tool_call.to_provider_assistant_message(Provider::OpenAI);
@@ -676,6 +678,7 @@ fn test_toolcall_to_google_format() {
         args: serde_json::json!({"location": "Berlin"}),
         raw_arguments: None,
         signature: None,
+        tool_obj: None,
     };
 
     let format = tool_call.to_provider_assistant_message(Provider::GoogleGenAI);

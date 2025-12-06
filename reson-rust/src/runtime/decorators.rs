@@ -3,7 +3,6 @@
 //! Note: These are Rust function equivalents. The actual decorators will be
 //! implemented as proc macros in the reson-macros crate.
 
-use crate::error::Result;
 
 /// Helper to create empty value for a type (for streaming initialization)
 pub fn create_empty_value_for_type(type_name: &str) -> serde_json::Value {

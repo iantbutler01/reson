@@ -3,9 +3,9 @@
 //! These tests verify the AnthropicClient implementation matches Python behavior.
 //! Tests use mocking to avoid real API calls.
 
-use reson::prelude::*;
-use reson::providers::{GenerationConfig, GenerationResponse, InferenceClient};
-use reson::utils::ConversationMessage;
+use reson_agentic::prelude::*;
+use reson_agentic::providers::{GenerationConfig, GenerationResponse, InferenceClient};
+use reson_agentic::utils::ConversationMessage;
 
 // TODO: Implement AnthropicClient
 // For now, these tests will fail until we implement the client

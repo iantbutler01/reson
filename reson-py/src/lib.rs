@@ -72,23 +72,13 @@ fn create_services_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Create the `utils` submodule with `schema_generators`
+/// Create the `_utils` submodule with `schema_generators` (internal, wrapped by Python)
 fn create_utils_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let utils_module = PyModule::new(m.py(), "utils")?;
-
-    // Create schema_generators submodule
-    let schema_generators_module = PyModule::new(m.py(), "schema_generators")?;
-    schema_generators_module.add_function(wrap_pyfunction!(utils::supports_native_tools, &schema_generators_module)?)?;
-    schema_generators_module.add_function(wrap_pyfunction!(utils::get_schema_generator, &schema_generators_module)?)?;
-    schema_generators_module.add_class::<utils::SchemaGenerator>()?;
-    utils_module.add_submodule(&schema_generators_module)?;
-
-    m.add_submodule(&utils_module)?;
-
-    // Make them importable
-    let sys_modules = m.py().import("sys")?.getattr("modules")?;
-    sys_modules.set_item("reson.utils", utils_module)?;
-    sys_modules.set_item("reson.utils.schema_generators", schema_generators_module)?;
+    // Export Rust utils under reson.reson (the Rust module namespace)
+    // The Python wrapper in reson/utils/ will import from here and wrap them
+    m.add_function(wrap_pyfunction!(utils::supports_native_tools, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::get_schema_generator, m)?)?;
+    m.add_class::<utils::SchemaGenerator>()?;
 
     Ok(())
 }

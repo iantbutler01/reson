@@ -4,8 +4,8 @@
 //! Mirrors Python tests from:
 //! - integration_tests/test_toolcall_hydration.py
 
-use reson::prelude::*;
-use reson::utils::ConversationMessage;
+use reson_agentic::prelude::*;
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -431,7 +431,7 @@ fn get_openrouter_key() -> Option<String> {
 #[tokio::test]
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_toolcall_in_conversation_history() {
-    use reson::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
+    use reson_agentic::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
 
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
 
@@ -501,7 +501,7 @@ async fn test_toolcall_in_conversation_history() {
 #[tokio::test]
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_toolcall_hydration_workflow() {
-    use reson::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
+    use reson_agentic::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
 
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
 

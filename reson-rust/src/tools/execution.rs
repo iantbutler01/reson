@@ -89,6 +89,7 @@ mod tests {
             args: serde_json::json!({}),
             raw_arguments: None,
             signature: None,
+            tool_obj: None,
         };
 
         let result = execute_tool(&registry, &tool_call).await;
@@ -106,6 +107,7 @@ mod tests {
             args: serde_json::json!({}),
             raw_arguments: None,
             signature: None,
+            tool_obj: None,
         };
 
         let result = execute_tool(&registry, &tool_call).await;
@@ -134,6 +136,7 @@ mod tests {
                 args: serde_json::json!({}),
                 raw_arguments: None,
                 signature: None,
+                tool_obj: None,
             },
             ToolCall {
                 tool_use_id: "call_2".to_string(),
@@ -141,6 +144,7 @@ mod tests {
                 args: serde_json::json!({}),
                 raw_arguments: None,
                 signature: None,
+                tool_obj: None,
             },
         ];
 
@@ -168,6 +172,7 @@ mod tests {
                 args: serde_json::json!({}),
                 raw_arguments: None,
                 signature: None,
+                tool_obj: None,
             },
             ToolCall {
                 tool_use_id: "call_2".to_string(),
@@ -175,6 +180,7 @@ mod tests {
                 args: serde_json::json!({}),
                 raw_arguments: None,
                 signature: None,
+                tool_obj: None,
             },
         ];
 

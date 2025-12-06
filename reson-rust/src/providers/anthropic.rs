@@ -21,6 +21,7 @@ use crate::types::{CacheMarker, ChatRole, Provider, TokenUsage};
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
 
 /// Anthropic API client
+#[derive(Clone)]
 pub struct AnthropicClient {
     model: String,
     api_key: String,

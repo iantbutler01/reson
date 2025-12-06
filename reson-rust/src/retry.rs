@@ -83,13 +83,13 @@ impl RetryConfig {
 ///
 /// # Example
 /// ```no_run
-/// use reson::retry::{retry_with_backoff, RetryConfig};
+/// use reson_agentic::retry::{retry_with_backoff, RetryConfig};
 ///
 /// async fn example() {
 ///     let config = RetryConfig::default();
 ///     let result = retry_with_backoff(config, || async {
 ///         // Your retryable operation
-///         Ok::<_, reson::error::Error>(42)
+///         Ok::<_, reson_agentic::error::Error>(42)
 ///     }).await;
 /// }
 /// ```

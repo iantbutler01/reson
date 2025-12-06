@@ -2,7 +2,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
-use reson::utils::ConversationMessage;
+use reson_agentic::utils::ConversationMessage;
 
 use crate::types::{ChatMessage, ToolCall, ToolResult, ReasoningSegment};
 
@@ -32,28 +32,28 @@ impl InferenceProvider {
     }
 }
 
-impl From<InferenceProvider> for reson::types::Provider {
+impl From<InferenceProvider> for reson_agentic::types::Provider {
     fn from(provider: InferenceProvider) -> Self {
         match provider {
-            InferenceProvider::OPENAI => reson::types::Provider::OpenAI,
-            InferenceProvider::ANTHROPIC => reson::types::Provider::Anthropic,
-            InferenceProvider::GOOGLE_GENAI => reson::types::Provider::GoogleGenAI,
-            InferenceProvider::OPENROUTER => reson::types::Provider::OpenRouter,
-            InferenceProvider::BEDROCK => reson::types::Provider::Bedrock,
-            InferenceProvider::GOOGLE_ANTHROPIC => reson::types::Provider::GoogleAnthropic,
+            InferenceProvider::OPENAI => reson_agentic::types::Provider::OpenAI,
+            InferenceProvider::ANTHROPIC => reson_agentic::types::Provider::Anthropic,
+            InferenceProvider::GOOGLE_GENAI => reson_agentic::types::Provider::GoogleGenAI,
+            InferenceProvider::OPENROUTER => reson_agentic::types::Provider::OpenRouter,
+            InferenceProvider::BEDROCK => reson_agentic::types::Provider::Bedrock,
+            InferenceProvider::GOOGLE_ANTHROPIC => reson_agentic::types::Provider::GoogleAnthropic,
         }
     }
 }
 
-impl From<reson::types::Provider> for InferenceProvider {
-    fn from(provider: reson::types::Provider) -> Self {
+impl From<reson_agentic::types::Provider> for InferenceProvider {
+    fn from(provider: reson_agentic::types::Provider) -> Self {
         match provider {
-            reson::types::Provider::OpenAI => InferenceProvider::OPENAI,
-            reson::types::Provider::Anthropic => InferenceProvider::ANTHROPIC,
-            reson::types::Provider::GoogleGenAI => InferenceProvider::GOOGLE_GENAI,
-            reson::types::Provider::OpenRouter => InferenceProvider::OPENROUTER,
-            reson::types::Provider::Bedrock => InferenceProvider::BEDROCK,
-            reson::types::Provider::GoogleAnthropic => InferenceProvider::GOOGLE_ANTHROPIC,
+            reson_agentic::types::Provider::OpenAI => InferenceProvider::OPENAI,
+            reson_agentic::types::Provider::Anthropic => InferenceProvider::ANTHROPIC,
+            reson_agentic::types::Provider::GoogleGenAI => InferenceProvider::GOOGLE_GENAI,
+            reson_agentic::types::Provider::OpenRouter => InferenceProvider::OPENROUTER,
+            reson_agentic::types::Provider::Bedrock => InferenceProvider::BEDROCK,
+            reson_agentic::types::Provider::GoogleAnthropic => InferenceProvider::GOOGLE_ANTHROPIC,
         }
     }
 }
@@ -92,16 +92,16 @@ impl InferenceClient {
         for item in messages.iter() {
             // Try to extract as each type
             if let Ok(chat_msg) = item.extract::<ChatMessage>() {
-                let rust_msg: reson::types::ChatMessage = chat_msg.into();
+                let rust_msg: reson_agentic::types::ChatMessage = chat_msg.into();
                 conversation_messages.push(ConversationMessage::Chat(rust_msg));
             } else if let Ok(tool_call) = item.extract::<ToolCall>() {
-                let rust_tc: reson::types::ToolCall = tool_call.into();
+                let rust_tc: reson_agentic::types::ToolCall = tool_call.into();
                 conversation_messages.push(ConversationMessage::ToolCall(rust_tc));
             } else if let Ok(tool_result) = item.extract::<ToolResult>() {
-                let rust_tr: reson::types::ToolResult = tool_result.into();
+                let rust_tr: reson_agentic::types::ToolResult = tool_result.into();
                 conversation_messages.push(ConversationMessage::ToolResult(rust_tr));
             } else if let Ok(reasoning) = item.extract::<ReasoningSegment>() {
-                let rust_rs: reson::types::ReasoningSegment = reasoning.into();
+                let rust_rs: reson_agentic::types::ReasoningSegment = reasoning.into();
                 conversation_messages.push(ConversationMessage::Reasoning(rust_rs));
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -111,8 +111,8 @@ impl InferenceClient {
         }
 
         // Convert using the Rust function
-        let rust_provider: reson::types::Provider = provider.into();
-        let converted = reson::utils::convert_messages_to_provider_format(
+        let rust_provider: reson_agentic::types::Provider = provider.into();
+        let converted = reson_agentic::utils::convert_messages_to_provider_format(
             &conversation_messages,
             rust_provider,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

@@ -12,7 +12,7 @@ use crate::errors::to_py_err;
 use crate::stores::MemoryStore;
 use crate::types::{ChatMessage, ReasoningSegment, ToolCall, ToolResult};
 
-type ChunkStream = Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value), reson::error::Error>> + Send>>;
+type ChunkStream = Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value), reson_agentic::error::Error>> + Send>>;
 
 /// Parameters needed to lazily create a stream
 #[derive(Clone)]
@@ -21,7 +21,7 @@ struct StreamParams {
     model: String,
     api_key: Option<String>,
     system: Option<String>,
-    history: Option<Vec<reson::utils::ConversationMessage>>,
+    history: Option<Vec<reson_agentic::utils::ConversationMessage>>,
     output_type_name: Option<String>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -60,17 +60,17 @@ impl StreamIterator {
                 let mut params_guard = params.lock().await;
                 if let Some(p) = params_guard.take() {
                     // Create the stream
-                    let rust_tools: Arc<RwLock<HashMap<String, reson::runtime::ToolFunction>>> =
+                    let rust_tools: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolFunction>>> =
                         Arc::new(RwLock::new(HashMap::new()));
-                    let rust_tool_schemas: Arc<RwLock<HashMap<String, reson::runtime::ToolSchemaInfo>>> =
+                    let rust_tool_schemas: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>> =
                         Arc::new(RwLock::new(HashMap::new()));
-                    let store: Arc<dyn reson::storage::Storage> =
-                        Arc::new(reson::storage::MemoryStore::new());
+                    let store: Arc<dyn reson_agentic::storage::Storage> =
+                        Arc::new(reson_agentic::storage::MemoryStore::new());
                     let call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>> =
                         Arc::new(RwLock::new(None));
-                    let accumulators = Arc::new(RwLock::new(reson::runtime::Accumulators::default()));
+                    let accumulators = Arc::new(RwLock::new(reson_agentic::runtime::Accumulators::default()));
 
-                    let new_stream = reson::runtime::inference::call_llm_stream(
+                    let new_stream = reson_agentic::runtime::inference::call_llm_stream(
                         p.prompt.as_deref(),
                         &p.model,
                         rust_tools,
@@ -145,7 +145,7 @@ pub struct Runtime {
     // We store Python tool functions separately since they can't go in the Rust Runtime
     tools: Arc<RwLock<HashMap<String, PyObject>>>,
     tool_types: Arc<RwLock<HashMap<String, PyObject>>>,
-    tool_schemas: Arc<RwLock<HashMap<String, reson::runtime::ToolSchemaInfo>>>,
+    tool_schemas: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>>,
     model: Option<String>,
     api_key: Option<String>,
     native_tools: bool,
@@ -153,9 +153,9 @@ pub struct Runtime {
     // Accumulators
     raw_response: Arc<RwLock<Vec<String>>>,
     reasoning: Arc<RwLock<Vec<String>>>,
-    reasoning_segments: Arc<RwLock<Vec<reson::types::ReasoningSegment>>>,
+    reasoning_segments: Arc<RwLock<Vec<reson_agentic::types::ReasoningSegment>>>,
     // Store
-    store: Arc<RwLock<reson::storage::MemoryKVStore>>,
+    store: Arc<RwLock<reson_agentic::storage::MemoryKVStore>>,
 }
 
 #[pymethods]
@@ -194,38 +194,39 @@ impl Runtime {
             raw_response: Arc::new(RwLock::new(Vec::new())),
             reasoning: Arc::new(RwLock::new(Vec::new())),
             reasoning_segments: Arc::new(RwLock::new(Vec::new())),
-            store: Arc::new(RwLock::new(reson::storage::MemoryKVStore::new())),
+            store: Arc::new(RwLock::new(reson_agentic::storage::MemoryKVStore::new())),
         })
     }
 
     #[getter]
-    fn raw_response<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn raw_response(&self) -> String {
         let raw = self.raw_response.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        rt.block_on(async {
             let acc = raw.read().await;
-            Ok(acc.join(""))
+            acc.join("")
         })
     }
 
     #[getter]
-    fn reasoning<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn reasoning(&self) -> String {
         let reasoning = self.reasoning.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        rt.block_on(async {
             let acc = reasoning.read().await;
-            Ok(acc.join(""))
+            acc.join("")
         })
     }
 
     #[getter]
-    fn reasoning_segments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn reasoning_segments(&self) -> Vec<ReasoningSegment> {
         let segments = self.reasoning_segments.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        rt.block_on(async {
             let acc = segments.read().await;
-            let py_segments: Vec<ReasoningSegment> = acc
-                .iter()
+            acc.iter()
                 .map(|s| ReasoningSegment::from(s.clone()))
-                .collect();
-            Ok(py_segments)
+                .collect()
         })
     }
 
@@ -443,17 +444,17 @@ impl Runtime {
         let effective_api_key = api_key.or_else(|| self.api_key.clone());
 
         // Convert history to Rust types
-        let rust_history: Option<Vec<reson::utils::ConversationMessage>> =
+        let rust_history: Option<Vec<reson_agentic::utils::ConversationMessage>> =
             if let Some(hist) = history {
                 let mut messages = Vec::new();
                 for item in hist.iter() {
                     // Try to convert each item
                     if let Ok(msg) = item.extract::<ChatMessage>() {
-                        messages.push(reson::utils::ConversationMessage::Chat(msg.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::Chat(msg.into()));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
-                        messages.push(reson::utils::ConversationMessage::ToolResult(tr.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::ToolResult(tr.into()));
                     } else if let Ok(rs) = item.extract::<ReasoningSegment>() {
-                        messages.push(reson::utils::ConversationMessage::Reasoning(rs.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::Reasoning(rs.into()));
                     }
                     // Skip items we can't convert
                 }
@@ -472,8 +473,8 @@ impl Runtime {
         };
 
         // Create storage wrapper
-        let store: Arc<dyn reson::storage::Storage> =
-            Arc::new(reson::storage::MemoryStore::new());
+        let store: Arc<dyn reson_agentic::storage::Storage> =
+            Arc::new(reson_agentic::storage::MemoryStore::new());
 
         // Clone for move into async
         let prompt_clone = prompt.clone();
@@ -488,11 +489,11 @@ impl Runtime {
             reasoning_acc.write().await.clear();
 
             // Convert Python tools to Rust tool functions (empty for now - tools are Python side)
-            let rust_tools: Arc<RwLock<HashMap<String, reson::runtime::ToolFunction>>> =
+            let rust_tools: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolFunction>>> =
                 Arc::new(RwLock::new(HashMap::new()));
 
             // Convert tool schemas
-            let rust_tool_schemas: Arc<RwLock<HashMap<String, reson::runtime::ToolSchemaInfo>>> =
+            let rust_tool_schemas: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>> =
                 Arc::new(RwLock::new(HashMap::new()));
 
             // Create call context
@@ -500,7 +501,7 @@ impl Runtime {
                 Arc::new(RwLock::new(None));
 
             // Call the Rust inference engine
-            let result = reson::runtime::inference::call_llm(
+            let result = reson_agentic::runtime::inference::call_llm(
                 prompt_clone.as_deref(),
                 &effective_model,
                 rust_tools,
@@ -558,16 +559,16 @@ impl Runtime {
         let effective_api_key = api_key.or_else(|| self.api_key.clone());
 
         // Convert history to Rust types
-        let rust_history: Option<Vec<reson::utils::ConversationMessage>> =
+        let rust_history: Option<Vec<reson_agentic::utils::ConversationMessage>> =
             if let Some(hist) = history {
                 let mut messages = Vec::new();
                 for item in hist.iter() {
                     if let Ok(msg) = item.extract::<ChatMessage>() {
-                        messages.push(reson::utils::ConversationMessage::Chat(msg.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::Chat(msg.into()));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
-                        messages.push(reson::utils::ConversationMessage::ToolResult(tr.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::ToolResult(tr.into()));
                     } else if let Ok(rs) = item.extract::<ReasoningSegment>() {
-                        messages.push(reson::utils::ConversationMessage::Reasoning(rs.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::Reasoning(rs.into()));
                     }
                 }
                 Some(messages)
@@ -584,69 +585,44 @@ impl Runtime {
             None
         };
 
-        let prompt_clone = prompt.clone();
-        let system_clone = system.clone();
+        // Mark runtime as used synchronously
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
         let used = self.used.clone();
         let raw_response_acc = self.raw_response.clone();
         let reasoning_acc = self.reasoning.clone();
         let reasoning_segments_acc = self.reasoning_segments.clone();
 
-        // Return a future that resolves to a StreamIterator (async iterable)
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Mark as used
+        rt.block_on(async {
             *used.write().await = true;
-
-            // Clear accumulators
             raw_response_acc.write().await.clear();
             reasoning_acc.write().await.clear();
             reasoning_segments_acc.write().await.clear();
+        });
 
-            // Create empty tool registries (tools are Python-side)
-            let rust_tools: Arc<RwLock<HashMap<String, reson::runtime::ToolFunction>>> =
-                Arc::new(RwLock::new(HashMap::new()));
-            let rust_tool_schemas: Arc<RwLock<HashMap<String, reson::runtime::ToolSchemaInfo>>> =
-                Arc::new(RwLock::new(HashMap::new()));
+        // Create StreamIterator with params for lazy stream initialization
+        let params = StreamParams {
+            prompt: prompt,
+            model: effective_model,
+            api_key: effective_api_key,
+            system: system,
+            history: rust_history,
+            output_type_name,
+            temperature,
+            top_p,
+            max_tokens,
+        };
 
-            // Create storage and context
-            let store: Arc<dyn reson::storage::Storage> =
-                Arc::new(reson::storage::MemoryStore::new());
-            let call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>> =
-                Arc::new(RwLock::new(None));
+        let iterator = StreamIterator {
+            stream: Arc::new(tokio::sync::Mutex::new(None)),
+            params: Arc::new(tokio::sync::Mutex::new(Some(params))),
+            initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            raw_response_acc: self.raw_response.clone(),
+            reasoning_acc: self.reasoning.clone(),
+        };
 
-            // Create accumulators for the stream
-            let accumulators = Arc::new(RwLock::new(reson::runtime::Accumulators::default()));
-
-            // Get the stream
-            let stream = reson::runtime::inference::call_llm_stream(
-                prompt_clone.as_deref(),
-                &effective_model,
-                rust_tools,
-                rust_tool_schemas,
-                output_type_name,
-                store,
-                effective_api_key.as_deref(),
-                system_clone.as_deref(),
-                rust_history,
-                temperature,
-                top_p,
-                max_tokens,
-                call_context,
-                accumulators,
-            )
-            .await
-            .map_err(to_py_err)?;
-
-            // Create and return the async iterator
-            Python::with_gil(|py| -> PyResult<PyObject> {
-                let iterator = StreamIterator {
-                    stream: Arc::new(tokio::sync::Mutex::new(Some(stream))),
-                    raw_response_acc: raw_response_acc.clone(),
-                    reasoning_acc: reasoning_acc.clone(),
-                };
-                let bound = Py::new(py, iterator)?;
-                Ok(bound.into_any())
-            })
-        })
+        // Return the iterator directly (it's an async iterable)
+        let bound = Py::new(py, iterator)?;
+        Ok(bound.into_pyobject(py)?.into_any())
     }
 }
 
@@ -665,7 +641,7 @@ impl Runtime {
             raw_response: Arc::new(RwLock::new(Vec::new())),
             reasoning: Arc::new(RwLock::new(Vec::new())),
             reasoning_segments: Arc::new(RwLock::new(Vec::new())),
-            store: Arc::new(RwLock::new(reson::storage::MemoryKVStore::new())),
+            store: Arc::new(RwLock::new(reson_agentic::storage::MemoryKVStore::new())),
         }
     }
 

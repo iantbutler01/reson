@@ -5,12 +5,12 @@
 //! - integration_tests/test_parallel_tool_calling.py
 
 use futures::StreamExt;
-use reson::providers::{
+use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use reson::types::{ChatMessage, ToolCall, ToolResult};
-use reson::utils::ConversationMessage;
+use reson_agentic::types::{ChatMessage, ToolCall, ToolResult};
+use reson_agentic::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -22,7 +22,7 @@ fn get_anthropic_key() -> Option<String> {
 }
 
 fn get_google_key() -> Option<String> {
-    env::var("GOOGLE_API_KEY").ok()
+    env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
 fn get_openrouter_key() -> Option<String> {
@@ -348,9 +348,9 @@ async fn test_anthropic_direct_parallel_tools() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_parallel_tool_calling() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
@@ -592,9 +592,9 @@ async fn test_mixed_parallel_tool_types() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "Requires GOOGLE_API_KEY"]
+#[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_compositional_chaining() {
-    let api_key = get_google_key().expect("GOOGLE_API_KEY not set");
+    let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(

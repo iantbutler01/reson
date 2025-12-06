@@ -4,7 +4,6 @@
 
 #[cfg(feature = "templating")]
 use minijinja::{Environment, Error as TemplateError};
-use std::collections::HashMap;
 
 /// Template renderer with support for type interpolation
 #[cfg(feature = "templating")]
@@ -28,7 +27,7 @@ impl TemplateEngine {
     ///
     /// # Example
     /// ```no_run
-    /// use reson::templating::TemplateEngine;
+    /// use reson_agentic::templating::TemplateEngine;
     ///
     /// let engine = TemplateEngine::new();
     /// let result = engine.render_str("Hello {{ name }}!", &[("name", "World")]).unwrap();

@@ -3,7 +3,7 @@
 //! Run with: cargo run --example templating_example --features templating
 
 #[cfg(feature = "templating")]
-use reson::templating::TemplateEngine;
+use reson_agentic::templating::TemplateEngine;
 
 #[cfg(feature = "templating")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {

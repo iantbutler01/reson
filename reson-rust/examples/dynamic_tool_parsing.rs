@@ -3,8 +3,8 @@
 //! This example demonstrates how Reson's NativeToolParser dynamically constructs
 //! tool objects from JSON using a type registry, similar to Python's runtime type lookup.
 
-use reson::parsers::{Deserializable, FieldDescription};
-use reson::runtime::Runtime;
+use reson_agentic::parsers::{Deserializable, FieldDescription};
+use reson_agentic::runtime::Runtime;
 use serde::{Deserialize, Serialize};
 use futures::future::BoxFuture;
 
@@ -18,20 +18,20 @@ struct Chat {
 }
 
 impl Deserializable for Chat {
-    fn from_partial(partial: serde_json::Value) -> reson::error::Result<Self> {
+    fn from_partial(partial: serde_json::Value) -> reson_agentic::error::Result<Self> {
         serde_json::from_value(partial).map_err(|e| {
-            reson::error::Error::NonRetryable(format!("Failed to parse Chat: {}", e))
+            reson_agentic::error::Error::NonRetryable(format!("Failed to parse Chat: {}", e))
         })
     }
 
-    fn validate_complete(&self) -> reson::error::Result<()> {
+    fn validate_complete(&self) -> reson_agentic::error::Result<()> {
         if self.recipient.is_empty() {
-            return Err(reson::error::Error::NonRetryable(
+            return Err(reson_agentic::error::Error::NonRetryable(
                 "recipient is required".to_string(),
             ));
         }
         if self.message.is_empty() {
-            return Err(reson::error::Error::NonRetryable(
+            return Err(reson_agentic::error::Error::NonRetryable(
                 "message is required".to_string(),
             ));
         }
@@ -66,15 +66,15 @@ struct FileOp {
 }
 
 impl Deserializable for FileOp {
-    fn from_partial(partial: serde_json::Value) -> reson::error::Result<Self> {
+    fn from_partial(partial: serde_json::Value) -> reson_agentic::error::Result<Self> {
         serde_json::from_value(partial).map_err(|e| {
-            reson::error::Error::NonRetryable(format!("Failed to parse FileOp: {}", e))
+            reson_agentic::error::Error::NonRetryable(format!("Failed to parse FileOp: {}", e))
         })
     }
 
-    fn validate_complete(&self) -> reson::error::Result<()> {
+    fn validate_complete(&self) -> reson_agentic::error::Result<()> {
         if self.path.is_empty() {
-            return Err(reson::error::Error::NonRetryable(
+            return Err(reson_agentic::error::Error::NonRetryable(
                 "path is required".to_string(),
             ));
         }
@@ -100,7 +100,7 @@ impl Deserializable for FileOp {
 }
 
 #[tokio::main]
-async fn main() -> reson::error::Result<()> {
+async fn main() -> reson_agentic::error::Result<()> {
     println!("=== Dynamic Tool Parsing Example ===\n");
 
     // Create a runtime
@@ -110,7 +110,7 @@ async fn main() -> reson::error::Result<()> {
     // In Python: runtime.tool(handle_chat, name="Chat", tool_type=Chat)
     // In Rust:   runtime.tool::<Chat, _>(handle_chat, Some("Chat"))
 
-    let chat_handler = |parsed_tool: reson::parsers::ParsedTool| -> BoxFuture<'static, reson::error::Result<String>> {
+    let chat_handler = |parsed_tool: reson_agentic::parsers::ParsedTool| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
         Box::pin(async move {
             let chat: Chat = serde_json::from_value(parsed_tool.value)?;
             println!(
@@ -123,7 +123,7 @@ async fn main() -> reson::error::Result<()> {
 
     runtime.tool::<Chat, _>(chat_handler, Some("Chat")).await?;
 
-    let fileop_handler = |parsed_tool: reson::parsers::ParsedTool| -> BoxFuture<'static, reson::error::Result<String>> {
+    let fileop_handler = |parsed_tool: reson_agentic::parsers::ParsedTool| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
         Box::pin(async move {
             let file_op: FileOp = serde_json::from_value(parsed_tool.value)?;
             println!("📁 FileOp handler called: {} ({})", file_op.path, file_op.operation);

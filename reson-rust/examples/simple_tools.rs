@@ -2,8 +2,8 @@
 //!
 //! Run with: cargo run --example simple_tools
 
-use reson::runtime::{Runtime, ToolFunction};
-use reson::storage::MemoryStore;
+use reson_agentic::runtime::{Runtime, ToolFunction};
+use reson_agentic::storage::MemoryStore;
 use std::sync::Arc;
 
 #[tokio::main]

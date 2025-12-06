@@ -215,8 +215,8 @@ Returns ParsedToolResult
 ## Usage Example
 
 ```rust
-use reson::runtime::Runtime;
-use reson::parsers::{Deserializable, ParsedTool};
+use reson_agentic::runtime::Runtime;
+use reson_agentic::parsers::{Deserializable, ParsedTool};
 
 // 1. Define tool type
 #[derive(Serialize, Deserialize)]

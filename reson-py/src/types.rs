@@ -47,24 +47,24 @@ impl ChatRole {
     }
 }
 
-impl From<reson::types::ChatRole> for ChatRole {
-    fn from(role: reson::types::ChatRole) -> Self {
+impl From<reson_agentic::types::ChatRole> for ChatRole {
+    fn from(role: reson_agentic::types::ChatRole) -> Self {
         match role {
-            reson::types::ChatRole::System => ChatRole::System,
-            reson::types::ChatRole::User => ChatRole::User,
-            reson::types::ChatRole::Assistant => ChatRole::Assistant,
-            reson::types::ChatRole::Tool => ChatRole::Tool,
+            reson_agentic::types::ChatRole::System => ChatRole::System,
+            reson_agentic::types::ChatRole::User => ChatRole::User,
+            reson_agentic::types::ChatRole::Assistant => ChatRole::Assistant,
+            reson_agentic::types::ChatRole::Tool => ChatRole::Tool,
         }
     }
 }
 
-impl From<ChatRole> for reson::types::ChatRole {
+impl From<ChatRole> for reson_agentic::types::ChatRole {
     fn from(role: ChatRole) -> Self {
         match role {
-            ChatRole::System => reson::types::ChatRole::System,
-            ChatRole::User => reson::types::ChatRole::User,
-            ChatRole::Assistant => reson::types::ChatRole::Assistant,
-            ChatRole::Tool => reson::types::ChatRole::Tool,
+            ChatRole::System => reson_agentic::types::ChatRole::System,
+            ChatRole::User => reson_agentic::types::ChatRole::User,
+            ChatRole::Assistant => reson_agentic::types::ChatRole::Assistant,
+            ChatRole::Tool => reson_agentic::types::ChatRole::Tool,
         }
     }
 }
@@ -146,8 +146,8 @@ impl ChatMessage {
     }
 }
 
-impl From<reson::types::ChatMessage> for ChatMessage {
-    fn from(msg: reson::types::ChatMessage) -> Self {
+impl From<reson_agentic::types::ChatMessage> for ChatMessage {
+    fn from(msg: reson_agentic::types::ChatMessage) -> Self {
         Self {
             role: msg.role.into(),
             content: msg.content,
@@ -157,12 +157,12 @@ impl From<reson::types::ChatMessage> for ChatMessage {
     }
 }
 
-impl From<ChatMessage> for reson::types::ChatMessage {
+impl From<ChatMessage> for reson_agentic::types::ChatMessage {
     fn from(msg: ChatMessage) -> Self {
         Self {
             role: msg.role.into(),
             content: msg.content,
-            cache_marker: if msg.cache_marker { Some(reson::types::CacheMarker::Ephemeral) } else { None },
+            cache_marker: if msg.cache_marker { Some(reson_agentic::types::CacheMarker::Ephemeral) } else { None },
             model_families: None,
             signature: msg.signature,
         }
@@ -258,12 +258,12 @@ impl ToolCall {
         };
 
         // Call Rust create function
-        let result = reson::types::ToolCall::create(json_value)
+        let result = reson_agentic::types::ToolCall::create(json_value)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Unsupported tool call format: {}", e)))?;
 
         // Convert result back to Python
         match result {
-            reson::types::CreateResult::Single(mut tc) => {
+            reson_agentic::types::CreateResult::Single(mut tc) => {
                 // Apply signature override if provided
                 if signature.is_some() {
                     tc.signature = signature;
@@ -273,7 +273,7 @@ impl ToolCall {
                 py_tc.tool_obj_registry_key = Some(registry_key);
                 Ok(py_tc.into_pyobject(py)?.unbind().into_any())
             }
-            reson::types::CreateResult::Multiple(tcs) => {
+            reson_agentic::types::CreateResult::Multiple(tcs) => {
                 let py_list: Vec<ToolCall> = tcs.into_iter().map(|mut tc| {
                     if signature.is_some() {
                         tc.signature = signature.clone();
@@ -284,7 +284,7 @@ impl ToolCall {
                 }).collect();
                 Ok(py_list.into_pyobject(py)?.unbind().into_any())
             }
-            reson::types::CreateResult::Empty => {
+            reson_agentic::types::CreateResult::Empty => {
                 Err(pyo3::exceptions::PyValueError::new_err("No tool calls provided"))
             }
         }
@@ -344,8 +344,8 @@ impl ToolCall {
     /// Convert to provider-specific assistant message format.
     fn to_provider_assistant_message(&self, py: Python<'_>, provider: &crate::services::InferenceProvider) -> PyResult<PyObject> {
         // Convert to Rust type, call method, convert back
-        let rust_provider: reson::types::Provider = (*provider).into();
-        let rust_tc: reson::types::ToolCall = self.clone().into();
+        let rust_provider: reson_agentic::types::Provider = (*provider).into();
+        let rust_tc: reson_agentic::types::ToolCall = self.clone().into();
         let result = rust_tc.to_provider_assistant_message(rust_provider);
 
         pythonize::pythonize(py, &result)
@@ -397,8 +397,8 @@ impl ToolCall {
     }
 }
 
-impl From<reson::types::ToolCall> for ToolCall {
-    fn from(tc: reson::types::ToolCall) -> Self {
+impl From<reson_agentic::types::ToolCall> for ToolCall {
+    fn from(tc: reson_agentic::types::ToolCall) -> Self {
         Self {
             tool_use_id: tc.tool_use_id,
             tool_name: tc.tool_name,
@@ -411,7 +411,7 @@ impl From<reson::types::ToolCall> for ToolCall {
     }
 }
 
-impl From<ToolCall> for reson::types::ToolCall {
+impl From<ToolCall> for reson_agentic::types::ToolCall {
     fn from(tc: ToolCall) -> Self {
         Self {
             tool_use_id: tc.tool_use_id,
@@ -487,8 +487,8 @@ impl ToolResult {
     }
 }
 
-impl From<reson::types::ToolResult> for ToolResult {
-    fn from(tr: reson::types::ToolResult) -> Self {
+impl From<reson_agentic::types::ToolResult> for ToolResult {
+    fn from(tr: reson_agentic::types::ToolResult) -> Self {
         Self {
             tool_use_id: tr.tool_use_id,
             content: tr.content,
@@ -499,7 +499,7 @@ impl From<reson::types::ToolResult> for ToolResult {
     }
 }
 
-impl From<ToolResult> for reson::types::ToolResult {
+impl From<ToolResult> for reson_agentic::types::ToolResult {
     fn from(tr: ToolResult) -> Self {
         Self {
             tool_use_id: tr.tool_use_id,
@@ -607,8 +607,8 @@ impl ReasoningSegment {
     }
 }
 
-impl From<reson::types::ReasoningSegment> for ReasoningSegment {
-    fn from(rs: reson::types::ReasoningSegment) -> Self {
+impl From<reson_agentic::types::ReasoningSegment> for ReasoningSegment {
+    fn from(rs: reson_agentic::types::ReasoningSegment) -> Self {
         Self {
             content: rs.content,
             signature: rs.signature,
@@ -620,7 +620,7 @@ impl From<reson::types::ReasoningSegment> for ReasoningSegment {
     }
 }
 
-impl From<ReasoningSegment> for reson::types::ReasoningSegment {
+impl From<ReasoningSegment> for reson_agentic::types::ReasoningSegment {
     fn from(rs: ReasoningSegment) -> Self {
         Self {
             content: rs.content,

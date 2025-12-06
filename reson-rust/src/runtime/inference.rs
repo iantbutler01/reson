@@ -2,19 +2,22 @@
 //!
 //! Handles LLM API calls with native tools or parser-based approaches.
 
+use futures::stream::{Stream, StreamExt};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use futures::stream::{Stream, StreamExt};
-use std::pin::Pin;
 
 use crate::error::{Error, Result};
-use crate::providers::{AnthropicClient, OAIClient, OpenRouterClient, InferenceClient, GenerationConfig};
+use crate::providers::{
+    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
+    OpenRouterClient,
+};
 use crate::storage::Storage;
-use crate::types::{ChatMessage, ChatRole, Provider};
+use crate::types::ChatMessage;
 use crate::utils::ConversationMessage;
 
-use super::{ToolFunction, ToolSchemaInfo, Accumulators};
+use super::{Accumulators, ToolFunction, ToolSchemaInfo};
 
 /// Result from non-streaming LLM call
 pub struct CallResult {
@@ -30,7 +33,8 @@ fn field_type_to_json_type(field_type: &str) -> serde_json::Value {
     match field_type {
         "string" | "String" | "str" | "&str" => serde_json::json!("string"),
         "number" | "f32" | "f64" | "float" => serde_json::json!("number"),
-        "integer" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
+        "integer" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize"
+        | "usize" => {
             serde_json::json!("integer")
         }
         "boolean" | "bool" => serde_json::json!("boolean"),
@@ -39,7 +43,8 @@ fn field_type_to_json_type(field_type: &str) -> serde_json::Value {
         t if t.starts_with("Vec<") || t.starts_with("&[") => serde_json::json!("array"),
         t if t.starts_with("Option<") => {
             // Extract inner type for Optional fields
-            let inner = t.strip_prefix("Option<")
+            let inner = t
+                .strip_prefix("Option<")
                 .and_then(|s| s.strip_suffix(">"))
                 .unwrap_or("string");
             field_type_to_json_type(inner)
@@ -79,9 +84,15 @@ fn generate_tool_schemas(
 
             for field in &schema_info.fields {
                 let mut field_schema = serde_json::Map::new();
-                field_schema.insert("type".to_string(), field_type_to_json_type(&field.field_type));
+                field_schema.insert(
+                    "type".to_string(),
+                    field_type_to_json_type(&field.field_type),
+                );
                 if !field.description.is_empty() {
-                    field_schema.insert("description".to_string(), serde_json::json!(field.description));
+                    field_schema.insert(
+                        "description".to_string(),
+                        serde_json::json!(field.description),
+                    );
                 }
                 properties.insert(field.name.clone(), serde_json::Value::Object(field_schema));
 
@@ -97,7 +108,7 @@ fn generate_tool_schemas(
                     "type": "object",
                     "properties": properties,
                     "required": required
-                })
+                }),
             )
         } else {
             // No schema info - generate minimal schema
@@ -108,7 +119,7 @@ fn generate_tool_schemas(
                     "type": "object",
                     "properties": {},
                     "required": []
-                })
+                }),
             )
         };
 
@@ -168,7 +179,16 @@ pub fn create_inference_client(
             "openrouter" => std::env::var("OPENROUTER_API_KEY")
                 .or_else(|_| std::env::var("OPENROUTER_KEY"))
                 .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
-            _ => return Err(Error::NonRetryable(format!("Unknown provider: {}", provider))),
+            "google-gemini" | "google-genai" | "gemini" => {
+                std::env::var("GOOGLE_GEMINI_API_KEY")
+                    .map_err(|_| Error::NonRetryable("GOOGLE_GEMINI_API_KEY not set".to_string()))?
+            }
+            _ => {
+                return Err(Error::NonRetryable(format!(
+                    "Unknown provider: {}",
+                    provider
+                )))
+            }
         },
     };
 
@@ -197,7 +217,21 @@ pub fn create_inference_client(
             }
             Box::new(client)
         }
-        _ => return Err(Error::NonRetryable(format!("Unsupported provider: {}", provider))),
+        "google-gemini" | "google-genai" | "gemini" => {
+            let mut client = GoogleGenAIClient::new(key, model_name);
+            if let Some(r) = reasoning {
+                if let Ok(budget) = r.parse::<u32>() {
+                    client = client.with_thinking_budget(budget);
+                }
+            }
+            Box::new(client)
+        }
+        _ => {
+            return Err(Error::NonRetryable(format!(
+                "Unsupported provider: {}",
+                provider
+            )))
+        }
     };
 
     Ok(client)
@@ -300,7 +334,9 @@ pub async fn call_llm(
                             obj.insert("_tool_name".to_string(), serde_json::json!(name));
                             // Parse arguments JSON and copy to top level
                             if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
-                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
+                                if let Ok(args) =
+                                    serde_json::from_str::<serde_json::Value>(args_str)
+                                {
                                     if let Some(args_obj) = args.as_object() {
                                         for (k, v) in args_obj {
                                             obj.insert(k.clone(), v.clone());
@@ -417,37 +453,34 @@ pub async fn call_llm_stream(
     let stream = client.connect_and_listen(&messages, &config).await?;
 
     // Transform stream to (chunk_type, value) tuples
-    let transformed = stream.map(move |chunk_result| {
-        match chunk_result {
-            Ok(chunk) => {
-                use crate::providers::StreamChunk;
-                match chunk {
-                    StreamChunk::Content(text) => {
-                        Ok(("content".to_string(), serde_json::json!(text)))
-                    }
-                    StreamChunk::Reasoning(text) => {
-                        Ok(("reasoning".to_string(), serde_json::json!(text)))
-                    }
-                    StreamChunk::Signature(sig) => {
-                        Ok(("signature".to_string(), serde_json::json!(sig)))
-                    }
-                    StreamChunk::ToolCallComplete(tool) => {
-                        Ok(("tool_call_complete".to_string(), tool))
-                    }
-                    StreamChunk::ToolCallPartial(tool) => {
-                        Ok(("tool_call_partial".to_string(), tool))
-                    }
-                    StreamChunk::Usage { input_tokens, output_tokens, cached_tokens } => {
-                        Ok(("usage".to_string(), serde_json::json!({
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "cached_tokens": cached_tokens
-                        })))
-                    }
+    let transformed = stream.map(move |chunk_result| match chunk_result {
+        Ok(chunk) => {
+            use crate::providers::StreamChunk;
+            match chunk {
+                StreamChunk::Content(text) => Ok(("content".to_string(), serde_json::json!(text))),
+                StreamChunk::Reasoning(text) => {
+                    Ok(("reasoning".to_string(), serde_json::json!(text)))
                 }
+                StreamChunk::Signature(sig) => {
+                    Ok(("signature".to_string(), serde_json::json!(sig)))
+                }
+                StreamChunk::ToolCallComplete(tool) => Ok(("tool_call_complete".to_string(), tool)),
+                StreamChunk::ToolCallPartial(tool) => Ok(("tool_call_partial".to_string(), tool)),
+                StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                } => Ok((
+                    "usage".to_string(),
+                    serde_json::json!({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cached_tokens": cached_tokens
+                    }),
+                )),
             }
-            Err(e) => Err(e),
         }
+        Err(e) => Err(e),
     });
 
     Ok(Box::pin(transformed))
@@ -467,7 +500,8 @@ mod tests {
     #[test]
     fn test_create_inference_client_with_reasoning() {
         std::env::set_var("ANTHROPIC_API_KEY", "test-key");
-        let result = create_inference_client("anthropic:claude-3-5-sonnet-20241022@reasoning=1024", None);
+        let result =
+            create_inference_client("anthropic:claude-3-5-sonnet-20241022@reasoning=1024", None);
         assert!(result.is_ok());
     }
 
@@ -532,7 +566,10 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "get_weather");
         assert!(schemas[0]["input_schema"].is_object());
-        assert_eq!(schemas[0]["input_schema"]["properties"]["location"]["type"], "string");
+        assert_eq!(
+            schemas[0]["input_schema"]["properties"]["location"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -567,7 +604,10 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["type"], "function");
         assert_eq!(schemas[0]["function"]["name"], "calculate");
-        assert_eq!(schemas[0]["function"]["parameters"]["properties"]["expression"]["type"], "string");
+        assert_eq!(
+            schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -626,12 +666,27 @@ mod tests {
 
     #[test]
     fn test_field_type_to_json_type() {
-        assert_eq!(field_type_to_json_type("String"), serde_json::json!("string"));
+        assert_eq!(
+            field_type_to_json_type("String"),
+            serde_json::json!("string")
+        );
         assert_eq!(field_type_to_json_type("i32"), serde_json::json!("integer"));
         assert_eq!(field_type_to_json_type("f64"), serde_json::json!("number"));
-        assert_eq!(field_type_to_json_type("bool"), serde_json::json!("boolean"));
-        assert_eq!(field_type_to_json_type("Vec<String>"), serde_json::json!("array"));
-        assert_eq!(field_type_to_json_type("Option<i32>"), serde_json::json!("integer"));
-        assert_eq!(field_type_to_json_type("CustomType"), serde_json::json!("string"));
+        assert_eq!(
+            field_type_to_json_type("bool"),
+            serde_json::json!("boolean")
+        );
+        assert_eq!(
+            field_type_to_json_type("Vec<String>"),
+            serde_json::json!("array")
+        );
+        assert_eq!(
+            field_type_to_json_type("Option<i32>"),
+            serde_json::json!("integer")
+        );
+        assert_eq!(
+            field_type_to_json_type("CustomType"),
+            serde_json::json!("string")
+        );
     }
 }

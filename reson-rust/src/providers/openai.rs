@@ -41,7 +41,7 @@ impl Clone for OAIClient {
             reasoning: self.reasoning.clone(),
             ranking_referer: self.ranking_referer.clone(),
             ranking_title: self.ranking_title.clone(),
-            trace_callback: None, // TraceCallback is not cloneable
+            trace_callback: self.trace_callback.clone(),
             provider: self.provider,
         }
     }

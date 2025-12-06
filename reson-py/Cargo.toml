@@ -20,7 +20,7 @@ pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio = { version = "1.40", features = ["full"] }
 
 # Core reson library
-reson = { path = "../reson-rust", features = ["full"] }
+reson-agentic = { path = "../reson-rust", features = ["full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

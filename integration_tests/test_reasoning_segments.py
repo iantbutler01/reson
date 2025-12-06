@@ -8,7 +8,7 @@ from reson.types import ReasoningSegment
 models_to_test = [
     "openrouter:anthropic/claude-3.5-sonnet@reasoning=2000",
     "openrouter:openai/gpt-4o@reasoning=high",
-    "google-gemini:gemini-1.5-flash-latest@reasoning=1024",
+    "google-gemini:gemini-flash-latest@reasoning=1024",
 ]
 
 
@@ -16,8 +16,8 @@ models_to_test = [
 @pytest.mark.asyncio
 async def test_reasoning_segments_across_providers(model: str):
     """Test basic ReasoningSegment functionality across multiple providers."""
-    if "google" in model and not os.getenv("GOOGLE_API_KEY"):
-        pytest.skip("GOOGLE_API_KEY not set")
+    if "google" in model and not os.getenv("GOOGLE_GEMINI_API_KEY"):
+        pytest.skip("GOOGLE_GEMINI_API_KEY not set")
     if "openrouter" in model and not os.getenv("OPENROUTER_API_KEY"):
         pytest.skip("OPENROUTER_API_KEY not set")
 

@@ -9,7 +9,7 @@ use crate::errors::to_py_err;
 /// In-memory store exposed to Python
 #[pyclass]
 pub struct MemoryStore {
-    inner: Arc<RwLock<reson::storage::MemoryKVStore>>,
+    inner: Arc<RwLock<reson_agentic::storage::MemoryKVStore>>,
 }
 
 #[pymethods]
@@ -17,7 +17,7 @@ impl MemoryStore {
     #[new]
     fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(reson::storage::MemoryKVStore::new())),
+            inner: Arc::new(RwLock::new(reson_agentic::storage::MemoryKVStore::new())),
         }
     }
 
@@ -25,7 +25,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.read().await;
-            let result: Option<serde_json::Value> = reson::storage::Store::get(&*store, &key)
+            let result: Option<serde_json::Value> = reson_agentic::storage::Store::get(&*store, &key)
                 .await
                 .map_err(to_py_err)?;
 
@@ -48,7 +48,7 @@ impl MemoryStore {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.write().await;
-            reson::storage::Store::set(&*store, &key, &json_value)
+            reson_agentic::storage::Store::set(&*store, &key, &json_value)
                 .await
                 .map_err(to_py_err)?;
             Ok::<_, PyErr>(Python::with_gil(|py| py.None()))
@@ -59,7 +59,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.write().await;
-            reson::storage::Store::delete(&*store, &key)
+            reson_agentic::storage::Store::delete(&*store, &key)
                 .await
                 .map_err(to_py_err)?;
             Ok::<_, PyErr>(Python::with_gil(|py| py.None()))
@@ -70,7 +70,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.write().await;
-            reson::storage::Store::clear(&*store)
+            reson_agentic::storage::Store::clear(&*store)
                 .await
                 .map_err(to_py_err)?;
             Ok::<_, PyErr>(Python::with_gil(|py| py.None()))
@@ -81,7 +81,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.read().await;
-            let result = reson::storage::Store::get_all(&*store)
+            let result = reson_agentic::storage::Store::get_all(&*store)
                 .await
                 .map_err(to_py_err)?;
 
@@ -97,7 +97,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.read().await;
-            let result = reson::storage::Store::keys(&*store)
+            let result = reson_agentic::storage::Store::keys(&*store)
                 .await
                 .map_err(to_py_err)?;
 
@@ -112,7 +112,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.read().await;
-            reson::storage::Store::close(&*store)
+            reson_agentic::storage::Store::close(&*store)
                 .await
                 .map_err(to_py_err)?;
             Ok::<_, PyErr>(Python::with_gil(|py| py.None()))
@@ -127,7 +127,7 @@ impl MemoryStore {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.write().await;
-            reson::storage::Store::publish_to_mailbox(&*store, &mailbox_id, &json_value)
+            reson_agentic::storage::Store::publish_to_mailbox(&*store, &mailbox_id, &json_value)
                 .await
                 .map_err(to_py_err)?;
             Ok::<_, PyErr>(Python::with_gil(|py| py.None()))
@@ -139,7 +139,7 @@ impl MemoryStore {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = inner.write().await;
-            let result = reson::storage::Store::get_message(&*store, &mailbox_id, timeout)
+            let result = reson_agentic::storage::Store::get_message(&*store, &mailbox_id, timeout)
                 .await
                 .map_err(to_py_err)?;
 
