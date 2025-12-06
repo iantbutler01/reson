@@ -30,26 +30,154 @@ pub struct CallResult {
 
 /// Convert a field type to JSON schema type
 fn field_type_to_json_type(field_type: &str) -> serde_json::Value {
-    match field_type {
-        "string" | "String" | "str" | "&str" => serde_json::json!("string"),
-        "number" | "f32" | "f64" | "float" => serde_json::json!("number"),
-        "integer" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize"
-        | "usize" => {
-            serde_json::json!("integer")
+    serde_json::json!(infer_json_type(field_type))
+}
+
+/// Infer JSON schema type name from a Rust type string
+fn infer_json_type(field_type: &str) -> &'static str {
+    let ty = strip_type_modifiers(field_type);
+    if ty.is_empty() {
+        return "string";
+    }
+
+    // Handle slices/arrays like &[T] or [T; N]
+    if ty.starts_with('[') {
+        return "array";
+    }
+
+    // Handle manual descriptors (string, integer, etc)
+    let ty_lower = ty.to_ascii_lowercase();
+    match ty_lower.as_str() {
+        "string" | "&str" | "str" => return "string",
+        "number" | "f32" | "f64" | "float" => return "number",
+        "integer" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
+        | "isize" => return "integer",
+        "boolean" | "bool" => return "boolean",
+        "array" => return "array",
+        "object" => return "object",
+        _ => {}
+    }
+
+    let (base, generics) = split_type_and_generics(ty);
+    let ident = base.rsplit("::").next().unwrap_or(base);
+
+    if ident == "Option" {
+        if let Some(inner) = generics {
+            return infer_json_type(inner);
         }
-        "boolean" | "bool" => serde_json::json!("boolean"),
-        "array" => serde_json::json!("array"),
-        "object" => serde_json::json!("object"),
-        t if t.starts_with("Vec<") || t.starts_with("&[") => serde_json::json!("array"),
-        t if t.starts_with("Option<") => {
-            // Extract inner type for Optional fields
-            let inner = t
-                .strip_prefix("Option<")
-                .and_then(|s| s.strip_suffix(">"))
-                .unwrap_or("string");
-            field_type_to_json_type(inner)
+        return "string";
+    }
+
+    if ident == "Vec" || ident == "VecDeque" || ident == "LinkedList" {
+        return "array";
+    }
+
+    if ident == "HashMap" || ident == "BTreeMap" || ident == "IndexMap" {
+        return "object";
+    }
+
+    if ident == "Value" && base.contains("serde_json") {
+        return "object";
+    }
+
+    match ident {
+        "String" => "string",
+        "str" => "string",
+        "f32" | "f64" => "number",
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => "integer",
+        "bool" => "boolean",
+        _ => "string",
+    }
+}
+
+/// Determine the `items` schema for array-like fields
+fn field_type_array_items(field_type: &str) -> Option<serde_json::Value> {
+    let ty = strip_type_modifiers(field_type);
+    if ty.is_empty() {
+        return None;
+    }
+
+    // Handle manual "array" descriptor with unknown item type
+    if ty.eq_ignore_ascii_case("array") {
+        return Some(serde_json::json!({ "type": "string" }));
+    }
+
+    // Handle slices like &[T] or [T; N]
+    if ty.starts_with('[') {
+        if let Some(end) = ty.find(';') {
+            let inner = ty[1..end].trim();
+            if !inner.is_empty() {
+                return Some(serde_json::json!({ "type": infer_json_type(inner) }));
+            }
+        } else if let Some(end) = ty.rfind(']') {
+            let inner = ty[1..end].trim();
+            if !inner.is_empty() {
+                return Some(serde_json::json!({ "type": infer_json_type(inner) }));
+            }
         }
-        _ => serde_json::json!("string"), // Default to string for unknown types
+        return Some(serde_json::json!({ "type": "string" }));
+    }
+
+    let (base, generics) = split_type_and_generics(ty);
+    let ident = base.rsplit("::").next().unwrap_or(base);
+
+    if ident == "Option" {
+        if let Some(inner) = generics {
+            return field_type_array_items(inner);
+        }
+        return None;
+    }
+
+    if ident == "Vec" || ident == "VecDeque" || ident == "LinkedList" {
+        if let Some(inner) = generics {
+            return Some(serde_json::json!({ "type": infer_json_type(inner) }));
+        }
+        return Some(serde_json::json!({ "type": "string" }));
+    }
+
+    None
+}
+
+/// Remove reference/mut modifiers from type strings
+fn strip_type_modifiers(field_type: &str) -> &str {
+    let mut ty = field_type.trim();
+    loop {
+        if let Some(stripped) = ty.strip_prefix('&') {
+            ty = stripped.trim_start();
+            if let Some(stripped_mut) = ty.strip_prefix("mut") {
+                ty = stripped_mut.trim_start();
+            }
+            continue;
+        }
+        break;
+    }
+    ty
+}
+
+/// Split a type string into the base identifier and its first generic argument
+fn split_type_and_generics(ty: &str) -> (&str, Option<&str>) {
+    if let Some(start) = ty.find('<') {
+        let base = &ty[..start];
+        let mut depth = 0usize;
+        for (offset, ch) in ty[start..].char_indices() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        let inner = &ty[start + 1..start + offset];
+                        return (base, Some(inner));
+                    }
+                }
+                _ => {}
+            }
+        }
+        (base, None)
+    } else {
+        (ty, None)
     }
 }
 
@@ -84,10 +212,14 @@ fn generate_tool_schemas(
 
             for field in &schema_info.fields {
                 let mut field_schema = serde_json::Map::new();
-                field_schema.insert(
-                    "type".to_string(),
-                    field_type_to_json_type(&field.field_type),
-                );
+                let field_type_json = field_type_to_json_type(&field.field_type);
+                let is_array = field_type_json == serde_json::json!("array");
+                field_schema.insert("type".to_string(), field_type_json);
+                if is_array {
+                    let items_schema = field_type_array_items(&field.field_type)
+                        .unwrap_or_else(|| serde_json::json!({ "type": "string" }));
+                    field_schema.insert("items".to_string(), items_schema);
+                }
                 if !field.description.is_empty() {
                     field_schema.insert(
                         "description".to_string(),
@@ -639,6 +771,12 @@ mod tests {
                         description: "Max results".to_string(),
                         required: false,
                     },
+                    FieldDescription {
+                        name: "ids".to_string(),
+                        field_type: "Vec<i64>".to_string(),
+                        description: "Optional document ids".to_string(),
+                        required: false,
+                    },
                 ],
             },
         );
@@ -649,6 +787,10 @@ mod tests {
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "search");
+        assert_eq!(
+            schemas[0]["input_schema"]["properties"]["ids"]["items"]["type"],
+            "integer"
+        );
     }
 
     #[test]
@@ -685,8 +827,24 @@ mod tests {
             serde_json::json!("integer")
         );
         assert_eq!(
+            field_type_to_json_type("alloc::vec::Vec<i64>"),
+            serde_json::json!("array")
+        );
+        assert_eq!(
             field_type_to_json_type("CustomType"),
             serde_json::json!("string")
         );
+    }
+
+    #[test]
+    fn test_field_type_array_items_detection() {
+        let array_items = field_type_array_items("Vec<i64>").unwrap();
+        assert_eq!(array_items["type"], "integer");
+
+        let option_items = field_type_array_items("Option<Vec<String>>").unwrap();
+        assert_eq!(option_items["type"], "string");
+
+        let slice_items = field_type_array_items("&[bool]").unwrap();
+        assert_eq!(slice_items["type"], "boolean");
     }
 }

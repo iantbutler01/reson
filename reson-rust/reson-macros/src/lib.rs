@@ -417,14 +417,13 @@ pub fn derive_deserializable(input: TokenStream) -> TokenStream {
         let field_name_str = field_name.to_string();
         let field_desc = extract_doc_comments(&field.attrs);
         let field_type = &field.ty;
-        let field_type_str = quote!(#field_type).to_string();
         let is_optional = is_option_type(&field.ty);
         let is_required = !is_optional;
 
         field_desc_tokens.push(quote! {
             ::reson_agentic::parsers::FieldDescription {
                 name: #field_name_str.to_string(),
-                field_type: #field_type_str.to_string(),
+                field_type: ::std::any::type_name::<#field_type>().to_string(),
                 description: #field_desc.to_string(),
                 required: #is_required,
             }
