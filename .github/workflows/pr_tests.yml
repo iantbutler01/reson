@@ -1,36 +1,110 @@
-name: Run Integration Tests
+name: CI
 
-on: [pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
 
 jobs:
-  test:
+  # Rust tests for reson-rust crate
+  rust-test:
+    name: Rust Tests
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12"]
-        # We will dynamically generate the list of test files later
-        # For now, let's add a placeholder or a way to list them.
-        # We can use a script to find all test files in integration_tests
-        # and then run them one by one.
-
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v3
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
         with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            reson-rust/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('reson-rust/**/Cargo.lock') }}
+      - name: Run tests
+        working-directory: reson-rust
+        run: cargo test --all-features
+
+  rust-clippy:
+    name: Rust Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            reson-rust/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('reson-rust/**/Cargo.lock') }}
+      - name: Run clippy
+        working-directory: reson-rust
+        run: cargo clippy --all-features -- -D warnings
+
+  rust-fmt:
+    name: Rust Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        working-directory: reson-rust
+        run: cargo fmt --all -- --check
+
+  # Python build test (just verify it compiles)
+  python-build:
+    name: Python Build Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build Python package
+        working-directory: reson-py
+        run: maturin build --release
+
+  # Python integration tests (requires API keys)
+  python-integration:
+    name: Python Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin and test deps
         run: |
-          python -m pip install --upgrade pip
-          pip install .  # Assuming pyproject.toml and setup.py or setup.cfg are present
-          pip install pytest # Ensure pytest is installed
-      - name: List test files and run them one by one
+          pip install maturin pytest
+      - name: Build and install package
+        working-directory: reson-py
+        run: maturin develop --release
+      - name: Run integration tests
         env:
           OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
         run: |
-          TEST_FILES=$(find integration_tests -name "test_*.py")
-          for test_file in $TEST_FILES
-          do
-            echo "Running $test_file"
-            pytest -v "$test_file"
-          done
+          if [ -n "$OPENROUTER_KEY" ]; then
+            pytest -v integration_tests/
+          else
+            echo "Skipping integration tests - no API key configured"
+          fi
