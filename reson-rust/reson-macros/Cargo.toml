@@ -1,10 +1,10 @@
 [package]
 name = "resonai-macros"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Reson Contributors"]
 description = "Proc macros for the resonai LLM agent framework"
-license = "ApacheV2"
+license = "Apache-2.0"
 repository = "https://github.com/iantbutler01/reson"
 documentation = "https://docs.rs/resonai-macros"
 keywords = ["llm", "ai", "agents", "macros"]

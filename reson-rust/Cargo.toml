@@ -4,11 +4,11 @@ resolver = "2"
 
 [package]
 name = "reson-agentic"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Reson Contributors"]
 description = "Agents are just functions - production-grade LLM agent framework"
-license = "ApacheV2"
+license = "Apache-2.0"
 repository = "https://github.com/ianhundere/reson"
 homepage = "https://github.com/ianhundere/reson"
 documentation = "https://docs.rs/reson-agentic"
@@ -18,7 +18,7 @@ categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 # Proc macros
-resonai-macros = { version = "0.1.1", path = "reson-macros" }
+resonai-macros = { version = "0.1.2" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
