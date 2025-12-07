@@ -232,4 +232,4 @@ reson-agentic = { version = "0.1", features = ["full"] }
 
 ## License
 
-ApacheV2
+Apache-2.0
