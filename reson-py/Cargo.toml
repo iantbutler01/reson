@@ -3,7 +3,7 @@ name = "reson-py"
 version = "0.1.0"
 edition = "2021"
 description = "Python bindings for reson - Agents are just functions"
-license = "MIT"
+license = "ApacheV2"
 
 [lib]
 name = "reson"
