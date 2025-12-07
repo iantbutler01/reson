@@ -13,7 +13,7 @@ async def test_reasoning_stream():
 
     runtime_instance = None
 
-    @agentic_generator(model="openrouter:openai/gpt-5-mini@reasoning=high")
+    @agentic_generator(model="openrouter:openai/gpt-5-mini-2025-08-07@reasoning=high")
     async def reasoning_stream_agent(query: str, runtime: Runtime):
         nonlocal runtime_instance
         runtime_instance = runtime

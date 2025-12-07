@@ -1,0 +1,273 @@
+Skip to main content
+Gemini API
+Search
+/
+
+
+English
+Get API key
+Cookbook
+Community
+Sign in
+Gemini API Docs
+API reference
+
+Gemini 3 Pro is here. Try it for free in Google AI Studio.
+Home
+Gemini API
+Gemini API Docs
+Audio understanding
+
+content_copy
+
+
+
+
+Gemini can analyze and understand audio input and generate text responses to it, enabling use cases like the following:
+
+Describe, summarize, or answer questions about audio content.
+Provide a transcription and translation of the audio (speech to text).
+Detect and label different speakers (speaker diarization).
+Detect emotion in speech and music.
+Analyze specific segments of the audio, and provide timestamps.
+As of now the Gemini API doesn't support real-time transcription use cases. For real-time voice and video interactions refer to the Live API. For dedicated speech to text models with support for real-time transcription, use the Google Cloud Speech-to-Text API.
+
+Transcribe speech to text
+This example application shows how to prompt the Gemini API to transcribe, translate, and summarize speech, including timestamps, speaker diarization, and emotion detection using structured outputs.
+
+Python
+JavaScript
+REST
+curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
+    -H "x-goog-api-key: $GEMINI_API_KEY" \
+    -H 'Content-Type: application/json' \
+    -X POST \
+    -d '{
+      "contents": [
+        {
+          "parts": [
+            {
+              "file_data": {
+                "file_uri": "https://www.youtube.com/watch?v=ku-N-eS1lgM",
+                "mime_type": "video/mp4"
+              }
+            },
+            {
+              "text": "Process the audio file and generate a detailed transcription.\n\nRequirements:\n1. Identify distinct speakers (e.g., Speaker 1, Speaker 2, or names if context allows).\n2. Provide accurate timestamps for each segment (Format: MM:SS).\n3. Detect the primary language of each segment.\n4. If the segment is in a language different than English, also provide the English translation.\n5. Identify the primary emotion of the speaker in this segment. You MUST choose exactly one of the following: Happy, Sad, Angry, Neutral.\n6. Provide a brief summary of the entire audio at the beginning."
+            }
+          ]
+        }
+      ],
+      "generation_config": {
+        "response_mime_type": "application/json",
+        "response_schema": {
+          "type": "OBJECT",
+          "properties": {
+            "summary": {
+              "type": "STRING",
+              "description": "A concise summary of the audio content."
+            },
+            "segments": {
+              "type": "ARRAY",
+              "description": "List of transcribed segments with speaker and timestamp.",
+              "items": {
+                "type": "OBJECT",
+                "properties": {
+                  "speaker": { "type": "STRING" },
+                  "timestamp": { "type": "STRING" },
+                  "content": { "type": "STRING" },
+                  "language": { "type": "STRING" },
+                  "language_code": { "type": "STRING" },
+                  "translation": { "type": "STRING" },
+                  "emotion": {
+                    "type": "STRING",
+                    "enum": ["happy", "sad", "angry", "neutral"]
+                  }
+                },
+                "required": ["speaker", "timestamp", "content", "language", "language_code", "emotion"]
+              }
+            }
+          },
+          "required": ["summary", "segments"]
+        }
+      }
+    }' 2> /dev/null > response.json
+
+cat response.json
+echo
+
+jq ".candidates[].content.parts[].text" response.json
+You can prompt AI Studio Build to create a transcription app just like this one, with the click of a button.
+
+A multilingual audio transcription Gemini app
+
+Input audio
+You can provide audio data to Gemini in the following ways:
+
+Upload an audio file before making a request to generateContent.
+Pass inline audio data with the request to generateContent.
+Upload an audio file
+You can use the Files API to upload an audio file. Always use the Files API when the total request size (including the files, text prompt, system instructions, etc.) is larger than 20 MB.
+
+The following code uploads an audio file and then uses the file in a call to generateContent.
+
+Python
+JavaScript
+Go
+REST
+AUDIO_PATH="path/to/sample.mp3"
+MIME_TYPE=$(file -b --mime-type "${AUDIO_PATH}")
+NUM_BYTES=$(wc -c < "${AUDIO_PATH}")
+DISPLAY_NAME=AUDIO
+
+tmp_header_file=upload-header.tmp
+
+# Initial resumable request defining metadata.
+# The upload url is in the response headers dump them to a file.
+curl "https://generativelanguage.googleapis.com/upload/v1beta/files" \
+  -H "x-goog-api-key: $GEMINI_API_KEY" \
+  -D upload-header.tmp \
+  -H "X-Goog-Upload-Protocol: resumable" \
+  -H "X-Goog-Upload-Command: start" \
+  -H "X-Goog-Upload-Header-Content-Length: ${NUM_BYTES}" \
+  -H "X-Goog-Upload-Header-Content-Type: ${MIME_TYPE}" \
+  -H "Content-Type: application/json" \
+  -d "{'file': {'display_name': '${DISPLAY_NAME}'}}" 2> /dev/null
+
+upload_url=$(grep -i "x-goog-upload-url: " "${tmp_header_file}" | cut -d" " -f2 | tr -d "\r")
+rm "${tmp_header_file}"
+
+# Upload the actual bytes.
+curl "${upload_url}" \
+  -H "Content-Length: ${NUM_BYTES}" \
+  -H "X-Goog-Upload-Offset: 0" \
+  -H "X-Goog-Upload-Command: upload, finalize" \
+  --data-binary "@${AUDIO_PATH}" 2> /dev/null > file_info.json
+
+file_uri=$(jq ".file.uri" file_info.json)
+echo file_uri=$file_uri
+
+# Now generate content using that file
+curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent" \
+    -H "x-goog-api-key: $GEMINI_API_KEY" \
+    -H 'Content-Type: application/json' \
+    -X POST \
+    -d '{
+      "contents": [{
+        "parts":[
+          {"text": "Describe this audio clip"},
+          {"file_data":{"mime_type": "${MIME_TYPE}", "file_uri": '$file_uri'}}]
+        }]
+      }' 2> /dev/null > response.json
+
+cat response.json
+echo
+
+jq ".candidates[].content.parts[].text" response.json
+To learn more about working with media files, see Files API.
+
+Pass audio data inline
+Instead of uploading an audio file, you can pass inline audio data in the request to generateContent:
+
+Python
+JavaScript
+Go
+from google import genai
+from google.genai import types
+
+with open('path/to/small-sample.mp3', 'rb') as f:
+    audio_bytes = f.read()
+
+client = genai.Client()
+response = client.models.generate_content(
+  model='gemini-2.5-flash',
+  contents=[
+    'Describe this audio clip',
+    types.Part.from_bytes(
+      data=audio_bytes,
+      mime_type='audio/mp3',
+    )
+  ]
+)
+
+print(response.text)
+A few things to keep in mind about inline audio data:
+
+The maximum request size is 20 MB, which includes text prompts, system instructions, and files provided inline. If your file's size will make the total request size exceed 20 MB, then use the Files API to upload an audio file for use in the request.
+If you're using an audio sample multiple times, it's more efficient to upload an audio file.
+Get a transcript
+To get a transcript of audio data, just ask for it in the prompt:
+
+Python
+JavaScript
+Go
+from google import genai
+
+client = genai.Client()
+myfile = client.files.upload(file='path/to/sample.mp3')
+prompt = 'Generate a transcript of the speech.'
+
+response = client.models.generate_content(
+  model='gemini-2.5-flash',
+  contents=[prompt, myfile]
+)
+
+print(response.text)
+Refer to timestamps
+You can refer to specific sections of an audio file using timestamps of the form MM:SS. For example, the following prompt requests a transcript that
+
+Starts at 2 minutes 30 seconds from the beginning of the file.
+Ends at 3 minutes 29 seconds from the beginning of the file.
+
+Python
+JavaScript
+Go
+# Create a prompt containing timestamps.
+prompt = "Provide a transcript of the speech from 02:30 to 03:29."
+Count tokens
+Call the countTokens method to get a count of the number of tokens in an audio file. For example:
+
+Python
+JavaScript
+Go
+from google import genai
+
+client = genai.Client()
+response = client.models.count_tokens(
+  model='gemini-2.5-flash',
+  contents=[myfile]
+)
+
+print(response)
+Supported audio formats
+Gemini supports the following audio format MIME types:
+
+WAV - audio/wav
+MP3 - audio/mp3
+AIFF - audio/aiff
+AAC - audio/aac
+OGG Vorbis - audio/ogg
+FLAC - audio/flac
+Technical details about audio
+Gemini represents each second of audio as 32 tokens; for example, one minute of audio is represented as 1,920 tokens.
+Gemini can "understand" non-speech components, such as birdsong or sirens.
+The maximum supported length of audio data in a single prompt is 9.5 hours. Gemini doesn't limit the number of audio files in a single prompt; however, the total combined length of all audio files in a single prompt can't exceed 9.5 hours.
+Gemini downsamples audio files to a 16 Kbps data resolution.
+If the audio source contains multiple channels, Gemini combines those channels into a single channel.
+What's next
+This guide shows how to generate text in response to audio data. To learn more, see the following resources:
+
+File prompting strategies: The Gemini API supports prompting with text, image, audio, and video data, also known as multimodal prompting.
+System instructions: System instructions let you steer the behavior of the model based on your specific needs and use cases.
+Safety guidance: Sometimes generative AI models produce unexpected outputs, such as outputs that are inaccurate, biased, or offensive. Post-processing and human evaluation are essential to limit the risk of harm from such outputs.
+Was this helpful?
+
+Send feedback
+Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License, and code samples are licensed under the Apache 2.0 License. For details, see the Google Developers Site Policies. Java is a registered trademark of Oracle and/or its affiliates.
+
+Last updated 2025-12-03 UTC.
+
+Terms
+Privacy
+
+English
