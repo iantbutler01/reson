@@ -4,6 +4,8 @@
 
 #[cfg(feature = "templating")]
 use minijinja::{Environment, Error as TemplateError};
+#[cfg(feature = "templating")]
+use std::collections::HashMap;
 
 /// Template renderer with support for type interpolation
 #[cfg(feature = "templating")]

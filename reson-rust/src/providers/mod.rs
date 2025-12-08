@@ -61,6 +61,12 @@ pub struct GenerationConfig {
 
     /// Thinking budget tokens (for Claude extended thinking)
     pub thinking_budget: Option<u32>,
+
+    /// Output schema for structured outputs (JSON schema)
+    pub output_schema: Option<serde_json::Value>,
+
+    /// Name for the output type (used in schema wrapper)
+    pub output_type_name: Option<String>,
 }
 
 impl Default for GenerationConfig {
@@ -74,6 +80,8 @@ impl Default for GenerationConfig {
             native_tools: false,
             reasoning_effort: None,
             thinking_budget: None,
+            output_schema: None,
+            output_type_name: None,
         }
     }
 }
@@ -120,6 +128,13 @@ impl GenerationConfig {
     /// Set thinking budget (for Claude extended thinking)
     pub fn with_thinking_budget(mut self, budget: u32) -> Self {
         self.thinking_budget = Some(budget);
+        self
+    }
+
+    /// Set output schema for structured outputs
+    pub fn with_output_schema(mut self, schema: serde_json::Value, type_name: impl Into<String>) -> Self {
+        self.output_schema = Some(schema);
+        self.output_type_name = Some(type_name.into());
         self
     }
 }

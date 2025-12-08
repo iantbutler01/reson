@@ -119,6 +119,14 @@ impl AnthropicClient {
             }
         }
 
+        // Add structured output schema if provided
+        if let Some(ref schema) = config.output_schema {
+            request["output_format"] = serde_json::json!({
+                "type": "json_schema",
+                "schema": schema
+            });
+        }
+
         Ok(request)
     }
 
@@ -207,17 +215,22 @@ impl AnthropicClient {
     }
 
     /// Make HTTP request to Anthropic API
-    async fn make_request(&self, body: serde_json::Value) -> Result<reqwest::Response> {
+    async fn make_request(&self, body: serde_json::Value, use_structured_outputs: bool) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
+
+        // Build beta header - add structured-outputs if needed
+        let beta_header = if use_structured_outputs {
+            "prompt-caching-2024-07-31,output-128k-2025-02-19,structured-outputs-2025-11-13"
+        } else {
+            "prompt-caching-2024-07-31,output-128k-2025-02-19"
+        };
+
         let response = client
             .post(&self.api_url)
             .timeout(std::time::Duration::from_secs(300))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header(
-                "anthropic-beta",
-                "prompt-caching-2024-07-31,output-128k-2025-02-19",
-            )
+            .header("anthropic-beta", beta_header)
             .json(&body)
             .send()
             .await?;
@@ -249,11 +262,11 @@ impl AnthropicClient {
     }
 
     /// Make request with retry and exponential backoff
-    async fn make_request_with_retry(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+    async fn make_request_with_retry(&self, body: serde_json::Value, use_structured_outputs: bool) -> Result<serde_json::Value> {
         let config = RetryConfig::default();
 
         retry_with_backoff(config, || async {
-            let response = self.make_request(body.clone()).await?;
+            let response = self.make_request(body.clone(), use_structured_outputs).await?;
             let status = response.status();
 
             if !status.is_success() {
@@ -274,8 +287,9 @@ impl InferenceClient for AnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
+        let use_structured_outputs = config.output_schema.is_some();
         let request_body = self.build_request_body(messages, config, false)?;
-        let body = self.make_request_with_retry(request_body).await?;
+        let body = self.make_request_with_retry(request_body, use_structured_outputs).await?;
 
         // Parse usage statistics
         let usage = self.parse_usage(&body["usage"]);
@@ -311,12 +325,13 @@ impl InferenceClient for AnthropicClient {
         use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
         use crate::utils::parse_sse_stream;
 
+        let use_structured_outputs = config.output_schema.is_some();
         let request_body = self.build_request_body(messages, config, true)?;
 
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
-            let resp = self.make_request(request_body.clone()).await?;
+            let resp = self.make_request(request_body.clone(), use_structured_outputs).await?;
             let status = resp.status();
 
             if !status.is_success() {

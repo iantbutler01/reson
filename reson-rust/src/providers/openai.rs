@@ -153,6 +153,19 @@ impl OAIClient {
             }
         }
 
+        // Add structured output schema if provided
+        if let Some(ref schema) = config.output_schema {
+            let type_name = config.output_type_name.as_deref().unwrap_or("response");
+            request["response_format"] = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": type_name,
+                    "schema": schema,
+                    "strict": true
+                }
+            });
+        }
+
         Ok(request)
     }
 

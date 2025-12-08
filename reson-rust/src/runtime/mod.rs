@@ -62,9 +62,20 @@ pub struct Runtime {
 }
 
 /// Wrapper for tool functions (sync or async)
+///
+/// Tool functions receive raw JSON args and are responsible for deserializing
+/// into their expected type. The `tool<T, F>()` method handles this automatically
+/// by wrapping typed handlers.
 pub enum ToolFunction {
     Sync(Box<dyn Fn(serde_json::Value) -> Result<String> + Send + Sync>),
     Async(Box<dyn Fn(serde_json::Value) -> futures::future::BoxFuture<'static, Result<String>> + Send + Sync>),
+}
+
+/// Metadata about a tool call for execution context
+#[derive(Debug, Clone)]
+pub struct ToolCallContext {
+    pub tool_name: String,
+    pub tool_use_id: String,
 }
 
 impl Runtime {
@@ -237,23 +248,31 @@ impl Runtime {
     /// Register a tool with type and handler (Python: runtime.tool(fn, name=..., tool_type=...))
     ///
     /// This is the primary API for registering tools for native tool calling.
-    /// The type parameter T must implement Deserializable.
+    /// The type parameter T must implement Deserializable. The handler receives
+    /// the typed struct directly - deserialization is handled automatically.
     ///
     /// # Arguments
-    /// * `handler` - Async function that handles tool execution
+    /// * `handler` - Async function that receives the typed struct T
     /// * `name` - Optional tool name (defaults to type name if None)
     ///
     /// # Example
     /// ```ignore
-    /// // Register a tool with a type parameter
-    /// runtime.tool::<MyToolType, _>(my_handler, Some("my_tool")).await?;
-    /// // Or let it derive the name from the type
-    /// runtime.tool::<MyToolType, _>(my_handler, None).await?;
+    /// #[derive(Deserialize, Serialize)]
+    /// struct WeatherQuery {
+    ///     city: String,
+    ///     units: Option<String>,
+    /// }
+    /// impl Deserializable for WeatherQuery { ... }
+    ///
+    /// // Handler receives WeatherQuery directly, not raw JSON
+    /// runtime.tool::<WeatherQuery, _>(|query| Box::pin(async move {
+    ///     Ok(format!("Weather in {}: Sunny", query.city))
+    /// }), Some("get_weather")).await?;
     /// ```
     pub async fn tool<T, F>(&self, handler: F, name: Option<&str>) -> Result<()>
     where
         T: Deserializable + serde::Serialize + 'static,
-        F: Fn(ParsedTool) -> BoxFuture<'static, Result<String>> + Send + Sync + 'static,
+        F: Fn(T) -> BoxFuture<'static, Result<String>> + Send + Sync + 'static,
     {
         // Get tool name - either from parameter or type name
         let type_name = std::any::type_name::<T>();
@@ -263,9 +282,9 @@ impl Runtime {
                 .last()
                 .unwrap_or(type_name)
         });
-        let tool_name = tool_name_str.to_string(); // Convert to owned String
+        let tool_name = tool_name_str.to_string();
 
-        // Store handler function (wrap to match ToolFunction signature)
+        // Check for duplicate registration
         let mut tools = self.tools.write().await;
         if tools.contains_key(&tool_name) {
             return Err(Error::NonRetryable(format!(
@@ -274,25 +293,24 @@ impl Runtime {
             )));
         }
 
-        // Wrap the handler to convert ParsedTool -> serde_json::Value
-        let tool_name_for_handler = tool_name.clone();
+        // Wrap the typed handler to deserialize JSON -> T before calling
+        let handler = Arc::new(handler);
         let wrapped_handler = Box::new(move |json_value: serde_json::Value| {
-            // For now, create a ParsedTool from the JSON
-            // TODO: This will be populated properly by NativeToolParser
-            let parsed_tool = ParsedTool {
-                tool_name: tool_name_for_handler.clone(),
-                tool_use_id: String::new(),
-                value: json_value,
-            };
-            handler(parsed_tool)
+            let handler = handler.clone();
+            Box::pin(async move {
+                // Deserialize JSON into the typed struct T
+                let typed_args: T = T::from_partial(json_value)?;
+                // Call the handler with the typed struct
+                handler(typed_args).await
+            }) as BoxFuture<'static, Result<String>>
         });
 
         tools.insert(tool_name.clone(), ToolFunction::Async(wrapped_handler));
         drop(tools);
 
-        // Store type name
+        // Store type name for introspection
         let mut tool_types = self.tool_types.write().await;
-        tool_types.insert(tool_name.to_string(), type_name.to_string());
+        tool_types.insert(tool_name.clone(), type_name.to_string());
         drop(tool_types);
 
         // Extract and store schema information from Deserializable type
@@ -306,7 +324,7 @@ impl Runtime {
         schemas.insert(tool_name.clone(), schema_info);
         drop(schemas);
 
-        // Store constructor for NativeToolParser
+        // Store constructor for NativeToolParser (streaming use case)
         let tool_name_clone = tool_name.clone();
         let constructor: ToolConstructor = Box::new(move |json: serde_json::Value| {
             T::from_partial(json.clone()).map(|tool| {
@@ -346,6 +364,7 @@ impl Runtime {
     /// * `system` - System message (optional)
     /// * `history` - Previous messages (optional)
     /// * `output_type` - Expected output type name (optional)
+    /// * `output_schema` - JSON schema for structured output (optional)
     /// * `temperature`, `top_p`, `max_tokens` - Generation parameters (optional)
     /// * `model` - Override model (optional)
     /// * `api_key` - Override API key (optional)
@@ -358,6 +377,7 @@ impl Runtime {
         system: Option<&str>,
         history: Option<Vec<ConversationMessage>>,
         output_type: Option<String>,
+        output_schema: Option<serde_json::Value>,
         temperature: Option<f32>,
         top_p: Option<f32>,
         max_tokens: Option<u32>,
@@ -390,6 +410,7 @@ impl Runtime {
             self.tools.clone(),
             self.tool_schemas.clone(),
             output_type,
+            output_schema,
             self.store.clone(),
             effective_api_key.as_deref(),
             system,
@@ -424,6 +445,7 @@ impl Runtime {
         system: Option<&str>,
         history: Option<Vec<ConversationMessage>>,
         output_type: Option<String>,
+        output_schema: Option<serde_json::Value>,
         temperature: Option<f32>,
         top_p: Option<f32>,
         max_tokens: Option<u32>,
@@ -457,6 +479,7 @@ impl Runtime {
             self.tools.clone(),
             self.tool_schemas.clone(),
             output_type,
+            output_schema,
             self.store.clone(),
             effective_api_key.as_deref(),
             system,
@@ -775,12 +798,11 @@ mod tests {
 
         let runtime = Runtime::new();
 
-        // Register tool with type parameter
+        // Register tool with type parameter - handler receives WeatherQuery directly
         runtime
             .tool::<WeatherQuery, _>(
-                |parsed_tool| -> BoxFuture<'static, crate::error::Result<String>> {
+                |query| -> BoxFuture<'static, crate::error::Result<String>> {
                     Box::pin(async move {
-                        let query: WeatherQuery = serde_json::from_value(parsed_tool.value)?;
                         Ok(format!("Weather in {}: Sunny", query.location))
                     })
                 },
@@ -811,12 +833,11 @@ mod tests {
 
         let runtime = Runtime::new();
 
-        // Register tool
+        // Register tool - handler receives WeatherQuery directly
         runtime
             .tool::<WeatherQuery, _>(
-                |parsed_tool| -> BoxFuture<'static, crate::error::Result<String>> {
+                |_query| -> BoxFuture<'static, crate::error::Result<String>> {
                     Box::pin(async move {
-                        let _query: WeatherQuery = serde_json::from_value(parsed_tool.value)?;
                         Ok("Sunny".to_string())
                     })
                 },
@@ -832,5 +853,69 @@ mod tests {
         let weather_schema = schemas.get("get_weather").unwrap();
         assert!(weather_schema.fields.iter().any(|f| f.name == "location" && f.required));
         assert!(weather_schema.fields.iter().any(|f| f.name == "unit" && !f.required));
+    }
+
+    #[tokio::test]
+    async fn test_tool_hydration_and_execution() {
+        use futures::future::BoxFuture;
+
+        let runtime = Runtime::new();
+
+        // Register tool - handler receives WeatherQuery, not raw JSON
+        runtime
+            .tool::<WeatherQuery, _>(
+                |query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move {
+                        // Handler receives the deserialized WeatherQuery struct
+                        let unit = query.unit.unwrap_or_else(|| "celsius".to_string());
+                        Ok(format!("Weather in {} ({}): Sunny, 22°", query.location, unit))
+                    })
+                },
+                Some("get_weather"),
+            )
+            .await
+            .unwrap();
+
+        // Simulate a tool call from LLM with JSON args
+        let tool_call = serde_json::json!({
+            "_tool_name": "get_weather",
+            "location": "Paris",
+            "unit": "fahrenheit"
+        });
+
+        // Execute the tool - it should deserialize JSON -> WeatherQuery -> call handler
+        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        assert_eq!(result, "Weather in Paris (fahrenheit): Sunny, 22°");
+    }
+
+    #[tokio::test]
+    async fn test_tool_hydration_with_defaults() {
+        use futures::future::BoxFuture;
+
+        let runtime = Runtime::new();
+
+        // Register tool
+        runtime
+            .tool::<WeatherQuery, _>(
+                |query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move {
+                        let unit = query.unit.unwrap_or_else(|| "celsius".to_string());
+                        Ok(format!("{} in {}", unit, query.location))
+                    })
+                },
+                Some("get_weather"),
+            )
+            .await
+            .unwrap();
+
+        // Tool call with optional field missing
+        let tool_call = serde_json::json!({
+            "_tool_name": "get_weather",
+            "location": "Tokyo"
+            // unit is not provided, should use default
+        });
+
+        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        assert_eq!(result, "celsius in Tokyo");
     }
 }

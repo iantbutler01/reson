@@ -285,7 +285,7 @@ class TestToolCallProviderConversion:
 
         expected = {
             "role": "model",
-            "content": [
+            "parts": [
                 {
                     "functionCall": {
                         "name": "get_weather",
@@ -303,8 +303,8 @@ class TestToolCallProviderConversion:
             tool_use_id="call_123", tool_name="get_weather", args={"location": "SF"}
         )
 
-        # Use a provider that doesn't have explicit handling (should fallback to OpenAI)
-        message = tool_call.to_provider_assistant_message(InferenceProvider.ART)
+        # Use OpenRouter which should use OpenAI format
+        message = tool_call.to_provider_assistant_message(InferenceProvider.OPENROUTER)
 
         assert message["role"] == "assistant"
         assert "tool_calls" in message

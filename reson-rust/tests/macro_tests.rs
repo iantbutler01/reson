@@ -163,7 +163,7 @@ mod agentic_macro_tests {
         // but the point is to verify the macro generates valid code
         runtime.run(
             Some(&input),
-            None, None, None, None, None, None, None, None
+            None, None, None, None, None, None, None, None, None
         ).await
     }
 
@@ -185,7 +185,7 @@ mod agentic_macro_tests {
         let _ = data; // Use the parameter
         runtime.run(
             Some("test"),
-            None, None, None, None, None, None, None, None
+            None, None, None, None, None, None, None, None, None
         ).await
     }
 
@@ -203,7 +203,7 @@ mod agentic_macro_tests {
         let prompt = format!("Name: {}, Count: {}", name, count);
         runtime.run(
             Some(&prompt),
-            None, None, None, None, None, None, None, None
+            None, None, None, None, None, None, None, None, None
         ).await
     }
 

@@ -8,11 +8,12 @@ use reson_agentic::agentic;
 use reson_agentic::error::Result;
 use reson_agentic::parsers::Deserializable;
 use reson_agentic::runtime::Runtime;
-use reson_agentic::types::{ToolCall, ToolResult};
+use reson_agentic::types::ToolResult;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SearchQuery {
+    #[serde(default)]
     text: String,
     #[serde(default = "default_category")]
     category: String,
@@ -63,9 +64,75 @@ impl Deserializable for SearchQuery {
     }
 }
 
-fn search_database(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
+/// Tool type for math operations
+#[derive(Debug, Serialize, Deserialize)]
+struct MathOperation {
+    #[serde(default)]
+    a: i64,
+    #[serde(default)]
+    b: i64,
+}
+
+impl Deserializable for MathOperation {
+    fn from_partial(value: serde_json::Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|e| {
+            reson_agentic::error::Error::NonRetryable(format!("Failed to parse MathOperation: {}", e))
+        })
+    }
+
+    fn validate_complete(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn field_descriptions() -> Vec<reson_agentic::parsers::FieldDescription> {
+        vec![
+            reson_agentic::parsers::FieldDescription {
+                name: "a".to_string(),
+                field_type: "number".to_string(),
+                description: "First number".to_string(),
+                required: true,
+            },
+            reson_agentic::parsers::FieldDescription {
+                name: "b".to_string(),
+                field_type: "number".to_string(),
+                description: "Second number".to_string(),
+                required: true,
+            },
+        ]
+    }
+}
+
+/// Tool type for factorial
+#[derive(Debug, Serialize, Deserialize)]
+struct FactorialInput {
+    #[serde(default)]
+    n: i32,
+}
+
+impl Deserializable for FactorialInput {
+    fn from_partial(value: serde_json::Value) -> Result<Self> {
+        serde_json::from_value(value).map_err(|e| {
+            reson_agentic::error::Error::NonRetryable(format!("Failed to parse FactorialInput: {}", e))
+        })
+    }
+
+    fn validate_complete(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn field_descriptions() -> Vec<reson_agentic::parsers::FieldDescription> {
+        vec![reson_agentic::parsers::FieldDescription {
+            name: "n".to_string(),
+            field_type: "number".to_string(),
+            description: "Number to calculate factorial of".to_string(),
+            required: true,
+        }]
+    }
+}
+
+// Handlers now receive typed structs directly, not ParsedTool
+fn search_database(query: SearchQuery) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
-        let query: SearchQuery = serde_json::from_value(parsed_tool.value)?;
         Ok(format!(
             "Found {} results for '{}' in category '{}'",
             query.max_results, query.text, query.category
@@ -73,40 +140,16 @@ fn search_database(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture
     })
 }
 
-fn add_numbers(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
-    Box::pin(async move {
-        let data: serde_json::Value = parsed_tool.value;
-        let a = data["a"].as_i64().ok_or_else(|| {
-            reson_agentic::error::Error::NonRetryable("Missing parameter 'a'".to_string())
-        })?;
-        let b = data["b"].as_i64().ok_or_else(|| {
-            reson_agentic::error::Error::NonRetryable("Missing parameter 'b'".to_string())
-        })?;
-        Ok((a + b).to_string())
-    })
+fn add_numbers(op: MathOperation) -> BoxFuture<'static, Result<String>> {
+    Box::pin(async move { Ok((op.a + op.b).to_string()) })
 }
 
-fn multiply_numbers(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
-    Box::pin(async move {
-        let data: serde_json::Value = parsed_tool.value;
-        let a = data["a"].as_i64().ok_or_else(|| {
-            reson_agentic::error::Error::NonRetryable("Missing parameter 'a'".to_string())
-        })?;
-        let b = data["b"].as_i64().ok_or_else(|| {
-            reson_agentic::error::Error::NonRetryable("Missing parameter 'b'".to_string())
-        })?;
-        Ok((a * b).to_string())
-    })
+fn multiply_numbers(op: MathOperation) -> BoxFuture<'static, Result<String>> {
+    Box::pin(async move { Ok((op.a * op.b).to_string()) })
 }
 
-fn factorial(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'static, Result<String>> {
+fn factorial(input: FactorialInput) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
-        let data: serde_json::Value = parsed_tool.value;
-        let n = data["n"]
-            .as_i64()
-            .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing parameter 'n'".to_string()))?
-            as i32;
-
         fn calc_factorial(n: i32) -> i32 {
             if n <= 1 {
                 1
@@ -115,24 +158,24 @@ fn factorial(parsed_tool: reson_agentic::parsers::ParsedTool) -> BoxFuture<'stat
             }
         }
 
-        Ok(calc_factorial(n).to_string())
+        Ok(calc_factorial(input.n).to_string())
     })
 }
 
 #[agentic(model = "openrouter:anthropic/claude-sonnet-4")]
 async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
-    // Register tools
+    // Register tools - each handler receives its typed struct directly
     runtime
         .tool::<SearchQuery, _>(search_database, Some("search_database"))
         .await?;
     runtime
-        .tool::<SearchQuery, _>(add_numbers, Some("add_numbers"))
+        .tool::<MathOperation, _>(add_numbers, Some("add_numbers"))
         .await?;
     runtime
-        .tool::<SearchQuery, _>(multiply_numbers, Some("multiply_numbers"))
+        .tool::<MathOperation, _>(multiply_numbers, Some("multiply_numbers"))
         .await?;
     runtime
-        .tool::<SearchQuery, _>(factorial, Some("factorial"))
+        .tool::<FactorialInput, _>(factorial, Some("factorial"))
         .await?;
 
     let mut history = Vec::new();
@@ -141,6 +184,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
             Some(&query),
             None,
             Some(history.clone()),
+            None,
             None,
             None,
             None,
@@ -192,6 +236,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
 
@@ -208,11 +253,11 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
 #[agentic(model = "anthropic:claude-haiku-4-5-20251001")]
 async fn single_tool_agent(query: String, runtime: Runtime) -> Result<String> {
     runtime
-        .tool::<SearchQuery, _>(add_numbers, Some("add_numbers"))
+        .tool::<MathOperation, _>(add_numbers, Some("add_numbers"))
         .await?;
 
     let result = runtime
-        .run(Some(&query), None, None, None, None, None, None, None, None)
+        .run(Some(&query), None, None, None, None, None, None, None, None, None)
         .await?;
     println!("📊 Result: {:?}", result);
 

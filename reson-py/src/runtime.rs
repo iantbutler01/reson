@@ -14,6 +14,205 @@ use crate::types::{ChatMessage, ReasoningSegment, ToolCall, ToolResult};
 
 type ChunkStream = Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value), reson_agentic::error::Error>> + Send>>;
 
+/// Generate JSON schema from a Python type (Pydantic model, dataclass, Deserializable, etc.)
+/// Note: Provider-specific schema fixes are applied in the Rust inference layer
+fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serde_json::Value> {
+    // Try Pydantic V2 first (model_json_schema)
+    if let Ok(schema) = output_type.call_method0(py, "model_json_schema") {
+        if let Ok(py_dict) = schema.extract::<Bound<'_, PyDict>>(py) {
+            if let Ok(json_val) = pythonize::depythonize::<serde_json::Value>(&py_dict) {
+                return Some(json_val);
+            }
+        }
+    }
+
+    // Try Pydantic V1 (schema)
+    if let Ok(schema) = output_type.call_method0(py, "schema") {
+        if let Ok(py_dict) = schema.extract::<Bound<'_, PyDict>>(py) {
+            if let Ok(json_val) = pythonize::depythonize::<serde_json::Value>(&py_dict) {
+                return Some(json_val);
+            }
+        }
+    }
+
+    // Try dataclasses (use __dataclass_fields__)
+    if output_type.bind(py).hasattr("__dataclass_fields__").unwrap_or(false) {
+        // For dataclasses, construct a basic schema from fields
+        if let Ok(fields) = output_type.getattr(py, "__dataclass_fields__") {
+            if let Ok(fields_dict) = fields.extract::<Bound<'_, PyDict>>(py) {
+                let mut properties = serde_json::Map::new();
+                let mut required = Vec::new();
+
+                for (key, _value) in fields_dict.iter() {
+                    if let Ok(field_name) = key.extract::<String>() {
+                        // Default to string type for now - dataclasses don't provide rich type info
+                        properties.insert(field_name.clone(), serde_json::json!({"type": "string"}));
+                        required.push(serde_json::Value::String(field_name));
+                    }
+                }
+
+                return Some(serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": false
+                }));
+            }
+        }
+    }
+
+    // Try Deserializable classes (have __annotations__ and __gasp_from_partial__)
+    // This handles custom classes that inherit from Deserializable
+    if output_type.bind(py).hasattr("__annotations__").unwrap_or(false) {
+        if let Ok(annotations) = output_type.getattr(py, "__annotations__") {
+            if let Ok(annotations_dict) = annotations.extract::<Bound<'_, PyDict>>(py) {
+                let mut properties = serde_json::Map::new();
+                let mut required = Vec::new();
+
+                for (key, type_hint) in annotations_dict.iter() {
+                    if let Ok(field_name) = key.extract::<String>() {
+                        // Get the JSON schema type from Python type hint
+                        let json_type = python_type_to_json_schema(py, &type_hint);
+                        properties.insert(field_name.clone(), json_type.clone());
+
+                        // Check if field is optional (has default value or is Optional[T])
+                        let is_optional = is_optional_type(py, &type_hint) ||
+                            has_class_default(py, output_type, &field_name);
+
+                        if !is_optional {
+                            required.push(serde_json::Value::String(field_name));
+                        }
+                    }
+                }
+
+                // Get class name for title
+                let title = output_type.getattr(py, "__name__")
+                    .and_then(|n| n.extract::<String>(py))
+                    .unwrap_or_else(|_| "Object".to_string());
+
+                return Some(serde_json::json!({
+                    "type": "object",
+                    "title": title,
+                    "properties": properties,
+                    "required": required
+                }));
+            }
+        }
+    }
+
+    None
+}
+
+/// Convert Python type hint to JSON schema type
+fn python_type_to_json_schema(py: Python<'_>, type_hint: &Bound<'_, pyo3::PyAny>) -> serde_json::Value {
+    // Get the type name or repr
+    let type_repr = type_hint.repr()
+        .and_then(|r| r.extract::<String>())
+        .unwrap_or_else(|_| "Any".to_string());
+
+    // Check for Optional types (Union[X, None] or X | None)
+    if type_repr.starts_with("typing.Optional[") || type_repr.contains(" | None") || type_repr.contains("None |") {
+        // Extract inner type from Optional[X]
+        if let Ok(args) = type_hint.getattr("__args__") {
+            if let Ok(args_tuple) = args.extract::<Vec<Bound<'_, pyo3::PyAny>>>() {
+                // Find the non-None type
+                for arg in args_tuple {
+                    let arg_repr = arg.repr()
+                        .and_then(|r| r.extract::<String>())
+                        .unwrap_or_default();
+                    if arg_repr != "<class 'NoneType'>" && arg_repr != "None" {
+                        let inner_schema = python_type_to_json_schema(py, &arg);
+                        // Return anyOf with inner type and null
+                        return serde_json::json!({
+                            "anyOf": [inner_schema, {"type": "null"}]
+                        });
+                    }
+                }
+            }
+        }
+        return serde_json::json!({"type": "string"});
+    }
+
+    // Check for List types
+    if type_repr.starts_with("typing.List[") || type_repr.starts_with("list[") {
+        if let Ok(args) = type_hint.getattr("__args__") {
+            if let Ok(args_tuple) = args.extract::<Vec<Bound<'_, pyo3::PyAny>>>() {
+                if let Some(item_type) = args_tuple.first() {
+                    let item_schema = python_type_to_json_schema(py, item_type);
+                    return serde_json::json!({
+                        "type": "array",
+                        "items": item_schema
+                    });
+                }
+            }
+        }
+        return serde_json::json!({"type": "array"});
+    }
+
+    // Check for Dict types
+    if type_repr.starts_with("typing.Dict[") || type_repr.starts_with("dict[") {
+        return serde_json::json!({"type": "object"});
+    }
+
+    // Get the actual type name
+    let type_name = if let Ok(name) = type_hint.getattr("__name__") {
+        name.extract::<String>().unwrap_or_else(|_| type_repr.clone())
+    } else {
+        // Extract from repr like "<class 'str'>" or "typing.List[str]"
+        if type_repr.starts_with("<class '") && type_repr.ends_with("'>") {
+            type_repr[8..type_repr.len()-2].to_string()
+        } else {
+            type_repr.clone()
+        }
+    };
+
+    // Map Python types to JSON schema types
+    match type_name.as_str() {
+        "str" | "string" => serde_json::json!({"type": "string"}),
+        "int" | "integer" => serde_json::json!({"type": "integer"}),
+        "float" | "number" => serde_json::json!({"type": "number"}),
+        "bool" | "boolean" => serde_json::json!({"type": "boolean"}),
+        "list" | "List" => serde_json::json!({"type": "array"}),
+        "dict" | "Dict" => serde_json::json!({"type": "object"}),
+        "None" | "NoneType" => serde_json::json!({"type": "null"}),
+        _ => serde_json::json!({"type": "string"}) // Default to string for unknown types
+    }
+}
+
+/// Check if a Python type hint is Optional
+fn is_optional_type(_py: Python<'_>, type_hint: &Bound<'_, pyo3::PyAny>) -> bool {
+    let type_repr = type_hint.repr()
+        .and_then(|r| r.extract::<String>())
+        .unwrap_or_default();
+
+    // Check common Optional patterns
+    type_repr.starts_with("typing.Optional[") ||
+    type_repr.contains(" | None") ||
+    type_repr.contains("None |") ||
+    type_repr.starts_with("typing.Union[") && type_repr.contains("NoneType")
+}
+
+/// Check if a class has a default value for a field
+fn has_class_default(py: Python<'_>, class_obj: &PyObject, field_name: &str) -> bool {
+    // Check if the class has an attribute with this name (default value)
+    if let Ok(has_attr) = class_obj.bind(py).hasattr(field_name) {
+        if has_attr {
+            // Also check it's not just the annotation
+            if let Ok(attr) = class_obj.getattr(py, field_name) {
+                // If we can get the attribute, it has a default
+                // Skip if it's a classmethod, property, or callable
+                let attr_repr = attr.bind(py).repr()
+                    .and_then(|r| r.extract::<String>())
+                    .unwrap_or_default();
+                return !attr_repr.contains("method") &&
+                       !attr_repr.contains("property") &&
+                       !attr_repr.contains("function");
+            }
+        }
+    }
+    false
+}
+
 /// Parameters needed to lazily create a stream
 #[derive(Clone)]
 struct StreamParams {
@@ -23,6 +222,7 @@ struct StreamParams {
     system: Option<String>,
     history: Option<Vec<reson_agentic::utils::ConversationMessage>>,
     output_type_name: Option<String>,
+    output_schema: Option<serde_json::Value>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
@@ -76,6 +276,7 @@ impl StreamIterator {
                         rust_tools,
                         rust_tool_schemas,
                         p.output_type_name,
+                        p.output_schema,
                         store,
                         p.api_key.as_deref(),
                         p.system.as_deref(),
@@ -370,12 +571,17 @@ impl Runtime {
     }
 
     /// Execute a tool - calls the registered Python function
+    ///
+    /// If a `tool_type` was registered for this tool, the JSON args are hydrated
+    /// into a typed instance (Pydantic, Deserializable, dataclass, or regular class)
+    /// before being passed to the tool function.
     fn execute_tool<'py>(
         &self,
         py: Python<'py>,
         tool_result: PyObject,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tools = self.tools.clone();
+        let tool_types = self.tool_types.clone();
         let tool_result_clone = tool_result.clone_ref(py);
 
         // Get tool name
@@ -386,7 +592,35 @@ impl Runtime {
             })?
         };
 
+        // Extract args dict from the tool result
+        let args_dict: PyObject = {
+            let bound = tool_result.bind(py);
+            // First try to get 'args' attribute (ToolCall object)
+            if let Ok(args) = bound.getattr("args") {
+                args.unbind()
+            // Then try to get it as a dict key
+            } else if let Ok(dict) = bound.downcast::<pyo3::types::PyDict>() {
+                if let Some(args) = dict.get_item("args")? {
+                    args.unbind()
+                } else {
+                    // No args key, filter out metadata keys and use remaining as args
+                    let filtered = pyo3::types::PyDict::new(py);
+                    for (k, v) in dict.iter() {
+                        let key: String = k.extract()?;
+                        if !key.starts_with("_tool") {
+                            filtered.set_item(k, v)?;
+                        }
+                    }
+                    filtered.unbind().into()
+                }
+            } else {
+                // Fallback: create empty dict
+                pyo3::types::PyDict::new(py).unbind().into()
+            }
+        };
+
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Look up the tool function
             let tool_fn = {
                 let tools_guard = tools.read().await;
                 let func = tools_guard.get(&tool_name).ok_or_else(|| {
@@ -395,10 +629,39 @@ impl Runtime {
                 Python::with_gil(|py| func.clone_ref(py))
             };
 
-            // Call the Python function
+            // Look up the tool type (if registered)
+            let tool_type_opt = {
+                let guard = tool_types.read().await;
+                guard.get(&tool_name).map(|t| Python::with_gil(|py| t.clone_ref(py)))
+            };
+
+            // Call the Python function with hydrated args or raw tool_result
             Python::with_gil(|py| -> PyResult<PyObject> {
                 let asyncio = py.import("asyncio")?;
-                let result = tool_fn.call1(py, (tool_result_clone.clone_ref(py),))?;
+
+                // Hydrate args into typed instance if tool_type is registered
+                let call_arg = if let Some(tool_type) = tool_type_opt {
+                    let args_bound = args_dict.bind(py);
+
+                    // Check if Pydantic V2 (has model_validate classmethod)
+                    if tool_type.bind(py).hasattr("model_validate")? {
+                        // Pydantic V2: MyClass.model_validate(args_dict)
+                        tool_type.call_method1(py, "model_validate", (args_bound,))?
+                    // Check if Pydantic V1 (has parse_obj classmethod)
+                    } else if tool_type.bind(py).hasattr("parse_obj")? {
+                        // Pydantic V1: MyClass.parse_obj(args_dict)
+                        tool_type.call_method1(py, "parse_obj", (args_bound,))?
+                    } else {
+                        // Deserializable, dataclass, or regular class: MyClass(**args_dict)
+                        let kwargs = args_bound.downcast::<pyo3::types::PyDict>()?;
+                        tool_type.call(py, (), Some(kwargs))?
+                    }
+                } else {
+                    // No type registered, pass raw tool_result
+                    tool_result_clone.clone_ref(py)
+                };
+
+                let result = tool_fn.call1(py, (call_arg,))?;
 
                 // Check if it's a coroutine and await it
                 if asyncio
@@ -463,13 +726,18 @@ impl Runtime {
                 None
             };
 
-        // Extract output type name if provided
-        let output_type_name: Option<String> = if let Some(ref ot) = output_type {
-            ot.getattr(py, "__name__")
+        // Extract output type name and schema if provided
+        let (output_type_name, output_schema, output_type_clone): (Option<String>, Option<serde_json::Value>, Option<PyObject>) = if let Some(ref ot) = output_type {
+            let type_name = ot.getattr(py, "__name__")
                 .ok()
-                .and_then(|n| n.extract(py).ok())
+                .and_then(|n| n.extract(py).ok());
+
+            // Try to generate JSON schema from the type
+            let schema = generate_output_schema(py, ot);
+
+            (type_name, schema, Some(ot.clone_ref(py)))
         } else {
-            None
+            (None, None, None)
         };
 
         // Create storage wrapper
@@ -507,6 +775,7 @@ impl Runtime {
                 rust_tools,
                 rust_tool_schemas,
                 output_type_name,
+                output_schema,
                 store,
                 effective_api_key.as_deref(),
                 system_clone.as_deref(),
@@ -527,11 +796,31 @@ impl Runtime {
                 reasoning_acc.write().await.push(reasoning.clone());
             }
 
-            // Convert result to Python
+            // Convert result to Python, hydrating into output_type if provided
             Python::with_gil(|py| -> PyResult<PyObject> {
-                pythonize::pythonize(py, &result.parsed_value)
-                    .map(|b| b.unbind())
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+                let py_value = pythonize::pythonize(py, &result.parsed_value)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+                // If output_type was provided, hydrate the response into the typed instance
+                if let Some(output_type) = output_type_clone {
+                    // Check if the result is a dict (structured output)
+                    if let Ok(dict) = py_value.downcast::<pyo3::types::PyDict>() {
+                        // Check if Pydantic V2 (has model_validate classmethod)
+                        if output_type.bind(py).hasattr("model_validate")? {
+                            // Pydantic V2: MyClass.model_validate(dict)
+                            return output_type.call_method1(py, "model_validate", (dict,));
+                        // Check if Pydantic V1 (has parse_obj classmethod)
+                        } else if output_type.bind(py).hasattr("parse_obj")? {
+                            // Pydantic V1: MyClass.parse_obj(dict)
+                            return output_type.call_method1(py, "parse_obj", (dict,));
+                        } else {
+                            // Deserializable, dataclass, or regular class: MyClass(**dict)
+                            return output_type.call(py, (), Some(dict));
+                        }
+                    }
+                }
+
+                Ok(py_value.unbind())
             })
         })
     }
@@ -576,13 +865,15 @@ impl Runtime {
                 None
             };
 
-        // Extract output type name
-        let output_type_name: Option<String> = if let Some(ref ot) = output_type {
-            ot.getattr(py, "__name__")
+        // Extract output type name and schema
+        let (output_type_name, output_schema): (Option<String>, Option<serde_json::Value>) = if let Some(ref ot) = output_type {
+            let type_name = ot.getattr(py, "__name__")
                 .ok()
-                .and_then(|n| n.extract(py).ok())
+                .and_then(|n| n.extract(py).ok());
+            let schema = generate_output_schema(py, ot);
+            (type_name, schema)
         } else {
-            None
+            (None, None)
         };
 
         // Mark runtime as used synchronously
@@ -607,6 +898,7 @@ impl Runtime {
             system: system,
             history: rust_history,
             output_type_name,
+            output_schema,
             temperature,
             top_p,
             max_tokens,

@@ -13,6 +13,7 @@ use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenRouterClient,
 };
+use crate::schema::fix_output_schema_for_provider;
 use crate::storage::Storage;
 use crate::types::ChatMessage;
 use crate::utils::ConversationMessage;
@@ -376,7 +377,8 @@ pub async fn call_llm(
     model: &str,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
-    _output_type: Option<String>,
+    output_type_name: Option<String>,
+    output_schema: Option<serde_json::Value>,
     _store: Arc<dyn Storage>,
     api_key: Option<&str>,
     system: Option<&str>,
@@ -421,6 +423,13 @@ pub async fn call_llm(
         }
     };
 
+    // Fix output schema for provider-specific requirements
+    let provider = model.split(':').next().unwrap_or(model);
+    let fixed_output_schema = output_schema.map(|mut schema| {
+        fix_output_schema_for_provider(&mut schema, provider);
+        schema
+    });
+
     // Build config
     let config = GenerationConfig {
         model: String::new(), // Use client's default
@@ -431,6 +440,8 @@ pub async fn call_llm(
         native_tools: true, // Always true - we only support native tools
         reasoning_effort: None,
         thinking_budget: None,
+        output_schema: fixed_output_schema,
+        output_type_name,
     };
 
     // Make API call
@@ -523,7 +534,8 @@ pub async fn call_llm_stream(
     model: &str,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
-    _output_type: Option<String>,
+    output_type_name: Option<String>,
+    output_schema: Option<serde_json::Value>,
     _store: Arc<dyn Storage>,
     api_key: Option<&str>,
     system: Option<&str>,
@@ -569,6 +581,13 @@ pub async fn call_llm_stream(
         }
     };
 
+    // Fix output schema for provider-specific requirements
+    let provider = model.split(':').next().unwrap_or(model);
+    let fixed_output_schema = output_schema.map(|mut schema| {
+        fix_output_schema_for_provider(&mut schema, provider);
+        schema
+    });
+
     // Build config
     let config = GenerationConfig {
         model: String::new(),
@@ -579,6 +598,8 @@ pub async fn call_llm_stream(
         native_tools: true, // Always true - we only support native tools
         reasoning_effort: None,
         thinking_budget: None,
+        output_schema: fixed_output_schema,
+        output_type_name,
     };
 
     // Get streaming response

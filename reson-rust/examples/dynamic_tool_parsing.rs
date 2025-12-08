@@ -110,9 +110,9 @@ async fn main() -> reson_agentic::error::Result<()> {
     // In Python: runtime.tool(handle_chat, name="Chat", tool_type=Chat)
     // In Rust:   runtime.tool::<Chat, _>(handle_chat, Some("Chat"))
 
-    let chat_handler = |parsed_tool: reson_agentic::parsers::ParsedTool| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
+    // Handlers now receive typed structs directly (not ParsedTool)
+    let chat_handler = |chat: Chat| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
         Box::pin(async move {
-            let chat: Chat = serde_json::from_value(parsed_tool.value)?;
             println!(
                 "📨 Chat handler called: {} -> {}",
                 chat.recipient, chat.message
@@ -123,9 +123,8 @@ async fn main() -> reson_agentic::error::Result<()> {
 
     runtime.tool::<Chat, _>(chat_handler, Some("Chat")).await?;
 
-    let fileop_handler = |parsed_tool: reson_agentic::parsers::ParsedTool| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
+    let fileop_handler = |file_op: FileOp| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
         Box::pin(async move {
-            let file_op: FileOp = serde_json::from_value(parsed_tool.value)?;
             println!("📁 FileOp handler called: {} ({})", file_op.path, file_op.operation);
             Ok(format!("Performed {} on {}", file_op.operation, file_op.path))
         })

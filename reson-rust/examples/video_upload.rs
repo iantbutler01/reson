@@ -148,7 +148,8 @@ async fn analyze_video(
             None, // prompt is in the multimodal message
             Some("You are a video analysis assistant. Use the available tools to analyze the video and answer the user's question."),
             Some(vec![ConversationMessage::Multimodal(video_message)]),
-            None, // output_type
+            None, // output_type_name
+            None, // output_schema
             None, // temperature
             None, // top_p
             None, // max_tokens

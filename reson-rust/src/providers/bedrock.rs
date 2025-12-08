@@ -10,11 +10,12 @@
 
 use async_trait::async_trait;
 use futures::stream::Stream;
+use futures::StreamExt;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
 use crate::providers::{
-    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
+    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TokenUsage, TraceCallback,
 };
 use crate::types::Provider;
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
@@ -123,8 +124,26 @@ impl BedrockClient {
             request["top_p"] = serde_json::json!(top_p);
         }
 
-        // Note: Tools are excluded from Bedrock requests per Python implementation
-        // request.model_dump_json(exclude={"tools", "tool_choice"})
+        // Add tools if provided
+        if let Some(ref tools) = config.tools {
+            if !tools.is_empty() {
+                request["tools"] = serde_json::json!(tools);
+                // Enable parallel tool calling via tool_choice
+                request["tool_choice"] = serde_json::json!({
+                    "type": "auto",
+                    "disable_parallel_tool_use": false
+                });
+            }
+        }
+
+        // Add structured output schema if provided
+        // Bedrock uses the same format as Anthropic API
+        if let Some(ref schema) = config.output_schema {
+            request["output_format"] = serde_json::json!({
+                "type": "json_schema",
+                "schema": schema
+            });
+        }
 
         Ok(request)
     }
@@ -172,24 +191,48 @@ impl InferenceClient for BedrockClient {
             let response_json: serde_json::Value = serde_json::from_slice(body_bytes)?;
 
             // Parse response (same format as Anthropic)
-            let content = response_json["content"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            // Extract text content and tool calls from content blocks
+            let content_blocks = response_json["content"].as_array();
+
+            let mut text_content = String::new();
+            let mut tool_calls = Vec::new();
+
+            if let Some(blocks) = content_blocks {
+                for block in blocks {
+                    // Extract text content
+                    if block["type"] == "text" {
+                        if let Some(text) = block["text"].as_str() {
+                            text_content.push_str(text);
+                        }
+                    }
+                    // Extract tool calls
+                    else if block["type"] == "tool_use" {
+                        tool_calls.push(block.clone());
+                    }
+                }
+            }
 
             let usage = TokenUsage {
                 input_tokens: response_json["usage"]["input_tokens"].as_u64().unwrap_or(0),
                 output_tokens: response_json["usage"]["output_tokens"].as_u64().unwrap_or(0),
-                cached_tokens: 0,
+                cached_tokens: response_json["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
             };
 
+            // If tools were provided, return full response for tool extraction
+            let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
+            let has_tool_calls = !tool_calls.is_empty();
+
             Ok(GenerationResponse {
-                content,
+                content: text_content,
                 reasoning: None,
-                tool_calls: Vec::new(),
+                tool_calls,
                 reasoning_segments: Vec::new(),
                 usage,
-                raw: Some(response_json),
+                raw: if has_tools || has_tool_calls {
+                    Some(response_json)
+                } else {
+                    None
+                },
             })
         }
 

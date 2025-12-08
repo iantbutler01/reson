@@ -542,6 +542,12 @@ impl GoogleGenAIClient {
             });
         }
 
+        // Add structured output schema if provided
+        if let Some(ref schema) = config.output_schema {
+            request["generationConfig"]["responseMimeType"] = serde_json::json!("application/json");
+            request["generationConfig"]["responseSchema"] = schema.clone();
+        }
+
         Ok(request)
     }
 
@@ -804,7 +810,7 @@ impl GoogleGenAIClient {
         stream: bool,
     ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
-        let request = client
+        let mut request = client
             .post(&self.get_endpoint(stream))
             .timeout(std::time::Duration::from_secs(300))
             .header("Content-Type", "application/json");
