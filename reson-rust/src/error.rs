@@ -75,10 +75,7 @@ pub enum Error {
 impl Error {
     /// Check if error is retryable (suitable for backoff retry)
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Error::Inference(_) | Error::Network(_) | Error::Io(_)
-        )
+        matches!(self, Error::Inference(_) | Error::Network(_) | Error::Io(_))
     }
 
     /// Check if error indicates retries were exceeded

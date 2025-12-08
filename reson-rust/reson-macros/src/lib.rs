@@ -5,7 +5,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, ItemFn, Lit, Token, FnArg, PatType, Pat};
+use syn::{parse_macro_input, FnArg, ItemFn, Lit, Pat, PatType, Token};
 
 // Helper struct to parse macro attributes
 struct AgenticArgs {
@@ -142,7 +142,7 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !has_runtime {
         return syn::Error::new_spanned(
             &input_fn.sig.ident,
-            "#[agentic] function must have a `runtime: Runtime` parameter"
+            "#[agentic] function must have a `runtime: Runtime` parameter",
         )
         .to_compile_error()
         .into();
@@ -535,14 +535,15 @@ fn get_json_type(ty: &syn::Type) -> String {
             // Map Rust types to JSON schema types
             return match ident.as_str() {
                 "String" | "str" => "string",
-                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
-                "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => "integer",
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+                | "u128" | "usize" => "integer",
                 "f32" | "f64" => "number",
                 "bool" => "boolean",
                 "Vec" => "array",
                 "HashMap" | "BTreeMap" => "object",
                 _ => "object", // Default for custom types
-            }.to_string();
+            }
+            .to_string();
         }
     }
     "object".to_string()

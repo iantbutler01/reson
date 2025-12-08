@@ -3,8 +3,8 @@
 //! Provides Python Cache/Store parity with prefix/suffix namespacing and mailbox support.
 
 use async_trait::async_trait;
+use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{HashMap, HashSet};
-use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::Result;
 
@@ -33,7 +33,11 @@ pub trait Store: Send + Sync {
     async fn publish_to_mailbox(&self, mailbox_id: &str, value: &serde_json::Value) -> Result<()>;
 
     /// Get a message from a mailbox (blocking with optional timeout)
-    async fn get_message(&self, mailbox_id: &str, timeout_secs: Option<f64>) -> Result<Option<serde_json::Value>>;
+    async fn get_message(
+        &self,
+        mailbox_id: &str,
+        timeout_secs: Option<f64>,
+    ) -> Result<Option<serde_json::Value>>;
 
     /// Close/cleanup the store
     async fn close(&self) -> Result<()>;

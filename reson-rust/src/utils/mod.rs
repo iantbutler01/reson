@@ -5,5 +5,7 @@
 pub mod message_conversion;
 pub mod sse;
 
-pub use message_conversion::{convert_messages_to_provider_format, ConversationMessage, media_part_to_google_format};
+pub use message_conversion::{
+    convert_messages_to_provider_format, media_part_to_google_format, ConversationMessage,
+};
 pub use sse::parse_sse_stream;

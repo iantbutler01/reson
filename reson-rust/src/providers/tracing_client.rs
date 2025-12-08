@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use futures::stream::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::providers::{GenerationConfig, GenerationResponse, InferenceClient, StreamChunk};
@@ -197,6 +197,7 @@ impl TracingInferenceClient {
     }
 
     /// Trace request to storage if configured
+    #[allow(dead_code)]
     async fn trace_request(&self, _messages: &[ConversationMessage], _id: u64) -> Result<()> {
         // TODO: Implement trace_output equivalent
         // Would write to RESON_TRACE directory or S3 bucket
@@ -204,6 +205,7 @@ impl TracingInferenceClient {
     }
 
     /// Trace response to storage if configured
+    #[allow(dead_code)]
     async fn trace_response(&self, _response: &str, _id: u64) -> Result<()> {
         // TODO: Implement trace_output equivalent
         Ok(())
@@ -252,8 +254,14 @@ impl InferenceClient for TracingInferenceClient {
                 // Record token usage on span
                 let span = tracing::Span::current();
                 span.record("inference.usage.input_tokens", response.usage.input_tokens);
-                span.record("inference.usage.output_tokens", response.usage.output_tokens);
-                span.record("inference.usage.cached_tokens", response.usage.cached_tokens);
+                span.record(
+                    "inference.usage.output_tokens",
+                    response.usage.output_tokens,
+                );
+                span.record(
+                    "inference.usage.cached_tokens",
+                    response.usage.cached_tokens,
+                );
 
                 // Track cost and trace
                 let fallback_provider = fallback.provider();
@@ -271,8 +279,14 @@ impl InferenceClient for TracingInferenceClient {
         // Record token usage on span
         let span = tracing::Span::current();
         span.record("inference.usage.input_tokens", response.usage.input_tokens);
-        span.record("inference.usage.output_tokens", response.usage.output_tokens);
-        span.record("inference.usage.cached_tokens", response.usage.cached_tokens);
+        span.record(
+            "inference.usage.output_tokens",
+            response.usage.output_tokens,
+        );
+        span.record(
+            "inference.usage.cached_tokens",
+            response.usage.cached_tokens,
+        );
 
         // Track cost for successful call
         let model = format!("{:?}", provider);
@@ -438,6 +452,10 @@ mod tests {
         let credits: Option<u64> = store.get("credits_used").await.unwrap();
         assert!(credits.is_some(), "No credits tracked");
         let credits_value = credits.unwrap();
-        assert!(credits_value > 0, "Credits tracked but zero: {}", credits_value);
+        assert!(
+            credits_value > 0,
+            "Credits tracked but zero: {}",
+            credits_value
+        );
     }
 }

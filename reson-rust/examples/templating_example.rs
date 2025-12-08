@@ -20,11 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("2. Multiple variables:");
     let result = engine.render_str(
         "User: {{ first }} {{ last }}, Age: {{ age }}",
-        &[
-            ("first", "John"),
-            ("last", "Doe"),
-            ("age", "30"),
-        ],
+        &[("first", "John"), ("last", "Doe"), ("age", "30")],
     )?;
     println!("   {}\n", result);
 

@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example store_usage
 
-use reson_agentic::storage::{Store, MemoryKVStore};
+use reson_agentic::storage::{MemoryKVStore, Store};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,15 +32,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Mailbox pub/sub
     println!("\n4. Mailbox pub/sub:");
-    store.publish_to_mailbox("notifications", &serde_json::json!({
-        "type": "email",
-        "message": "Welcome!"
-    })).await?;
+    store
+        .publish_to_mailbox(
+            "notifications",
+            &serde_json::json!({
+                "type": "email",
+                "message": "Welcome!"
+            }),
+        )
+        .await?;
 
-    store.publish_to_mailbox("notifications", &serde_json::json!({
-        "type": "sms",
-        "message": "Verification code: 123456"
-    })).await?;
+    store
+        .publish_to_mailbox(
+            "notifications",
+            &serde_json::json!({
+                "type": "sms",
+                "message": "Verification code: 123456"
+            }),
+        )
+        .await?;
 
     let msg1 = store.get_message("notifications", None).await?;
     println!("   Message 1: {}", serde_json::to_string_pretty(&msg1)?);

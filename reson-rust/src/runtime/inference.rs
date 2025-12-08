@@ -85,7 +85,9 @@ fn infer_json_type(field_type: &str) -> &'static str {
         "String" => "string",
         "str" => "string",
         "f32" | "f64" => "number",
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => "integer",
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
+            "integer"
+        }
         "bool" => "boolean",
         _ => "string",
     }

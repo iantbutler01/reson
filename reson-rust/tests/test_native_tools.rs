@@ -76,7 +76,10 @@ struct MathOperation {
 impl Deserializable for MathOperation {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            reson_agentic::error::Error::NonRetryable(format!("Failed to parse MathOperation: {}", e))
+            reson_agentic::error::Error::NonRetryable(format!(
+                "Failed to parse MathOperation: {}",
+                e
+            ))
         })
     }
 
@@ -112,7 +115,10 @@ struct FactorialInput {
 impl Deserializable for FactorialInput {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            reson_agentic::error::Error::NonRetryable(format!("Failed to parse FactorialInput: {}", e))
+            reson_agentic::error::Error::NonRetryable(format!(
+                "Failed to parse FactorialInput: {}",
+                e
+            ))
         })
     }
 
@@ -222,7 +228,9 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
         };
 
         // Add to history
-        history.push(reson_agentic::utils::ConversationMessage::ToolResult(tool_result));
+        history.push(reson_agentic::utils::ConversationMessage::ToolResult(
+            tool_result,
+        ));
 
         // Continue conversation
         result = runtime
@@ -257,7 +265,18 @@ async fn single_tool_agent(query: String, runtime: Runtime) -> Result<String> {
         .await?;
 
     let result = runtime
-        .run(Some(&query), None, None, None, None, None, None, None, None, None)
+        .run(
+            Some(&query),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await?;
     println!("📊 Result: {:?}", result);
 

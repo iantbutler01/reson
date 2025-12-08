@@ -25,9 +25,9 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{Provider, TokenUsage};
 use crate::types::ChatRole;
-use crate::utils::{ConversationMessage, media_part_to_google_format};
+use crate::types::{Provider, TokenUsage};
+use crate::utils::{media_part_to_google_format, ConversationMessage};
 
 /// Authentication method for Google GenAI
 #[derive(Clone)]
@@ -123,10 +123,10 @@ impl GoogleGenAIClient {
             .expect("GOOGLE_APPLICATION_CREDENTIALS environment variable must be set");
 
         let creds_content = std::fs::read_to_string(&creds_path)
-            .expect(&format!("Failed to read credentials file: {}", creds_path));
+            .unwrap_or_else(|_| panic!("Failed to read credentials file: {}", creds_path));
 
-        let creds_json: serde_json::Value = serde_json::from_str(&creds_content)
-            .expect("Failed to parse credentials file as JSON");
+        let creds_json: serde_json::Value =
+            serde_json::from_str(&creds_content).expect("Failed to parse credentials file as JSON");
 
         let project = creds_json["project_id"]
             .as_str()
@@ -134,8 +134,8 @@ impl GoogleGenAIClient {
             .to_string();
 
         // Get location from env var or default to us-central1
-        let loc = std::env::var("GOOGLE_CLOUD_LOCATION")
-            .unwrap_or_else(|_| "us-central1".to_string());
+        let loc =
+            std::env::var("GOOGLE_CLOUD_LOCATION").unwrap_or_else(|_| "us-central1".to_string());
 
         let model_str = model.into();
         Self {
@@ -245,7 +245,10 @@ impl GoogleGenAIClient {
             .post(&start_url)
             .header("X-Goog-Upload-Protocol", "resumable")
             .header("X-Goog-Upload-Command", "start")
-            .header("X-Goog-Upload-Header-Content-Length", data.len().to_string())
+            .header(
+                "X-Goog-Upload-Header-Content-Length",
+                data.len().to_string(),
+            )
             .header("X-Goog-Upload-Header-Content-Type", mime_type)
             .header("Content-Type", "application/json");
 
@@ -317,9 +320,8 @@ impl GoogleGenAIClient {
             })?
             .clone();
 
-        let uploaded_file: UploadedFile = serde_json::from_value(file_json).map_err(|e| {
-            Error::NonRetryable(format!("Failed to parse UploadedFile: {}", e))
-        })?;
+        let uploaded_file: UploadedFile = serde_json::from_value(file_json)
+            .map_err(|e| Error::NonRetryable(format!("Failed to parse UploadedFile: {}", e)))?;
 
         Ok(uploaded_file)
     }
@@ -472,7 +474,8 @@ impl GoogleGenAIClient {
 
             // Initialize if needed
             if provider.is_none() {
-                let tp = gcp_auth::provider().await
+                let tp = gcp_auth::provider()
+                    .await
                     .map_err(|e| Error::NonRetryable(format!("Failed to initialize ADC: {}", e)))?;
                 *provider = Some(tp);
             }
@@ -480,12 +483,16 @@ impl GoogleGenAIClient {
             // Get token with cloud-platform scope (required for Vertex AI/Generative AI)
             let tp = provider.as_ref().unwrap();
             let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
-            let token = tp.token(scopes).await
+            let token = tp
+                .token(scopes)
+                .await
                 .map_err(|e| Error::NonRetryable(format!("Failed to get ADC token: {}", e)))?;
 
             Ok(token.as_str().to_string())
         } else {
-            Err(Error::NonRetryable("Not using ADC authentication".to_string()))
+            Err(Error::NonRetryable(
+                "Not using ADC authentication".to_string(),
+            ))
         }
     }
 
@@ -578,7 +585,7 @@ impl GoogleGenAIClient {
                         ChatRole::User => "user",
                         ChatRole::Assistant => "model",
                         ChatRole::System => continue, // Skip system messages (handled separately)
-                        ChatRole::Tool => "user", // Tool results come from user role
+                        ChatRole::Tool => "user",     // Tool results come from user role
                     };
 
                     contents.push(serde_json::json!({
@@ -665,7 +672,10 @@ impl GoogleGenAIClient {
         tools: &[serde_json::Value],
     ) -> Result<serde_json::Value> {
         // Check if already in Google format
-        if tools.iter().any(|t| t.get("function_declarations").is_some()) {
+        if tools
+            .iter()
+            .any(|t| t.get("function_declarations").is_some())
+        {
             return Ok(serde_json::json!(tools));
         }
 
@@ -694,7 +704,11 @@ impl GoogleGenAIClient {
             if let Some(parts) = first["content"]["parts"].as_array() {
                 for part in parts {
                     // Skip thought parts
-                    if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                    if part
+                        .get("thought")
+                        .and_then(|t| t.as_bool())
+                        .unwrap_or(false)
+                    {
                         continue;
                     }
                     if let Some(text) = part["text"].as_str() {
@@ -713,7 +727,9 @@ impl GoogleGenAIClient {
                 let reasoning: Vec<String> = parts
                     .iter()
                     .filter(|part| {
-                        part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false)
+                        part.get("thought")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false)
                     })
                     .filter_map(|part| part["text"].as_str().map(|s| s.to_string()))
                     .collect();
@@ -735,14 +751,16 @@ impl GoogleGenAIClient {
                 for part in parts {
                     if let Some(func_call) = part.get("functionCall") {
                         let name = func_call["name"].as_str().unwrap_or("");
-                        let args = func_call.get("args").cloned().unwrap_or(serde_json::json!({}));
+                        let args = func_call
+                            .get("args")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
 
                         // Generate ID since Google doesn't provide one
                         let id = format!(
                             "google_{}_{:x}",
                             name,
-                            std::collections::hash_map::DefaultHasher::new()
-                                .finish()
+                            std::collections::hash_map::DefaultHasher::new().finish()
                         );
 
                         // Convert to normalized format with _tool_name for compatibility
@@ -770,11 +788,14 @@ impl GoogleGenAIClient {
         TokenUsage {
             input_tokens: usage_metadata["promptTokenCount"].as_u64().unwrap_or(0),
             output_tokens: usage_metadata["candidatesTokenCount"].as_u64().unwrap_or(0),
-            cached_tokens: usage_metadata["cachedContentTokenCount"].as_u64().unwrap_or(0),
+            cached_tokens: usage_metadata["cachedContentTokenCount"]
+                .as_u64()
+                .unwrap_or(0),
         }
     }
 
     /// Check if using Vertex AI endpoint
+    #[allow(dead_code)]
     fn is_vertex_ai(&self) -> bool {
         self.api_url.contains("aiplatform.googleapis.com")
     }
@@ -811,7 +832,7 @@ impl GoogleGenAIClient {
     ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
         let mut request = client
-            .post(&self.get_endpoint(stream))
+            .post(self.get_endpoint(stream))
             .timeout(std::time::Duration::from_secs(300))
             .header("Content-Type", "application/json");
 
@@ -835,16 +856,12 @@ impl GoogleGenAIClient {
                 Error::NonRetryable(format!("{}: {}", status, body))
             }
             // Rate limit - retryable
-            StatusCode::TOO_MANY_REQUESTS => {
-                Error::Inference(format!("Rate limited: {}", body))
-            }
+            StatusCode::TOO_MANY_REQUESTS => Error::Inference(format!("Rate limited: {}", body)),
             // Server errors (5xx) are retryable
             StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT => {
-                Error::Inference(format!("{}: {}", status, body))
-            }
+            | StatusCode::GATEWAY_TIMEOUT => Error::Inference(format!("{}: {}", status, body)),
             // Default: assume retryable for unknown errors
             _ => Error::Inference(format!("{}: {}", status, body)),
         }
@@ -930,7 +947,7 @@ impl InferenceClient for GoogleGenAIClient {
         })
         .await?;
 
-        let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
+        let _has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
 
         // Google streams responses as newline-delimited JSON
         let stream = response.bytes_stream();
@@ -1154,7 +1171,10 @@ mod tests {
         let body = client.build_request_body(&messages, &config).unwrap();
 
         assert!(body["systemInstruction"].is_object());
-        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "You are helpful");
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "You are helpful"
+        );
         // Only user message should be in contents
         assert_eq!(body["contents"].as_array().unwrap().len(), 1);
     }
@@ -1173,7 +1193,10 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["includeThoughts"],
             true
         );
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 1024);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
     }
 
     #[test]

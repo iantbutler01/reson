@@ -10,10 +10,12 @@
 //! Or specific test: cargo test --test integration_tests test_anthropic_simple -- --ignored
 
 use reson_agentic::providers::{
-    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient,
-    OAIClient, OpenRouterClient,
+    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
+    OpenRouterClient,
 };
-use reson_agentic::schema::{AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator};
+use reson_agentic::schema::{
+    AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator,
+};
 use reson_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
 use reson_agentic::utils::ConversationMessage;
 use std::env;
@@ -109,7 +111,9 @@ async fn test_anthropic_simple_generation() {
     let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
 
     let messages = vec![
-        ConversationMessage::Chat(ChatMessage::system("You are a helpful assistant. Respond concisely.")),
+        ConversationMessage::Chat(ChatMessage::system(
+            "You are a helpful assistant. Respond concisely.",
+        )),
         ConversationMessage::Chat(ChatMessage::user("What is 2+2? Just give the number.")),
     ];
 
@@ -150,7 +154,10 @@ async fn test_anthropic_with_tools() {
 
     // Verify tool call structure
     let tool_call = &response.tool_calls[0];
-    assert_eq!(tool_call.get("name").and_then(|v| v.as_str()), Some("add_numbers"));
+    assert_eq!(
+        tool_call.get("name").and_then(|v| v.as_str()),
+        Some("add_numbers")
+    );
 
     let input = tool_call.get("input").expect("Tool call should have input");
     assert_eq!(input.get("a").and_then(|v| v.as_i64()), Some(15));
@@ -179,9 +186,18 @@ async fn test_anthropic_multi_turn_tool_conversation() {
 
     // Turn 2: Provide tool result and ask for final answer
     let tool_call_json = &response1.tool_calls[0];
-    let tool_use_id = tool_call_json.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let tool_name = tool_call_json.get("name").and_then(|v| v.as_str()).unwrap_or("add_numbers");
-    let tool_input = tool_call_json.get("input").cloned().unwrap_or(serde_json::json!({}));
+    let tool_use_id = tool_call_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let tool_name = tool_call_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("add_numbers");
+    let tool_input = tool_call_json
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     let mut messages2 = messages.clone();
     // Add assistant's tool call as a ToolCall (NOT an empty assistant message)
@@ -308,15 +324,14 @@ async fn test_google_with_tools() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_with_thinking() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp")
-        .with_thinking_budget(1024);
+    let client =
+        GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What are the prime factors of 360? Think through this step by step.",
     ))];
 
-    let config = GenerationConfig::new("gemini-2.0-flash-thinking-exp")
-        .with_max_tokens(2048);
+    let config = GenerationConfig::new("gemini-2.0-flash-thinking-exp").with_max_tokens(2048);
 
     let response = client.get_generation(&messages, &config).await.unwrap();
 
@@ -328,7 +343,9 @@ async fn test_google_with_thinking() {
     assert!(!response.content.is_empty());
     // Should mention prime factors
     assert!(
-        response.content.contains("2") || response.content.contains("3") || response.content.contains("5"),
+        response.content.contains("2")
+            || response.content.contains("3")
+            || response.content.contains("5"),
         "Response should mention prime factors"
     );
 }
@@ -413,7 +430,11 @@ async fn test_openrouter_with_tools_streaming() {
                     println!("Tool call complete: {:?}", tc);
                     tool_calls.push(tc);
                 }
-                reson_agentic::providers::StreamChunk::Usage { input_tokens, output_tokens, .. } => {
+                reson_agentic::providers::StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
                     println!("Usage: {} in, {} out", input_tokens, output_tokens);
                 }
                 _ => {}
@@ -502,8 +523,14 @@ async fn test_5_turn_tool_conversation() {
             .or_else(|| tool_call.get("_tool_name"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let tool_id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let input = tool_call.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let tool_id = tool_call
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let input = tool_call
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
         println!("Tool call: {} with input: {:?}", tool_name, input);
 
@@ -567,7 +594,11 @@ async fn test_anthropic_streaming() {
                         print!("{}", text);
                         full_content.push_str(&text);
                     }
-                    reson_agentic::providers::StreamChunk::Usage { input_tokens, output_tokens, .. } => {
+                    reson_agentic::providers::StreamChunk::Usage {
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    } => {
                         println!("\nUsage: {} in, {} out", input_tokens, output_tokens);
                     }
                     _ => {}
@@ -597,8 +628,7 @@ async fn test_google_streaming() {
         "List the days of the week, one per line.",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
-        .with_max_tokens(200);
+    let config = GenerationConfig::new("gemini-1.5-flash").with_max_tokens(200);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
 
@@ -606,15 +636,13 @@ async fn test_google_streaming() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => {
-                match chunk {
-                    reson_agentic::providers::StreamChunk::Content(text) => {
-                        print!("{}", text);
-                        full_content.push_str(&text);
-                    }
-                    _ => {}
+            Ok(chunk) => match chunk {
+                reson_agentic::providers::StreamChunk::Content(text) => {
+                    print!("{}", text);
+                    full_content.push_str(&text);
                 }
-            }
+                _ => {}
+            },
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;
@@ -833,10 +861,7 @@ async fn test_google_anthropic_streaming_with_tools() {
     }
 
     println!("\nTool calls: {:?}", tool_calls);
-    assert!(
-        !tool_calls.is_empty(),
-        "Expected tool call via streaming"
-    );
+    assert!(!tool_calls.is_empty(), "Expected tool call via streaming");
 
     // Streaming tool calls have format: {"function": {"name": ..., "arguments": ...}, "id": ...}
     let tool_call = &tool_calls[0];

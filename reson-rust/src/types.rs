@@ -12,18 +12,19 @@ use crate::error::{Error, Result};
 fn format_json_python_style(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Object(map) => {
-            let pairs: Vec<String> = map.iter()
+            let pairs: Vec<String> = map
+                .iter()
                 .map(|(k, v)| format!("\"{}\": {}", k, format_json_python_style(v)))
                 .collect();
             format!("{{{}}}", pairs.join(", "))
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter()
-                .map(format_json_python_style)
-                .collect();
+            let items: Vec<String> = arr.iter().map(format_json_python_style).collect();
             format!("[{}]", items.join(", "))
         }
-        serde_json::Value::String(_) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
+        serde_json::Value::String(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+        }
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Null => "null".to_string(),
@@ -207,18 +208,11 @@ impl TokenUsage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaSource {
     /// Base64-encoded data with MIME type
-    Base64 {
-        data: String,
-        mime_type: String,
-    },
+    Base64 { data: String, mime_type: String },
     /// URL to the media (public URL)
-    Url {
-        url: String,
-    },
+    Url { url: String },
     /// Provider file ID (uploaded via provider's File API)
-    FileId {
-        file_id: String,
-    },
+    FileId { file_id: String },
     /// Provider file URI (Google-style, includes YouTube URLs)
     FileUri {
         uri: String,
@@ -243,17 +237,25 @@ impl MediaSource {
 
     /// Create from provider file ID
     pub fn file_id(file_id: impl Into<String>) -> Self {
-        Self::FileId { file_id: file_id.into() }
+        Self::FileId {
+            file_id: file_id.into(),
+        }
     }
 
     /// Create from provider file URI (Google)
     pub fn file_uri(uri: impl Into<String>) -> Self {
-        Self::FileUri { uri: uri.into(), mime_type: None }
+        Self::FileUri {
+            uri: uri.into(),
+            mime_type: None,
+        }
     }
 
     /// Create from YouTube URL (Google)
     pub fn youtube(url: impl Into<String>) -> Self {
-        Self::FileUri { uri: url.into(), mime_type: Some("video/*".to_string()) }
+        Self::FileUri {
+            uri: url.into(),
+            mime_type: Some("video/*".to_string()),
+        }
     }
 }
 
@@ -310,9 +312,7 @@ impl VideoMetadata {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaPart {
     /// Text content
-    Text {
-        text: String,
-    },
+    Text { text: String },
 
     /// Image content
     Image {
@@ -339,9 +339,7 @@ pub enum MediaPart {
     },
 
     /// PDF document (Anthropic, Google)
-    Document {
-        source: MediaSource,
-    },
+    Document { source: MediaSource },
 }
 
 impl MediaPart {
@@ -352,32 +350,50 @@ impl MediaPart {
 
     /// Create an image part from a source
     pub fn image(source: MediaSource) -> Self {
-        Self::Image { source, detail: None }
+        Self::Image {
+            source,
+            detail: None,
+        }
     }
 
     /// Create an image part with detail level
     pub fn image_with_detail(source: MediaSource, detail: impl Into<String>) -> Self {
-        Self::Image { source, detail: Some(detail.into()) }
+        Self::Image {
+            source,
+            detail: Some(detail.into()),
+        }
     }
 
     /// Create an audio part
     pub fn audio(source: MediaSource) -> Self {
-        Self::Audio { source, format: None }
+        Self::Audio {
+            source,
+            format: None,
+        }
     }
 
     /// Create an audio part with format hint
     pub fn audio_with_format(source: MediaSource, format: impl Into<String>) -> Self {
-        Self::Audio { source, format: Some(format.into()) }
+        Self::Audio {
+            source,
+            format: Some(format.into()),
+        }
     }
 
     /// Create a video part
     pub fn video(source: MediaSource) -> Self {
-        Self::Video { source, metadata: None }
+        Self::Video {
+            source,
+            metadata: None,
+        }
     }
 
     /// Create a video part with metadata
     pub fn video_with_metadata(source: MediaSource, metadata: VideoMetadata) -> Self {
-        Self::Video { source, metadata: Some(metadata) }
+        Self::Video {
+            source,
+            metadata: Some(metadata),
+        }
     }
 
     /// Create a video from YouTube URL
@@ -389,7 +405,11 @@ impl MediaPart {
     }
 
     /// Create a video from YouTube URL with clipping
-    pub fn youtube_clip(url: impl Into<String>, start: impl Into<String>, end: impl Into<String>) -> Self {
+    pub fn youtube_clip(
+        url: impl Into<String>,
+        start: impl Into<String>,
+        end: impl Into<String>,
+    ) -> Self {
         Self::Video {
             source: MediaSource::youtube(url),
             metadata: Some(VideoMetadata::new().with_clip(start, end)),
@@ -547,14 +567,17 @@ impl ToolCall {
             Self::from_provider_format(data, Provider::Anthropic).map(CreateResult::Single)
         } else if data.get("_tool_name").is_some() {
             // Deserializable object format
-            let tool_name = data["_tool_name"].as_str()
+            let tool_name = data["_tool_name"]
+                .as_str()
                 .ok_or_else(|| Error::Parse("_tool_name must be a string".to_string()))?
                 .to_string();
-            let tool_use_id = data.get("_tool_use_id")
+            let tool_use_id = data
+                .get("_tool_use_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
-            let signature = data.get("signature")
+            let signature = data
+                .get("signature")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .or_else(|| {
@@ -587,24 +610,25 @@ impl ToolCall {
     }
 
     /// Create from provider-specific format
-    pub fn from_provider_format(provider_format: serde_json::Value, provider: Provider) -> Result<Self> {
+    pub fn from_provider_format(
+        provider_format: serde_json::Value,
+        provider: Provider,
+    ) -> Result<Self> {
         match provider {
-            Provider::Anthropic | Provider::Bedrock => {
-                Ok(Self {
-                    tool_use_id: provider_format["id"]
-                        .as_str()
-                        .ok_or_else(|| Error::Parse("Missing 'id' in tool call".to_string()))?
-                        .to_string(),
-                    tool_name: provider_format["name"]
-                        .as_str()
-                        .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
-                        .to_string(),
-                    args: provider_format["input"].clone(),
-                    raw_arguments: None,
-                    signature: None,
-                    tool_obj: Some(provider_format),
-                })
-            }
+            Provider::Anthropic | Provider::Bedrock => Ok(Self {
+                tool_use_id: provider_format["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::Parse("Missing 'id' in tool call".to_string()))?
+                    .to_string(),
+                tool_name: provider_format["name"]
+                    .as_str()
+                    .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
+                    .to_string(),
+                args: provider_format["input"].clone(),
+                raw_arguments: None,
+                signature: None,
+                tool_obj: Some(provider_format),
+            }),
             Provider::OpenAI | Provider::OpenRouter => {
                 let function = &provider_format["function"];
                 let args_str = function["arguments"]
@@ -632,7 +656,10 @@ impl ToolCall {
                 let name = func_call["name"]
                     .as_str()
                     .ok_or_else(|| Error::Parse("Missing 'name' in functionCall".to_string()))?;
-                let args = func_call.get("args").cloned().unwrap_or(serde_json::json!({}));
+                let args = func_call
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
 
                 // Generate ID matching Python: google_{name}_{hash}
                 use std::collections::hash_map::DefaultHasher;
@@ -952,8 +979,7 @@ mod tests {
         let msg = ChatMessage::user("Hello");
         assert_eq!(msg.role, ChatRole::User);
 
-        let msg = ChatMessage::assistant("Hi there")
-            .with_cache_marker(CacheMarker::Ephemeral);
+        let msg = ChatMessage::assistant("Hi there").with_cache_marker(CacheMarker::Ephemeral);
         assert_eq!(msg.role, ChatRole::Assistant);
         assert!(msg.cache_marker.is_some());
     }

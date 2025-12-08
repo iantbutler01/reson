@@ -62,8 +62,8 @@ impl GoogleAnthropicClient {
         let creds_content = std::fs::read_to_string(&creds_path)
             .unwrap_or_else(|_| panic!("Failed to read credentials file: {}", creds_path));
 
-        let creds_json: serde_json::Value = serde_json::from_str(&creds_content)
-            .expect("Failed to parse credentials file as JSON");
+        let creds_json: serde_json::Value =
+            serde_json::from_str(&creds_content).expect("Failed to parse credentials file as JSON");
 
         let project_id = creds_json["project_id"]
             .as_str()
@@ -123,18 +123,19 @@ impl GoogleAnthropicClient {
 
         // Initialize if needed
         if provider.is_none() {
-            let tp = gcp_auth::provider().await.map_err(|e| {
-                Error::NonRetryable(format!("Failed to initialize ADC: {}", e))
-            })?;
+            let tp = gcp_auth::provider()
+                .await
+                .map_err(|e| Error::NonRetryable(format!("Failed to initialize ADC: {}", e)))?;
             *provider = Some(tp);
         }
 
         // Get token with cloud-platform scope
         let tp = provider.as_ref().unwrap();
         let scopes = &["https://www.googleapis.com/auth/cloud-platform"];
-        let token = tp.token(scopes).await.map_err(|e| {
-            Error::NonRetryable(format!("Failed to get ADC token: {}", e))
-        })?;
+        let token = tp
+            .token(scopes)
+            .await
+            .map_err(|e| Error::NonRetryable(format!("Failed to get ADC token: {}", e)))?;
 
         Ok(token.as_str().to_string())
     }
@@ -305,7 +306,7 @@ impl GoogleAnthropicClient {
         let client = reqwest::Client::new();
 
         let response = client
-            .post(&self.get_endpoint_url())
+            .post(self.get_endpoint_url())
             .timeout(std::time::Duration::from_secs(300))
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
@@ -324,16 +325,12 @@ impl GoogleAnthropicClient {
                 Error::NonRetryable(format!("{}: {}", status, body))
             }
             // Rate limit - retryable
-            StatusCode::TOO_MANY_REQUESTS => {
-                Error::Inference(format!("Rate limited: {}", body))
-            }
+            StatusCode::TOO_MANY_REQUESTS => Error::Inference(format!("Rate limited: {}", body)),
             // Server errors (5xx) are retryable
             StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT => {
-                Error::Inference(format!("{}: {}", status, body))
-            }
+            | StatusCode::GATEWAY_TIMEOUT => Error::Inference(format!("{}: {}", status, body)),
             // Default: assume retryable for unknown errors
             _ => Error::Inference(format!("{}: {}", status, body)),
         }
@@ -442,9 +439,7 @@ impl InferenceClient for GoogleAnthropicClient {
         );
 
         // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(
-            chunk_stream.flat_map(|chunk_vec| futures::stream::iter(chunk_vec)),
-        ))
+        Ok(Box::pin(chunk_stream.flat_map(futures::stream::iter)))
     }
 
     fn provider(&self) -> Provider {

@@ -2,8 +2,8 @@
 //!
 //! Handles SSE parsing and progressive tool call accumulation for Anthropic API.
 
-use std::collections::HashMap;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::providers::StreamChunk;
 
@@ -66,7 +66,9 @@ impl ToolCallAccumulator {
                 "{}".to_string()
             } else {
                 match serde_json::from_str::<Value>(&tool.input) {
-                    Ok(parsed) => serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_string()),
+                    Ok(parsed) => {
+                        serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_string())
+                    }
                     Err(_) => "{}".to_string(),
                 }
             };
@@ -112,7 +114,9 @@ pub fn parse_anthropic_chunk(
                 "input_json_delta" if has_tools => {
                     if let Some(partial_json) = delta["partial_json"].as_str() {
                         let index = chunk_json["index"].as_u64().unwrap_or(0) as usize;
-                        if let Some(partial_tool) = accumulator.accumulate_input(index, partial_json) {
+                        if let Some(partial_tool) =
+                            accumulator.accumulate_input(index, partial_json)
+                        {
                             results.push(StreamChunk::ToolCallPartial(partial_tool));
                         }
                     }

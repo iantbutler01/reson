@@ -64,7 +64,10 @@ pub fn media_part_to_google_format(part: &MediaPart, metadata: Option<&VideoMeta
 
         MediaPart::Audio { source, .. } => media_source_to_google_format(source, None),
 
-        MediaPart::Video { source, metadata: video_meta } => {
+        MediaPart::Video {
+            source,
+            metadata: video_meta,
+        } => {
             let meta = video_meta.as_ref().or(metadata);
             media_source_to_google_format(source, meta)
         }
@@ -125,7 +128,11 @@ fn media_source_to_google_format(source: &MediaSource, metadata: Option<&VideoMe
         if let Some(fps) = meta.fps {
             video_metadata["fps"] = json!(fps);
         }
-        if video_metadata.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        if video_metadata
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+        {
             part["video_metadata"] = video_metadata;
         }
     }
@@ -141,63 +148,59 @@ fn media_part_to_anthropic_format(part: &MediaPart) -> Value {
             "text": text
         }),
 
-        MediaPart::Image { source, .. } => {
-            match source {
-                MediaSource::Base64 { data, mime_type } => json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime_type,
-                        "data": data
-                    }
-                }),
-                MediaSource::Url { url } => json!({
-                    "type": "image",
-                    "source": {
-                        "type": "url",
-                        "url": url
-                    }
-                }),
-                MediaSource::FileId { file_id } => json!({
-                    "type": "image",
-                    "source": {
-                        "type": "file",
-                        "file_id": file_id
-                    }
-                }),
-                MediaSource::FileUri { uri, .. } => json!({
-                    "type": "image",
-                    "source": {
-                        "type": "url",
-                        "url": uri
-                    }
-                }),
-            }
-        }
+        MediaPart::Image { source, .. } => match source {
+            MediaSource::Base64 { data, mime_type } => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data
+                }
+            }),
+            MediaSource::Url { url } => json!({
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": url
+                }
+            }),
+            MediaSource::FileId { file_id } => json!({
+                "type": "image",
+                "source": {
+                    "type": "file",
+                    "file_id": file_id
+                }
+            }),
+            MediaSource::FileUri { uri, .. } => json!({
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": uri
+                }
+            }),
+        },
 
-        MediaPart::Document { source } => {
-            match source {
-                MediaSource::Base64 { data, mime_type } => json!({
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime_type,
-                        "data": data
-                    }
-                }),
-                MediaSource::FileId { file_id } => json!({
-                    "type": "document",
-                    "source": {
-                        "type": "file",
-                        "file_id": file_id
-                    }
-                }),
-                _ => json!({
-                    "type": "text",
-                    "text": "[Unsupported document source for Anthropic]"
-                }),
-            }
-        }
+        MediaPart::Document { source } => match source {
+            MediaSource::Base64 { data, mime_type } => json!({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data
+                }
+            }),
+            MediaSource::FileId { file_id } => json!({
+                "type": "document",
+                "source": {
+                    "type": "file",
+                    "file_id": file_id
+                }
+            }),
+            _ => json!({
+                "type": "text",
+                "text": "[Unsupported document source for Anthropic]"
+            }),
+        },
 
         // Anthropic doesn't support audio/video directly
         MediaPart::Audio { .. } | MediaPart::Video { .. } => json!({
@@ -250,24 +253,22 @@ fn media_part_to_openai_format(part: &MediaPart) -> Value {
             img
         }
 
-        MediaPart::Audio { source, format } => {
-            match source {
-                MediaSource::Base64 { data, .. } => {
-                    let fmt = format.as_deref().unwrap_or("wav");
-                    json!({
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": data,
-                            "format": fmt
-                        }
-                    })
-                }
-                _ => json!({
-                    "type": "text",
-                    "text": "[Unsupported audio source for OpenAI - use base64]"
-                }),
+        MediaPart::Audio { source, format } => match source {
+            MediaSource::Base64 { data, .. } => {
+                let fmt = format.as_deref().unwrap_or("wav");
+                json!({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": data,
+                        "format": fmt
+                    }
+                })
             }
-        }
+            _ => json!({
+                "type": "text",
+                "text": "[Unsupported audio source for OpenAI - use base64]"
+            }),
+        },
 
         // OpenAI doesn't support video/documents in chat
         MediaPart::Video { .. } | MediaPart::Document { .. } => json!({
@@ -286,15 +287,17 @@ fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) ->
         ChatRole::Tool => "tool",
     };
 
-    let parts: Vec<Value> = msg.parts.iter().map(|part| {
-        match provider {
+    let parts: Vec<Value> = msg
+        .parts
+        .iter()
+        .map(|part| match provider {
             Provider::GoogleGenAI => media_part_to_google_format(part, None),
             Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
                 media_part_to_anthropic_format(part)
             }
             Provider::OpenAI | Provider::OpenRouter => media_part_to_openai_format(part),
-        }
-    }).collect();
+        })
+        .collect();
 
     // Google uses "parts", others use "content" array
     match provider {
@@ -357,7 +360,7 @@ pub fn convert_messages_to_provider_format(
         }
     };
 
-    for (_idx, msg) in messages.iter().enumerate() {
+    for msg in messages.iter() {
         match msg {
             ConversationMessage::Chat(chat_msg) => {
                 // Check if this is a user message that should be merged with pending tool results
@@ -543,8 +546,7 @@ mod tests {
             ConversationMessage::ToolResult(ToolResult::success("toolu_2", "Rainy, 55°F")),
         ];
 
-        let result =
-            convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+        let result = convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
 
         // Should be 2 messages: original user message + coalesced tool results
         assert_eq!(result.len(), 2);
@@ -571,8 +573,7 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::user("Thanks!")),
         ];
 
-        let result =
-            convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+        let result = convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
 
         // Should be 2 messages: original user + coalesced (tool result + trailing user text)
         assert_eq!(result.len(), 2);
@@ -594,8 +595,7 @@ mod tests {
             ConversationMessage::ToolResult(ToolResult::success("toolu_2", "Rainy, 55°F")),
         ];
 
-        let result =
-            convert_messages_to_provider_format(&messages, Provider::GoogleGenAI).unwrap();
+        let result = convert_messages_to_provider_format(&messages, Provider::GoogleGenAI).unwrap();
 
         // Should be 2 messages
         assert_eq!(result.len(), 2);
@@ -616,8 +616,7 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::user("Thanks!")),
         ];
 
-        let result =
-            convert_messages_to_provider_format(&messages, Provider::GoogleGenAI).unwrap();
+        let result = convert_messages_to_provider_format(&messages, Provider::GoogleGenAI).unwrap();
 
         // Should be 1 message with both functionResponse and text
         assert_eq!(result.len(), 1);
@@ -650,8 +649,7 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("I understand")),
         ];
 
-        let result =
-            convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+        let result = convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
 
         // Reasoning segments should be separate messages
         assert_eq!(result.len(), 3);

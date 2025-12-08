@@ -134,7 +134,10 @@ fn execute_mock_tool(tool_name: &str, input: &serde_json::Value) -> String {
             (a * b).to_string()
         }
         "calculate" => {
-            let op = input.get("operation").and_then(|v| v.as_str()).unwrap_or("add");
+            let op = input
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("add");
             let a = input.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let b = input.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
             match op {
@@ -153,7 +156,10 @@ fn execute_mock_tool(tool_name: &str, input: &serde_json::Value) -> String {
         }
         "search_database" => {
             let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let max = input.get("max_results").and_then(|v| v.as_i64()).unwrap_or(5);
+            let max = input
+                .get("max_results")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(5);
             let category = input
                 .get("category")
                 .and_then(|v| v.as_str())
@@ -578,7 +584,8 @@ fn test_toolcall_from_anthropic_format() {
         "input": {"location": "San Francisco"}
     });
 
-    let tool_call = ToolCall::from_provider_format(anthropic_format.clone(), Provider::Anthropic).unwrap();
+    let tool_call =
+        ToolCall::from_provider_format(anthropic_format.clone(), Provider::Anthropic).unwrap();
 
     assert_eq!(tool_call.tool_use_id, "toolu_123");
     assert_eq!(tool_call.tool_name, "get_weather");
@@ -599,7 +606,8 @@ fn test_toolcall_from_openai_format() {
         }
     });
 
-    let tool_call = ToolCall::from_provider_format(openai_format.clone(), Provider::OpenAI).unwrap();
+    let tool_call =
+        ToolCall::from_provider_format(openai_format.clone(), Provider::OpenAI).unwrap();
 
     assert_eq!(tool_call.tool_use_id, "call_abc123");
     assert_eq!(tool_call.tool_name, "get_weather");
@@ -618,7 +626,8 @@ fn test_toolcall_from_google_format() {
         }
     });
 
-    let tool_call = ToolCall::from_provider_format(google_format.clone(), Provider::GoogleGenAI).unwrap();
+    let tool_call =
+        ToolCall::from_provider_format(google_format.clone(), Provider::GoogleGenAI).unwrap();
 
     assert_eq!(tool_call.tool_name, "get_weather");
     assert_eq!(
@@ -694,8 +703,7 @@ fn test_toolcall_to_google_format() {
 
 #[test]
 fn test_toolresult_to_anthropic_format() {
-    let result = ToolResult::success("toolu_123", "Weather is sunny")
-        .with_tool_name("get_weather");
+    let result = ToolResult::success("toolu_123", "Weather is sunny").with_tool_name("get_weather");
 
     let format = result.to_provider_format(Provider::Anthropic);
 
@@ -706,8 +714,7 @@ fn test_toolresult_to_anthropic_format() {
 
 #[test]
 fn test_toolresult_to_openai_format() {
-    let result = ToolResult::success("call_abc", "Weather is cloudy")
-        .with_tool_name("get_weather");
+    let result = ToolResult::success("call_abc", "Weather is cloudy").with_tool_name("get_weather");
 
     let format = result.to_provider_format(Provider::OpenAI);
 
@@ -718,13 +725,16 @@ fn test_toolresult_to_openai_format() {
 
 #[test]
 fn test_toolresult_to_google_format() {
-    let result = ToolResult::success("google_123", "Weather is rainy")
-        .with_tool_name("get_weather");
+    let result =
+        ToolResult::success("google_123", "Weather is rainy").with_tool_name("get_weather");
 
     let format = result.to_provider_format(Provider::GoogleGenAI);
 
     assert_eq!(format["functionResponse"]["name"], "get_weather");
-    assert_eq!(format["functionResponse"]["response"]["result"], "Weather is rainy");
+    assert_eq!(
+        format["functionResponse"]["response"]["result"],
+        "Weather is rainy"
+    );
 }
 
 // ============================================================================

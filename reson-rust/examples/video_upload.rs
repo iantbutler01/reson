@@ -162,8 +162,18 @@ async fn analyze_video(
     let content = response
         .as_str()
         .map(|s| s.to_string())
-        .or_else(|| response.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()))
-        .or_else(|| response.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+        .or_else(|| {
+            response
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            response
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| response.to_string());
 
     Ok(content)
@@ -176,8 +186,7 @@ async fn analyze_video(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get API key
-    let api_key =
-        env::var("GOOGLE_GEMINI_API_KEY").expect("GOOGLE_GEMINI_API_KEY must be set");
+    let api_key = env::var("GOOGLE_GEMINI_API_KEY").expect("GOOGLE_GEMINI_API_KEY must be set");
 
     // Get video path from args
     let args: Vec<String> = env::args().collect();
@@ -185,10 +194,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(1)
         .expect("Usage: video_upload <path_to_video.mp4> [query]");
 
-    let user_query = args
-        .get(2)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "Describe what's happening in this video and identify any key objects or people.".to_string());
+    let user_query = args.get(2).map(|s| s.to_string()).unwrap_or_else(|| {
+        "Describe what's happening in this video and identify any key objects or people."
+            .to_string()
+    });
 
     // Read video file
     println!("Reading video file: {}", video_path);
@@ -232,12 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Query: {}", user_query);
     println!();
 
-    let result = analyze_video(
-        uploaded.uri.clone(),
-        mime_type.to_string(),
-        user_query,
-    )
-    .await?;
+    let result = analyze_video(uploaded.uri.clone(), mime_type.to_string(), user_query).await?;
 
     println!("--- Agent Response ---");
     println!("{}", result);

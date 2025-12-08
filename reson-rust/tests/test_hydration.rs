@@ -209,10 +209,7 @@ fn test_toolcall_to_google_format() {
 
 #[test]
 fn test_toolcall_to_openrouter_format() {
-    let tool_call = ToolCall::new(
-        "get_weather",
-        serde_json::json!({"location": "SF"}),
-    );
+    let tool_call = ToolCall::new("get_weather", serde_json::json!({"location": "SF"}));
 
     let message = tool_call.to_provider_assistant_message(Provider::OpenRouter);
 
@@ -362,10 +359,7 @@ fn test_toolresult_to_google_format() {
 
 #[test]
 fn test_toolcall_in_conversation_message() {
-    let tool_call = ToolCall::new(
-        "get_weather",
-        serde_json::json!({"location": "SF"}),
-    );
+    let tool_call = ToolCall::new("get_weather", serde_json::json!({"location": "SF"}));
 
     let message: ConversationMessage = tool_call.clone().into();
 
@@ -416,7 +410,10 @@ fn test_conversation_with_tool_calls() {
     // Verify types
     assert!(matches!(conversation[0], ConversationMessage::Chat(_)));
     assert!(matches!(conversation[1], ConversationMessage::ToolCall(_)));
-    assert!(matches!(conversation[2], ConversationMessage::ToolResult(_)));
+    assert!(matches!(
+        conversation[2],
+        ConversationMessage::ToolResult(_)
+    ));
     assert!(matches!(conversation[3], ConversationMessage::Chat(_)));
 }
 
@@ -454,7 +451,8 @@ async fn test_toolcall_in_conversation_history() {
         "name": "get_weather",
         "input": {"location": "New York"}
     });
-    let previous_tool_call = ToolCall::from_provider_format(previous_anthropic_format, Provider::Anthropic).unwrap();
+    let previous_tool_call =
+        ToolCall::from_provider_format(previous_anthropic_format, Provider::Anthropic).unwrap();
 
     let previous_tool_result = ToolResult::success_with_name(
         "toolu_previous_123".to_string(),
@@ -467,9 +465,7 @@ async fn test_toolcall_in_conversation_history() {
         ConversationMessage::Chat(ChatMessage::user("What's the weather in New York?")),
         ConversationMessage::ToolCall(previous_tool_call),
         ConversationMessage::ToolResult(previous_tool_result),
-        ConversationMessage::Chat(ChatMessage::user(
-            "Thanks! Now what about San Francisco?",
-        )),
+        ConversationMessage::Chat(ChatMessage::user("Thanks! Now what about San Francisco?")),
     ];
 
     let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
@@ -528,7 +524,8 @@ async fn test_toolcall_hydration_workflow() {
     });
 
     // Create ToolCall from provider format (hydration)
-    let hydrated_tool_call = ToolCall::from_provider_format(openai_tool_call_data, Provider::OpenAI).unwrap();
+    let hydrated_tool_call =
+        ToolCall::from_provider_format(openai_tool_call_data, Provider::OpenAI).unwrap();
 
     // Create corresponding result
     let tool_result = ToolResult::success_with_name(
@@ -542,9 +539,7 @@ async fn test_toolcall_hydration_workflow() {
         ConversationMessage::Chat(ChatMessage::user("Please add 10 and 5")),
         ConversationMessage::ToolCall(hydrated_tool_call),
         ConversationMessage::ToolResult(tool_result),
-        ConversationMessage::Chat(ChatMessage::user(
-            "Great! Now multiply that result by 2",
-        )),
+        ConversationMessage::Chat(ChatMessage::user("Great! Now multiply that result by 2")),
     ];
 
     let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);

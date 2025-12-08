@@ -3,7 +3,7 @@
 //! Provides persistent key-value storage using PostgreSQL JSONB column.
 
 use async_trait::async_trait;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -69,10 +69,7 @@ impl Store for PostgresStore {
     async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let modified_key = self.apply_key_modifications(key).await;
 
-        let query = format!(
-            "SELECT value FROM {} WHERE key = $1",
-            self.table_name
-        );
+        let query = format!("SELECT value FROM {} WHERE key = $1", self.table_name);
 
         let row = sqlx::query(&query)
             .bind(&modified_key)
@@ -118,10 +115,7 @@ impl Store for PostgresStore {
     async fn delete(&self, key: &str) -> Result<()> {
         let modified_key = self.apply_key_modifications(key).await;
 
-        let query = format!(
-            "DELETE FROM {} WHERE key = $1",
-            self.table_name
-        );
+        let query = format!("DELETE FROM {} WHERE key = $1", self.table_name);
 
         sqlx::query(&query)
             .bind(&modified_key)
@@ -167,10 +161,7 @@ impl Store for PostgresStore {
     }
 
     async fn get_all(&self) -> Result<HashMap<String, serde_json::Value>> {
-        let query = format!(
-            "SELECT key, value FROM {}",
-            self.table_name
-        );
+        let query = format!("SELECT key, value FROM {}", self.table_name);
 
         let rows = sqlx::query(&query)
             .fetch_all(&self.pool)
@@ -188,10 +179,7 @@ impl Store for PostgresStore {
     }
 
     async fn keys(&self) -> Result<HashSet<String>> {
-        let query = format!(
-            "SELECT key FROM {}",
-            self.table_name
-        );
+        let query = format!("SELECT key FROM {}", self.table_name);
 
         let rows = sqlx::query(&query)
             .fetch_all(&self.pool)
@@ -228,12 +216,18 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn get_message(&self, mailbox_id: &str, _timeout_secs: Option<f64>) -> Result<Option<serde_json::Value>> {
+    async fn get_message(
+        &self,
+        mailbox_id: &str,
+        _timeout_secs: Option<f64>,
+    ) -> Result<Option<serde_json::Value>> {
         // Note: PostgreSQL doesn't have blocking pop like Redis, so we implement non-blocking
         let modified_mailbox_id = self.apply_key_modifications(mailbox_id).await;
 
         // Begin transaction to atomically get and remove first message
-        let mut tx = self.pool.begin()
+        let mut tx = self
+            .pool
+            .begin()
             .await
             .map_err(|e| Error::NonRetryable(format!("PostgreSQL transaction error: {}", e)))?;
 
@@ -258,15 +252,15 @@ impl Store for PostgresStore {
 
                     if remaining.is_empty() {
                         // Delete the mailbox if empty
-                        let delete_query = format!(
-                            "DELETE FROM {} WHERE key = $1",
-                            self.table_name
-                        );
+                        let delete_query =
+                            format!("DELETE FROM {} WHERE key = $1", self.table_name);
                         sqlx::query(&delete_query)
                             .bind(&modified_mailbox_id)
                             .execute(&mut *tx)
                             .await
-                            .map_err(|e| Error::NonRetryable(format!("PostgreSQL delete error: {}", e)))?;
+                            .map_err(|e| {
+                                Error::NonRetryable(format!("PostgreSQL delete error: {}", e))
+                            })?;
                     } else {
                         // Update with remaining messages
                         let update_query = format!(
@@ -278,12 +272,14 @@ impl Store for PostgresStore {
                             .bind(&modified_mailbox_id)
                             .execute(&mut *tx)
                             .await
-                            .map_err(|e| Error::NonRetryable(format!("PostgreSQL update error: {}", e)))?;
+                            .map_err(|e| {
+                                Error::NonRetryable(format!("PostgreSQL update error: {}", e))
+                            })?;
                     }
 
-                    tx.commit()
-                        .await
-                        .map_err(|e| Error::NonRetryable(format!("PostgreSQL commit error: {}", e)))?;
+                    tx.commit().await.map_err(|e| {
+                        Error::NonRetryable(format!("PostgreSQL commit error: {}", e))
+                    })?;
 
                     return Ok(Some(first_msg));
                 }
@@ -330,7 +326,10 @@ mod tests {
     async fn test_postgres_store_set_and_get() {
         let store = get_test_store().await;
 
-        store.set("test_key", &"test_value".to_string()).await.unwrap();
+        store
+            .set("test_key", &"test_value".to_string())
+            .await
+            .unwrap();
 
         let result: Option<String> = store.get("test_key").await.unwrap();
         assert_eq!(result, Some("test_value".to_string()));
@@ -344,8 +343,14 @@ mod tests {
     async fn test_postgres_store_mailbox() {
         let store = get_test_store().await;
 
-        store.publish_to_mailbox("test_mailbox", &serde_json::json!({"msg": "hello"})).await.unwrap();
-        store.publish_to_mailbox("test_mailbox", &serde_json::json!({"msg": "world"})).await.unwrap();
+        store
+            .publish_to_mailbox("test_mailbox", &serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
+        store
+            .publish_to_mailbox("test_mailbox", &serde_json::json!({"msg": "world"}))
+            .await
+            .unwrap();
 
         let msg1 = store.get_message("test_mailbox", None).await.unwrap();
         assert_eq!(msg1, Some(serde_json::json!({"msg": "hello"})));

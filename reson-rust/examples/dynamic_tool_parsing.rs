@@ -3,10 +3,10 @@
 //! This example demonstrates how Reson's NativeToolParser dynamically constructs
 //! tool objects from JSON using a type registry, similar to Python's runtime type lookup.
 
+use futures::future::BoxFuture;
 use reson_agentic::parsers::{Deserializable, FieldDescription};
 use reson_agentic::runtime::Runtime;
 use serde::{Deserialize, Serialize};
-use futures::future::BoxFuture;
 
 /// Example tool: Chat message
 #[derive(Debug, Serialize, Deserialize)]
@@ -123,14 +123,23 @@ async fn main() -> reson_agentic::error::Result<()> {
 
     runtime.tool::<Chat, _>(chat_handler, Some("Chat")).await?;
 
-    let fileop_handler = |file_op: FileOp| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
-        Box::pin(async move {
-            println!("📁 FileOp handler called: {} ({})", file_op.path, file_op.operation);
-            Ok(format!("Performed {} on {}", file_op.operation, file_op.path))
-        })
-    };
+    let fileop_handler =
+        |file_op: FileOp| -> BoxFuture<'static, reson_agentic::error::Result<String>> {
+            Box::pin(async move {
+                println!(
+                    "📁 FileOp handler called: {} ({})",
+                    file_op.path, file_op.operation
+                );
+                Ok(format!(
+                    "Performed {} on {}",
+                    file_op.operation, file_op.path
+                ))
+            })
+        };
 
-    runtime.tool::<FileOp, _>(fileop_handler, Some("FileOp")).await?;
+    runtime
+        .tool::<FileOp, _>(fileop_handler, Some("FileOp"))
+        .await?;
 
     println!("✓ Registered 2 tools: Chat, FileOp\n");
 

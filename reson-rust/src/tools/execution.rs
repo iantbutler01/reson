@@ -3,7 +3,7 @@
 //! Handles executing tools from ToolCall objects.
 
 use crate::error::{Error, Result};
-use crate::tools::{Tool, ToolRegistry};
+use crate::tools::ToolRegistry;
 use crate::types::ToolCall;
 
 /// Execute a tool from a ToolCall

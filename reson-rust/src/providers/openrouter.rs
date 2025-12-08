@@ -123,13 +123,8 @@ mod tests {
 
     #[test]
     fn test_with_reasoning() {
-        let client = OpenRouterClient::new(
-            "test-key",
-            "anthropic/claude-3-5-sonnet",
-            None,
-            None,
-        )
-        .with_reasoning("high");
+        let client = OpenRouterClient::new("test-key", "anthropic/claude-3-5-sonnet", None, None)
+            .with_reasoning("high");
 
         assert_eq!(client.provider(), Provider::OpenRouter);
     }

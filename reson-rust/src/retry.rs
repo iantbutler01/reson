@@ -128,7 +128,8 @@ where
 
                 // Calculate next backoff (capped at max_backoff)
                 current_backoff = Duration::from_secs_f64(
-                    (current_backoff.as_secs_f64() * config.multiplier).min(config.max_backoff.as_secs_f64()),
+                    (current_backoff.as_secs_f64() * config.multiplier)
+                        .min(config.max_backoff.as_secs_f64()),
                 );
             }
         }

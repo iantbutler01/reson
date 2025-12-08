@@ -7,6 +7,8 @@
 //! - Context/state storage
 //! - Structured output parsing
 
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -57,6 +59,7 @@ pub struct Runtime {
     default_prompt: Arc<RwLock<String>>,
     return_type: Arc<RwLock<Option<String>>>, // Store type name as string
     accumulators: Arc<RwLock<Accumulators>>,
+    #[allow(dead_code)]
     messages: Arc<RwLock<Vec<ConversationMessage>>>,
     current_call_args: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 }
@@ -68,7 +71,13 @@ pub struct Runtime {
 /// by wrapping typed handlers.
 pub enum ToolFunction {
     Sync(Box<dyn Fn(serde_json::Value) -> Result<String> + Send + Sync>),
-    Async(Box<dyn Fn(serde_json::Value) -> futures::future::BoxFuture<'static, Result<String>> + Send + Sync>),
+    Async(
+        Box<
+            dyn Fn(serde_json::Value) -> futures::future::BoxFuture<'static, Result<String>>
+                + Send
+                + Sync,
+        >,
+    ),
 }
 
 /// Metadata about a tool call for execution context
@@ -213,21 +222,26 @@ impl Runtime {
     }
 
     /// Helper to extract field descriptions from a JSON schema
-    fn extract_fields_from_schema(schema: &serde_json::Value) -> Vec<crate::parsers::FieldDescription> {
+    fn extract_fields_from_schema(
+        schema: &serde_json::Value,
+    ) -> Vec<crate::parsers::FieldDescription> {
         let mut fields = Vec::new();
 
         if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-            let required = schema.get("required")
+            let required = schema
+                .get("required")
                 .and_then(|r| r.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_default();
 
             for (name, prop) in properties {
-                let field_type = prop.get("type")
+                let field_type = prop
+                    .get("type")
                     .and_then(|t| t.as_str())
                     .unwrap_or("object")
                     .to_string();
-                let description = prop.get("description")
+                let description = prop
+                    .get("description")
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .to_string();
@@ -276,12 +290,8 @@ impl Runtime {
     {
         // Get tool name - either from parameter or type name
         let type_name = std::any::type_name::<T>();
-        let tool_name_str = name.unwrap_or_else(|| {
-            type_name
-                .split("::")
-                .last()
-                .unwrap_or(type_name)
-        });
+        let tool_name_str =
+            name.unwrap_or_else(|| type_name.split("::").last().unwrap_or(type_name));
         let tool_name = tool_name_str.to_string();
 
         // Check for duplicate registration
@@ -496,10 +506,7 @@ impl Runtime {
     /// Check if a result is a tool call
     pub fn is_tool_call(&self, result: &serde_json::Value) -> bool {
         // Check for _tool_name field in JSON
-        result
-            .get("_tool_name")
-            .and_then(|v| v.as_str())
-            .is_some()
+        result.get("_tool_name").and_then(|v| v.as_str()).is_some()
     }
 
     /// Get tool name from result
@@ -680,7 +687,10 @@ mod tests {
             "arg1": "value1"
         });
 
-        assert_eq!(runtime.get_tool_name(&tool_call), Some("my_tool".to_string()));
+        assert_eq!(
+            runtime.get_tool_name(&tool_call),
+            Some("my_tool".to_string())
+        );
     }
 
     #[tokio::test]
@@ -692,10 +702,7 @@ mod tests {
             Ok(format!("Hello, {}!", name))
         }));
 
-        runtime
-            .register_tool("greet", tool_fn, None)
-            .await
-            .unwrap();
+        runtime.register_tool("greet", tool_fn, None).await.unwrap();
 
         let tool_call = serde_json::json!({
             "_tool_name": "greet",
@@ -760,9 +767,8 @@ mod tests {
 
     impl crate::parsers::Deserializable for WeatherQuery {
         fn from_partial(partial: serde_json::Value) -> crate::error::Result<Self> {
-            serde_json::from_value(partial).map_err(|e| {
-                crate::error::Error::NonRetryable(format!("Parse error: {}", e))
-            })
+            serde_json::from_value(partial)
+                .map_err(|e| crate::error::Error::NonRetryable(format!("Parse error: {}", e)))
         }
 
         fn validate_complete(&self) -> crate::error::Result<()> {
@@ -802,9 +808,7 @@ mod tests {
         runtime
             .tool::<WeatherQuery, _>(
                 |query| -> BoxFuture<'static, crate::error::Result<String>> {
-                    Box::pin(async move {
-                        Ok(format!("Weather in {}: Sunny", query.location))
-                    })
+                    Box::pin(async move { Ok(format!("Weather in {}: Sunny", query.location)) })
                 },
                 Some("get_weather"),
             )
@@ -837,9 +841,7 @@ mod tests {
         runtime
             .tool::<WeatherQuery, _>(
                 |_query| -> BoxFuture<'static, crate::error::Result<String>> {
-                    Box::pin(async move {
-                        Ok("Sunny".to_string())
-                    })
+                    Box::pin(async move { Ok("Sunny".to_string()) })
                 },
                 Some("get_weather"),
             )
@@ -851,8 +853,14 @@ mod tests {
         assert_eq!(schemas.len(), 1);
 
         let weather_schema = schemas.get("get_weather").unwrap();
-        assert!(weather_schema.fields.iter().any(|f| f.name == "location" && f.required));
-        assert!(weather_schema.fields.iter().any(|f| f.name == "unit" && !f.required));
+        assert!(weather_schema
+            .fields
+            .iter()
+            .any(|f| f.name == "location" && f.required));
+        assert!(weather_schema
+            .fields
+            .iter()
+            .any(|f| f.name == "unit" && !f.required));
     }
 
     #[tokio::test]
@@ -868,7 +876,10 @@ mod tests {
                     Box::pin(async move {
                         // Handler receives the deserialized WeatherQuery struct
                         let unit = query.unit.unwrap_or_else(|| "celsius".to_string());
-                        Ok(format!("Weather in {} ({}): Sunny, 22°", query.location, unit))
+                        Ok(format!(
+                            "Weather in {} ({}): Sunny, 22°",
+                            query.location, unit
+                        ))
                     })
                 },
                 Some("get_weather"),

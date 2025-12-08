@@ -2,8 +2,8 @@
 //!
 //! Converts Rust types to provider-specific tool schemas and output schemas.
 
-use serde_json::Value;
 use crate::error::{Error, Result};
+use serde_json::Value;
 
 /// Fix output schema for provider-specific requirements
 ///
@@ -16,10 +16,11 @@ use crate::error::{Error, Result};
 pub fn fix_output_schema_for_provider(schema: &mut Value, provider: &str) {
     match provider {
         "openai" | "openrouter" => fix_schema_for_openai(schema),
-        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => fix_schema_for_anthropic(schema),
-        "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai" | "google-gemini" => {
-            fix_schema_for_google(schema)
+        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
+            fix_schema_for_anthropic(schema)
         }
+        "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
+        | "google-gemini" => fix_schema_for_google(schema),
         _ => {
             // Default: apply OpenAI-style fixes (most restrictive)
             fix_schema_for_openai(schema)
@@ -39,9 +40,7 @@ fn fix_schema_for_openai(schema: &mut Value) {
 
             // Make all properties required (OpenAI strict mode requirement)
             if let Some(Value::Object(props)) = map.get("properties") {
-                let all_keys: Vec<Value> = props.keys()
-                    .map(|k| Value::String(k.clone()))
-                    .collect();
+                let all_keys: Vec<Value> = props.keys().map(|k| Value::String(k.clone())).collect();
                 map.insert("required".to_string(), Value::Array(all_keys));
             }
         }
@@ -95,7 +94,8 @@ fn fix_schema_for_google(schema: &mut Value) {
 fn inline_schema_refs(schema: &mut Value) {
     // Extract $defs if present
     let defs = if let Value::Object(map) = schema {
-        map.get("$defs").cloned()
+        map.get("$defs")
+            .cloned()
             .or_else(|| map.get("definitions").cloned())
     } else {
         None
@@ -244,9 +244,8 @@ pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> 
         "anthropic" => Ok(Box::new(AnthropicSchemaGenerator)),
         "openai" => Ok(Box::new(OpenAISchemaGenerator)),
         "openrouter" => Ok(Box::new(OpenAISchemaGenerator)), // OpenRouter uses OpenAI format
-        "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai" | "google-gemini" => {
-            Ok(Box::new(GoogleSchemaGenerator))
-        }
+        "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
+        | "google-gemini" => Ok(Box::new(GoogleSchemaGenerator)),
         "bedrock" => Ok(Box::new(AnthropicSchemaGenerator)), // Bedrock uses Anthropic format
         "google-anthropic" | "vertexai" => Ok(Box::new(AnthropicSchemaGenerator)), // Vertex AI with Claude
         _ => Err(Error::NonRetryable(format!(
@@ -291,7 +290,10 @@ mod tests {
 
         assert_eq!(schema["type"], "function");
         assert_eq!(schema["function"]["name"], "get_weather");
-        assert_eq!(schema["function"]["description"], "Get weather for location");
+        assert_eq!(
+            schema["function"]["description"],
+            "Get weather for location"
+        );
         assert!(schema["function"]["parameters"].is_object());
     }
 

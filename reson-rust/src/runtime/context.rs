@@ -31,13 +31,11 @@ impl ContextApi {
         }
 
         // We store the value as JSON in the first message content
-        if let Some(first_msg) = messages.first() {
-            if let crate::utils::ConversationMessage::Chat(chat_msg) = first_msg {
-                let value: T = serde_json::from_str(&chat_msg.content).map_err(|e| {
-                    Error::NonRetryable(format!("Failed to deserialize context value: {}", e))
-                })?;
-                return Ok(Some(value));
-            }
+        if let Some(crate::utils::ConversationMessage::Chat(chat_msg)) = messages.first() {
+            let value: T = serde_json::from_str(&chat_msg.content).map_err(|e| {
+                Error::NonRetryable(format!("Failed to deserialize context value: {}", e))
+            })?;
+            return Ok(Some(value));
         }
 
         Ok(None)
@@ -55,17 +53,17 @@ impl ContextApi {
 
         // Store as a message
         let context_id = format!("__context__{}", key);
-        let message = crate::utils::ConversationMessage::Chat(crate::types::ChatMessage::user(
-            json_str,
-        ));
+        let message =
+            crate::utils::ConversationMessage::Chat(crate::types::ChatMessage::user(json_str));
 
         // Clear existing and store new
-        let store_mut = self.store.clone();
+        let _store_mut = self.store.clone();
         // Note: Storage trait requires mutable reference, but we have Arc<dyn Storage>
         // We'll need to handle this differently - store the JSON directly
 
         // For now, store as messages
-        let messages = vec![message];
+        let _messages = [message];
+        let _context_id = context_id;
 
         // This is a workaround - in real implementation, Storage would need interior mutability
         // or we'd use a different approach for context storage

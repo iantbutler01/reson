@@ -90,11 +90,7 @@ impl OAIClient {
     }
 
     /// Set ranking headers (for OpenRouter)
-    pub fn with_ranking_headers(
-        mut self,
-        referer: Option<String>,
-        title: Option<String>,
-    ) -> Self {
+    pub fn with_ranking_headers(mut self, referer: Option<String>, title: Option<String>) -> Self {
         self.ranking_referer = referer;
         self.ranking_title = title;
         self
@@ -117,7 +113,7 @@ impl OAIClient {
         let formatted_messages = convert_messages_to_provider_format(messages, self.provider)?;
 
         let mut request = serde_json::json!({
-            "model": config.model.is_empty().then(|| &self.model).unwrap_or(&config.model),
+            "model": if config.model.is_empty() { &self.model } else { &config.model },
             "messages": formatted_messages,
             "max_completion_tokens": config.max_tokens.unwrap_or(4096),
             "temperature": config.temperature.unwrap_or(0.7),
@@ -216,16 +212,12 @@ impl OAIClient {
                 Error::NonRetryable(format!("{}: {}", status, body))
             }
             // Rate limit - retryable
-            StatusCode::TOO_MANY_REQUESTS => {
-                Error::Inference(format!("Rate limited: {}", body))
-            }
+            StatusCode::TOO_MANY_REQUESTS => Error::Inference(format!("Rate limited: {}", body)),
             // Server errors (5xx) are retryable
             StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT => {
-                Error::Inference(format!("{}: {}", status, body))
-            }
+            | StatusCode::GATEWAY_TIMEOUT => Error::Inference(format!("{}: {}", status, body)),
             // Default: assume retryable for unknown errors
             _ => Error::Inference(format!("{}: {}", status, body)),
         }
@@ -261,12 +253,17 @@ impl InferenceClient for OAIClient {
         let response_text = self.make_request_with_retry(request_body).await?;
 
         // Parse JSON - provide better error context if it fails
-        let body: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| Error::Inference(format!(
+        let body: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
+            Error::Inference(format!(
                 "Failed to parse response as JSON: {}. Response: {}",
                 e,
-                if response_text.len() > 500 { &response_text[..500] } else { &response_text }
-            )))?;
+                if response_text.len() > 500 {
+                    &response_text[..500]
+                } else {
+                    &response_text
+                }
+            ))
+        })?;
 
         // Check for error in response body
         if let Some(error) = body.get("error") {
@@ -298,7 +295,7 @@ impl InferenceClient for OAIClient {
         let tool_calls = message
             .get("tool_calls")
             .and_then(|tc| tc.as_array())
-            .map(|arr| arr.clone())
+            .cloned()
             .unwrap_or_default();
 
         // If tools were provided, return full response for tool extraction
@@ -365,9 +362,9 @@ impl InferenceClient for OAIClient {
         );
 
         // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(chunk_stream.flat_map(|chunk_vec| {
-            futures::stream::iter(chunk_vec)
-        })))
+        Ok(Box::pin(
+            chunk_stream.flat_map(|chunk_vec| futures::stream::iter(chunk_vec)),
+        ))
     }
 
     fn provider(&self) -> Provider {
@@ -389,10 +386,7 @@ mod tests {
         let client = OAIClient::new("test-key", "gpt-4");
         assert_eq!(client.model, "gpt-4");
         assert_eq!(client.api_key, "test-key");
-        assert_eq!(
-            client.api_url,
-            "https://api.openai.com/v1/chat/completions"
-        );
+        assert_eq!(client.api_url, "https://api.openai.com/v1/chat/completions");
         assert_eq!(client.provider, Provider::OpenAI);
     }
 
@@ -414,7 +408,10 @@ mod tests {
             Some("https://example.com".to_string()),
             Some("My App".to_string()),
         );
-        assert_eq!(client.ranking_referer, Some("https://example.com".to_string()));
+        assert_eq!(
+            client.ranking_referer,
+            Some("https://example.com".to_string())
+        );
         assert_eq!(client.ranking_title, Some("My App".to_string()));
     }
 
@@ -426,7 +423,9 @@ mod tests {
             .with_max_tokens(2048)
             .with_temperature(0.8);
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert_eq!(body["model"], "gpt-4");
         assert_eq!(body["max_completion_tokens"], 2048);
@@ -451,10 +450,13 @@ mod tests {
     fn test_build_request_with_tools() {
         let client = OAIClient::new("test-key", "gpt-4");
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
-        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
+        let tools =
+            vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
         let config = GenerationConfig::new("gpt-4").with_tools(tools);
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
@@ -466,7 +468,9 @@ mod tests {
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
         let config = GenerationConfig::new("o3");
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert_eq!(body["reasoning"]["max_tokens"], 1024);
     }
@@ -477,7 +481,9 @@ mod tests {
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
         let config = GenerationConfig::new("o3");
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert_eq!(body["reasoning"]["effort"], "high");
     }
@@ -512,5 +518,4 @@ mod tests {
         assert_eq!(parsed.output_tokens, 50);
         assert_eq!(parsed.cached_tokens, 0);
     }
-
 }

@@ -95,7 +95,11 @@ pub fn parse_openai_chunk(
     let mut chunks = Vec::new();
 
     // Extract delta from choices[0]
-    let delta = match chunk_json.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta")) {
+    let delta = match chunk_json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+    {
         Some(d) => d,
         None => {
             // Check for usage in final chunk
@@ -221,7 +225,12 @@ mod tests {
     #[test]
     fn test_accumulator_complete_tool() {
         let mut acc = OpenAIToolAccumulator::new();
-        acc.update_tool(0, Some("call_123"), Some("get_weather"), "{\"location\":\"SF\"}");
+        acc.update_tool(
+            0,
+            Some("call_123"),
+            Some("get_weather"),
+            "{\"location\":\"SF\"}",
+        );
 
         let completed = acc.complete_tool(0).unwrap();
         assert_eq!(completed["id"], "call_123");

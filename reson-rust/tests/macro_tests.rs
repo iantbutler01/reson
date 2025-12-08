@@ -3,8 +3,8 @@
 //! These tests demonstrate that the #[agentic], #[tool], and #[deserializable]
 //! macros compile and generate correct code.
 
-use reson_agentic::Deserializable;
 use reson_agentic::parsers::Deserializable as DeserializableTrait;
+use reson_agentic::Deserializable;
 use serde::{Deserialize, Serialize};
 
 #[test]
@@ -71,7 +71,7 @@ fn test_tool_macro_snake_case_conversion() {
     // Test that the Tool derive macro generates proper methods
 
     use reson_agentic::Tool;
-    use serde::{Serialize, Deserialize};
+    use serde::{Deserialize, Serialize};
 
     /// A calculator tool for basic math operations
     #[derive(Tool, Serialize, Deserialize)]
@@ -90,7 +90,10 @@ fn test_tool_macro_snake_case_conversion() {
     assert_eq!(CalculatorTool::tool_name(), "calculator_tool");
 
     // Test that description() returns doc comment
-    assert_eq!(CalculatorTool::description(), "A calculator tool for basic math operations");
+    assert_eq!(
+        CalculatorTool::description(),
+        "A calculator tool for basic math operations"
+    );
 
     // Test that schema() generates proper JSON schema
     let schema = CalculatorTool::schema();
@@ -109,7 +112,10 @@ fn test_tool_macro_snake_case_conversion() {
     assert_eq!(props["precision"]["type"], "integer"); // u32 inside Option<u32>
 
     // Check descriptions
-    assert_eq!(props["operation"]["description"], "The operation to perform (add, subtract, multiply, divide)");
+    assert_eq!(
+        props["operation"]["description"],
+        "The operation to perform (add, subtract, multiply, divide)"
+    );
     assert_eq!(props["a"]["description"], "First number");
 
     // Check required fields (non-Option fields)
@@ -122,9 +128,9 @@ fn test_tool_macro_snake_case_conversion() {
 
 #[test]
 fn test_tool_macro_with_schema_generator() {
-    use reson_agentic::Tool;
     use reson_agentic::schema::AnthropicSchemaGenerator;
-    use serde::{Serialize, Deserialize};
+    use reson_agentic::Tool;
+    use serde::{Deserialize, Serialize};
 
     /// Get current weather for a location
     #[derive(Tool, Serialize, Deserialize)]
@@ -152,8 +158,8 @@ fn test_tool_macro_with_schema_generator() {
 #[cfg(test)]
 mod agentic_macro_tests {
     use reson_agentic::agentic;
-    use reson_agentic::runtime::Runtime;
     use reson_agentic::error::Result;
+    use reson_agentic::runtime::Runtime;
 
     // Test that the macro compiles and generates a function without runtime param
     #[agentic(model = "anthropic:claude-3-5-sonnet-20241022")]
@@ -161,10 +167,20 @@ mod agentic_macro_tests {
         // Mark runtime as used by calling run()
         // Note: This won't actually call an LLM in tests, it will fail without API key
         // but the point is to verify the macro generates valid code
-        runtime.run(
-            Some(&input),
-            None, None, None, None, None, None, None, None, None
-        ).await
+        runtime
+            .run(
+                Some(&input),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
     }
 
     #[test]
@@ -174,44 +190,75 @@ mod agentic_macro_tests {
 
         // We can check that the function exists and has the right signature
         // by creating a function pointer (this will fail to compile if signature is wrong)
-        let _fn_ptr: fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>> = |input| {
-            Box::pin(simple_agentic_fn(input))
-        };
+        let _fn_ptr: fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>,
+        > = |input| Box::pin(simple_agentic_fn(input));
     }
 
     // Test with no model attribute (should use None)
     #[agentic]
     async fn no_model_agentic_fn(data: i32, runtime: Runtime) -> Result<serde_json::Value> {
         let _ = data; // Use the parameter
-        runtime.run(
-            Some("test"),
-            None, None, None, None, None, None, None, None, None
-        ).await
+        runtime
+            .run(
+                Some("test"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
     }
 
     #[test]
     fn test_agentic_macro_no_model_compiles() {
         // Just verify it compiles
-        let _fn_ptr: fn(i32) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>> = |data| {
-            Box::pin(no_model_agentic_fn(data))
-        };
+        let _fn_ptr: fn(
+            i32,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>,
+        > = |data| Box::pin(no_model_agentic_fn(data));
     }
 
     // Test with multiple parameters
     #[agentic(model = "openai:gpt-4")]
-    async fn multi_param_fn(name: String, count: u32, runtime: Runtime) -> Result<serde_json::Value> {
+    async fn multi_param_fn(
+        name: String,
+        count: u32,
+        runtime: Runtime,
+    ) -> Result<serde_json::Value> {
         let prompt = format!("Name: {}, Count: {}", name, count);
-        runtime.run(
-            Some(&prompt),
-            None, None, None, None, None, None, None, None, None
-        ).await
+        runtime
+            .run(
+                Some(&prompt),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
     }
 
     #[test]
     fn test_agentic_macro_multi_params_compiles() {
         // Verify multi-param function compiles correctly
-        let _fn_ptr: fn(String, u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>> = |name, count| {
-            Box::pin(multi_param_fn(name, count))
-        };
+        let _fn_ptr: fn(
+            String,
+            u32,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>,
+        > = |name, count| Box::pin(multi_param_fn(name, count));
     }
 }

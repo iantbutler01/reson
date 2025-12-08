@@ -135,7 +135,10 @@ fn execute_mock_tool(tool_call: &serde_json::Value) -> String {
         }
         "search_database" => {
             let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let max = input.get("max_results").and_then(|v| v.as_i64()).unwrap_or(5);
+            let max = input
+                .get("max_results")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(5);
             format!("Found {} results for '{}'", max, text)
         }
         "calculate" => {
@@ -488,7 +491,10 @@ async fn test_parallel_execution_pattern() {
         }
     }
 
-    println!("Collected {} tool calls for parallel execution", tool_calls.len());
+    println!(
+        "Collected {} tool calls for parallel execution",
+        tool_calls.len()
+    );
 
     // Execute tools in parallel using JoinSet
     let mut join_set = JoinSet::new();
@@ -538,9 +544,9 @@ async fn test_mixed_parallel_tool_types() {
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
         .with_tools(vec![
-            calculate_tool_schema(),    // Requires a, b params
-            get_time_tool_schema(),     // No params required
-            weather_tool_schema(),      // Requires location
+            calculate_tool_schema(), // Requires a, b params
+            get_time_tool_schema(),  // No params required
+            weather_tool_schema(),   // Requires location
         ])
         .with_native_tools(true);
 
@@ -730,7 +736,10 @@ async fn test_multi_turn_parallel_tools() {
         "Thanks! Now what's the difference between the calculation result and 250?",
     )));
 
-    let result2 = client2.get_generation(&conversation, &config).await.unwrap();
+    let result2 = client2
+        .get_generation(&conversation, &config)
+        .await
+        .unwrap();
 
     println!("\nSecond turn response: {}", result2.content);
 

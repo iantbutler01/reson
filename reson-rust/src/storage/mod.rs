@@ -29,13 +29,21 @@ pub use postgres_store::PostgresStore;
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Store messages for a conversation
-    async fn store_messages(&mut self, conversation_id: &str, messages: Vec<ConversationMessage>) -> Result<()>;
+    async fn store_messages(
+        &mut self,
+        conversation_id: &str,
+        messages: Vec<ConversationMessage>,
+    ) -> Result<()>;
 
     /// Retrieve messages for a conversation
     async fn get_messages(&self, conversation_id: &str) -> Result<Vec<ConversationMessage>>;
 
     /// Append a message to an existing conversation
-    async fn append_message(&mut self, conversation_id: &str, message: ConversationMessage) -> Result<()>;
+    async fn append_message(
+        &mut self,
+        conversation_id: &str,
+        message: ConversationMessage,
+    ) -> Result<()>;
 
     /// Delete a conversation
     async fn delete_conversation(&mut self, conversation_id: &str) -> Result<()>;
@@ -79,9 +87,10 @@ impl Default for MemoryKVStore {
 impl Store for MemoryKVStore {
     async fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let modified_key = self.apply_key_modifications(key).await;
-        let store = self.data.read().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let store = self
+            .data
+            .read()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         if let Some(value) = store.get(&modified_key) {
             let deserialized = serde_json::from_value(value.clone())
@@ -97,9 +106,10 @@ impl Store for MemoryKVStore {
         let serialized = serde_json::to_value(value)
             .map_err(|e| Error::NonRetryable(format!("Serialization error: {}", e)))?;
 
-        let mut store = self.data.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let mut store = self
+            .data
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         store.insert(modified_key, serialized);
         Ok(())
@@ -107,9 +117,10 @@ impl Store for MemoryKVStore {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let modified_key = self.apply_key_modifications(key).await;
-        let mut store = self.data.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let mut store = self
+            .data
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         store.remove(&modified_key);
         Ok(())
@@ -119,9 +130,10 @@ impl Store for MemoryKVStore {
         let prefix = self.get_prefix().await;
         let suffix = self.get_suffix().await;
 
-        let mut store = self.data.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let mut store = self
+            .data
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         if prefix.is_empty() && suffix.is_empty() {
             // Clear everything
@@ -153,17 +165,19 @@ impl Store for MemoryKVStore {
     }
 
     async fn get_all(&self) -> Result<HashMap<String, serde_json::Value>> {
-        let store = self.data.read().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let store = self
+            .data
+            .read()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         Ok(store.clone())
     }
 
     async fn keys(&self) -> Result<std::collections::HashSet<String>> {
-        let store = self.data.read().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let store = self
+            .data
+            .read()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         Ok(store.keys().cloned().collect())
     }
@@ -172,9 +186,10 @@ impl Store for MemoryKVStore {
         // For in-memory implementation, we'll use a simple list stored at the mailbox key
         let modified_mailbox_id = self.apply_key_modifications(mailbox_id).await;
 
-        let mut store = self.data.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let mut store = self
+            .data
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         let mailbox = store
             .entry(modified_mailbox_id)
@@ -189,13 +204,18 @@ impl Store for MemoryKVStore {
         Ok(())
     }
 
-    async fn get_message(&self, mailbox_id: &str, _timeout_secs: Option<f64>) -> Result<Option<serde_json::Value>> {
+    async fn get_message(
+        &self,
+        mailbox_id: &str,
+        _timeout_secs: Option<f64>,
+    ) -> Result<Option<serde_json::Value>> {
         // For in-memory implementation, we can't truly block, so we just pop the first message
         let modified_mailbox_id = self.apply_key_modifications(mailbox_id).await;
 
-        let mut store = self.data.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let mut store = self
+            .data
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         if let Some(mailbox) = store.get_mut(&modified_mailbox_id) {
             if let Some(arr) = mailbox.as_array_mut() {
@@ -238,27 +258,38 @@ impl Default for MemoryStore {
 
 #[async_trait]
 impl Storage for MemoryStore {
-    async fn store_messages(&mut self, conversation_id: &str, messages: Vec<ConversationMessage>) -> Result<()> {
-        let mut store = self.conversations.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+    async fn store_messages(
+        &mut self,
+        conversation_id: &str,
+        messages: Vec<ConversationMessage>,
+    ) -> Result<()> {
+        let mut store = self
+            .conversations
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         store.insert(conversation_id.to_string(), messages);
         Ok(())
     }
 
     async fn get_messages(&self, conversation_id: &str) -> Result<Vec<ConversationMessage>> {
-        let store = self.conversations.read().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let store = self
+            .conversations
+            .read()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         Ok(store.get(conversation_id).cloned().unwrap_or_default())
     }
 
-    async fn append_message(&mut self, conversation_id: &str, message: ConversationMessage) -> Result<()> {
-        let mut store = self.conversations.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+    async fn append_message(
+        &mut self,
+        conversation_id: &str,
+        message: ConversationMessage,
+    ) -> Result<()> {
+        let mut store = self
+            .conversations
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         store
             .entry(conversation_id.to_string())
@@ -269,26 +300,29 @@ impl Storage for MemoryStore {
     }
 
     async fn delete_conversation(&mut self, conversation_id: &str) -> Result<()> {
-        let mut store = self.conversations.write().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let mut store = self
+            .conversations
+            .write()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         store.remove(conversation_id);
         Ok(())
     }
 
     async fn list_conversations(&self) -> Result<Vec<String>> {
-        let store = self.conversations.read().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let store = self
+            .conversations
+            .read()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         Ok(store.keys().cloned().collect())
     }
 
     async fn conversation_exists(&self, conversation_id: &str) -> Result<bool> {
-        let store = self.conversations.read().map_err(|e| {
-            Error::NonRetryable(format!("Lock poisoned: {}", e))
-        })?;
+        let store = self
+            .conversations
+            .read()
+            .map_err(|e| Error::NonRetryable(format!("Lock poisoned: {}", e)))?;
 
         Ok(store.contains_key(conversation_id))
     }
@@ -314,7 +348,10 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("Hi!")),
         ];
 
-        store.store_messages("conv1", messages.clone()).await.unwrap();
+        store
+            .store_messages("conv1", messages.clone())
+            .await
+            .unwrap();
 
         let retrieved = store.get_messages("conv1").await.unwrap();
         assert_eq!(retrieved.len(), 2);
@@ -332,12 +369,18 @@ mod tests {
         let mut store = MemoryStore::new();
 
         store
-            .append_message("conv1", ConversationMessage::Chat(ChatMessage::user("First")))
+            .append_message(
+                "conv1",
+                ConversationMessage::Chat(ChatMessage::user("First")),
+            )
             .await
             .unwrap();
 
         store
-            .append_message("conv1", ConversationMessage::Chat(ChatMessage::assistant("Second")))
+            .append_message(
+                "conv1",
+                ConversationMessage::Chat(ChatMessage::assistant("Second")),
+            )
             .await
             .unwrap();
 
@@ -384,7 +427,10 @@ mod tests {
         assert!(!store.conversation_exists("conv1").await.unwrap());
 
         store
-            .append_message("conv1", ConversationMessage::Chat(ChatMessage::user("Hello")))
+            .append_message(
+                "conv1",
+                ConversationMessage::Chat(ChatMessage::user("Hello")),
+            )
             .await
             .unwrap();
 
@@ -470,8 +516,14 @@ mod tests {
     async fn test_memory_kv_store_mailbox() {
         let store = MemoryKVStore::new();
 
-        store.publish_to_mailbox("mailbox1", &serde_json::json!({"msg": "hello"})).await.unwrap();
-        store.publish_to_mailbox("mailbox1", &serde_json::json!({"msg": "world"})).await.unwrap();
+        store
+            .publish_to_mailbox("mailbox1", &serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
+        store
+            .publish_to_mailbox("mailbox1", &serde_json::json!({"msg": "world"}))
+            .await
+            .unwrap();
 
         let msg1 = store.get_message("mailbox1", None).await.unwrap();
         assert_eq!(msg1, Some(serde_json::json!({"msg": "hello"})));

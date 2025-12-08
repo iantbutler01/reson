@@ -3,11 +3,10 @@
 //! Provides persistent key-value storage with pub/sub mailbox support using Redis.
 
 use async_trait::async_trait;
-use redis::{Client, Commands, AsyncCommands, RedisError};
-use serde::{Serialize, de::DeserializeOwned};
+use redis::{AsyncCommands, Client};
+use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::storage::Store;
@@ -68,7 +67,7 @@ impl Store for RedisStore {
 
         let mut conn = self.get_connection().await?;
 
-        conn.set(&modified_key, json_str)
+        conn.set::<_, _, ()>(&modified_key, json_str)
             .await
             .map_err(|e| Error::NonRetryable(format!("Redis SET error: {}", e)))?;
 
@@ -79,7 +78,7 @@ impl Store for RedisStore {
         let modified_key = self.apply_key_modifications(key).await;
         let mut conn = self.get_connection().await?;
 
-        conn.del(&modified_key)
+        conn.del::<_, ()>(&modified_key)
             .await
             .map_err(|e| Error::NonRetryable(format!("Redis DEL error: {}", e)))?;
 
@@ -94,7 +93,7 @@ impl Store for RedisStore {
         if prefix.is_empty() && suffix.is_empty() {
             // Clear all keys (dangerous!)
             redis::cmd("FLUSHDB")
-                .query_async(&mut conn)
+                .query_async::<()>(&mut conn)
                 .await
                 .map_err(|e| Error::NonRetryable(format!("Redis FLUSHDB error: {}", e)))?;
         } else {
@@ -116,7 +115,7 @@ impl Store for RedisStore {
                 .map_err(|e| Error::NonRetryable(format!("Redis KEYS error: {}", e)))?;
 
             if !keys.is_empty() {
-                conn.del(keys)
+                conn.del::<_, ()>(keys)
                     .await
                     .map_err(|e| Error::NonRetryable(format!("Redis DEL error: {}", e)))?;
             }
@@ -173,14 +172,18 @@ impl Store for RedisStore {
         let mut conn = self.get_connection().await?;
 
         // Use RPUSH to append to list (mailbox)
-        conn.rpush(&modified_mailbox_id, json_str)
+        conn.rpush::<_, _, ()>(&modified_mailbox_id, json_str)
             .await
             .map_err(|e| Error::NonRetryable(format!("Redis RPUSH error: {}", e)))?;
 
         Ok(())
     }
 
-    async fn get_message(&self, mailbox_id: &str, timeout_secs: Option<f64>) -> Result<Option<serde_json::Value>> {
+    async fn get_message(
+        &self,
+        mailbox_id: &str,
+        timeout_secs: Option<f64>,
+    ) -> Result<Option<serde_json::Value>> {
         let modified_mailbox_id = self.apply_key_modifications(mailbox_id).await;
         let mut conn = self.get_connection().await?;
 
@@ -231,7 +234,10 @@ mod tests {
     async fn test_redis_store_set_and_get() {
         let store = get_test_store().await;
 
-        store.set("test_key", &"test_value".to_string()).await.unwrap();
+        store
+            .set("test_key", &"test_value".to_string())
+            .await
+            .unwrap();
 
         let result: Option<String> = store.get("test_key").await.unwrap();
         assert_eq!(result, Some("test_value".to_string()));
@@ -245,7 +251,10 @@ mod tests {
     async fn test_redis_store_mailbox() {
         let store = get_test_store().await;
 
-        store.publish_to_mailbox("test_mailbox", &serde_json::json!({"msg": "hello"})).await.unwrap();
+        store
+            .publish_to_mailbox("test_mailbox", &serde_json::json!({"msg": "hello"}))
+            .await
+            .unwrap();
 
         let msg = store.get_message("test_mailbox", Some(1.0)).await.unwrap();
         assert_eq!(msg, Some(serde_json::json!({"msg": "hello"})));

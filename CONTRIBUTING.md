@@ -39,6 +39,23 @@ cd reson-rust
 cargo test --features full
 ```
 
+### Linting and Formatting Requirements
+
+All code must pass linting and be properly formatted before it can be merged:
+
+```bash
+cd reson-rust
+
+# Rust - clippy with warnings as errors
+cargo clippy --all-features -- -D warnings
+
+# Rust - format your code
+cargo fmt --all
+
+# Rust - verify formatting (CI runs this)
+cargo fmt --all -- --check
+```
+
 ### What We Look For
 
 - Integration tests that exercise the feature with real LLM responses

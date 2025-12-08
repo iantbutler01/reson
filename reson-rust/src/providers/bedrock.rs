@@ -28,14 +28,11 @@ use tokio::sync::OnceCell;
 
 #[cfg(feature = "bedrock")]
 use aws_sdk_bedrockruntime::{
-    Client as BedrockRuntimeClient,
-    primitives::Blob,
-    types::ResponseStream,
+    primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
 };
 
 #[cfg(feature = "bedrock")]
 use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
-
 
 /// AWS Bedrock client for Claude models
 #[derive(Clone)]
@@ -68,13 +65,16 @@ impl BedrockClient {
     #[cfg(feature = "bedrock")]
     /// Initialize the AWS SDK client (lazy initialization)
     async fn get_client(&self) -> Result<&BedrockRuntimeClient> {
-        self.runtime_client.get_or_try_init(|| async {
-            let config = aws_config::from_env()
-                .region(aws_config::Region::new(self.region_name.clone()))
-                .load()
-                .await;
-            Ok::<_, Error>(BedrockRuntimeClient::new(&config))
-        }).await
+        self.runtime_client
+            .get_or_try_init(|| async {
+                #[allow(deprecated)]
+                let config = aws_config::from_env()
+                    .region(aws_config::Region::new(self.region_name.clone()))
+                    .load()
+                    .await;
+                Ok::<_, Error>(BedrockRuntimeClient::new(&config))
+            })
+            .await
     }
 
     /// Build request body (same format as Anthropic)
@@ -153,11 +153,9 @@ impl BedrockClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<String>, &'a [ConversationMessage])> {
-        if let Some(first) = messages.first() {
-            if let ConversationMessage::Chat(chat_msg) = first {
-                if chat_msg.role == crate::types::ChatRole::System {
-                    return Ok((Some(chat_msg.content.clone()), &messages[1..]));
-                }
+        if let Some(ConversationMessage::Chat(chat_msg)) = messages.first() {
+            if chat_msg.role == crate::types::ChatRole::System {
+                return Ok((Some(chat_msg.content.clone()), &messages[1..]));
             }
         }
         Ok((None, messages))
@@ -214,8 +212,12 @@ impl InferenceClient for BedrockClient {
 
             let usage = TokenUsage {
                 input_tokens: response_json["usage"]["input_tokens"].as_u64().unwrap_or(0),
-                output_tokens: response_json["usage"]["output_tokens"].as_u64().unwrap_or(0),
-                cached_tokens: response_json["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                output_tokens: response_json["usage"]["output_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                cached_tokens: response_json["usage"]["cache_read_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
             };
 
             // If tools were provided, return full response for tool extraction
@@ -265,7 +267,7 @@ impl InferenceClient for BedrockClient {
                 .await
                 .map_err(|e| Error::Inference(e.to_string()))?;
 
-            let mut receiver = response.body;
+            let receiver = response.body;
             let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
 
             // AWS Bedrock EventReceiver uses async recv() instead of Stream trait
@@ -278,38 +280,50 @@ impl InferenceClient for BedrockClient {
                             // Extract the chunk bytes from the AWS event
                             // ResponseStream is an enum with a Chunk variant
                             let chunk_bytes = match event {
-                                ResponseStream::Chunk(payload_part) => {
-                                    payload_part.bytes.map(|b| b.into_inner()).unwrap_or_default()
-                                }
+                                ResponseStream::Chunk(payload_part) => payload_part
+                                    .bytes
+                                    .map(|b| b.into_inner())
+                                    .unwrap_or_default(),
                                 _ => Vec::new(),
                             };
 
                             // Parse as Anthropic-format JSON event
-                            let chunks = match serde_json::from_slice::<serde_json::Value>(&chunk_bytes) {
-                                Ok(json) => {
-                                    // Use Anthropic streaming parser
-                                    parse_anthropic_chunk(&json, &mut accumulator, has_tools)
-                                        .into_iter()
-                                        .map(Ok)
-                                        .collect::<Vec<_>>()
-                                }
-                                Err(e) => {
-                                    vec![Err(Error::Inference(format!("Failed to parse Bedrock chunk: {}", e)))]
-                                }
-                            };
-                            Some((futures::stream::iter(chunks), (recv, accumulator, has_tools)))
+                            let chunks =
+                                match serde_json::from_slice::<serde_json::Value>(&chunk_bytes) {
+                                    Ok(json) => {
+                                        // Use Anthropic streaming parser
+                                        parse_anthropic_chunk(&json, &mut accumulator, has_tools)
+                                            .into_iter()
+                                            .map(Ok)
+                                            .collect::<Vec<_>>()
+                                    }
+                                    Err(e) => {
+                                        vec![Err(Error::Inference(format!(
+                                            "Failed to parse Bedrock chunk: {}",
+                                            e
+                                        )))]
+                                    }
+                                };
+                            Some((
+                                futures::stream::iter(chunks),
+                                (recv, accumulator, has_tools),
+                            ))
                         }
                         Ok(None) => None, // Stream ended
                         Err(e) => {
                             // Return error and then end stream
                             Some((
-                                futures::stream::iter(vec![Err(Error::Inference(format!("Bedrock stream error: {}", e)))]),
+                                futures::stream::iter(vec![Err(Error::Inference(format!(
+                                    "Bedrock stream error: {}",
+                                    e
+                                )))]),
                                 (recv, accumulator, has_tools),
                             ))
                         }
                     }
                 },
-            ).flatten();
+            )
+            .flatten();
 
             Ok(Box::pin(stream))
         }
@@ -430,9 +444,6 @@ mod tests {
         let result = client.get_generation(&messages, &config).await;
         assert!(result.is_err());
         #[cfg(not(feature = "bedrock"))]
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("bedrock"));
+        assert!(result.unwrap_err().to_string().contains("bedrock"));
     }
 }

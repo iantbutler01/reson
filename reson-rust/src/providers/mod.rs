@@ -28,7 +28,7 @@ pub mod tracing_client;
 
 pub use anthropic::AnthropicClient;
 pub use bedrock::BedrockClient;
-pub use google::{GoogleGenAIClient, FileState, UploadedFile};
+pub use google::{FileState, GoogleGenAIClient, UploadedFile};
 #[cfg(feature = "google-adc")]
 pub use google_anthropic::GoogleAnthropicClient;
 pub use openai::OAIClient;
@@ -132,7 +132,11 @@ impl GenerationConfig {
     }
 
     /// Set output schema for structured outputs
-    pub fn with_output_schema(mut self, schema: serde_json::Value, type_name: impl Into<String>) -> Self {
+    pub fn with_output_schema(
+        mut self,
+        schema: serde_json::Value,
+        type_name: impl Into<String>,
+    ) -> Self {
         self.output_schema = Some(schema);
         self.output_type_name = Some(type_name.into());
         self
@@ -208,7 +212,11 @@ pub enum StreamChunk {
 
 /// Trace callback type for monitoring (wrapped in Arc for Clone support)
 pub type TraceCallback = std::sync::Arc<
-    dyn Fn(u64, Vec<serde_json::Value>, &GenerationResponse) -> Pin<Box<dyn futures::Future<Output = ()> + Send>>
+    dyn Fn(
+            u64,
+            Vec<serde_json::Value>,
+            &GenerationResponse,
+        ) -> Pin<Box<dyn futures::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
@@ -271,7 +279,9 @@ mod tests {
     #[test]
     fn test_generation_response_with_tool_calls() {
         let mut response = GenerationResponse::text("Using tools...");
-        response.tool_calls.push(serde_json::json!({"name": "get_weather"}));
+        response
+            .tool_calls
+            .push(serde_json::json!({"name": "get_weather"}));
         assert!(response.has_tool_calls());
     }
 }

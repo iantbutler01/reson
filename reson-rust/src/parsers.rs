@@ -103,12 +103,7 @@ impl NativeToolParser {
     ///
     /// Takes the tool name, accumulated JSON arguments string, and tool ID,
     /// and uses the registered constructor to build a ParsedTool with metadata.
-    pub fn parse_tool(
-        &self,
-        tool_name: &str,
-        delta_json: &str,
-        tool_id: &str,
-    ) -> ParsedToolResult {
+    pub fn parse_tool(&self, tool_name: &str, delta_json: &str, tool_id: &str) -> ParsedToolResult {
         // Check if tool exists in registry
         let constructor = match self.tool_constructors.get(tool_name) {
             Some(ctor) => ctor,
@@ -285,9 +280,8 @@ where
 
     /// Parse from complete JSON
     pub fn parse(&self, json: &str) -> Result<T> {
-        serde_json::from_str(json).map_err(|e| {
-            crate::error::Error::NonRetryable(format!("Failed to parse JSON: {}", e))
-        })
+        serde_json::from_str(json)
+            .map_err(|e| crate::error::Error::NonRetryable(format!("Failed to parse JSON: {}", e)))
     }
 
     /// Parse from JSON value
@@ -324,9 +318,8 @@ mod tests {
     impl Deserializable for TestStruct {
         fn from_partial(partial: serde_json::Value) -> Result<Self> {
             // For testing, just use serde with defaults
-            serde_json::from_value(partial).map_err(|e| {
-                crate::error::Error::NonRetryable(format!("Parse error: {}", e))
-            })
+            serde_json::from_value(partial)
+                .map_err(|e| crate::error::Error::NonRetryable(format!("Parse error: {}", e)))
         }
 
         fn validate_complete(&self) -> Result<()> {

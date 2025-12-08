@@ -41,8 +41,7 @@ async fn test_anthropic_with_system_cache_marker() {
     // Test that cache_marker on system message adds cache_control
     let messages = vec![
         ConversationMessage::Chat(
-            ChatMessage::system("Long context...")
-                .with_cache_marker(CacheMarker::Ephemeral)
+            ChatMessage::system("Long context...").with_cache_marker(CacheMarker::Ephemeral),
         ),
         ConversationMessage::Chat(ChatMessage::user("Question")),
     ];
@@ -59,9 +58,9 @@ async fn test_anthropic_with_system_cache_marker() {
 #[ignore]
 async fn test_anthropic_with_tools() {
     // Test tool calling with native tools
-    let messages = vec![
-        ConversationMessage::Chat(ChatMessage::user("What's the weather?")),
-    ];
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "What's the weather?",
+    ))];
 
     let tool_schema = serde_json::json!({
         "name": "get_weather",
@@ -90,9 +89,9 @@ async fn test_anthropic_with_tools() {
 #[ignore]
 async fn test_anthropic_parallel_tool_use_enabled() {
     // Verify that parallel tool calling is enabled by default
-    let messages = vec![
-        ConversationMessage::Chat(ChatMessage::user("Weather in SF and NYC?")),
-    ];
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "Weather in SF and NYC?",
+    ))];
 
     let config = GenerationConfig::new("claude-3-opus-20240229")
         .with_tools(vec![serde_json::json!({"name": "get_weather"})])
@@ -106,9 +105,9 @@ async fn test_anthropic_parallel_tool_use_enabled() {
 #[ignore]
 async fn test_anthropic_extended_thinking() {
     // Test extended thinking mode with budget_tokens
-    let messages = vec![
-        ConversationMessage::Chat(ChatMessage::user("Think deeply about this")),
-    ];
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "Think deeply about this",
+    ))];
 
     // When thinking budget is provided:
     // - request["thinking"] = {"type": "enabled", "budget_tokens": 1024}
@@ -145,9 +144,7 @@ async fn test_anthropic_message_coalescing() {
 #[ignore]
 async fn test_anthropic_string_content_wrapping() {
     // Test that string content is wrapped in [{"type": "text", "text": "..."}]
-    let messages = vec![
-        ConversationMessage::Chat(ChatMessage::user("Hello")),
-    ];
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
 
     let config = GenerationConfig::new("claude-3-opus-20240229");
 

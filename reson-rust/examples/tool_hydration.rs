@@ -96,8 +96,10 @@ impl Deserializable for MathOperation {
 
 fn get_weather(query: WeatherQuery) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
-        println!("  📍 get_weather called: location={}, units={:?}",
-            query.location, query.units);
+        println!(
+            "  📍 get_weather called: location={}, units={:?}",
+            query.location, query.units
+        );
 
         let temp = match query.location.to_lowercase().as_str() {
             "tokyo" => 25,
@@ -114,7 +116,10 @@ fn get_weather(query: WeatherQuery) -> BoxFuture<'static, Result<String>> {
             format!("{}°C", temp)
         };
 
-        Ok(format!("Weather in {}: {}, partly cloudy", query.location, temp_display))
+        Ok(format!(
+            "Weather in {}: {}, partly cloudy",
+            query.location, temp_display
+        ))
     })
 }
 
@@ -151,13 +156,30 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
     "#;
 
     // Register tools with types - handlers receive typed structs
-    runtime.tool::<WeatherQuery, _>(get_weather, Some("get_weather")).await?;
-    runtime.tool::<MathOperation, _>(add_numbers, Some("add_numbers")).await?;
-    runtime.tool::<MathOperation, _>(multiply_numbers, Some("multiply_numbers")).await?;
+    runtime
+        .tool::<WeatherQuery, _>(get_weather, Some("get_weather"))
+        .await?;
+    runtime
+        .tool::<MathOperation, _>(add_numbers, Some("add_numbers"))
+        .await?;
+    runtime
+        .tool::<MathOperation, _>(multiply_numbers, Some("multiply_numbers"))
+        .await?;
 
     // Initial LLM call
     let mut result = runtime
-        .run(Some(&request), None, None, None, None, None, None, None, None, None)
+        .run(
+            Some(&request),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await?;
 
     // Tool loop
@@ -172,12 +194,26 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
         // Continue with tool result
         let prompt = format!("Tool returned: {}. Respond to the user.", tool_output);
         result = runtime
-            .run(Some(&prompt), None, None, None, None, None, None, None, None, None)
+            .run(
+                Some(&prompt),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await?;
     }
 
     // Extract content from response
-    Ok(result["content"].as_str().unwrap_or(&format!("{:?}", result)).to_string())
+    Ok(result["content"]
+        .as_str()
+        .unwrap_or(&format!("{:?}", result))
+        .to_string())
 }
 
 #[tokio::main]

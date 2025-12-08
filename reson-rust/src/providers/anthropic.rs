@@ -65,13 +65,14 @@ impl AnthropicClient {
         let (system, messages) = self.extract_system_message(messages)?;
 
         // Convert messages to provider format
-        let formatted_messages = convert_messages_to_provider_format(messages, Provider::Anthropic)?;
+        let formatted_messages =
+            convert_messages_to_provider_format(messages, Provider::Anthropic)?;
 
         // Wrap string content in proper format
         let formatted_messages = self.wrap_string_content(formatted_messages);
 
         let mut request = serde_json::json!({
-            "model": config.model.is_empty().then(|| &self.model).unwrap_or(&config.model),
+            "model": if config.model.is_empty() { &self.model } else { &config.model },
             "max_tokens": config.max_tokens.unwrap_or(4096),
             "messages": formatted_messages,
             "stream": stream,
@@ -147,10 +148,7 @@ impl AnthropicClient {
                     system_dict["cache_control"] = serde_json::json!({"type": "ephemeral"});
                 }
 
-                return Ok((
-                    Some(serde_json::json!([system_dict])),
-                    &messages[1..],
-                ));
+                return Ok((Some(serde_json::json!([system_dict])), &messages[1..]));
             }
         }
         Ok((None, messages))
@@ -215,7 +213,11 @@ impl AnthropicClient {
     }
 
     /// Make HTTP request to Anthropic API
-    async fn make_request(&self, body: serde_json::Value, use_structured_outputs: bool) -> Result<reqwest::Response> {
+    async fn make_request(
+        &self,
+        body: serde_json::Value,
+        use_structured_outputs: bool,
+    ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
 
         // Build beta header - add structured-outputs if needed
@@ -246,27 +248,29 @@ impl AnthropicClient {
                 Error::NonRetryable(format!("{}: {}", status, body))
             }
             // Rate limit - retryable
-            StatusCode::TOO_MANY_REQUESTS => {
-                Error::Inference(format!("Rate limited: {}", body))
-            }
+            StatusCode::TOO_MANY_REQUESTS => Error::Inference(format!("Rate limited: {}", body)),
             // Server errors (5xx) are retryable
             StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT => {
-                Error::Inference(format!("{}: {}", status, body))
-            }
+            | StatusCode::GATEWAY_TIMEOUT => Error::Inference(format!("{}: {}", status, body)),
             // Default: assume retryable for unknown errors
             _ => Error::Inference(format!("{}: {}", status, body)),
         }
     }
 
     /// Make request with retry and exponential backoff
-    async fn make_request_with_retry(&self, body: serde_json::Value, use_structured_outputs: bool) -> Result<serde_json::Value> {
+    async fn make_request_with_retry(
+        &self,
+        body: serde_json::Value,
+        use_structured_outputs: bool,
+    ) -> Result<serde_json::Value> {
         let config = RetryConfig::default();
 
         retry_with_backoff(config, || async {
-            let response = self.make_request(body.clone(), use_structured_outputs).await?;
+            let response = self
+                .make_request(body.clone(), use_structured_outputs)
+                .await?;
             let status = response.status();
 
             if !status.is_success() {
@@ -289,7 +293,9 @@ impl InferenceClient for AnthropicClient {
     ) -> Result<GenerationResponse> {
         let use_structured_outputs = config.output_schema.is_some();
         let request_body = self.build_request_body(messages, config, false)?;
-        let body = self.make_request_with_retry(request_body, use_structured_outputs).await?;
+        let body = self
+            .make_request_with_retry(request_body, use_structured_outputs)
+            .await?;
 
         // Parse usage statistics
         let usage = self.parse_usage(&body["usage"]);
@@ -331,7 +337,9 @@ impl InferenceClient for AnthropicClient {
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
-            let resp = self.make_request(request_body.clone(), use_structured_outputs).await?;
+            let resp = self
+                .make_request(request_body.clone(), use_structured_outputs)
+                .await?;
             let status = resp.status();
 
             if !status.is_success() {
@@ -364,9 +372,9 @@ impl InferenceClient for AnthropicClient {
         );
 
         // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(chunk_stream.flat_map(|chunk_vec| {
-            futures::stream::iter(chunk_vec)
-        })))
+        Ok(Box::pin(
+            chunk_stream.flat_map(|chunk_vec| futures::stream::iter(chunk_vec)),
+        ))
     }
 
     fn provider(&self) -> Provider {
@@ -388,16 +396,13 @@ mod tests {
         let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
         assert_eq!(client.model, "claude-3-opus-20240229");
         assert_eq!(client.api_key, "test-key");
-        assert_eq!(
-            client.api_url,
-            "https://api.anthropic.com/v1/messages"
-        );
+        assert_eq!(client.api_url, "https://api.anthropic.com/v1/messages");
     }
 
     #[test]
     fn test_with_thinking_budget() {
-        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229")
-            .with_thinking_budget(1024);
+        let client =
+            AnthropicClient::new("test-key", "claude-3-opus-20240229").with_thinking_budget(1024);
         assert_eq!(client.thinking_budget, Some(1024));
     }
 
@@ -494,7 +499,9 @@ mod tests {
             .with_max_tokens(1024)
             .with_temperature(0.7);
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert_eq!(body["model"], "claude-3-opus-20240229");
         assert_eq!(body["max_tokens"], 1024);
@@ -510,7 +517,9 @@ mod tests {
         let tools = vec![serde_json::json!({"name": "get_weather"})];
         let config = GenerationConfig::new("claude-3-opus-20240229").with_tools(tools);
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"]["type"], "auto");
@@ -519,12 +528,14 @@ mod tests {
 
     #[test]
     fn test_build_request_with_thinking() {
-        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229")
-            .with_thinking_budget(1024);
+        let client =
+            AnthropicClient::new("test-key", "claude-3-opus-20240229").with_thinking_budget(1024);
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
         let config = GenerationConfig::new("claude-3-opus-20240229").with_max_tokens(2048);
 
-        let body = client.build_request_body(&messages, &config, false).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 1024);
