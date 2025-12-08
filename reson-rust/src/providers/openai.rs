@@ -363,7 +363,7 @@ impl InferenceClient for OAIClient {
 
         // Flatten the Vec<Result<StreamChunk>> into individual items
         Ok(Box::pin(
-            chunk_stream.flat_map(|chunk_vec| futures::stream::iter(chunk_vec)),
+            chunk_stream.flat_map(futures::stream::iter),
         ))
     }
 
