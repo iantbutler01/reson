@@ -372,9 +372,7 @@ impl InferenceClient for AnthropicClient {
         );
 
         // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(
-            chunk_stream.flat_map(futures::stream::iter),
-        ))
+        Ok(Box::pin(chunk_stream.flat_map(futures::stream::iter)))
     }
 
     fn provider(&self) -> Provider {
