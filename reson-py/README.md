@@ -144,8 +144,10 @@ Connect to any major LLM provider:
 |----------|--------------|---------|
 | Anthropic | `anthropic:model` | `anthropic:claude-3-5-sonnet-20241022` |
 | OpenAI | `openai:model` | `openai:gpt-4o` |
+| OpenAI Responses | `openai:resp:model` | `openai:resp:gpt-4o` |
 | Google Gemini | `google-gemini:model` | `google-gemini:gemini-2.0-flash` |
 | OpenRouter | `openrouter:provider/model` | `openrouter:anthropic/claude-sonnet-4` |
+| OpenRouter Responses | `openrouter:resp:provider/model` | `openrouter:resp:openai/o4-mini` |
 | AWS Bedrock | `bedrock:model-id` | `bedrock:anthropic.claude-3-sonnet-20240229-v1:0` |
 | Vertex AI | `google-anthropic:model` | `google-anthropic:claude-3-opus@20240514` |
 
@@ -206,6 +208,9 @@ client = InferenceClient(
     model="claude-3-5-sonnet-20241022",
     api_key="..."  # or use environment variable
 )
+
+# Responses API providers are also available:
+# InferenceProvider.OPENAI_RESPONSES / InferenceProvider.OPENROUTER_RESPONSES
 
 messages = [ChatMessage(role=ChatRole.User, content="Hello!")]
 response = await client.generate(messages)

@@ -8,6 +8,7 @@ Agents are just functions - production-grade LLM agent framework for Rust.
 - **Native tool calling** with structured outputs via `#[derive(Tool)]`
 - **Agent macro** for ergonomic agent definitions with `#[agentic]`
 - **Streaming responses** with reasoning/thinking support
+- **OpenAI/OpenRouter Responses API** support (`openai:resp:*`, `openrouter:resp:*`)
 - **Google File API** for video/large media uploads
 - **Retry with exponential backoff**
 - **Clone-friendly clients** for use in async contexts
