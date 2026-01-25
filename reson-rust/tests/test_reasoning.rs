@@ -110,13 +110,13 @@ async fn test_anthropic_reasoning_via_openrouter() {
 async fn test_google_thinking_model() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client =
-        GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp").with_thinking_budget(1024);
+        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Explain the process of photosynthesis in detail",
     ))];
 
-    let config = GenerationConfig::new("gemini-2.0-flash-thinking-exp").with_max_tokens(2048);
+    let config = GenerationConfig::new("gemini-flash-latest").with_max_tokens(2048);
 
     let result = client.get_generation(&messages, &config).await;
 
@@ -285,13 +285,13 @@ async fn test_anthropic_reasoning_stream() {
 async fn test_google_thinking_stream() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client =
-        GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp").with_thinking_budget(1024);
+        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What is 17 * 23? Think through this step by step.",
     ))];
 
-    let config = GenerationConfig::new("gemini-2.0-flash-thinking-exp").with_max_tokens(2048);
+    let config = GenerationConfig::new("gemini-flash-latest").with_max_tokens(2048);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
 
@@ -552,7 +552,7 @@ async fn test_reasoning_across_providers() {
 
     let providers_to_test = vec![
         ("anthropic", "claude-haiku-4-5-20251001"),
-        ("google", "gemini-2.0-flash-thinking-exp"),
+        ("google", "gemini-flash-latest"),
         ("openrouter", "openai/gpt-4o"),
     ];
 

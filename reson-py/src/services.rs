@@ -11,9 +11,11 @@ use crate::types::{ChatMessage, ToolCall, ToolResult, ReasoningSegment};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InferenceProvider {
     OPENAI,
+    OPENAI_RESPONSES,
     ANTHROPIC,
     GOOGLE_GENAI,
     OPENROUTER,
+    OPENROUTER_RESPONSES,
     BEDROCK,
     GOOGLE_ANTHROPIC,
 }
@@ -23,9 +25,11 @@ impl InferenceProvider {
     fn __repr__(&self) -> String {
         match self {
             InferenceProvider::OPENAI => "InferenceProvider.OPENAI".to_string(),
+            InferenceProvider::OPENAI_RESPONSES => "InferenceProvider.OPENAI_RESPONSES".to_string(),
             InferenceProvider::ANTHROPIC => "InferenceProvider.ANTHROPIC".to_string(),
             InferenceProvider::GOOGLE_GENAI => "InferenceProvider.GOOGLE_GENAI".to_string(),
             InferenceProvider::OPENROUTER => "InferenceProvider.OPENROUTER".to_string(),
+            InferenceProvider::OPENROUTER_RESPONSES => "InferenceProvider.OPENROUTER_RESPONSES".to_string(),
             InferenceProvider::BEDROCK => "InferenceProvider.BEDROCK".to_string(),
             InferenceProvider::GOOGLE_ANTHROPIC => "InferenceProvider.GOOGLE_ANTHROPIC".to_string(),
         }
@@ -36,9 +40,13 @@ impl From<InferenceProvider> for reson_agentic::types::Provider {
     fn from(provider: InferenceProvider) -> Self {
         match provider {
             InferenceProvider::OPENAI => reson_agentic::types::Provider::OpenAI,
+            InferenceProvider::OPENAI_RESPONSES => reson_agentic::types::Provider::OpenAIResponses,
             InferenceProvider::ANTHROPIC => reson_agentic::types::Provider::Anthropic,
             InferenceProvider::GOOGLE_GENAI => reson_agentic::types::Provider::GoogleGenAI,
             InferenceProvider::OPENROUTER => reson_agentic::types::Provider::OpenRouter,
+            InferenceProvider::OPENROUTER_RESPONSES => {
+                reson_agentic::types::Provider::OpenRouterResponses
+            }
             InferenceProvider::BEDROCK => reson_agentic::types::Provider::Bedrock,
             InferenceProvider::GOOGLE_ANTHROPIC => reson_agentic::types::Provider::GoogleAnthropic,
         }
@@ -49,9 +57,13 @@ impl From<reson_agentic::types::Provider> for InferenceProvider {
     fn from(provider: reson_agentic::types::Provider) -> Self {
         match provider {
             reson_agentic::types::Provider::OpenAI => InferenceProvider::OPENAI,
+            reson_agentic::types::Provider::OpenAIResponses => InferenceProvider::OPENAI_RESPONSES,
             reson_agentic::types::Provider::Anthropic => InferenceProvider::ANTHROPIC,
             reson_agentic::types::Provider::GoogleGenAI => InferenceProvider::GOOGLE_GENAI,
             reson_agentic::types::Provider::OpenRouter => InferenceProvider::OPENROUTER,
+            reson_agentic::types::Provider::OpenRouterResponses => {
+                InferenceProvider::OPENROUTER_RESPONSES
+            }
             reson_agentic::types::Provider::Bedrock => InferenceProvider::BEDROCK,
             reson_agentic::types::Provider::GoogleAnthropic => InferenceProvider::GOOGLE_ANTHROPIC,
         }
@@ -112,10 +124,25 @@ impl InferenceClient {
 
         // Convert using the Rust function
         let rust_provider: reson_agentic::types::Provider = provider.into();
-        let converted = reson_agentic::utils::convert_messages_to_provider_format(
-            &conversation_messages,
+        let converted = if matches!(
             rust_provider,
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            reson_agentic::types::Provider::OpenAIResponses
+                | reson_agentic::types::Provider::OpenRouterResponses
+        ) {
+            let (_instructions, input_items) =
+                reson_agentic::utils::convert_messages_to_responses_input(
+                    &conversation_messages,
+                    rust_provider,
+                )
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            input_items
+        } else {
+            reson_agentic::utils::convert_messages_to_provider_format(
+                &conversation_messages,
+                rust_provider,
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+        };
 
         // Convert Vec<Value> back to Python list of dicts
         pythonize::pythonize(py, &converted)

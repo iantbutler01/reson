@@ -38,6 +38,8 @@ pub enum Provider {
     Anthropic,
     /// OpenAI GPT models (direct API)
     OpenAI,
+    /// OpenAI Responses API
+    OpenAIResponses,
     /// AWS Bedrock (Claude and others)
     Bedrock,
     /// Google Gemini via GenAI SDK
@@ -46,28 +48,42 @@ pub enum Provider {
     GoogleAnthropic,
     /// OpenRouter proxy service
     OpenRouter,
+    /// OpenRouter Responses API
+    OpenRouterResponses,
 }
 
 impl Provider {
     /// Parse provider from model string (e.g., "anthropic:claude-3-opus")
     pub fn from_model_string(model: &str) -> Result<(Self, String)> {
-        if let Some((provider_str, model_name)) = model.split_once(':') {
-            let provider = match provider_str {
-                "anthropic" => Provider::Anthropic,
-                "openai" => Provider::OpenAI,
-                "bedrock" => Provider::Bedrock,
-                "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
-                "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,
-                "openrouter" => Provider::OpenRouter,
-                _ => return Err(Error::InvalidProvider(provider_str.to_string())),
-            };
-            Ok((provider, model_name.to_string()))
-        } else {
-            Err(Error::InvalidProvider(format!(
+        let parts: Vec<&str> = model.split(':').collect();
+        if parts.len() < 2 {
+            return Err(Error::InvalidProvider(format!(
                 "Invalid model string format: {}. Expected 'provider:model'",
                 model
-            )))
+            )));
         }
+
+        let (provider_str, model_name) = if parts.len() >= 3 && parts[1] == "resp" {
+            let provider = match parts[0] {
+                "openai" => Provider::OpenAIResponses,
+                "openrouter" => Provider::OpenRouterResponses,
+                _ => return Err(Error::InvalidProvider(parts[0].to_string())),
+            };
+            return Ok((provider, parts[2..].join(":")));
+        } else {
+            (parts[0], parts[1..].join(":"))
+        };
+
+        let provider = match provider_str {
+            "anthropic" => Provider::Anthropic,
+            "openai" => Provider::OpenAI,
+            "bedrock" => Provider::Bedrock,
+            "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
+            "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,
+            "openrouter" => Provider::OpenRouter,
+            _ => return Err(Error::InvalidProvider(provider_str.to_string())),
+        };
+        Ok((provider, model_name))
     }
 
     /// Check if this provider supports native tool calling
@@ -76,10 +92,12 @@ impl Provider {
             self,
             Provider::Anthropic
                 | Provider::OpenAI
+                | Provider::OpenAIResponses
                 | Provider::Bedrock
                 | Provider::GoogleGenAI
                 | Provider::GoogleAnthropic
                 | Provider::OpenRouter
+                | Provider::OpenRouterResponses
         )
     }
 }
@@ -559,6 +577,15 @@ impl ToolCall {
         if data.get("function").is_some() {
             // OpenAI format
             Self::from_provider_format(data, Provider::OpenAI).map(CreateResult::Single)
+        } else if data
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|t| t == "function_call")
+            .unwrap_or(false)
+            && data.get("name").is_some()
+        {
+            // OpenAI/OpenRouter Responses format
+            Self::from_provider_format(data, Provider::OpenAIResponses).map(CreateResult::Single)
         } else if data.get("functionCall").is_some() {
             // Google format
             Self::from_provider_format(data, Provider::GoogleGenAI).map(CreateResult::Single)
@@ -650,6 +677,27 @@ impl ToolCall {
                     tool_obj: Some(provider_format),
                 })
             }
+            Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                let args_str = provider_format["arguments"]
+                    .as_str()
+                    .unwrap_or("");
+                let call_id = provider_format
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| provider_format.get("id").and_then(|v| v.as_str()))
+                    .ok_or_else(|| Error::Parse("Missing 'call_id' in tool call".to_string()))?;
+                Ok(Self {
+                    tool_use_id: call_id.to_string(),
+                    tool_name: provider_format["name"]
+                        .as_str()
+                        .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
+                        .to_string(),
+                    args: serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({})),
+                    raw_arguments: Some(args_str.to_string()),
+                    signature: None,
+                    tool_obj: Some(provider_format),
+                })
+            }
             Provider::GoogleGenAI | Provider::GoogleAnthropic => {
                 // Google format generates tool_use_id based on name + args hash (matches Python)
                 let func_call = &provider_format["functionCall"];
@@ -711,6 +759,19 @@ impl ToolCall {
                             "arguments": args_str
                         }
                     }]
+                })
+            }
+            Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                let args_str = self
+                    .raw_arguments
+                    .clone()
+                    .unwrap_or_else(|| serde_json::to_string(&self.args).unwrap_or_else(|_| "{}".to_string()));
+                serde_json::json!({
+                    "type": "function_call",
+                    "id": format!("fc_{}", self.tool_use_id),
+                    "call_id": self.tool_use_id,
+                    "name": self.tool_name,
+                    "arguments": args_str
                 })
             }
             Provider::GoogleGenAI | Provider::GoogleAnthropic => {
@@ -824,6 +885,13 @@ impl ToolResult {
                     "content": self.content
                 })
             }
+            Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": self.tool_use_id,
+                    "output": self.content
+                })
+            }
             Provider::GoogleGenAI | Provider::GoogleAnthropic => {
                 // Try to get tool_name from: 1) tool_name field, 2) tool_obj["_tool_name"], 3) "unknown"
                 let name = self.tool_name.clone().unwrap_or_else(|| {
@@ -929,6 +997,19 @@ impl ReasoningSegment {
                 }
                 obj
             }
+            Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                let mut obj = serde_json::json!({
+                    "type": "reasoning",
+                    "content": [{
+                        "type": "output_text",
+                        "text": self.content
+                    }]
+                });
+                if let Some(ref sig) = self.signature {
+                    obj["signature"] = serde_json::Value::String(sig.clone());
+                }
+                obj
+            }
             Provider::GoogleGenAI => {
                 let mut obj = serde_json::json!({
                     "thought": true,
@@ -957,6 +1038,14 @@ mod tests {
         assert_eq!(provider, Provider::OpenAI);
         assert_eq!(model, "gpt-4");
 
+        let (provider, model) = Provider::from_model_string("openai:resp:gpt-4").unwrap();
+        assert_eq!(provider, Provider::OpenAIResponses);
+        assert_eq!(model, "gpt-4");
+
+        let (provider, model) = Provider::from_model_string("openrouter:resp:openai/o4-mini").unwrap();
+        assert_eq!(provider, Provider::OpenRouterResponses);
+        assert_eq!(model, "openai/o4-mini");
+
         assert!(Provider::from_model_string("invalid").is_err());
     }
 
@@ -964,9 +1053,11 @@ mod tests {
     fn test_provider_supports_native_tools() {
         assert!(Provider::Anthropic.supports_native_tools());
         assert!(Provider::OpenAI.supports_native_tools());
+        assert!(Provider::OpenAIResponses.supports_native_tools());
         assert!(Provider::GoogleAnthropic.supports_native_tools());
         assert!(Provider::GoogleGenAI.supports_native_tools());
         assert!(Provider::OpenRouter.supports_native_tools());
+        assert!(Provider::OpenRouterResponses.supports_native_tools());
         assert!(Provider::Bedrock.supports_native_tools());
     }
 

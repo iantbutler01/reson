@@ -22,8 +22,11 @@ pub mod google;
 #[cfg(feature = "google-adc")]
 pub mod google_anthropic;
 pub mod openai;
+pub mod openai_responses;
 pub(crate) mod openai_streaming;
+pub(crate) mod openai_responses_streaming;
 pub mod openrouter;
+pub mod openrouter_responses;
 pub mod tracing_client;
 
 pub use anthropic::AnthropicClient;
@@ -32,7 +35,9 @@ pub use google::{FileState, GoogleGenAIClient, UploadedFile};
 #[cfg(feature = "google-adc")]
 pub use google_anthropic::GoogleAnthropicClient;
 pub use openai::OAIClient;
+pub use openai_responses::OpenAIResponsesClient;
 pub use openrouter::OpenRouterClient;
+pub use openrouter_responses::OpenRouterResponsesClient;
 pub use tracing_client::TracingInferenceClient;
 
 /// Configuration for generation requests

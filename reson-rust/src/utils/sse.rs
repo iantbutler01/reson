@@ -8,6 +8,7 @@ use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
+use crate::utils::parse_json_value_strict_str;
 
 /// Parse SSE stream from HTTP response
 ///
@@ -38,7 +39,7 @@ pub fn parse_sse_stream(
                 }
 
                 // Parse JSON
-                match serde_json::from_str::<serde_json::Value>(&data) {
+                match parse_json_value_strict_str(&data) {
                     Ok(json) => Some(Ok(json)),
                     Err(e) => Some(Err(Error::Json(e))),
                 }

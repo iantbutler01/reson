@@ -3,15 +3,28 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 
+fn resolve_provider_name(provider: &str) -> String {
+    let parts: Vec<&str> = provider.split(':').collect();
+    if parts.len() >= 2 && parts[1] == "resp" {
+        match parts[0] {
+            "openai" => "openai-responses".to_string(),
+            "openrouter" => "openrouter-responses".to_string(),
+            other => other.to_string(),
+        }
+    } else {
+        parts.first().unwrap_or(&provider).to_string()
+    }
+}
+
 /// Check if a provider supports native tools
 #[pyfunction]
 pub fn supports_native_tools(provider: &str) -> bool {
-    // Parse provider string (may have format "provider:model" or just "provider")
-    let provider_name = provider.split(':').next().unwrap_or(provider);
+    let provider_name = resolve_provider_name(provider);
 
-    match provider_name {
+    match provider_name.as_str() {
         "openai" | "anthropic" | "google-gemini" | "google-genai" | "vertex-gemini"
-        | "openrouter" | "bedrock" | "custom-openai" | "google-anthropic" => true,
+        | "openrouter" | "bedrock" | "custom-openai" | "google-anthropic"
+        | "openai-responses" | "openrouter-responses" => true,
         _ => false,
     }
 }
@@ -180,8 +193,8 @@ impl SchemaGenerator {
         }
 
         // Wrap in provider-specific container format
-        let provider_name = self.provider.split(':').next().unwrap_or(&self.provider);
-        let final_schemas = match provider_name {
+        let provider_name = resolve_provider_name(&self.provider);
+        let final_schemas = match provider_name.as_str() {
             "google-gemini" | "google-genai" | "vertex-gemini" => {
                 // Google expects schemas wrapped in function_declarations
                 vec![serde_json::json!({
@@ -200,9 +213,9 @@ impl SchemaGenerator {
 impl SchemaGenerator {
     /// Generate schema with introspected parameters
     fn generate_schema_with_params(&self, name: &str, description: &str, params: serde_json::Value) -> serde_json::Value {
-        let provider_name = self.provider.split(':').next().unwrap_or(&self.provider);
+        let provider_name = resolve_provider_name(&self.provider);
 
-        match provider_name {
+        match provider_name.as_str() {
             "anthropic" | "bedrock" | "google-anthropic" => {
                 serde_json::json!({
                     "name": name,
@@ -218,6 +231,14 @@ impl SchemaGenerator {
                         "description": description,
                         "parameters": params,
                     }
+                })
+            }
+            "openai-responses" | "openrouter-responses" => {
+                serde_json::json!({
+                    "type": "function",
+                    "name": name,
+                    "description": description,
+                    "parameters": params,
                 })
             }
             "google-gemini" | "google-genai" | "vertex-gemini" => {

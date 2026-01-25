@@ -354,14 +354,14 @@ async fn test_anthropic_direct_parallel_tools() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_parallel_tool_calling() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Please: 1) Calculate 25 + 17, 2) Convert 100 USD to EUR, \
          3) Get weather for 'Tokyo'. Use the appropriate tools.",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
+    let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![
             calculate_tool_schema(),
@@ -601,14 +601,14 @@ async fn test_mixed_parallel_tool_types() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_compositional_chaining() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 50 + 30, then convert that result from USD to EUR, \
          then get weather for 'Berlin'",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
+    let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![
             calculate_tool_schema(),

@@ -9,6 +9,7 @@ use crate::types::{
     ToolCall, ToolResult, VideoMetadata,
 };
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 /// Message type that can appear in conversation history
 #[derive(Debug, Clone)]
@@ -278,6 +279,66 @@ fn media_part_to_openai_format(part: &MediaPart) -> Value {
     }
 }
 
+/// Convert a MediaPart to OpenAI Responses API format
+fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
+    match part {
+        MediaPart::Text { text } => json!({
+            "type": "input_text",
+            "text": text
+        }),
+
+        MediaPart::Image { source, .. } => match source {
+            MediaSource::Base64 { data, mime_type } => json!({
+                "type": "input_image",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", mime_type, data)
+                }
+            }),
+            MediaSource::Url { url } => json!({
+                "type": "input_image",
+                "image_url": {
+                    "url": url
+                }
+            }),
+            MediaSource::FileId { file_id } => json!({
+                "type": "input_image",
+                "image_file": {
+                    "file_id": file_id
+                }
+            }),
+            MediaSource::FileUri { uri, .. } => json!({
+                "type": "input_image",
+                "image_url": {
+                    "url": uri
+                }
+            }),
+        },
+
+        MediaPart::Audio { source, format } => match source {
+            MediaSource::Base64 { data, .. } => {
+                let fmt = format.as_deref().unwrap_or("wav");
+                json!({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": data,
+                        "format": fmt
+                    }
+                })
+            }
+            _ => json!({
+                "type": "input_text",
+                "text": "[Unsupported audio source for OpenAI Responses - use base64]"
+            }),
+        },
+
+        // OpenAI Responses doesn't support video/documents in chat input
+        MediaPart::Video { .. } | MediaPart::Document { .. } => json!({
+            "type": "input_text",
+            "text": "[Video/Document not supported by this provider]"
+        }),
+    }
+}
+
 /// Convert a MultimodalMessage to provider-specific format
 fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) -> Value {
     let role = match msg.role {
@@ -295,7 +356,10 @@ fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) ->
             Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
                 media_part_to_anthropic_format(part)
             }
-            Provider::OpenAI | Provider::OpenRouter => media_part_to_openai_format(part),
+            Provider::OpenAI
+            | Provider::OpenRouter
+            | Provider::OpenAIResponses
+            | Provider::OpenRouterResponses => media_part_to_openai_format(part),
         })
         .collect();
 
@@ -310,6 +374,137 @@ fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) ->
             "content": parts
         }),
     }
+}
+
+/// Convert messages to OpenAI/OpenRouter Responses API input format.
+///
+/// Returns (instructions, input_items).
+pub fn convert_messages_to_responses_input(
+    messages: &[ConversationMessage],
+    provider: Provider,
+) -> Result<(Option<String>, Vec<Value>)> {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input_items: Vec<Value> = Vec::new();
+
+    for msg in messages.iter() {
+        match msg {
+            ConversationMessage::Chat(chat_msg) => match chat_msg.role {
+                ChatRole::System => {
+                    instructions.push(chat_msg.content.clone());
+                }
+                ChatRole::User => {
+                    input_items.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": chat_msg.content
+                        }]
+                    }));
+                }
+                ChatRole::Assistant => {
+                    input_items.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "id": format!("msg_{}", Uuid::new_v4()),
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": chat_msg.content,
+                            "annotations": []
+                        }]
+                    }));
+                }
+                ChatRole::Tool => {
+                    input_items.push(json!({
+                        "type": "message",
+                        "role": "tool",
+                        "content": [{
+                            "type": "input_text",
+                            "text": chat_msg.content
+                        }]
+                    }));
+                }
+            },
+            ConversationMessage::ToolCall(tool_call) => {
+                let args_str = tool_call
+                    .raw_arguments
+                    .clone()
+                    .unwrap_or_else(|| serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string()));
+                input_items.push(json!({
+                    "type": "function_call",
+                    "id": format!("fc_{}", tool_call.tool_use_id),
+                    "call_id": tool_call.tool_use_id,
+                    "name": tool_call.tool_name,
+                    "arguments": args_str
+                }));
+            }
+            ConversationMessage::ToolResult(tool_result) => {
+                input_items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_result.tool_use_id,
+                    "output": tool_result.content
+                }));
+            }
+            ConversationMessage::Reasoning(reasoning_segment) => {
+                input_items.push(json!({
+                    "type": "reasoning",
+                    "content": [{
+                        "type": "output_text",
+                        "text": reasoning_segment.content
+                    }]
+                }));
+            }
+            ConversationMessage::Multimodal(multimodal_msg) => {
+                let role = match multimodal_msg.role {
+                    ChatRole::System => "system",
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::Tool => "tool",
+                };
+
+                let parts: Vec<Value> = multimodal_msg
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        if matches!(provider, Provider::OpenAIResponses | Provider::OpenRouterResponses) {
+                            match part {
+                                MediaPart::Text { text } if role == "assistant" => json!({
+                                    "type": "output_text",
+                                    "text": text,
+                                    "annotations": []
+                                }),
+                                _ => media_part_to_openai_responses_format(part),
+                            }
+                        } else {
+                            media_part_to_openai_format(part)
+                        }
+                    })
+                    .collect();
+
+                let mut item = json!({
+                    "type": "message",
+                    "role": role,
+                    "content": parts
+                });
+
+                if role == "assistant" {
+                    item["id"] = json!(format!("msg_{}", Uuid::new_v4()));
+                    item["status"] = json!("completed");
+                }
+
+                input_items.push(item);
+            }
+        }
+    }
+
+    let instructions = if instructions.is_empty() {
+        None
+    } else {
+        Some(instructions.join("\n\n"))
+    };
+
+    Ok((instructions, input_items))
 }
 
 /// Convert messages to provider-specific format with coalescing
@@ -445,7 +640,10 @@ pub fn convert_messages_to_provider_format(
 
             ConversationMessage::ToolResult(tool_result) => {
                 match provider {
-                    Provider::OpenAI | Provider::OpenRouter => {
+                    Provider::OpenAI
+                    | Provider::OpenRouter
+                    | Provider::OpenAIResponses
+                    | Provider::OpenRouterResponses => {
                         // OpenAI: Each ToolResult becomes a separate tool message
                         flush_pending(
                             &mut converted_messages,
@@ -606,6 +804,25 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert!(content[0].get("functionResponse").is_some());
         assert!(content[1].get("functionResponse").is_some());
+    }
+
+    #[test]
+    fn test_responses_input_conversion() {
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::system("You are helpful")),
+            ConversationMessage::Chat(ChatMessage::user("Hello")),
+            ConversationMessage::ToolResult(ToolResult::success("call_1", "Result")),
+        ];
+
+        let (instructions, input) =
+            convert_messages_to_responses_input(&messages, Provider::OpenAIResponses).unwrap();
+
+        assert_eq!(instructions.unwrap(), "You are helpful");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
     }
 
     #[test]

@@ -18,7 +18,10 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TokenUsage, TraceCallback,
 };
 use crate::types::Provider;
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::utils::{
+    convert_messages_to_provider_format, parse_json_value_strict_bytes, ConversationMessage,
+    JsonStreamAccumulator,
+};
 
 #[cfg(feature = "bedrock")]
 use std::sync::Arc;
@@ -186,7 +189,8 @@ impl InferenceClient for BedrockClient {
                 .map_err(|e| Error::Inference(e.to_string()))?;
 
             let body_bytes = response.body().as_ref();
-            let response_json: serde_json::Value = serde_json::from_slice(body_bytes)?;
+            let response_json: serde_json::Value =
+                parse_json_value_strict_bytes(body_bytes)?;
 
             // Parse response (same format as Anthropic)
             // Extract text content and tool calls from content blocks
@@ -273,8 +277,13 @@ impl InferenceClient for BedrockClient {
             // AWS Bedrock EventReceiver uses async recv() instead of Stream trait
             // Convert it to a stream using unfold
             let stream = futures::stream::unfold(
-                (receiver, ToolCallAccumulator::new(), has_tools),
-                |(mut recv, mut accumulator, has_tools)| async move {
+                (
+                    receiver,
+                    ToolCallAccumulator::new(),
+                    JsonStreamAccumulator::new(),
+                    has_tools,
+                ),
+                |(mut recv, mut accumulator, mut json_parser, has_tools)| async move {
                     match recv.recv().await {
                         Ok(Some(event)) => {
                             // Extract the chunk bytes from the AWS event
@@ -288,25 +297,27 @@ impl InferenceClient for BedrockClient {
                             };
 
                             // Parse as Anthropic-format JSON event
-                            let chunks =
-                                match serde_json::from_slice::<serde_json::Value>(&chunk_bytes) {
-                                    Ok(json) => {
-                                        // Use Anthropic streaming parser
-                                        parse_anthropic_chunk(&json, &mut accumulator, has_tools)
+                            let chunks = match json_parser.push_bytes(&chunk_bytes) {
+                                Ok(values) => {
+                                    let mut out = Vec::new();
+                                    for json in values {
+                                        out.extend(
+                                            parse_anthropic_chunk(
+                                                &json,
+                                                &mut accumulator,
+                                                has_tools,
+                                            )
                                             .into_iter()
-                                            .map(Ok)
-                                            .collect::<Vec<_>>()
+                                            .map(Ok),
+                                        );
                                     }
-                                    Err(e) => {
-                                        vec![Err(Error::Inference(format!(
-                                            "Failed to parse Bedrock chunk: {}",
-                                            e
-                                        )))]
-                                    }
-                                };
+                                    out
+                                }
+                                Err(e) => vec![Err(e)],
+                            };
                             Some((
                                 futures::stream::iter(chunks),
-                                (recv, accumulator, has_tools),
+                                (recv, accumulator, json_parser, has_tools),
                             ))
                         }
                         Ok(None) => None, // Stream ended
@@ -317,7 +328,7 @@ impl InferenceClient for BedrockClient {
                                     "Bedrock stream error: {}",
                                     e
                                 )))]),
-                                (recv, accumulator, has_tools),
+                                (recv, accumulator, json_parser, has_tools),
                             ))
                         }
                     }

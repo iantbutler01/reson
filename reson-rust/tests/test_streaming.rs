@@ -111,13 +111,13 @@ async fn test_anthropic_basic_streaming() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_basic_streaming() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "List the days of the week, one per line.",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash").with_max_tokens(200);
+    let config = GenerationConfig::new("gemini-flash-latest").with_max_tokens(200);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
 
@@ -267,13 +267,13 @@ async fn test_anthropic_streaming_with_tools() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_streaming_tool_detection() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Use the add_numbers tool to calculate 5 + 7",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
+    let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![add_numbers_schema()])
         .with_native_tools(true);
@@ -316,13 +316,13 @@ async fn test_google_streaming_tool_detection() {
 async fn test_google_streaming_with_thinking() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
     let client =
-        GoogleGenAIClient::new(api_key, "gemini-2.0-flash-thinking-exp").with_thinking_budget(1024);
+        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What is 17 * 23? Think through this step by step.",
     ))];
 
-    let config = GenerationConfig::new("gemini-2.0-flash-thinking-exp").with_max_tokens(2048);
+    let config = GenerationConfig::new("gemini-flash-latest").with_max_tokens(2048);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
 

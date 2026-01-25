@@ -221,8 +221,10 @@ fn test_provider_supports_native_tools() {
     // Test that all expected providers support native tools
     assert!(Provider::Anthropic.supports_native_tools());
     assert!(Provider::OpenAI.supports_native_tools());
+    assert!(Provider::OpenAIResponses.supports_native_tools());
     assert!(Provider::GoogleGenAI.supports_native_tools());
     assert!(Provider::OpenRouter.supports_native_tools());
+    assert!(Provider::OpenRouterResponses.supports_native_tools());
     assert!(Provider::Bedrock.supports_native_tools());
 }
 
@@ -231,6 +233,10 @@ fn test_provider_prefix_parsing() {
     // Test that provider prefixes are parsed correctly
     let (provider, model) = Provider::from_model_string("openai:gpt-4").unwrap();
     assert_eq!(provider, Provider::OpenAI);
+    assert_eq!(model, "gpt-4");
+
+    let (provider, model) = Provider::from_model_string("openai:resp:gpt-4").unwrap();
+    assert_eq!(provider, Provider::OpenAIResponses);
     assert_eq!(model, "gpt-4");
 
     let (provider, model) = Provider::from_model_string("anthropic:claude-3").unwrap();
@@ -341,13 +347,13 @@ async fn test_openrouter_multi_turn_tool_conversation() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_native_tools_single_call() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Use the get_weather tool to get weather for 'New York' in fahrenheit",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
+    let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![weather_tool_schema(), add_numbers_schema()])
         .with_native_tools(true);
@@ -378,9 +384,9 @@ async fn test_google_native_tools_single_call() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_multi_turn_tool_conversation() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
+    let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![add_numbers_schema()])
         .with_native_tools(true);

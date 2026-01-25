@@ -8,6 +8,7 @@
 //! - Usage arrives in separate final chunk
 
 use crate::providers::StreamChunk;
+use crate::utils::parse_json_value_strict_str;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -55,7 +56,7 @@ impl OpenAIToolAccumulator {
     pub fn complete_tool(&mut self, index: usize) -> Option<Value> {
         self.current_tool_calls.remove(&index).and_then(|tool| {
             // Parse accumulated JSON
-            serde_json::from_str(&tool.arguments)
+            parse_json_value_strict_str(&tool.arguments)
                 .ok()
                 .map(|args: Value| {
                     serde_json::json!({
@@ -67,6 +68,28 @@ impl OpenAIToolAccumulator {
                         }
                     })
                 })
+        })
+    }
+
+    /// Return partial tool call data if name is known
+    pub fn tool_partial(&self, index: usize) -> Option<Value> {
+        self.current_tool_calls.get(&index).and_then(|tool| {
+            if tool.name.is_empty() {
+                return None;
+            }
+            let call_id = if tool.id.is_empty() {
+                format!("call_{}", index)
+            } else {
+                tool.id.clone()
+            };
+            Some(serde_json::json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "arguments": tool.arguments
+                }
+            }))
         })
     }
 
@@ -172,6 +195,11 @@ pub fn parse_openai_chunk(
                     }
                     // Re-add the new tool
                     accumulator.update_tool(index, id, name, args);
+                }
+
+                // Emit partial tool state for UI updates
+                if let Some(partial) = accumulator.tool_partial(index) {
+                    chunks.push(StreamChunk::ToolCallPartial(partial));
                 }
             }
         }
@@ -333,8 +361,14 @@ mod tests {
         let mut acc = OpenAIToolAccumulator::new();
         let chunks = parse_openai_chunk(&chunk, &mut acc, true);
 
-        // Should not emit completion yet
-        assert_eq!(chunks.len(), 0);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::ToolCallPartial(tool) => {
+                assert_eq!(tool["id"], "call_123");
+                assert_eq!(tool["function"]["name"], "get_weather");
+            }
+            _ => panic!("Expected ToolCallPartial chunk"),
+        }
         assert!(acc.is_tool_ready(0));
     }
 
@@ -357,7 +391,11 @@ mod tests {
                 }
             }]
         });
-        parse_openai_chunk(&chunk1, &mut acc, true);
+        let chunks1 = parse_openai_chunk(&chunk1, &mut acc, true);
+        assert!(matches!(
+            chunks1.first(),
+            Some(StreamChunk::ToolCallPartial(_))
+        ));
 
         // Second chunk - continue arguments
         let chunk2 = serde_json::json!({
@@ -372,7 +410,11 @@ mod tests {
                 }
             }]
         });
-        parse_openai_chunk(&chunk2, &mut acc, true);
+        let chunks2 = parse_openai_chunk(&chunk2, &mut acc, true);
+        assert!(matches!(
+            chunks2.first(),
+            Some(StreamChunk::ToolCallPartial(_))
+        ));
 
         // Should have accumulated full JSON
         let tool = acc.current_tool_calls.get(&0).unwrap();

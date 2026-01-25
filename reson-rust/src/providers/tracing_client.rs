@@ -241,14 +241,13 @@ impl InferenceClient for TracingInferenceClient {
 
         // Handle fallback on retries exceeded
         if let Err(Error::RetriesExceeded) = result {
-            if self.fallback_client.is_some() {
+            if let Some(fallback) = self.fallback_client.as_ref() {
                 log::info!("Switching to fallback client after retries exceeded");
                 let mut state = self.fallback_state.write().await;
                 state.activate();
                 drop(state);
 
                 // Retry with fallback
-                let fallback = self.fallback_client.as_ref().unwrap();
                 let response = fallback.get_generation(messages, config).await?;
 
                 // Record token usage on span
@@ -318,14 +317,13 @@ impl InferenceClient for TracingInferenceClient {
 
         // Handle fallback on retries exceeded
         if let Err(Error::RetriesExceeded) = result {
-            if self.fallback_client.is_some() {
+            if let Some(fallback) = self.fallback_client.as_ref() {
                 log::info!("Switching to fallback client for streaming after retries exceeded");
                 let mut state = self.fallback_state.write().await;
                 state.activate();
                 drop(state);
 
                 // Retry with fallback
-                let fallback = self.fallback_client.as_ref().unwrap();
                 return fallback.connect_and_listen(messages, config).await;
             } else {
                 return Err(Error::RetriesExceeded);

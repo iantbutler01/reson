@@ -15,7 +15,9 @@ use serde_json::Value;
 /// This function modifies the schema in-place to match provider requirements.
 pub fn fix_output_schema_for_provider(schema: &mut Value, provider: &str) {
     match provider {
-        "openai" | "openrouter" => fix_schema_for_openai(schema),
+        "openai" | "openrouter" | "openai-responses" | "openrouter-responses" => {
+            fix_schema_for_openai(schema)
+        }
         "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
             fix_schema_for_anthropic(schema)
         }
@@ -225,6 +227,20 @@ impl SchemaGenerator for OpenAISchemaGenerator {
     }
 }
 
+/// OpenAI Responses schema generator
+pub struct OpenAIResponsesSchemaGenerator;
+
+impl SchemaGenerator for OpenAIResponsesSchemaGenerator {
+    fn generate_schema(&self, name: &str, description: &str, parameters: Value) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        })
+    }
+}
+
 /// Google GenAI schema generator
 pub struct GoogleSchemaGenerator;
 
@@ -244,6 +260,8 @@ pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> 
         "anthropic" => Ok(Box::new(AnthropicSchemaGenerator)),
         "openai" => Ok(Box::new(OpenAISchemaGenerator)),
         "openrouter" => Ok(Box::new(OpenAISchemaGenerator)), // OpenRouter uses OpenAI format
+        "openai-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
+        "openrouter-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
         | "google-gemini" => Ok(Box::new(GoogleSchemaGenerator)),
         "bedrock" => Ok(Box::new(AnthropicSchemaGenerator)), // Bedrock uses Anthropic format
@@ -329,6 +347,18 @@ mod tests {
     #[test]
     fn test_get_schema_generator_openrouter() {
         let result = get_schema_generator("openrouter");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_schema_generator_openai_responses() {
+        let result = get_schema_generator("openai-responses");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_schema_generator_openrouter_responses() {
+        let result = get_schema_generator("openrouter-responses");
         assert!(result.is_ok());
     }
 

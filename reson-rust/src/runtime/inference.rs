@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 use crate::error::{Error, Result};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenRouterClient,
+    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
 };
 use crate::schema::fix_output_schema_for_provider;
 use crate::storage::Storage;
@@ -198,10 +198,10 @@ fn generate_tool_schemas(
     }
 
     // Parse provider from model string
-    let provider = model.split(':').next().unwrap_or(model);
+    let provider = resolve_provider_key(model);
 
     // Get appropriate schema generator
-    let generator = crate::schema::get_schema_generator(provider)?;
+    let generator = crate::schema::get_schema_generator(&provider)?;
 
     // For each tool, generate schema
     let mut schemas = Vec::new();
@@ -264,28 +264,46 @@ fn generate_tool_schemas(
     Ok(schemas)
 }
 
+/// Resolve provider key for model strings, including responses modifiers.
+fn resolve_provider_key(model: &str) -> String {
+    let parts: Vec<&str> = model.split(':').collect();
+    if parts.len() >= 3 && parts[1] == "resp" {
+        match parts[0] {
+            "openai" => "openai-responses".to_string(),
+            "openrouter" => "openrouter-responses".to_string(),
+            other => other.to_string(),
+        }
+    } else {
+        parts.first().unwrap_or(&model).to_string()
+    }
+}
+
 /// Create an inference client from model string
 ///
-/// Format: `provider:model@param=value`
+/// Format: `provider:model@param=value` or `provider:resp:model@param=value`
 /// Examples:
 /// - `anthropic:claude-3-5-sonnet-20241022`
 /// - `openrouter:openai/gpt-4o@reasoning=high`
 /// - `openai:gpt-4o`
+/// - `openai:resp:gpt-4o`
+/// - `openrouter:resp:openai/o4-mini`
 pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
     // Parse model string
     let parts: Vec<&str> = model_str.split(':').collect();
-    if parts.len() != 2 {
+    if parts.len() < 2 {
         return Err(Error::NonRetryable(format!(
             "Invalid model string format: {}. Expected 'provider:model'",
             model_str
         )));
     }
-
-    let provider = parts[0];
-    let model_part = parts[1];
+    let (provider, model_part) = if parts.len() >= 3 && parts[1] == "resp" {
+        (format!("{}-responses", parts[0]), parts[2..].join(":"))
+    } else {
+        (parts[0].to_string(), parts[1..].join(":"))
+    };
 
     // Parse parameters (e.g., @reasoning=1024)
     let mut reasoning = None;
@@ -306,12 +324,17 @@ pub fn create_inference_client(
     // Get API key from env if not provided
     let key = match api_key {
         Some(k) => k.to_string(),
-        None => match provider {
+        None => match provider.as_str() {
             "anthropic" => std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| Error::NonRetryable("ANTHROPIC_API_KEY not set".to_string()))?,
             "openai" => std::env::var("OPENAI_API_KEY")
                 .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
+            "openai-responses" => std::env::var("OPENAI_API_KEY")
+                .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
             "openrouter" => std::env::var("OPENROUTER_API_KEY")
+                .or_else(|_| std::env::var("OPENROUTER_KEY"))
+                .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
+            "openrouter-responses" => std::env::var("OPENROUTER_API_KEY")
                 .or_else(|_| std::env::var("OPENROUTER_KEY"))
                 .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
             "google-gemini" | "google-genai" | "gemini" => {
@@ -328,7 +351,7 @@ pub fn create_inference_client(
     };
 
     // Create client
-    let client: Box<dyn InferenceClient> = match provider {
+    let client: Box<dyn InferenceClient> = match provider.as_str() {
         "anthropic" => {
             let mut client = AnthropicClient::new(key, model_name);
             if let Some(r) = reasoning {
@@ -345,8 +368,22 @@ pub fn create_inference_client(
             }
             Box::new(client)
         }
+        "openai-responses" => {
+            let mut client = OpenAIResponsesClient::new(key, model_name);
+            if let Some(r) = reasoning {
+                client = client.with_reasoning(r);
+            }
+            Box::new(client)
+        }
         "openrouter" => {
             let mut client = OpenRouterClient::new(key, model_name, None, None);
+            if let Some(r) = reasoning {
+                client = client.with_reasoning(r);
+            }
+            Box::new(client)
+        }
+        "openrouter-responses" => {
+            let mut client = OpenRouterResponsesClient::new(key, model_name, None, None);
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
@@ -426,9 +463,9 @@ pub async fn call_llm(
     };
 
     // Fix output schema for provider-specific requirements
-    let provider = model.split(':').next().unwrap_or(model);
+    let provider = resolve_provider_key(model);
     let fixed_output_schema = output_schema.map(|mut schema| {
-        fix_output_schema_for_provider(&mut schema, provider);
+        fix_output_schema_for_provider(&mut schema, &provider);
         schema
     });
 
@@ -584,9 +621,9 @@ pub async fn call_llm_stream(
     };
 
     // Fix output schema for provider-specific requirements
-    let provider = model.split(':').next().unwrap_or(model);
+    let provider = resolve_provider_key(model);
     let fixed_output_schema = output_schema.map(|mut schema| {
-        fix_output_schema_for_provider(&mut schema, provider);
+        fix_output_schema_for_provider(&mut schema, &provider);
         schema
     });
 
@@ -674,9 +711,23 @@ mod tests {
     }
 
     #[test]
+    fn test_create_inference_client_openai_responses() {
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        let result = create_inference_client("openai:resp:gpt-4o", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_create_inference_client_openrouter() {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
         let result = create_inference_client("openrouter:openai/gpt-4o", None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_inference_client_openrouter_responses() {
+        std::env::set_var("OPENROUTER_API_KEY", "test-key");
+        let result = create_inference_client("openrouter:resp:openai/o4-mini", None);
         assert!(result.is_ok());
     }
 

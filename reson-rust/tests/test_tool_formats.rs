@@ -337,13 +337,13 @@ async fn test_cross_provider_tool_call_format() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_tool_call_format() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client = GoogleGenAIClient::new(api_key, "gemini-1.5-flash");
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest");
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 10 + 20 using the calculate_function tool",
     ))];
 
-    let config = GenerationConfig::new("gemini-1.5-flash")
+    let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![calculate_tool_schema()])
         .with_native_tools(true);

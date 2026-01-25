@@ -27,7 +27,29 @@ use crate::providers::{
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::ChatRole;
 use crate::types::{Provider, TokenUsage};
-use crate::utils::{media_part_to_google_format, ConversationMessage};
+use crate::utils::{
+    media_part_to_google_format, parse_json_value_strict_str, ConversationMessage,
+    JsonStreamAccumulator,
+};
+
+fn google_debug_enabled() -> bool {
+    std::env::var("RESON_DEBUG_GOOGLE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false)
+}
+
+fn google_stream_debug_enabled() -> bool {
+    std::env::var("RESON_DEBUG_GOOGLE_STREAM")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false)
+}
+
+fn sanitize_google_endpoint(endpoint: &str) -> String {
+    endpoint
+        .split_once("?key=")
+        .map(|(base, _)| format!("{}?key=***", base))
+        .unwrap_or_else(|| endpoint.to_string())
+}
 
 /// Authentication method for Google GenAI
 #[derive(Clone)]
@@ -125,8 +147,8 @@ impl GoogleGenAIClient {
         let creds_content = std::fs::read_to_string(&creds_path)
             .unwrap_or_else(|_| panic!("Failed to read credentials file: {}", creds_path));
 
-        let creds_json: serde_json::Value =
-            serde_json::from_str(&creds_content).expect("Failed to parse credentials file as JSON");
+        let creds_json: serde_json::Value = parse_json_value_strict_str(&creds_content)
+            .expect("Failed to parse credentials file as JSON");
 
         let project = creds_json["project_id"]
             .as_str()
@@ -831,6 +853,13 @@ impl GoogleGenAIClient {
         stream: bool,
     ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
+        if google_debug_enabled() {
+            let endpoint = sanitize_google_endpoint(&self.get_endpoint(stream));
+            eprintln!(
+                "google request: model={} stream={} endpoint={} body={}",
+                self.model, stream, endpoint, body
+            );
+        }
         let mut request = client
             .post(self.get_endpoint(stream))
             .timeout(std::time::Duration::from_secs(300))
@@ -877,6 +906,12 @@ impl GoogleGenAIClient {
 
             if !status.is_success() {
                 let error_body = response.text().await.unwrap_or_default();
+                if google_debug_enabled() {
+                    eprintln!(
+                        "google response error: model={} status={} body={}",
+                        self.model, status, error_body
+                    );
+                }
                 return Err(self.handle_error_response(status, error_body));
             }
 
@@ -940,6 +975,12 @@ impl InferenceClient for GoogleGenAIClient {
 
             if !status.is_success() {
                 let error_body = resp.text().await.unwrap_or_default();
+                if google_debug_enabled() {
+                    eprintln!(
+                        "google streaming response error: model={} status={} body={}",
+                        self.model, status, error_body
+                    );
+                }
                 return Err(self.handle_error_response(status, error_body));
             }
 
@@ -949,97 +990,137 @@ impl InferenceClient for GoogleGenAIClient {
 
         let _has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
 
-        // Google streams responses as newline-delimited JSON
+        // Google streams a JSON array; use serde_json's streaming deserializer.
         let stream = response.bytes_stream();
 
-        Ok(Box::pin(stream.flat_map(move |chunk_result| {
-            use futures::stream;
-
-            match chunk_result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
+        Ok(Box::pin(
+            stream
+                .scan(JsonStreamAccumulator::new(), move |parser, chunk_result| {
                     let mut chunks = Vec::new();
 
-                    // Google returns JSON objects, potentially multiple per chunk
-                    for line in text.lines() {
-                        let line = line.trim();
-                        if line.is_empty() || line == "[" || line == "]" || line == "," {
-                            continue;
-                        }
+                    match chunk_result {
+                        Ok(bytes) => {
+                            if google_stream_debug_enabled() {
+                                let text = String::from_utf8_lossy(&bytes);
+                                eprintln!("google stream chunk: {}", text);
+                            }
+                            match parser.push_bytes(&bytes) {
+                                Ok(values) => {
+                                    for json in values {
+                                        if let Some(candidates) =
+                                            json.get("candidates").and_then(|c| c.as_array())
+                                        {
+                                            for candidate in candidates {
+                                                if let Some(parts) =
+                                                    candidate["content"]["parts"].as_array()
+                                                {
+                                                    for part in parts {
+                                                        if let Some(func_call) =
+                                                            part.get("functionCall")
+                                                        {
+                                                            let name = func_call["name"]
+                                                                .as_str()
+                                                                .unwrap_or("");
+                                                            let args = func_call
+                                                                .get("args")
+                                                                .cloned()
+                                                                .unwrap_or(serde_json::json!({}));
 
-                        // Try to parse as JSON
-                        let json_str = line.trim_start_matches(',');
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            // Process the chunk
-                            if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
-                                for candidate in candidates {
-                                    if let Some(parts) = candidate["content"]["parts"].as_array() {
-                                        for part in parts {
-                                            // Check for function call
-                                            if let Some(func_call) = part.get("functionCall") {
-                                                let name = func_call["name"].as_str().unwrap_or("");
-                                                let args = func_call.get("args").cloned().unwrap_or(serde_json::json!({}));
+                                                            let id = format!(
+                                                                "google_{}_{}",
+                                                                name,
+                                                                rand_id()
+                                                            );
 
-                                                let id = format!("google_{}_{}", name, rand_id());
+                                                            let tool_call = serde_json::json!({
+                                                                "id": id,
+                                                                "_tool_name": name,
+                                                                "_tool_use_id": id,
+                                                                "name": name,
+                                                                "input": args,
+                                                                "function": {
+                                                                    "name": name,
+                                                                    "arguments": serde_json::to_string(&args).unwrap_or_default()
+                                                                }
+                                                            });
 
-                                                let tool_call = serde_json::json!({
-                                                    "id": id,
-                                                    "_tool_name": name,
-                                                    "_tool_use_id": id,
-                                                    "name": name,
-                                                    "input": args,
-                                                    "function": {
-                                                        "name": name,
-                                                        "arguments": serde_json::to_string(&args).unwrap_or_default()
+                                                            chunks.push(Ok(
+                                                                StreamChunk::ToolCallComplete(
+                                                                    tool_call,
+                                                                ),
+                                                            ));
+                                                        } else if part
+                                                            .get("thought")
+                                                            .and_then(|t| t.as_bool())
+                                                            .unwrap_or(false)
+                                                        {
+                                                            if let Some(text) =
+                                                                part["text"].as_str()
+                                                            {
+                                                                chunks.push(Ok(
+                                                                    StreamChunk::Reasoning(
+                                                                        text.to_string(),
+                                                                    ),
+                                                                ));
+                                                            }
+                                                        } else if let Some(sig) = part
+                                                            .get("thoughtSignature")
+                                                            .and_then(|s| s.as_str())
+                                                        {
+                                                            chunks.push(Ok(StreamChunk::Signature(
+                                                                sig.to_string(),
+                                                            )));
+                                                        } else if let Some(text) =
+                                                            part["text"].as_str()
+                                                        {
+                                                            chunks.push(Ok(StreamChunk::Content(
+                                                                text.to_string(),
+                                                            )));
+                                                        }
                                                     }
-                                                });
-
-                                                chunks.push(Ok(StreamChunk::ToolCallComplete(tool_call)));
-                                            }
-                                            // Check for thought/reasoning
-                                            else if part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
-                                                if let Some(text) = part["text"].as_str() {
-                                                    chunks.push(Ok(StreamChunk::Reasoning(text.to_string())));
                                                 }
                                             }
-                                            // Check for thought signature
-                                            else if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
-                                                chunks.push(Ok(StreamChunk::Signature(sig.to_string())));
-                                            }
-                                            // Regular text content
-                                            else if let Some(text) = part["text"].as_str() {
-                                                chunks.push(Ok(StreamChunk::Content(text.to_string())));
-                                            }
+                                        }
+
+                                        if let Some(usage) = json.get("usageMetadata") {
+                                            let input = usage["promptTokenCount"]
+                                                .as_u64()
+                                                .unwrap_or(0);
+                                            let output = usage["candidatesTokenCount"]
+                                                .as_u64()
+                                                .unwrap_or(0);
+                                            let cached = usage["cachedContentTokenCount"]
+                                                .as_u64()
+                                                .unwrap_or(0);
+
+                                            chunks.push(Ok(StreamChunk::Usage {
+                                                input_tokens: input,
+                                                output_tokens: output,
+                                                cached_tokens: cached,
+                                            }));
                                         }
                                     }
                                 }
+                                Err(err) => {
+                                    if google_stream_debug_enabled() {
+                                        eprintln!("google stream parse error: {}", err);
+                                    }
+                                    chunks.push(Err(err));
+                                }
                             }
-
-                            // Check for usage metadata
-                            if let Some(usage) = json.get("usageMetadata") {
-                                let input = usage["promptTokenCount"].as_u64().unwrap_or(0);
-                                let output = usage["candidatesTokenCount"].as_u64().unwrap_or(0);
-                                let cached = usage["cachedContentTokenCount"].as_u64().unwrap_or(0);
-
-                                chunks.push(Ok(StreamChunk::Usage {
-                                    input_tokens: input,
-                                    output_tokens: output,
-                                    cached_tokens: cached,
-                                }));
-                            }
+                        }
+                        Err(e) => {
+                            chunks.push(Err(Error::Inference(format!(
+                                "Google stream error: {}",
+                                e
+                            ))));
                         }
                     }
 
-                    stream::iter(chunks).boxed()
-                }
-                Err(e) => {
-                    stream::once(async move {
-                        Err(Error::Inference(format!("Google stream error: {}", e)))
-                    })
-                    .boxed()
-                }
-            }
-        })))
+                    futures::future::ready(Some(chunks))
+                })
+                .flat_map(futures::stream::iter),
+        ))
     }
 
     fn provider(&self) -> Provider {

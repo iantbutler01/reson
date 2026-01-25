@@ -587,7 +587,10 @@ impl ReasoningSegment {
                     }
                 }
             }
-            crate::services::InferenceProvider::OPENAI | crate::services::InferenceProvider::OPENROUTER => {
+            crate::services::InferenceProvider::OPENAI
+            | crate::services::InferenceProvider::OPENAI_RESPONSES
+            | crate::services::InferenceProvider::OPENROUTER
+            | crate::services::InferenceProvider::OPENROUTER_RESPONSES => {
                 dict.set_item("type", "reasoning")?;
                 dict.set_item("content", &self.content)?;
                 if let Some(ref sig) = self.signature {

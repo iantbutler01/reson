@@ -23,7 +23,9 @@ use crate::providers::{
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::{CacheMarker, ChatRole, Provider, TokenUsage};
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::utils::{
+    convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
+};
 
 /// Google Anthropic (Vertex AI with Claude) client
 ///
@@ -62,8 +64,8 @@ impl GoogleAnthropicClient {
         let creds_content = std::fs::read_to_string(&creds_path)
             .unwrap_or_else(|_| panic!("Failed to read credentials file: {}", creds_path));
 
-        let creds_json: serde_json::Value =
-            serde_json::from_str(&creds_content).expect("Failed to parse credentials file as JSON");
+        let creds_json: serde_json::Value = parse_json_value_strict_str(&creds_content)
+            .expect("Failed to parse credentials file as JSON");
 
         let project_id = creds_json["project_id"]
             .as_str()

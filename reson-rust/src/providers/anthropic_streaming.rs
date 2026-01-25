@@ -3,6 +3,8 @@
 //! Handles SSE parsing and progressive tool call accumulation for Anthropic API.
 
 use serde_json::{json, Value};
+
+use crate::utils::parse_json_value_strict_str;
 use std::collections::HashMap;
 
 use crate::providers::StreamChunk;
@@ -65,7 +67,7 @@ impl ToolCallAccumulator {
             let arguments = if tool.input.is_empty() {
                 "{}".to_string()
             } else {
-                match serde_json::from_str::<Value>(&tool.input) {
+                match parse_json_value_strict_str(&tool.input) {
                     Ok(parsed) => {
                         serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_string())
                     }
