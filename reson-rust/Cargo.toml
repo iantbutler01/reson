@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "reson-agentic"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Reson Contributors"]
 description = "Agents are just functions - production-grade LLM agent framework"
