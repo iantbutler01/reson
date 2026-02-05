@@ -350,10 +350,22 @@ impl InferenceClient for OpenAIResponsesClient {
             return Err(Error::Inference(format!("{} ({:?})", error_msg, error)));
         }
 
-        let usage = body
-            .get("usage")
+        let usage_json = body.get("usage");
+        let usage = usage_json
             .map(|u| self.parse_usage(u))
             .unwrap_or_default();
+
+        // Extract provider cost if available (OpenRouter returns usage.cost in dollars)
+        let provider_cost_dollars = if matches!(
+            self.provider,
+            Provider::OpenRouter | Provider::OpenRouterResponses
+        ) {
+            usage_json
+                .and_then(|u| u.get("cost"))
+                .and_then(|c| c.as_f64())
+        } else {
+            None
+        };
 
         let content = self.extract_output_text(&body);
         let reasoning = self.extract_reasoning(&body);
@@ -368,6 +380,7 @@ impl InferenceClient for OpenAIResponsesClient {
             tool_calls,
             reasoning_segments: Vec::new(),
             usage,
+            provider_cost_dollars,
             raw: if has_tools || has_tool_calls {
                 Some(body)
             } else {

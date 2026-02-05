@@ -7,38 +7,40 @@
 //! - Same message format as Anthropic (coalescing, content wrapping)
 //! - Streaming uses invoke_model_with_response_stream
 //! - Same chunk types as Anthropic (content_block_*)
-
+#[cfg(feature = "bedrock")]
 use async_trait::async_trait;
+#[cfg(feature = "bedrock")]
 use futures::stream::Stream;
-use futures::StreamExt;
+#[cfg(feature = "bedrock")]
 use std::pin::Pin;
 
+#[cfg(feature = "bedrock")]
 use crate::error::{Error, Result};
+#[cfg(feature = "bedrock")]
 use crate::providers::{
-    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TokenUsage, TraceCallback,
+    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
+#[cfg(feature = "bedrock")]
 use crate::types::Provider;
-use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_bytes, ConversationMessage,
-    JsonStreamAccumulator,
+#[cfg(feature = "bedrock")]
+use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+
+#[cfg(feature = "bedrock")]
+use {
+    crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator},
+    crate::providers::TokenUsage,
+    crate::utils::{parse_json_value_strict_bytes, JsonStreamAccumulator},
+    aws_sdk_bedrockruntime::{
+        primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
+    },
+    futures::StreamExt,
+    std::sync::Arc,
+    tokio::sync::OnceCell,
 };
-
-#[cfg(feature = "bedrock")]
-use std::sync::Arc;
-
-#[cfg(feature = "bedrock")]
-use tokio::sync::OnceCell;
-
-#[cfg(feature = "bedrock")]
-use aws_sdk_bedrockruntime::{
-    primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
-};
-
-#[cfg(feature = "bedrock")]
-use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
 
 /// AWS Bedrock client for Claude models
 #[derive(Clone)]
+#[cfg(feature = "bedrock")]
 pub struct BedrockClient {
     model: String,
     region_name: String,
@@ -48,6 +50,7 @@ pub struct BedrockClient {
     runtime_client: Arc<OnceCell<BedrockRuntimeClient>>,
 }
 
+#[cfg(feature = "bedrock")]
 impl BedrockClient {
     /// Create a new Bedrock client
     ///
@@ -81,6 +84,7 @@ impl BedrockClient {
     }
 
     /// Build request body (same format as Anthropic)
+    #[cfg(feature = "bedrock")]
     fn build_request_body(
         &self,
         messages: &[ConversationMessage],
@@ -152,6 +156,7 @@ impl BedrockClient {
     }
 
     /// Extract system message from messages
+    #[cfg(feature = "bedrock")]
     fn extract_system_message<'a>(
         &self,
         messages: &'a [ConversationMessage],
@@ -166,6 +171,7 @@ impl BedrockClient {
 }
 
 #[async_trait]
+#[cfg(feature = "bedrock")]
 impl InferenceClient for BedrockClient {
     async fn get_generation(
         &self,
@@ -189,8 +195,7 @@ impl InferenceClient for BedrockClient {
                 .map_err(|e| Error::Inference(e.to_string()))?;
 
             let body_bytes = response.body().as_ref();
-            let response_json: serde_json::Value =
-                parse_json_value_strict_bytes(body_bytes)?;
+            let response_json: serde_json::Value = parse_json_value_strict_bytes(body_bytes)?;
 
             // Parse response (same format as Anthropic)
             // Extract text content and tool calls from content blocks
@@ -234,6 +239,7 @@ impl InferenceClient for BedrockClient {
                 tool_calls,
                 reasoning_segments: Vec::new(),
                 usage,
+                provider_cost_dollars: None,
                 raw: if has_tools || has_tool_calls {
                     Some(response_json)
                 } else {
@@ -244,6 +250,7 @@ impl InferenceClient for BedrockClient {
 
         #[cfg(not(feature = "bedrock"))]
         {
+            let _ = (messages, config);
             Err(Error::NonRetryable(
                 "Bedrock requires 'bedrock' feature flag. Enable with: cargo build --features bedrock".to_string(),
             ))
@@ -341,6 +348,7 @@ impl InferenceClient for BedrockClient {
 
         #[cfg(not(feature = "bedrock"))]
         {
+            let _ = (messages, config);
             Err(Error::NonRetryable(
                 "Bedrock streaming requires 'bedrock' feature flag. Enable with: cargo build --features bedrock".to_string(),
             ))
@@ -357,6 +365,7 @@ impl InferenceClient for BedrockClient {
 }
 
 #[cfg(test)]
+#[cfg(feature = "bedrock")]
 mod tests {
     use super::*;
     use crate::types::ChatMessage;

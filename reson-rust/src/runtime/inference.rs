@@ -14,7 +14,6 @@ use crate::providers::{
     OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
 };
 use crate::schema::fix_output_schema_for_provider;
-use crate::storage::Storage;
 use crate::types::ChatMessage;
 use crate::utils::ConversationMessage;
 
@@ -418,7 +417,6 @@ pub async fn call_llm(
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
-    _store: Arc<dyn Storage>,
     api_key: Option<&str>,
     system: Option<&str>,
     history: Option<Vec<ConversationMessage>>,
@@ -575,7 +573,6 @@ pub async fn call_llm_stream(
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
-    _store: Arc<dyn Storage>,
     api_key: Option<&str>,
     system: Option<&str>,
     history: Option<Vec<ConversationMessage>>,

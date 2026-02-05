@@ -4,7 +4,6 @@
 //! - LLM client lifecycle and API calls
 //! - Tool registration and execution
 //! - Message history and accumulators
-//! - Context/state storage
 //! - Structured output parsing
 
 #![allow(clippy::too_many_arguments)]
@@ -15,16 +14,12 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
-use crate::storage::{MemoryStore, Storage};
 use crate::types::ReasoningSegment;
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;
 
-pub mod context;
 pub mod decorators;
 pub mod inference;
-
-pub use context::ContextApi;
 
 /// Accumulated state during runtime execution
 #[derive(Debug, Default, Clone)]
@@ -51,7 +46,6 @@ pub struct Runtime {
     pub used: bool,
 
     // Private state (using interior mutability)
-    store: Arc<dyn Storage>,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
     tool_types: Arc<RwLock<HashMap<String, String>>>, // tool_name -> type_name mapping
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
@@ -94,7 +88,6 @@ impl Runtime {
             model: None,
             api_key: None,
             used: false,
-            store: Arc::new(MemoryStore::new()),
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
@@ -108,16 +101,11 @@ impl Runtime {
     }
 
     /// Create a Runtime with specific configuration
-    pub fn with_config(
-        model: Option<String>,
-        api_key: Option<String>,
-        store: Arc<dyn Storage>,
-    ) -> Self {
+    pub fn with_config(model: Option<String>, api_key: Option<String>) -> Self {
         Self {
             model,
             api_key,
             used: false,
-            store,
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
@@ -421,7 +409,6 @@ impl Runtime {
             self.tool_schemas.clone(),
             output_type,
             output_schema,
-            self.store.clone(),
             effective_api_key.as_deref(),
             system,
             history,
@@ -490,7 +477,6 @@ impl Runtime {
             self.tool_schemas.clone(),
             output_type,
             output_schema,
-            self.store.clone(),
             effective_api_key.as_deref(),
             system,
             history,
@@ -575,11 +561,6 @@ impl Runtime {
         acc.current_reasoning_segment = None;
     }
 
-    /// Get context API for key-value storage
-    pub fn context(&self) -> ContextApi {
-        ContextApi::new(self.store.clone())
-    }
-
     /// Set default prompt (from function docstring)
     pub async fn set_default_prompt(&self, prompt: impl Into<String>) {
         let mut default_prompt = self.default_prompt.write().await;
@@ -618,11 +599,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_with_config() {
-        let store = Arc::new(MemoryStore::new());
         let runtime = Runtime::with_config(
             Some("test-model".to_string()),
             Some("test-key".to_string()),
-            store,
         );
 
         assert_eq!(runtime.model, Some("test-model".to_string()));
@@ -744,16 +723,7 @@ mod tests {
     #[tokio::test]
     #[ignore] // TODO: Requires Storage trait refactor for interior mutability
     async fn test_context() {
-        let runtime = Runtime::new();
-        let ctx = runtime.context();
-
-        // Context is accessible
-        ctx.set("test_key", serde_json::json!("test_value"))
-            .await
-            .unwrap();
-
-        let value: Option<String> = ctx.get("test_key").await.unwrap();
-        assert_eq!(value, Some("test_value".to_string()));
+        // TODO: Implement when context() method is added to Runtime
     }
 
     // Test types for tool registration

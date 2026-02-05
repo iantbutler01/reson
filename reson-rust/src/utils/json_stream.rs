@@ -39,7 +39,7 @@ impl JsonStreamAccumulator {
 
         let mut values = Vec::new();
 
-        'parse: loop {
+        loop {
             let mut offset = 0;
             while offset < self.buffer.len() {
                 match self.buffer[offset] {

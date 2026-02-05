@@ -1,18 +1,19 @@
 //! Python Runtime wrapper
 
+use futures::Stream;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use futures::Stream;
 
 use crate::errors::to_py_err;
-use crate::stores::MemoryStore;
 use crate::types::{ChatMessage, ReasoningSegment, ToolCall, ToolResult};
 
-type ChunkStream = Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value), reson_agentic::error::Error>> + Send>>;
+type ChunkStream = Pin<
+    Box<dyn Stream<Item = Result<(String, serde_json::Value), reson_agentic::error::Error>> + Send>,
+>;
 
 /// Generate JSON schema from a Python type (Pydantic model, dataclass, Deserializable, etc.)
 /// Note: Provider-specific schema fixes are applied in the Rust inference layer
@@ -36,7 +37,11 @@ fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serd
     }
 
     // Try dataclasses (use __dataclass_fields__)
-    if output_type.bind(py).hasattr("__dataclass_fields__").unwrap_or(false) {
+    if output_type
+        .bind(py)
+        .hasattr("__dataclass_fields__")
+        .unwrap_or(false)
+    {
         // For dataclasses, construct a basic schema from fields
         if let Ok(fields) = output_type.getattr(py, "__dataclass_fields__") {
             if let Ok(fields_dict) = fields.extract::<Bound<'_, PyDict>>(py) {
@@ -46,7 +51,8 @@ fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serd
                 for (key, _value) in fields_dict.iter() {
                     if let Ok(field_name) = key.extract::<String>() {
                         // Default to string type for now - dataclasses don't provide rich type info
-                        properties.insert(field_name.clone(), serde_json::json!({"type": "string"}));
+                        properties
+                            .insert(field_name.clone(), serde_json::json!({"type": "string"}));
                         required.push(serde_json::Value::String(field_name));
                     }
                 }
@@ -63,7 +69,11 @@ fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serd
 
     // Try Deserializable classes (have __annotations__ and __gasp_from_partial__)
     // This handles custom classes that inherit from Deserializable
-    if output_type.bind(py).hasattr("__annotations__").unwrap_or(false) {
+    if output_type
+        .bind(py)
+        .hasattr("__annotations__")
+        .unwrap_or(false)
+    {
         if let Ok(annotations) = output_type.getattr(py, "__annotations__") {
             if let Ok(annotations_dict) = annotations.extract::<Bound<'_, PyDict>>(py) {
                 let mut properties = serde_json::Map::new();
@@ -76,8 +86,8 @@ fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serd
                         properties.insert(field_name.clone(), json_type.clone());
 
                         // Check if field is optional (has default value or is Optional[T])
-                        let is_optional = is_optional_type(py, &type_hint) ||
-                            has_class_default(py, output_type, &field_name);
+                        let is_optional = is_optional_type(py, &type_hint)
+                            || has_class_default(py, output_type, &field_name);
 
                         if !is_optional {
                             required.push(serde_json::Value::String(field_name));
@@ -86,7 +96,8 @@ fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serd
                 }
 
                 // Get class name for title
-                let title = output_type.getattr(py, "__name__")
+                let title = output_type
+                    .getattr(py, "__name__")
                     .and_then(|n| n.extract::<String>(py))
                     .unwrap_or_else(|_| "Object".to_string());
 
@@ -104,20 +115,28 @@ fn generate_output_schema(py: Python<'_>, output_type: &PyObject) -> Option<serd
 }
 
 /// Convert Python type hint to JSON schema type
-fn python_type_to_json_schema(py: Python<'_>, type_hint: &Bound<'_, pyo3::PyAny>) -> serde_json::Value {
+fn python_type_to_json_schema(
+    py: Python<'_>,
+    type_hint: &Bound<'_, pyo3::PyAny>,
+) -> serde_json::Value {
     // Get the type name or repr
-    let type_repr = type_hint.repr()
+    let type_repr = type_hint
+        .repr()
         .and_then(|r| r.extract::<String>())
         .unwrap_or_else(|_| "Any".to_string());
 
     // Check for Optional types (Union[X, None] or X | None)
-    if type_repr.starts_with("typing.Optional[") || type_repr.contains(" | None") || type_repr.contains("None |") {
+    if type_repr.starts_with("typing.Optional[")
+        || type_repr.contains(" | None")
+        || type_repr.contains("None |")
+    {
         // Extract inner type from Optional[X]
         if let Ok(args) = type_hint.getattr("__args__") {
             if let Ok(args_tuple) = args.extract::<Vec<Bound<'_, pyo3::PyAny>>>() {
                 // Find the non-None type
                 for arg in args_tuple {
-                    let arg_repr = arg.repr()
+                    let arg_repr = arg
+                        .repr()
                         .and_then(|r| r.extract::<String>())
                         .unwrap_or_default();
                     if arg_repr != "<class 'NoneType'>" && arg_repr != "None" {
@@ -156,11 +175,12 @@ fn python_type_to_json_schema(py: Python<'_>, type_hint: &Bound<'_, pyo3::PyAny>
 
     // Get the actual type name
     let type_name = if let Ok(name) = type_hint.getattr("__name__") {
-        name.extract::<String>().unwrap_or_else(|_| type_repr.clone())
+        name.extract::<String>()
+            .unwrap_or_else(|_| type_repr.clone())
     } else {
         // Extract from repr like "<class 'str'>" or "typing.List[str]"
         if type_repr.starts_with("<class '") && type_repr.ends_with("'>") {
-            type_repr[8..type_repr.len()-2].to_string()
+            type_repr[8..type_repr.len() - 2].to_string()
         } else {
             type_repr.clone()
         }
@@ -175,21 +195,22 @@ fn python_type_to_json_schema(py: Python<'_>, type_hint: &Bound<'_, pyo3::PyAny>
         "list" | "List" => serde_json::json!({"type": "array"}),
         "dict" | "Dict" => serde_json::json!({"type": "object"}),
         "None" | "NoneType" => serde_json::json!({"type": "null"}),
-        _ => serde_json::json!({"type": "string"}) // Default to string for unknown types
+        _ => serde_json::json!({"type": "string"}), // Default to string for unknown types
     }
 }
 
 /// Check if a Python type hint is Optional
 fn is_optional_type(_py: Python<'_>, type_hint: &Bound<'_, pyo3::PyAny>) -> bool {
-    let type_repr = type_hint.repr()
+    let type_repr = type_hint
+        .repr()
         .and_then(|r| r.extract::<String>())
         .unwrap_or_default();
 
     // Check common Optional patterns
-    type_repr.starts_with("typing.Optional[") ||
-    type_repr.contains(" | None") ||
-    type_repr.contains("None |") ||
-    type_repr.starts_with("typing.Union[") && type_repr.contains("NoneType")
+    type_repr.starts_with("typing.Optional[")
+        || type_repr.contains(" | None")
+        || type_repr.contains("None |")
+        || type_repr.starts_with("typing.Union[") && type_repr.contains("NoneType")
 }
 
 /// Check if a class has a default value for a field
@@ -201,12 +222,14 @@ fn has_class_default(py: Python<'_>, class_obj: &PyObject, field_name: &str) -> 
             if let Ok(attr) = class_obj.getattr(py, field_name) {
                 // If we can get the attribute, it has a default
                 // Skip if it's a classmethod, property, or callable
-                let attr_repr = attr.bind(py).repr()
+                let attr_repr = attr
+                    .bind(py)
+                    .repr()
                     .and_then(|r| r.extract::<String>())
                     .unwrap_or_default();
-                return !attr_repr.contains("method") &&
-                       !attr_repr.contains("property") &&
-                       !attr_repr.contains("function");
+                return !attr_repr.contains("method")
+                    && !attr_repr.contains("property")
+                    && !attr_repr.contains("function");
             }
         }
     }
@@ -260,15 +283,16 @@ impl StreamIterator {
                 let mut params_guard = params.lock().await;
                 if let Some(p) = params_guard.take() {
                     // Create the stream
-                    let rust_tools: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolFunction>>> =
-                        Arc::new(RwLock::new(HashMap::new()));
-                    let rust_tool_schemas: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>> =
-                        Arc::new(RwLock::new(HashMap::new()));
-                    let store: Arc<dyn reson_agentic::storage::Storage> =
-                        Arc::new(reson_agentic::storage::MemoryStore::new());
+                    let rust_tools: Arc<
+                        RwLock<HashMap<String, reson_agentic::runtime::ToolFunction>>,
+                    > = Arc::new(RwLock::new(HashMap::new()));
+                    let rust_tool_schemas: Arc<
+                        RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>,
+                    > = Arc::new(RwLock::new(HashMap::new()));
                     let call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>> =
                         Arc::new(RwLock::new(None));
-                    let accumulators = Arc::new(RwLock::new(reson_agentic::runtime::Accumulators::default()));
+                    let accumulators =
+                        Arc::new(RwLock::new(reson_agentic::runtime::Accumulators::default()));
 
                     let new_stream = reson_agentic::runtime::inference::call_llm_stream(
                         p.prompt.as_deref(),
@@ -277,7 +301,6 @@ impl StreamIterator {
                         rust_tool_schemas,
                         p.output_type_name,
                         p.output_schema,
-                        store,
                         p.api_key.as_deref(),
                         p.system.as_deref(),
                         p.history,
@@ -587,9 +610,8 @@ impl Runtime {
         // Get tool name
         let tool_name: String = {
             let bound = tool_result.bind(py);
-            self.get_tool_name(bound)?.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("No _tool_name in result")
-            })?
+            self.get_tool_name(bound)?
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("No _tool_name in result"))?
         };
 
         // Extract args dict from the tool result
@@ -624,7 +646,10 @@ impl Runtime {
             let tool_fn = {
                 let tools_guard = tools.read().await;
                 let func = tools_guard.get(&tool_name).ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!("Tool '{}' not found", tool_name))
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Tool '{}' not found",
+                        tool_name
+                    ))
                 })?;
                 Python::with_gil(|py| func.clone_ref(py))
             };
@@ -632,7 +657,9 @@ impl Runtime {
             // Look up the tool type (if registered)
             let tool_type_opt = {
                 let guard = tool_types.read().await;
-                guard.get(&tool_name).map(|t| Python::with_gil(|py| t.clone_ref(py)))
+                guard
+                    .get(&tool_name)
+                    .map(|t| Python::with_gil(|py| t.clone_ref(py)))
             };
 
             // Call the Python function with hydrated args or raw tool_result
@@ -715,9 +742,13 @@ impl Runtime {
                     if let Ok(msg) = item.extract::<ChatMessage>() {
                         messages.push(reson_agentic::utils::ConversationMessage::Chat(msg.into()));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
-                        messages.push(reson_agentic::utils::ConversationMessage::ToolResult(tr.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::ToolResult(
+                            tr.into(),
+                        ));
                     } else if let Ok(rs) = item.extract::<ReasoningSegment>() {
-                        messages.push(reson_agentic::utils::ConversationMessage::Reasoning(rs.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::Reasoning(
+                            rs.into(),
+                        ));
                     }
                     // Skip items we can't convert
                 }
@@ -727,8 +758,13 @@ impl Runtime {
             };
 
         // Extract output type name and schema if provided
-        let (output_type_name, output_schema, output_type_clone): (Option<String>, Option<serde_json::Value>, Option<PyObject>) = if let Some(ref ot) = output_type {
-            let type_name = ot.getattr(py, "__name__")
+        let (output_type_name, output_schema, output_type_clone): (
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<PyObject>,
+        ) = if let Some(ref ot) = output_type {
+            let type_name = ot
+                .getattr(py, "__name__")
                 .ok()
                 .and_then(|n| n.extract(py).ok());
 
@@ -739,10 +775,6 @@ impl Runtime {
         } else {
             (None, None, None)
         };
-
-        // Create storage wrapper
-        let store: Arc<dyn reson_agentic::storage::Storage> =
-            Arc::new(reson_agentic::storage::MemoryStore::new());
 
         // Clone for move into async
         let prompt_clone = prompt.clone();
@@ -761,8 +793,9 @@ impl Runtime {
                 Arc::new(RwLock::new(HashMap::new()));
 
             // Convert tool schemas
-            let rust_tool_schemas: Arc<RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>> =
-                Arc::new(RwLock::new(HashMap::new()));
+            let rust_tool_schemas: Arc<
+                RwLock<HashMap<String, reson_agentic::runtime::ToolSchemaInfo>>,
+            > = Arc::new(RwLock::new(HashMap::new()));
 
             // Create call context
             let call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>> =
@@ -776,7 +809,6 @@ impl Runtime {
                 rust_tool_schemas,
                 output_type_name,
                 output_schema,
-                store,
                 effective_api_key.as_deref(),
                 system_clone.as_deref(),
                 rust_history,
@@ -855,9 +887,13 @@ impl Runtime {
                     if let Ok(msg) = item.extract::<ChatMessage>() {
                         messages.push(reson_agentic::utils::ConversationMessage::Chat(msg.into()));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
-                        messages.push(reson_agentic::utils::ConversationMessage::ToolResult(tr.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::ToolResult(
+                            tr.into(),
+                        ));
                     } else if let Ok(rs) = item.extract::<ReasoningSegment>() {
-                        messages.push(reson_agentic::utils::ConversationMessage::Reasoning(rs.into()));
+                        messages.push(reson_agentic::utils::ConversationMessage::Reasoning(
+                            rs.into(),
+                        ));
                     }
                 }
                 Some(messages)
@@ -866,15 +902,17 @@ impl Runtime {
             };
 
         // Extract output type name and schema
-        let (output_type_name, output_schema): (Option<String>, Option<serde_json::Value>) = if let Some(ref ot) = output_type {
-            let type_name = ot.getattr(py, "__name__")
-                .ok()
-                .and_then(|n| n.extract(py).ok());
-            let schema = generate_output_schema(py, ot);
-            (type_name, schema)
-        } else {
-            (None, None)
-        };
+        let (output_type_name, output_schema): (Option<String>, Option<serde_json::Value>) =
+            if let Some(ref ot) = output_type {
+                let type_name = ot
+                    .getattr(py, "__name__")
+                    .ok()
+                    .and_then(|n| n.extract(py).ok());
+                let schema = generate_output_schema(py, ot);
+                (type_name, schema)
+            } else {
+                (None, None)
+            };
 
         // Mark runtime as used synchronously
         let rt = pyo3_async_runtimes::tokio::get_runtime();

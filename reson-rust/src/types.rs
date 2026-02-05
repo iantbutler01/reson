@@ -217,6 +217,185 @@ impl TokenUsage {
     }
 }
 
+/// Cost information for inference requests
+///
+/// Stores costs in microdollars ($1 = 1,000,000 microdollars) for billing-level precision.
+/// This avoids floating-point rounding errors when accumulating many small costs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CostInfo {
+    /// Input tokens consumed
+    pub input_tokens: u64,
+
+    /// Output tokens generated
+    pub output_tokens: u64,
+
+    /// Cache read tokens (prompt caching hits)
+    pub cache_read_input_tokens: u64,
+
+    /// Cache write tokens (prompt caching misses that were cached)
+    pub cache_write_input_tokens: u64,
+
+    /// Cost in microdollars ($1 = 1,000,000) - calculated from pricing tables
+    pub microdollar_cost: u64,
+
+    /// Provider-reported cost in microdollars (e.g., from OpenRouter)
+    /// When present, this takes precedence over calculated cost
+    pub provider_cost_microdollars: Option<u64>,
+
+    /// Manual adjustment in microdollars (can be negative via wrapping)
+    pub microdollar_adjust: u64,
+}
+
+impl CostInfo {
+    /// Create CostInfo from TokenUsage and model name
+    ///
+    /// Calculates cost based on per-model pricing. Uses microdollars for precision.
+    pub fn from_usage(usage: &TokenUsage, model: &str) -> Self {
+        let mut info = Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cached_tokens,
+            cache_write_input_tokens: 0, // Not tracked in TokenUsage currently
+            microdollar_cost: 0,
+            provider_cost_microdollars: None,
+            microdollar_adjust: 0,
+        };
+
+        info.microdollar_cost = info.calculate_microdollar_cost(model);
+        info
+    }
+
+    /// Create CostInfo with provider-reported cost (e.g., from OpenRouter)
+    ///
+    /// When the provider returns cost directly, we use that instead of calculating.
+    /// The provider cost takes precedence in `total_microdollars()`.
+    pub fn from_usage_with_provider_cost(
+        usage: &TokenUsage,
+        model: &str,
+        provider_cost_dollars: f64,
+    ) -> Self {
+        let mut info = Self::from_usage(usage, model);
+        // Convert dollars to microdollars
+        info.provider_cost_microdollars = Some((provider_cost_dollars * 1_000_000.0) as u64);
+        info
+    }
+
+    /// Set provider-reported cost in dollars
+    pub fn with_provider_cost(mut self, cost_dollars: f64) -> Self {
+        self.provider_cost_microdollars = Some((cost_dollars * 1_000_000.0) as u64);
+        self
+    }
+
+    /// Calculate cost in microdollars based on model pricing
+    ///
+    /// Pricing per million tokens, converted to microdollars per token:
+    /// - $X per 1M tokens = X microdollars per token
+    fn calculate_microdollar_cost(&self, model: &str) -> u64 {
+        let model_lower = model.to_lowercase();
+
+        // Anthropic models
+        if model_lower.contains("claude") || model_lower.contains("anthropic") {
+            if model_lower.contains("haiku") {
+                // Haiku: $0.80/1M input, $4/1M output, $0.08/1M cache read
+                // In microdollars: 0.80 input, 4.0 output, 0.08 cache read
+                let input_cost = (self.input_tokens as f64) * 0.80;
+                let output_cost = (self.output_tokens as f64) * 4.0;
+                let cache_cost = (self.cache_read_input_tokens as f64) * 0.08;
+                (input_cost + output_cost + cache_cost).ceil() as u64
+            } else if model_lower.contains("opus") {
+                // Opus: $15/1M input, $75/1M output, $1.50/1M cache read
+                let input_cost = (self.input_tokens as f64) * 15.0;
+                let output_cost = (self.output_tokens as f64) * 75.0;
+                let cache_cost = (self.cache_read_input_tokens as f64) * 1.50;
+                (input_cost + output_cost + cache_cost).ceil() as u64
+            } else {
+                // Sonnet (default): $3/1M input, $15/1M output, $0.30/1M cache read
+                let input_cost = (self.input_tokens as f64) * 3.0;
+                let output_cost = (self.output_tokens as f64) * 15.0;
+                let cache_cost = (self.cache_read_input_tokens as f64) * 0.30;
+                (input_cost + output_cost + cache_cost).ceil() as u64
+            }
+        }
+        // OpenAI models
+        else if model_lower.contains("gpt-4o") || model_lower.contains("o4-mini") {
+            if model_lower.contains("mini") {
+                // GPT-4o-mini / o4-mini: $1.10/1M input, $4.40/1M output
+                let input_cost = (self.input_tokens as f64) * 1.10;
+                let output_cost = (self.output_tokens as f64) * 4.40;
+                let cache_cost = (self.cache_read_input_tokens as f64) * 0.275;
+                (input_cost + output_cost + cache_cost).ceil() as u64
+            } else {
+                // GPT-4o: $5/1M input, $15/1M output
+                let input_cost = (self.input_tokens as f64) * 5.0;
+                let output_cost = (self.output_tokens as f64) * 15.0;
+                let cache_cost = (self.cache_read_input_tokens as f64) * 1.25;
+                (input_cost + output_cost + cache_cost).ceil() as u64
+            }
+        } else if model_lower.contains("o3") {
+            // o3: $10/1M input, $40/1M output
+            let input_cost = (self.input_tokens as f64) * 10.0;
+            let output_cost = (self.output_tokens as f64) * 40.0;
+            let cache_cost = (self.cache_read_input_tokens as f64) * 2.5;
+            (input_cost + output_cost + cache_cost).ceil() as u64
+        } else if model_lower.contains("o1") {
+            // o1: $15/1M input, $60/1M output
+            let input_cost = (self.input_tokens as f64) * 15.0;
+            let output_cost = (self.output_tokens as f64) * 60.0;
+            (input_cost + output_cost).ceil() as u64
+        }
+        // Google models
+        else if model_lower.contains("gemini") {
+            if model_lower.contains("flash") {
+                // Gemini Flash: $0.075/1M input, $0.30/1M output
+                let input_cost = (self.input_tokens as f64) * 0.075;
+                let output_cost = (self.output_tokens as f64) * 0.30;
+                (input_cost + output_cost).ceil() as u64
+            } else if model_lower.contains("pro") {
+                // Gemini Pro: $1.25/1M input, $5/1M output
+                let input_cost = (self.input_tokens as f64) * 1.25;
+                let output_cost = (self.output_tokens as f64) * 5.0;
+                (input_cost + output_cost).ceil() as u64
+            } else {
+                0
+            }
+        } else {
+            // Unknown model - return 0 cost
+            0
+        }
+    }
+
+    /// Total cost in microdollars (including adjustments)
+    ///
+    /// Prefers provider-reported cost when available (e.g., from OpenRouter),
+    /// falls back to calculated cost from pricing tables.
+    pub fn total_microdollars(&self) -> u64 {
+        let base_cost = self
+            .provider_cost_microdollars
+            .unwrap_or(self.microdollar_cost);
+        base_cost.wrapping_add(self.microdollar_adjust)
+    }
+
+    /// Get the calculated cost (from pricing tables), ignoring provider cost
+    pub fn calculated_microdollars(&self) -> u64 {
+        self.microdollar_cost.wrapping_add(self.microdollar_adjust)
+    }
+
+    /// Check if provider reported cost directly
+    pub fn has_provider_cost(&self) -> bool {
+        self.provider_cost_microdollars.is_some()
+    }
+
+    /// Convert to dollars (for display)
+    pub fn total_dollars(&self) -> f64 {
+        (self.total_microdollars() as f64) / 1_000_000.0
+    }
+
+    /// Convert to cents (for legacy compatibility)
+    pub fn total_cents(&self) -> u64 {
+        self.total_microdollars() / 10_000
+    }
+}
+
 // ============================================================================
 // Media Types - for multimodal content (images, audio, video)
 // ============================================================================

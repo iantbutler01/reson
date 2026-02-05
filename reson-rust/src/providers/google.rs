@@ -27,10 +27,10 @@ use crate::providers::{
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::ChatRole;
 use crate::types::{Provider, TokenUsage};
-use crate::utils::{
-    media_part_to_google_format, parse_json_value_strict_str, ConversationMessage,
-    JsonStreamAccumulator,
-};
+use crate::utils::{media_part_to_google_format, ConversationMessage, JsonStreamAccumulator};
+
+#[cfg(feature = "google-adc")]
+use crate::utils::parse_json_value_strict_str;
 
 fn google_debug_enabled() -> bool {
     std::env::var("RESON_DEBUG_GOOGLE")
@@ -262,7 +262,7 @@ impl GoogleGenAIClient {
             }
         });
 
-        #[allow(unused_mut)]
+        #[allow(unused_mut)] // mut needed only with google-adc feature
         let mut start_request = client
             .post(&start_url)
             .header("X-Goog-Upload-Protocol", "resumable")
@@ -366,7 +366,7 @@ impl GoogleGenAIClient {
             }
         };
 
-        #[allow(unused_mut)]
+        #[allow(unused_mut)] // mut needed only with google-adc feature
         let mut request = client.get(&url);
 
         #[cfg(feature = "google-adc")]
@@ -461,7 +461,7 @@ impl GoogleGenAIClient {
             }
         };
 
-        #[allow(unused_mut)]
+        #[allow(unused_mut)] // mut needed only with google-adc feature
         let mut request = client.delete(&url);
 
         #[cfg(feature = "google-adc")]
@@ -860,6 +860,7 @@ impl GoogleGenAIClient {
                 self.model, stream, endpoint, body
             );
         }
+        #[allow(unused_mut)] // mut needed only with google-adc feature
         let mut request = client
             .post(self.get_endpoint(stream))
             .timeout(std::time::Duration::from_secs(300))
@@ -952,6 +953,7 @@ impl InferenceClient for GoogleGenAIClient {
             tool_calls,
             reasoning_segments: Vec::new(),
             usage,
+            provider_cost_dollars: None,
             raw: if has_tools || has_tool_calls {
                 Some(body)
             } else {

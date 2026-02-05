@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// Message type that can appear in conversation history
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum ConversationMessage {
     /// Regular chat message (user, assistant, system)
     Chat(ChatMessage),

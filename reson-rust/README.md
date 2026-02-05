@@ -199,6 +199,50 @@ client.delete_file(&uploaded.name).await?;
 
 All clients implement `Clone` for easy use in async contexts.
 
+## Cost Tracking
+
+Track API costs with `TracingInferenceClient`:
+
+```rust
+use reson_agentic::providers::{
+    AnthropicClient, TracingInferenceClient, MemoryCostStore,
+    GenerationConfig, InferenceClient,
+};
+use std::sync::Arc;
+
+let client = AnthropicClient::new(api_key, "claude-sonnet-4-20250514");
+let store = Arc::new(MemoryCostStore::new());
+let tracing_client = TracingInferenceClient::new(Box::new(client))
+    .with_cost_store(store.clone());
+
+// Make requests as normal
+let response = tracing_client.get_generation(&messages, &config).await?;
+
+// Check accumulated cost
+let credits = store.credits();  // microdollars ($1 = 1,000,000)
+println!("Total cost: ${:.6}", credits as f64 / 1_000_000.0);
+```
+
+### Cost Sources
+
+| Provider | Source | Accuracy |
+|----------|--------|----------|
+| OpenRouter | `usage.cost` from API | Exact (provider-reported) |
+| OpenRouter Responses | `usage.cost` from API | Exact (provider-reported) |
+| Anthropic | Calculated from tokens | Estimated |
+| OpenAI | Calculated from tokens | Estimated |
+| Google Gemini | Calculated from tokens | Estimated |
+| Bedrock | Calculated from tokens | Estimated |
+
+OpenRouter is the only provider that returns actual cost in the response. For others, cost is calculated from token counts using pricing tables.
+
+### Features
+
+- **Microdollar precision**: Costs stored as `u64` ($1 = 1,000,000 microdollars) to avoid floating-point errors
+- **CostStore trait**: Implement custom storage backends (database, metrics, etc.)
+- **Trace callbacks**: Hook into every request for custom logging
+- **RESON_TRACE env var**: Set to a directory path to write JSON traces
+
 ## Examples
 
 See the [examples](./examples) directory:

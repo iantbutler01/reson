@@ -1,6 +1,6 @@
 [package]
 name = "resonai-macros"
-version = "0.1.3"
+version = "0.2.1"
 edition = "2021"
 authors = ["Reson Contributors"]
 description = "Proc macros for the resonai LLM agent framework"

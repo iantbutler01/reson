@@ -387,6 +387,7 @@ impl InferenceClient for GoogleAnthropicClient {
             tool_calls,
             reasoning_segments: Vec::new(),
             usage,
+            provider_cost_dollars: None,
             raw: if has_tools || has_tool_calls {
                 Some(body)
             } else {

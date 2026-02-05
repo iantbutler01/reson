@@ -8,11 +8,10 @@ use futures::stream::Stream;
 use std::pin::Pin;
 
 use crate::error::Result;
-use crate::types::TokenUsage;
 use crate::utils::ConversationMessage;
 
-// Re-export Provider from types for convenience
-pub use crate::types::Provider;
+// Re-export types for convenience
+pub use crate::types::{CostInfo, Provider, TokenUsage};
 
 // Provider implementations
 pub mod anthropic;
@@ -23,13 +22,14 @@ pub mod google;
 pub mod google_anthropic;
 pub mod openai;
 pub mod openai_responses;
-pub(crate) mod openai_streaming;
 pub(crate) mod openai_responses_streaming;
+pub(crate) mod openai_streaming;
 pub mod openrouter;
 pub mod openrouter_responses;
 pub mod tracing_client;
 
 pub use anthropic::AnthropicClient;
+#[cfg(feature = "bedrock")]
 pub use bedrock::BedrockClient;
 pub use google::{FileState, GoogleGenAIClient, UploadedFile};
 #[cfg(feature = "google-adc")]
@@ -166,6 +166,10 @@ pub struct GenerationResponse {
     /// Token usage statistics
     pub usage: TokenUsage,
 
+    /// Provider-reported cost in dollars (e.g., from OpenRouter's usage.cost field)
+    /// When present, this is the actual cost charged by the provider.
+    pub provider_cost_dollars: Option<f64>,
+
     /// Raw response (for debugging/tool extraction)
     pub raw: Option<serde_json::Value>,
 }
@@ -179,6 +183,7 @@ impl GenerationResponse {
             tool_calls: Vec::new(),
             reasoning_segments: Vec::new(),
             usage: TokenUsage::default(),
+            provider_cost_dollars: None,
             raw: None,
         }
     }
@@ -186,6 +191,12 @@ impl GenerationResponse {
     /// Check if response contains tool calls
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
+    }
+
+    /// Set provider-reported cost
+    pub fn with_provider_cost(mut self, cost_dollars: f64) -> Self {
+        self.provider_cost_dollars = Some(cost_dollars);
+        self
     }
 }
 
@@ -216,15 +227,76 @@ pub enum StreamChunk {
 }
 
 /// Trace callback type for monitoring (wrapped in Arc for Clone support)
+///
+/// Called after each inference request with:
+/// - request_id: Unique identifier for this request
+/// - messages: The input messages (as JSON values)
+/// - response: The generation response
+/// - cost: Cost information including token counts and calculated cost
 pub type TraceCallback = std::sync::Arc<
     dyn Fn(
             u64,
             Vec<serde_json::Value>,
             &GenerationResponse,
+            &CostInfo,
         ) -> Pin<Box<dyn futures::Future<Output = ()> + Send>>
         + Send
         + Sync,
 >;
+
+/// Trait for cost storage backends
+///
+/// Implementations can store costs in memory, databases, or external services.
+#[async_trait]
+pub trait CostStore: Send + Sync {
+    /// Record cost from an inference request
+    async fn record_cost(&self, model: &str, cost: &CostInfo) -> Result<()>;
+
+    /// Get total credits used in microdollars
+    async fn get_credits_used(&self) -> Result<u64>;
+}
+
+/// In-memory cost store using atomic operations
+///
+/// Stores costs in microdollars ($1 = 1,000,000) for billing-level precision.
+pub struct MemoryCostStore {
+    credits_used: std::sync::atomic::AtomicU64,
+}
+
+impl MemoryCostStore {
+    /// Create a new memory cost store
+    pub fn new() -> Self {
+        Self {
+            credits_used: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Get current credits used (non-async for convenience)
+    pub fn credits(&self) -> u64 {
+        self.credits_used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for MemoryCostStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl CostStore for MemoryCostStore {
+    async fn record_cost(&self, _model: &str, cost: &CostInfo) -> Result<()> {
+        self.credits_used.fetch_add(
+            cost.total_microdollars(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    async fn get_credits_used(&self) -> Result<u64> {
+        Ok(self.credits())
+    }
+}
 
 /// Core trait for LLM provider clients
 #[async_trait]

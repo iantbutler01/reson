@@ -152,6 +152,64 @@ fn test_tool_macro_with_schema_generator() {
     assert_eq!(schema["input_schema"]["type"], "object");
 }
 
+#[test]
+fn test_tool_macro_with_nested_arrays() {
+    use reson_agentic::Tool;
+    use serde::{Deserialize, Serialize};
+
+    /// A single item in a thread
+    #[derive(Tool, Serialize, Deserialize, Clone)]
+    struct ThreadItem {
+        /// The text content
+        text: String,
+        /// Optional image IDs
+        image_ids: Option<Vec<i64>>,
+    }
+
+    /// Create a thread with multiple items
+    #[derive(Tool, Serialize, Deserialize)]
+    struct WriteThread {
+        /// Thread title
+        title: String,
+        /// The items in the thread
+        items: Vec<ThreadItem>,
+        /// IDs to attach
+        attachment_ids: Option<Vec<i64>>,
+    }
+
+    // Test primitive array schema
+    let thread_item_schema = ThreadItem::schema();
+    let props = thread_item_schema["properties"].as_object().unwrap();
+
+    // image_ids should be array of integers
+    assert_eq!(props["image_ids"]["type"], "array");
+    assert_eq!(props["image_ids"]["items"]["type"], "integer");
+
+    // Test nested struct array schema
+    let write_thread_schema = WriteThread::schema();
+    println!("WriteThread schema: {}", serde_json::to_string_pretty(&write_thread_schema).unwrap());
+
+    let thread_props = write_thread_schema["properties"].as_object().unwrap();
+
+    // items should be array with full object schema
+    assert_eq!(thread_props["items"]["type"], "array");
+    println!("items schema: {}", serde_json::to_string_pretty(&thread_props["items"]).unwrap());
+    assert_eq!(thread_props["items"]["items"]["type"], "object");
+
+    // The nested items schema should have properties
+    let nested_props = thread_props["items"]["items"]["properties"].as_object().unwrap();
+    assert!(nested_props.contains_key("text"));
+    assert!(nested_props.contains_key("image_ids"));
+
+    // And the nested array inside should also work
+    assert_eq!(nested_props["image_ids"]["type"], "array");
+    assert_eq!(nested_props["image_ids"]["items"]["type"], "integer");
+
+    // attachment_ids should be array of integers
+    assert_eq!(thread_props["attachment_ids"]["type"], "array");
+    assert_eq!(thread_props["attachment_ids"]["items"]["type"], "integer");
+}
+
 // Note: Testing the #[agentic] macro requires careful setup since it transforms
 // the function signature. Below we test that the macro generates valid code.
 

@@ -172,7 +172,6 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
             let mut runtime = ::reson_agentic::runtime::Runtime::with_config(
                 #model_setup,
                 #api_key_setup,
-                std::sync::Arc::new(::reson_agentic::storage::MemoryStore::new()),
             );
 
             // Execute the original function body with runtime in scope
@@ -291,33 +290,49 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
         }
 
         // Check if this is an array type and get the item type
-        let array_item_type = get_array_item_type(&field.ty);
+        let array_item_info = get_array_item_type(&field.ty);
 
-        if let Some(item_type) = array_item_type {
-            // Array type - include items property
-            schema_properties.push(quote! {
-                properties.insert(
-                    #field_name_str.to_string(),
-                    serde_json::json!({
-                        "type": #json_type,
-                        "description": #field_desc,
-                        "items": {
-                            "type": #item_type
-                        }
-                    })
-                );
-            });
-        } else {
-            // Non-array type
-            schema_properties.push(quote! {
-                properties.insert(
-                    #field_name_str.to_string(),
-                    serde_json::json!({
-                        "type": #json_type,
-                        "description": #field_desc
-                    })
-                );
-            });
+        match array_item_info {
+            Some(ArrayItemType::Primitive(item_type)) => {
+                // Array of primitives - static schema
+                schema_properties.push(quote! {
+                    properties.insert(
+                        #field_name_str.to_string(),
+                        serde_json::json!({
+                            "type": #json_type,
+                            "description": #field_desc,
+                            "items": {
+                                "type": #item_type
+                            }
+                        })
+                    );
+                });
+            }
+            Some(ArrayItemType::Complex(inner_ty)) => {
+                // Array of complex types - call inner type's schema() at runtime
+                schema_properties.push(quote! {
+                    {
+                        let mut arr_schema = serde_json::json!({
+                            "type": #json_type,
+                            "description": #field_desc
+                        });
+                        arr_schema["items"] = #inner_ty::schema();
+                        properties.insert(#field_name_str.to_string(), arr_schema);
+                    }
+                });
+            }
+            None => {
+                // Non-array type
+                schema_properties.push(quote! {
+                    properties.insert(
+                        #field_name_str.to_string(),
+                        serde_json::json!({
+                            "type": #json_type,
+                            "description": #field_desc
+                        })
+                    );
+                });
+            }
         }
     }
 
@@ -549,8 +564,16 @@ fn get_json_type(ty: &syn::Type) -> String {
     "object".to_string()
 }
 
+/// Represents the inner type of an array
+enum ArrayItemType {
+    /// Primitive type like string, integer, number, boolean
+    Primitive(String),
+    /// Complex type (struct) that has its own schema() method
+    Complex(syn::Type),
+}
+
 /// Get the inner type of Vec<T> or Option<Vec<T>>
-fn get_array_item_type(ty: &syn::Type) -> Option<String> {
+fn get_array_item_type(ty: &syn::Type) -> Option<ArrayItemType> {
     if let syn::Type::Path(type_path) = ty {
         if let Some(segment) = type_path.path.segments.last() {
             let ident = segment.ident.to_string();
@@ -568,11 +591,17 @@ fn get_array_item_type(ty: &syn::Type) -> Option<String> {
             if ident == "Vec" {
                 if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                     if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                        return Some(get_json_type(inner_ty));
+                        let json_type = get_json_type(inner_ty);
+                        // Primitive types just need "type": "string" etc
+                        if matches!(json_type.as_str(), "string" | "integer" | "number" | "boolean") {
+                            return Some(ArrayItemType::Primitive(json_type));
+                        }
+                        // Complex types need full schema from T::schema()
+                        return Some(ArrayItemType::Complex(inner_ty.clone()));
                     }
                 }
                 // Default to string if we can't determine the inner type
-                return Some("string".to_string());
+                return Some(ArrayItemType::Primitive("string".to_string()));
             }
         }
     }

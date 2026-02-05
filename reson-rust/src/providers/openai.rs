@@ -277,10 +277,22 @@ impl InferenceClient for OAIClient {
         }
 
         // Parse usage statistics
-        let usage = body
-            .get("usage")
+        let usage_json = body.get("usage");
+        let usage = usage_json
             .map(|u| self.parse_usage(u))
             .unwrap_or_default();
+
+        // Extract provider cost if available (OpenRouter returns usage.cost in dollars)
+        let provider_cost_dollars = if matches!(
+            self.provider,
+            Provider::OpenRouter | Provider::OpenRouterResponses
+        ) {
+            usage_json
+                .and_then(|u| u.get("cost"))
+                .and_then(|c| c.as_f64())
+        } else {
+            None
+        };
 
         // Extract message and content
         let choice = &body["choices"][0];
@@ -310,6 +322,7 @@ impl InferenceClient for OAIClient {
             tool_calls,
             reasoning_segments: Vec::new(),
             usage,
+            provider_cost_dollars,
             raw: if has_tools || has_tool_calls {
                 Some(body)
             } else {

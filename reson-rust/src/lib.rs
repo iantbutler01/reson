@@ -24,7 +24,6 @@ pub mod types;
 pub mod parsers;
 pub mod providers;
 pub mod schema;
-pub mod storage;
 pub mod templating;
 pub mod tools;
 pub mod utils;
@@ -35,7 +34,7 @@ pub use resonai_macros::{agentic, agentic_generator, Deserializable, Tool};
 // Prelude for convenient imports
 pub mod prelude {
     pub use crate::error::{Error, Result};
-    pub use crate::runtime::{ContextApi, Runtime};
+    pub use crate::runtime::Runtime;
     pub use crate::types::{
         CacheMarker, ChatMessage, ChatRole, CreateResult, Provider, ReasoningSegment, TokenUsage,
         ToolCall, ToolResult,

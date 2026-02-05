@@ -2,9 +2,10 @@
 //!
 //! Features:
 //! - Automatic fallback switching on RetriesExceeded
-//! - Cost tracking with per-model pricing
+//! - Cost tracking with per-model pricing (microdollar precision)
 //! - OpenTelemetry span instrumentation (via `tracing` crate)
-//! - Request/response tracing
+//! - Request/response tracing to RESON_TRACE directory
+//! - Trace callback for custom monitoring
 //! - Switches back to primary after 5 minutes
 //!
 //! OTEL Integration:
@@ -14,21 +15,24 @@
 //! - `inference.usage.input_tokens`
 //! - `inference.usage.output_tokens`
 //! - `inference.usage.cached_tokens`
+//! - `inference.cost.microdollars`
 
 use async_trait::async_trait;
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
-use crate::providers::{GenerationConfig, GenerationResponse, InferenceClient, StreamChunk};
-use crate::storage::{MemoryKVStore, Store};
-use crate::types::{Provider, TokenUsage};
+use crate::providers::{
+    CostInfo, CostStore, GenerationConfig, GenerationResponse, InferenceClient, StreamChunk,
+    TraceCallback,
+};
+use crate::types::Provider;
 use crate::utils::ConversationMessage;
 
-const MILLION: f64 = 1_000_000.0;
 const FALLBACK_DURATION: Duration = Duration::from_secs(5 * 60); // 5 minutes
 
 /// Tracks when fallback was activated
@@ -73,17 +77,26 @@ pub struct TracingInferenceClient {
     primary_client: Box<dyn InferenceClient>,
     fallback_client: Option<Box<dyn InferenceClient>>,
     fallback_state: Arc<RwLock<FallbackState>>,
-    store: Option<Arc<MemoryKVStore>>,
+    cost_store: Option<Arc<dyn CostStore>>,
+    trace_callback: Option<TraceCallback>,
+    trace_output_path: Option<String>,
+    request_counter: AtomicU64,
 }
 
 impl TracingInferenceClient {
     /// Create a new tracing client with primary client only
     pub fn new(primary: Box<dyn InferenceClient>) -> Self {
+        // Check for RESON_TRACE env var
+        let trace_output_path = std::env::var("RESON_TRACE").ok();
+
         Self {
             primary_client: primary,
             fallback_client: None,
             fallback_state: Arc::new(RwLock::new(FallbackState::new())),
-            store: None,
+            cost_store: None,
+            trace_callback: None,
+            trace_output_path,
+            request_counter: AtomicU64::new(0),
         }
     }
 
@@ -92,18 +105,40 @@ impl TracingInferenceClient {
         primary: Box<dyn InferenceClient>,
         fallback: Box<dyn InferenceClient>,
     ) -> Self {
+        let trace_output_path = std::env::var("RESON_TRACE").ok();
+
         Self {
             primary_client: primary,
             fallback_client: Some(fallback),
             fallback_state: Arc::new(RwLock::new(FallbackState::new())),
-            store: None,
+            cost_store: None,
+            trace_callback: None,
+            trace_output_path,
+            request_counter: AtomicU64::new(0),
         }
     }
 
-    /// Attach storage for cost tracking
-    pub fn with_store(mut self, store: Arc<MemoryKVStore>) -> Self {
-        self.store = Some(store);
+    /// Add a cost store for tracking credits used
+    pub fn with_cost_store(mut self, store: Arc<dyn CostStore>) -> Self {
+        self.cost_store = Some(store);
         self
+    }
+
+    /// Add a trace callback for custom monitoring
+    pub fn with_trace_callback(mut self, callback: TraceCallback) -> Self {
+        self.trace_callback = Some(callback);
+        self
+    }
+
+    /// Set trace output path (overrides RESON_TRACE env var)
+    pub fn with_trace_output(mut self, path: impl Into<String>) -> Self {
+        self.trace_output_path = Some(path.into());
+        self
+    }
+
+    /// Generate a unique request ID
+    fn next_request_id(&self) -> u64 {
+        self.request_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Get the active client (primary or fallback)
@@ -126,89 +161,156 @@ impl TracingInferenceClient {
         self.primary_client.as_ref()
     }
 
-    /// Calculate cost based on model and token usage
-    fn calculate_cost(&self, model: &str, usage: &TokenUsage) -> f64 {
-        let mut cost = 0.0;
-
-        // Note: TokenUsage.cached_tokens represents cache hits (reads)
-        // Python separates cache_read and cache_write tokens
-
-        if model.contains("claude") || model.contains("Anthropic") {
-            if model.contains("haiku") {
-                // Haiku pricing
-                cost += (usage.input_tokens as f64) * (80.0 / MILLION);
-                cost += (usage.output_tokens as f64) * (400.0 / MILLION);
-                cost += (usage.cached_tokens as f64) * (8.0 / MILLION); // cache read
-            } else if model.contains("opus") {
-                // Opus pricing
-                cost += (usage.input_tokens as f64) * (1500.0 / MILLION);
-                cost += (usage.output_tokens as f64) * (7500.0 / MILLION);
-                cost += (usage.cached_tokens as f64) * (150.0 / MILLION); // cache read
-            } else {
-                // Default to Sonnet pricing
-                cost += (usage.input_tokens as f64) * (300.0 / MILLION);
-                cost += (usage.output_tokens as f64) * (1500.0 / MILLION);
-                cost += (usage.cached_tokens as f64) * (30.0 / MILLION); // cache read
-            }
-        } else if model.contains("gpt-4o") || model.contains("o4-mini") {
-            if model.contains("mini") {
-                // GPT-4o-mini / o4-mini
-                cost += (usage.input_tokens as f64) * (110.0 / MILLION);
-                cost += (usage.output_tokens as f64) * (440.0 / MILLION);
-                cost += (usage.cached_tokens as f64) * (27.5 / MILLION); // cache read
-            } else {
-                // GPT-4o
-                cost += (usage.input_tokens as f64) * (500.0 / MILLION);
-                cost += (usage.output_tokens as f64) * (1500.0 / MILLION);
-                cost += (usage.cached_tokens as f64) * (125.0 / MILLION); // cache read
-            }
-        } else if model.contains("o3") {
-            // o3 pricing
-            cost += (usage.input_tokens as f64) * (1000.0 / MILLION);
-            cost += (usage.output_tokens as f64) * (4000.0 / MILLION);
-            cost += (usage.cached_tokens as f64) * (250.0 / MILLION); // cache read
+    /// Handle tracing after a successful request
+    async fn handle_trace(
+        &self,
+        request_id: u64,
+        messages: &[ConversationMessage],
+        response: &GenerationResponse,
+        model: &str,
+    ) -> Result<()> {
+        // Use provider cost if available (e.g., from OpenRouter), otherwise calculate
+        let cost = if let Some(provider_cost) = response.provider_cost_dollars {
+            CostInfo::from_usage_with_provider_cost(&response.usage, model, provider_cost)
         } else {
-            log::warn!("No cost information for model: {}", model);
-        }
+            CostInfo::from_usage(&response.usage, model)
+        };
 
-        cost
-    }
-
-    /// Track cost to storage (in cents)
-    async fn track_cost(&self, model: &str, usage: &TokenUsage) -> Result<()> {
-        if let Some(ref store) = self.store {
-            let cost_dollars = self.calculate_cost(model, usage);
-            let cost_cents = (cost_dollars * 100.0).ceil() as u64;
-
-            // Get current usage
-            let current: u64 = store.get("credits_used").await?.unwrap_or(0);
-
-            // Add new cost
-            store.set("credits_used", &(current + cost_cents)).await?;
-
+        // Record to cost store
+        if let Some(ref store) = self.cost_store {
+            store.record_cost(model, &cost).await?;
             log::debug!(
-                "Cost tracking: {} cents for {} tokens (model: {})",
-                cost_cents,
-                usage.input_tokens + usage.output_tokens,
+                "Cost tracking: {} microdollars for {} tokens (model: {})",
+                cost.total_microdollars(),
+                response.usage.input_tokens + response.usage.output_tokens,
                 model
             );
         }
+
+        // Call trace callback
+        if let Some(ref cb) = self.trace_callback {
+            let msgs_json: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+                .collect();
+            cb(request_id, msgs_json, response, &cost).await;
+        }
+
+        // Write trace output
+        if let Some(ref path) = self.trace_output_path {
+            self.write_trace(path, request_id, messages, response, &cost)
+                .await?;
+        }
+
         Ok(())
     }
 
-    /// Trace request to storage if configured
-    #[allow(dead_code)]
-    async fn trace_request(&self, _messages: &[ConversationMessage], _id: u64) -> Result<()> {
-        // TODO: Implement trace_output equivalent
-        // Would write to RESON_TRACE directory or S3 bucket
+    /// Write trace data to the configured output path
+    async fn write_trace(
+        &self,
+        path: &str,
+        request_id: u64,
+        messages: &[ConversationMessage],
+        response: &GenerationResponse,
+        cost: &CostInfo,
+    ) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let msgs_json: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .collect();
+
+        let trace_data = serde_json::json!({
+            "request_id": request_id,
+            "timestamp": timestamp,
+            "messages": msgs_json,
+            "response": {
+                "content": response.content,
+                "tool_calls_count": response.tool_calls.len(),
+                "has_reasoning": response.reasoning.is_some(),
+            },
+            "usage": {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "cached_tokens": response.usage.cached_tokens,
+            },
+            "cost": {
+                "input_tokens": cost.input_tokens,
+                "output_tokens": cost.output_tokens,
+                "cache_read_input_tokens": cost.cache_read_input_tokens,
+                "microdollar_cost": cost.microdollar_cost,
+                "total_dollars": cost.total_dollars(),
+            }
+        });
+
+        // Create directory if needed
+        tokio::fs::create_dir_all(path).await.map_err(|e| {
+            Error::NonRetryable(format!("Failed to create trace directory {}: {}", path, e))
+        })?;
+
+        // Write trace file
+        let file_path = format!("{}/trace_{}.json", path, request_id);
+        let json_str = serde_json::to_string_pretty(&trace_data)
+            .map_err(|e| Error::NonRetryable(format!("Failed to serialize trace: {}", e)))?;
+
+        tokio::fs::write(&file_path, json_str).await.map_err(|e| {
+            Error::NonRetryable(format!("Failed to write trace file {}: {}", file_path, e))
+        })?;
+
+        log::debug!("Wrote trace to {}", file_path);
         Ok(())
     }
 
-    /// Trace response to storage if configured
-    #[allow(dead_code)]
-    async fn trace_response(&self, _response: &str, _id: u64) -> Result<()> {
-        // TODO: Implement trace_output equivalent
-        Ok(())
+    /// Handle streaming cost tracking by wrapping the stream
+    fn wrap_stream_for_cost_tracking(
+        &self,
+        stream: Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>,
+        model: String,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>> {
+        let cost_store = self.cost_store.clone();
+
+        let wrapped = stream.then(move |chunk| {
+            let model = model.clone();
+            let cost_store = cost_store.clone();
+
+            async move {
+                if let Ok(StreamChunk::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                }) = &chunk
+                {
+                    // Calculate and record cost
+                    let usage = crate::types::TokenUsage::new(
+                        *input_tokens,
+                        *output_tokens,
+                        *cached_tokens,
+                    );
+                    let cost = CostInfo::from_usage(&usage, &model);
+
+                    if let Some(ref store) = cost_store {
+                        if let Err(e) = store.record_cost(&model, &cost).await {
+                            log::warn!("Failed to record streaming cost: {}", e);
+                        }
+                    }
+
+                    log::debug!(
+                        "Streaming cost: {} microdollars for {} tokens",
+                        cost.total_microdollars(),
+                        input_tokens + output_tokens
+                    );
+                }
+                chunk
+            }
+        });
+
+        Box::pin(wrapped)
     }
 }
 
@@ -222,7 +324,8 @@ impl InferenceClient for TracingInferenceClient {
             model = %config.model,
             inference.usage.input_tokens,
             inference.usage.output_tokens,
-            inference.usage.cached_tokens
+            inference.usage.cached_tokens,
+            inference.cost.microdollars
         )
     )]
     async fn get_generation(
@@ -230,6 +333,7 @@ impl InferenceClient for TracingInferenceClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
+        let request_id = self.next_request_id();
         let client = self.get_active_client().await;
         let provider = client.provider();
 
@@ -250,7 +354,7 @@ impl InferenceClient for TracingInferenceClient {
                 // Retry with fallback
                 let response = fallback.get_generation(messages, config).await?;
 
-                // Record token usage on span
+                // Record metrics on span
                 let span = tracing::Span::current();
                 span.record("inference.usage.input_tokens", response.usage.input_tokens);
                 span.record(
@@ -262,10 +366,20 @@ impl InferenceClient for TracingInferenceClient {
                     response.usage.cached_tokens,
                 );
 
-                // Track cost and trace
-                let fallback_provider = fallback.provider();
-                let model = format!("{:?}", fallback_provider);
-                self.track_cost(&model, &response.usage).await?;
+                let cost = if let Some(provider_cost) = response.provider_cost_dollars {
+                    CostInfo::from_usage_with_provider_cost(
+                        &response.usage,
+                        &config.model,
+                        provider_cost,
+                    )
+                } else {
+                    CostInfo::from_usage(&response.usage, &config.model)
+                };
+                span.record("inference.cost.microdollars", cost.total_microdollars());
+
+                // Handle tracing
+                self.handle_trace(request_id, messages, &response, &config.model)
+                    .await?;
 
                 return Ok(response);
             } else {
@@ -275,7 +389,7 @@ impl InferenceClient for TracingInferenceClient {
 
         let response = result?;
 
-        // Record token usage on span
+        // Record metrics on span
         let span = tracing::Span::current();
         span.record("inference.usage.input_tokens", response.usage.input_tokens);
         span.record(
@@ -287,9 +401,16 @@ impl InferenceClient for TracingInferenceClient {
             response.usage.cached_tokens,
         );
 
-        // Track cost for successful call
-        let model = format!("{:?}", provider);
-        self.track_cost(&model, &response.usage).await?;
+        let cost = if let Some(provider_cost) = response.provider_cost_dollars {
+            CostInfo::from_usage_with_provider_cost(&response.usage, &config.model, provider_cost)
+        } else {
+            CostInfo::from_usage(&response.usage, &config.model)
+        };
+        span.record("inference.cost.microdollars", cost.total_microdollars());
+
+        // Handle tracing
+        self.handle_trace(request_id, messages, &response, &config.model)
+            .await?;
 
         Ok(response)
     }
@@ -324,13 +445,15 @@ impl InferenceClient for TracingInferenceClient {
                 drop(state);
 
                 // Retry with fallback
-                return fallback.connect_and_listen(messages, config).await;
+                let stream = fallback.connect_and_listen(messages, config).await?;
+                return Ok(self.wrap_stream_for_cost_tracking(stream, config.model.clone()));
             } else {
                 return Err(Error::RetriesExceeded);
             }
         }
 
-        result
+        let stream = result?;
+        Ok(self.wrap_stream_for_cost_tracking(stream, config.model.clone()))
     }
 
     fn provider(&self) -> Provider {
@@ -342,15 +465,16 @@ impl InferenceClient for TracingInferenceClient {
         self.primary_client.supports_native_tools()
     }
 
-    fn set_trace_callback(&mut self, _callback: crate::providers::TraceCallback) {
-        // TracingClient handles its own tracing
+    fn set_trace_callback(&mut self, callback: TraceCallback) {
+        self.trace_callback = Some(callback);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryStore;
+    use crate::providers::MemoryCostStore;
+    use crate::types::TokenUsage;
 
     struct MockClient {
         should_fail: bool,
@@ -377,6 +501,7 @@ mod tests {
                         output_tokens: 50,
                         cached_tokens: 0,
                     },
+                    provider_cost_dollars: None,
                     raw: None,
                 })
             }
@@ -398,7 +523,7 @@ mod tests {
             true
         }
 
-        fn set_trace_callback(&mut self, _callback: crate::providers::TraceCallback) {}
+        fn set_trace_callback(&mut self, _callback: TraceCallback) {}
     }
 
     #[tokio::test]
@@ -409,7 +534,7 @@ mod tests {
         });
 
         let client = TracingInferenceClient::new(primary);
-        let config = GenerationConfig::default();
+        let config = GenerationConfig::new("claude-3-sonnet");
         let result = client.get_generation(&[], &config).await;
 
         assert!(result.is_ok());
@@ -427,7 +552,7 @@ mod tests {
         });
 
         let client = TracingInferenceClient::with_fallback(primary, fallback);
-        let config = GenerationConfig::default();
+        let config = GenerationConfig::new("claude-3-sonnet");
         let result = client.get_generation(&[], &config).await;
 
         assert!(result.is_ok());
@@ -440,20 +565,52 @@ mod tests {
             provider: Provider::Anthropic,
         });
 
-        let store = Arc::new(MemoryKVStore::new());
-        let client = TracingInferenceClient::new(primary).with_store(store.clone());
+        let store = Arc::new(MemoryCostStore::new());
+        let client = TracingInferenceClient::new(primary).with_cost_store(store.clone());
 
-        let config = GenerationConfig::default();
+        // Use a model name that triggers Sonnet pricing
+        let config = GenerationConfig::new("claude-3-sonnet");
         let _ = client.get_generation(&[], &config).await.unwrap();
 
         // Check cost was tracked
-        let credits: Option<u64> = store.get("credits_used").await.unwrap();
-        assert!(credits.is_some(), "No credits tracked");
-        let credits_value = credits.unwrap();
+        let credits = store.credits();
+        assert!(credits > 0, "Credits tracked but zero: {}", credits);
+
+        // Verify the cost is in a reasonable range for Sonnet pricing
+        // 100 input tokens * 3 microdollars + 50 output tokens * 15 microdollars = 1050 microdollars
         assert!(
-            credits_value > 0,
-            "Credits tracked but zero: {}",
-            credits_value
+            credits >= 1000 && credits <= 1100,
+            "Unexpected credit amount: {} (expected ~1050)",
+            credits
         );
+    }
+
+    #[tokio::test]
+    async fn test_cost_info_calculation() {
+        let usage = TokenUsage::new(1000, 500, 100);
+        let cost = CostInfo::from_usage(&usage, "claude-3-sonnet");
+
+        // Sonnet: 3 microdollars/input, 15 microdollars/output, 0.30 microdollars/cache
+        // 1000 * 3 + 500 * 15 + 100 * 0.30 = 3000 + 7500 + 30 = 10530 (ceil to 10530)
+        assert!(cost.microdollar_cost >= 10500);
+        assert!(cost.microdollar_cost <= 10600);
+
+        // Test Haiku pricing
+        let cost_haiku = CostInfo::from_usage(&usage, "claude-3-haiku");
+        // 1000 * 0.8 + 500 * 4 + 100 * 0.08 = 800 + 2000 + 8 = 2808
+        assert!(cost_haiku.microdollar_cost >= 2800);
+        assert!(cost_haiku.microdollar_cost <= 2900);
+
+        // Test Opus pricing
+        let cost_opus = CostInfo::from_usage(&usage, "claude-3-opus");
+        // 1000 * 15 + 500 * 75 + 100 * 1.5 = 15000 + 37500 + 150 = 52650
+        assert!(cost_opus.microdollar_cost >= 52600);
+        assert!(cost_opus.microdollar_cost <= 52700);
+    }
+
+    #[test]
+    fn test_memory_cost_store() {
+        let store = MemoryCostStore::new();
+        assert_eq!(store.credits(), 0);
     }
 }
