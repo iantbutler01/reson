@@ -37,16 +37,16 @@ fn get_openrouter_key() -> Option<String> {
 
 #[tokio::test]
 #[ignore = "Requires OPENROUTER_API_KEY"]
-async fn test_openai_reasoning_o3_mini() {
+async fn test_openai_reasoning() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    // O3-mini with reasoning=high
-    let client = OpenRouterClient::new(api_key, "openai/o3-mini", None, None);
+    // GPT-5.2 with reasoning=high
+    let client = OpenRouterClient::new(api_key, "openai/gpt-5.2", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "How would you build the world's tallest skyscraper?",
     ))];
 
-    let config = GenerationConfig::new("openai/o3-mini")
+    let config = GenerationConfig::new("openai/gpt-5.2")
         .with_max_tokens(5000)
         .with_reasoning_effort("high");
 
@@ -537,6 +537,121 @@ fn test_reasoning_segments_collection() {
         .collect::<Vec<_>>()
         .join(" ");
     assert_eq!(full_reasoning, "First thought Second thought Third thought");
+}
+
+// ============================================================================
+// Direct Anthropic Reasoning/Signature Tests
+// ============================================================================
+
+/// Test Anthropic extended thinking with signature_delta streaming.
+///
+/// This exercises the `signature_delta` code path in anthropic_streaming.rs
+/// which is the only way Anthropic emits reasoning signatures. Extended thinking
+/// requires `with_thinking_budget()` on the client and a model that supports it.
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_thinking_with_signature() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client =
+        AnthropicClient::new(api_key, "claude-sonnet-4-20250514").with_thinking_budget(1024);
+
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "What is 17 * 23? Think through this step by step.",
+    ))];
+
+    let config = GenerationConfig::new("claude-sonnet-4-20250514").with_max_tokens(4096);
+
+    let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
+
+    let mut content_chunks: Vec<String> = Vec::new();
+    let mut reasoning_chunks: Vec<String> = Vec::new();
+    let mut has_signature = false;
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => match chunk {
+                StreamChunk::Content(text) => {
+                    print!("C: {}", text);
+                    content_chunks.push(text);
+                }
+                StreamChunk::Reasoning(text) => {
+                    print!("R: {}", text);
+                    reasoning_chunks.push(text);
+                }
+                StreamChunk::Signature(sig) => {
+                    println!("\nSignature received ({} bytes)", sig.len());
+                    has_signature = true;
+                }
+                _ => {}
+            },
+            Err(e) => {
+                eprintln!("Stream error: {}", e);
+                break;
+            }
+        }
+    }
+
+    println!("\n\nContent chunks: {}", content_chunks.len());
+    println!("Reasoning chunks: {}", reasoning_chunks.len());
+    println!("Has signature: {}", has_signature);
+
+    // Extended thinking should produce reasoning content
+    assert!(
+        !reasoning_chunks.is_empty(),
+        "Anthropic extended thinking should produce reasoning chunks"
+    );
+
+    // Should have content with the answer
+    assert!(
+        !content_chunks.is_empty(),
+        "Should produce content with the answer"
+    );
+
+    let full_content: String = content_chunks.join("");
+    assert!(
+        full_content.contains("391"),
+        "Should contain the answer 391 (17 * 23)"
+    );
+
+    // Extended thinking should emit a signature_delta for reasoning integrity
+    assert!(
+        has_signature,
+        "Anthropic extended thinking should emit a signature for reasoning integrity"
+    );
+}
+
+/// Test Anthropic extended thinking with non-streaming get_generation.
+/// Verifies reasoning segments and signatures come through the non-streaming path.
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_thinking_non_streaming() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client =
+        AnthropicClient::new(api_key, "claude-sonnet-4-20250514").with_thinking_budget(1024);
+
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "What is 12 * 15? Think step by step.",
+    ))];
+
+    let config = GenerationConfig::new("claude-sonnet-4-20250514").with_max_tokens(4096);
+
+    let response = client.get_generation(&messages, &config).await.unwrap();
+
+    println!("Content: {}", response.content);
+    println!("Reasoning: {:?}", response.reasoning);
+
+    // Should have content
+    assert!(!response.content.is_empty(), "Should produce content");
+    assert!(
+        response.content.contains("180"),
+        "Should contain the answer 180 (12 * 15)"
+    );
+
+    // Extended thinking should produce reasoning
+    assert!(
+        response.reasoning.is_some(),
+        "Anthropic extended thinking should produce reasoning segments"
+    );
 }
 
 // ============================================================================

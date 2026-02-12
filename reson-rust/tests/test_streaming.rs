@@ -10,7 +10,7 @@ use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use reson_agentic::types::ChatMessage;
+use reson_agentic::types::{ChatMessage, ToolCall};
 use reson_agentic::utils::ConversationMessage;
 use std::env;
 
@@ -67,7 +67,8 @@ async fn test_anthropic_basic_streaming() {
 
     let mut full_content = String::new();
     let mut chunk_count = 0;
-    let mut got_usage = false;
+    let mut total_input_tokens = 0u64;
+    let mut total_output_tokens = 0u64;
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
@@ -84,9 +85,8 @@ async fn test_anthropic_basic_streaming() {
                         ..
                     } => {
                         println!("\nUsage: {} in, {} out", input_tokens, output_tokens);
-                        got_usage = true;
-                        assert!(input_tokens > 0);
-                        assert!(output_tokens > 0);
+                        total_input_tokens += input_tokens;
+                        total_output_tokens += output_tokens;
                     }
                     _ => {}
                 }
@@ -104,7 +104,8 @@ async fn test_anthropic_basic_streaming() {
         full_content.contains("1") && full_content.contains("5"),
         "Content should contain numbers 1 and 5"
     );
-    assert!(got_usage, "Should receive usage information");
+    assert!(total_input_tokens > 0, "Should receive input token usage");
+    assert!(total_output_tokens > 0, "Should receive output token usage");
 }
 
 #[tokio::test]
@@ -255,12 +256,13 @@ async fn test_anthropic_streaming_with_tools() {
         "Should receive tool call in streaming"
     );
 
-    let tool_call = &tool_calls[0];
-    let name = tool_call
-        .get("name")
-        .or_else(|| tool_call.get("_tool_name"))
-        .and_then(|v| v.as_str());
-    assert_eq!(name, Some("add_numbers"));
+    // Streaming accumulator emits tool calls in OpenAI format {id, function: {name, arguments}}
+    let tc = ToolCall::from_provider_format(
+        tool_calls[0].clone(),
+        reson_agentic::types::Provider::OpenAI,
+    )
+    .expect("Failed to parse tool call");
+    assert_eq!(tc.tool_name, "add_numbers");
 }
 
 #[tokio::test]
@@ -362,6 +364,9 @@ async fn test_google_streaming_with_thinking() {
         !reasoning_chunks.is_empty() || !content_chunks.is_empty(),
         "Should receive either reasoning or content"
     );
+
+    // Google thinking models should emit signatures for reasoning integrity
+    println!("Has signature: {}", has_signature);
 }
 
 #[tokio::test]
@@ -454,6 +459,16 @@ fn test_stream_chunk_types() {
             assert_eq!(input_tokens, 100);
             assert_eq!(output_tokens, 50);
         }
+        _ => panic!("Wrong variant"),
+    }
+
+    match signature {
+        StreamChunk::Signature(s) => assert_eq!(s, "sig123"),
+        _ => panic!("Wrong variant"),
+    }
+
+    match tool_partial {
+        StreamChunk::ToolCallPartial(v) => assert_eq!(v["partial"], true),
         _ => panic!("Wrong variant"),
     }
 

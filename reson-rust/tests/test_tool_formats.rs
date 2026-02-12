@@ -10,8 +10,19 @@ use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
+use reson_agentic::schema::get_schema_generator;
 use reson_agentic::utils::ConversationMessage;
 use std::env;
+
+/// Convert an Anthropic-format tool schema to the given provider format
+fn tool_schema_for(provider: &str, schema: &serde_json::Value) -> serde_json::Value {
+    let gen = get_schema_generator(provider).unwrap();
+    gen.generate_schema(
+        schema["name"].as_str().unwrap(),
+        schema["description"].as_str().unwrap(),
+        schema["input_schema"].clone(),
+    )
+}
 
 // ============================================================================
 // Helper Functions
@@ -295,7 +306,7 @@ async fn test_cross_provider_tool_call_format() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![calculate_tool_schema()])
+        .with_tools(vec![tool_schema_for("openrouter", &calculate_tool_schema())])
         .with_native_tools(true);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
@@ -308,16 +319,13 @@ async fn test_cross_provider_tool_call_format() {
                 StreamChunk::ToolCallComplete(tool_call) => {
                     println!("Tool call: {:?}", tool_call);
 
-                    // Validate format consistency
-                    // Should have either "name" (Anthropic) or "function.name" (OpenAI)
-                    let name = tool_call
-                        .get("name")
-                        .or_else(|| tool_call.get("function").and_then(|f| f.get("name")))
-                        .or_else(|| tool_call.get("_tool_name"))
-                        .and_then(|v| v.as_str());
-
-                    assert!(name.is_some(), "Tool call should have a name field");
-                    println!("Tool name: {}", name.unwrap());
+                    // Streaming emits OpenAI format {id, function: {name, arguments}}
+                    let tc = ToolCall::from_provider_format(
+                        tool_call.clone(),
+                        Provider::OpenAI,
+                    )
+                    .expect("Tool call should parse");
+                    println!("Tool name: {}", tc.tool_name);
 
                     tool_calls.push(tool_call);
                 }
@@ -398,7 +406,10 @@ async fn test_mixed_tool_registration_formats() {
     // Mix of tools
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![calculate_tool_schema(), untyped_tool_schema()])
+        .with_tools(vec![
+            tool_schema_for("openrouter", &calculate_tool_schema()),
+            tool_schema_for("openrouter", &untyped_tool_schema()),
+        ])
         .with_native_tools(true);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
@@ -410,15 +421,14 @@ async fn test_mixed_tool_registration_formats() {
         match chunk_result {
             Ok(chunk) => match chunk {
                 StreamChunk::ToolCallComplete(tool_call) => {
-                    let name = tool_call
-                        .get("name")
-                        .or_else(|| tool_call.get("_tool_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    println!("Mixed tool: {}", name);
-                    tool_names.push(name);
+                    // Streaming emits OpenAI format {id, function: {name, arguments}}
+                    let tc = ToolCall::from_provider_format(
+                        tool_call.clone(),
+                        Provider::OpenAI,
+                    )
+                    .expect("Tool call should parse");
+                    println!("Mixed tool: {}", tc.tool_name);
+                    tool_names.push(tc.tool_name);
                     tool_calls.push(tool_call);
                 }
                 _ => {}
@@ -597,7 +607,7 @@ async fn test_streaming_tool_call_deltas() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![search_tool_schema()])
+        .with_tools(vec![tool_schema_for("openrouter", &search_tool_schema())])
         .with_native_tools(true);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
@@ -632,4 +642,109 @@ async fn test_streaming_tool_call_deltas() {
         complete_count > 0,
         "Should receive complete tool call from stream"
     );
+}
+
+// ============================================================================
+// Direct Anthropic Streaming Tool Format Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_streaming_tool_call_format() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
+
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "Calculate 5 + 3 using calculate_function",
+    ))];
+
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001")
+        .with_max_tokens(1024)
+        .with_tools(vec![calculate_tool_schema()])
+        .with_native_tools(true);
+
+    let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
+
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut partial_count = 0;
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => match chunk {
+                StreamChunk::ToolCallPartial(_partial) => {
+                    partial_count += 1;
+                }
+                StreamChunk::ToolCallComplete(tool_call) => {
+                    println!("Anthropic tool call: {:?}", tool_call);
+
+                    // Streaming accumulator emits OpenAI format {id, function: {name, arguments}}
+                    let tc = ToolCall::from_provider_format(
+                        tool_call.clone(),
+                        Provider::OpenAI,
+                    )
+                    .expect("Anthropic streaming tool call should parse");
+                    println!("Tool name: {}", tc.tool_name);
+
+                    tool_calls.push(tool_call);
+                }
+                _ => {}
+            },
+            Err(e) => {
+                eprintln!("Stream error: {}", e);
+                break;
+            }
+        }
+    }
+
+    println!("Partials: {}, Complete: {}", partial_count, tool_calls.len());
+    assert!(!tool_calls.is_empty(), "Should receive Anthropic tool calls");
+
+    // Verify the tool call has expected structure
+    let tc = ToolCall::from_provider_format(
+        tool_calls[0].clone(),
+        Provider::OpenAI,
+    )
+    .expect("Should parse tool call");
+    assert_eq!(tc.tool_name, "calculate_function");
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_tool_call_with_tool_result() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
+
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "Search for 'rust programming' using search_function",
+    ))];
+
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001")
+        .with_max_tokens(1024)
+        .with_tools(vec![search_tool_schema()])
+        .with_native_tools(true);
+
+    let response = client.get_generation(&messages, &config).await.unwrap();
+
+    println!("Response: {:?}", response);
+
+    assert!(
+        !response.tool_calls.is_empty(),
+        "Expected tool call in response"
+    );
+
+    let tool_call_json = &response.tool_calls[0];
+
+    // Extract fields using Anthropic format
+    let tool_name = tool_call_json
+        .get("name")
+        .or_else(|| tool_call_json.get("_tool_name"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(tool_name, "search_function");
+
+    // Verify the tool call can be parsed into our ToolCall type
+    let tool_call =
+        ToolCall::from_provider_format(tool_call_json.clone(), Provider::Anthropic).unwrap();
+    assert_eq!(tool_call.tool_name, "search_function");
+    assert!(tool_call.args.get("text").is_some(), "Should have text arg");
 }

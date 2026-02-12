@@ -617,14 +617,21 @@ impl GoogleGenAIClient {
                 }
                 ConversationMessage::ToolCall(tool_call) => {
                     // Google uses functionCall for assistant tool calls
+                    let mut part = serde_json::json!({
+                        "functionCall": {
+                            "name": tool_call.tool_name,
+                            "args": tool_call.args
+                        }
+                    });
+                    // Include thoughtSignature if available (required by Google for multi-turn)
+                    if let Some(ref obj) = tool_call.tool_obj {
+                        if let Some(sig) = obj.get("thoughtSignature") {
+                            part["thoughtSignature"] = sig.clone();
+                        }
+                    }
                     contents.push(serde_json::json!({
                         "role": "model",
-                        "parts": [{
-                            "functionCall": {
-                                "name": tool_call.tool_name,
-                                "args": tool_call.args
-                            }
-                        }]
+                        "parts": [part]
                     }));
                 }
                 ConversationMessage::ToolResult(tool_result) => {
@@ -785,8 +792,11 @@ impl GoogleGenAIClient {
                             std::collections::hash_map::DefaultHasher::new().finish()
                         );
 
+                        // Preserve thoughtSignature if present (required for multi-turn)
+                        let thought_signature = part.get("thoughtSignature").cloned();
+
                         // Convert to normalized format with _tool_name for compatibility
-                        tool_calls.push(serde_json::json!({
+                        let mut tc = serde_json::json!({
                             "id": id,
                             "_tool_name": name,
                             "_tool_use_id": id,
@@ -794,9 +804,13 @@ impl GoogleGenAIClient {
                             "input": args,
                             "function": {
                                 "name": name,
-                                "arguments": serde_json::to_string(&args).unwrap_or_default()
+                                "arguments": args
                             }
-                        }));
+                        });
+                        if let Some(sig) = thought_signature {
+                            tc["thoughtSignature"] = sig;
+                        }
+                        tool_calls.push(tc);
                     }
                 }
             }
@@ -1042,7 +1056,7 @@ impl InferenceClient for GoogleGenAIClient {
                                                                 "input": args,
                                                                 "function": {
                                                                     "name": name,
-                                                                    "arguments": serde_json::to_string(&args).unwrap_or_default()
+                                                                    "arguments": args
                                                                 }
                                                             });
 

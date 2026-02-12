@@ -12,7 +12,6 @@ use futures::future::BoxFuture;
 use reson_agentic::agentic;
 use reson_agentic::error::Result;
 use reson_agentic::parsers::{Deserializable, FieldDescription};
-use reson_agentic::runtime::Runtime;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================

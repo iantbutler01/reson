@@ -837,9 +837,18 @@ impl ToolCall {
             }),
             Provider::OpenAI | Provider::OpenRouter => {
                 let function = &provider_format["function"];
-                let args_str = function["arguments"]
-                    .as_str()
-                    .ok_or_else(|| Error::Parse("Missing 'arguments' in tool call".to_string()))?;
+                let arguments = &function["arguments"];
+
+                // Handle both string (real API) and object (streaming accumulator) arguments
+                let (args, raw_arguments) = if let Some(args_str) = arguments.as_str() {
+                    let parsed: serde_json::Value = serde_json::from_str(args_str)?;
+                    (parsed, Some(args_str.to_string()))
+                } else if arguments.is_object() {
+                    let raw = serde_json::to_string(arguments)?;
+                    (arguments.clone(), Some(raw))
+                } else {
+                    return Err(Error::Parse("Missing 'arguments' in tool call".to_string()));
+                };
 
                 Ok(Self {
                     tool_use_id: provider_format["id"]
@@ -850,8 +859,8 @@ impl ToolCall {
                         .as_str()
                         .ok_or_else(|| Error::Parse("Missing 'name' in function".to_string()))?
                         .to_string(),
-                    args: serde_json::from_str(args_str)?,
-                    raw_arguments: Some(args_str.to_string()),
+                    args,
+                    raw_arguments,
                     signature: None,
                     tool_obj: Some(provider_format),
                 })

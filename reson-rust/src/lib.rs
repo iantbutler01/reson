@@ -28,8 +28,15 @@ pub mod templating;
 pub mod tools;
 pub mod utils;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 // Re-export proc macros from resonai-macros crate
 pub use resonai_macros::{agentic, agentic_generator, Deserializable, Tool};
+
+// Re-export McpServer for convenience
+#[cfg(feature = "mcp")]
+pub use crate::mcp::McpServer;
 
 // Prelude for convenient imports
 pub mod prelude {

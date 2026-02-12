@@ -67,17 +67,22 @@ opentelemetry_sdk = { version = "0.24", optional = true }
 # Optional: Google Cloud ADC authentication
 gcp_auth = { version = "0.12", optional = true }
 
+# Optional: MCP support
+reson-mcp = { path = "../reson-mcp", optional = true, default-features = false, features = ["client", "server"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 proptest = "1.4"
 
 [features]
 default = []
-full = ["bedrock", "templating", "telemetry", "google-adc"]
+full = ["bedrock", "templating", "telemetry", "google-adc", "mcp"]
 bedrock = ["aws-config", "aws-sdk-bedrockruntime"]
 templating = ["minijinja"]
 telemetry = ["opentelemetry", "opentelemetry_sdk"]
 google-adc = ["gcp_auth"]
+mcp = ["dep:reson-mcp"]
+mcp-apps = ["mcp", "reson-mcp/apps"]
 
 [lints.rust]
 warnings = "deny"

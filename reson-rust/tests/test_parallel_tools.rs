@@ -9,9 +9,20 @@ use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
+use reson_agentic::schema::get_schema_generator;
 use reson_agentic::types::{ChatMessage, ToolCall, ToolResult};
 use reson_agentic::utils::ConversationMessage;
 use std::env;
+
+/// Convert an Anthropic-format tool schema to the given provider format
+fn tool_schema_for(provider: &str, schema: &serde_json::Value) -> serde_json::Value {
+    let gen = get_schema_generator(provider).unwrap();
+    gen.generate_schema(
+        schema["name"].as_str().unwrap(),
+        schema["description"].as_str().unwrap(),
+        schema["input_schema"].clone(),
+    )
+}
 
 // ============================================================================
 // Helper Functions
@@ -192,10 +203,10 @@ async fn test_openai_parallel_tool_calling() {
     let config = GenerationConfig::new("openai/gpt-4o")
         .with_max_tokens(1024)
         .with_tools(vec![
-            weather_tool_schema(),
-            search_tool_schema(),
-            calculate_tool_schema(),
-            get_time_tool_schema(),
+            tool_schema_for("openrouter", &weather_tool_schema()),
+            tool_schema_for("openrouter", &search_tool_schema()),
+            tool_schema_for("openrouter", &calculate_tool_schema()),
+            tool_schema_for("openrouter", &get_time_tool_schema()),
         ])
         .with_native_tools(true);
 
@@ -261,9 +272,9 @@ async fn test_anthropic_parallel_tool_calling() {
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
         .with_tools(vec![
-            weather_tool_schema(),
-            search_tool_schema(),
-            get_time_tool_schema(),
+            tool_schema_for("openrouter", &weather_tool_schema()),
+            tool_schema_for("openrouter", &search_tool_schema()),
+            tool_schema_for("openrouter", &get_time_tool_schema()),
         ])
         .with_native_tools(true);
 
@@ -364,9 +375,9 @@ async fn test_google_parallel_tool_calling() {
     let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![
-            calculate_tool_schema(),
-            convert_currency_tool_schema(),
-            weather_tool_schema(),
+            tool_schema_for("google-genai", &calculate_tool_schema()),
+            tool_schema_for("google-genai", &convert_currency_tool_schema()),
+            tool_schema_for("google-genai", &weather_tool_schema()),
         ])
         .with_native_tools(true);
 
@@ -418,7 +429,7 @@ async fn test_backwards_compatibility_single_tool() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![calculate_tool_schema()])
+        .with_tools(vec![tool_schema_for("openrouter", &calculate_tool_schema())])
         .with_native_tools(true);
 
     let result = client.get_generation(&messages, &config).await;
@@ -429,12 +440,12 @@ async fn test_backwards_compatibility_single_tool() {
 
             // Check if we got tool calls
             if !response.tool_calls.is_empty() {
-                let tool_call = &response.tool_calls[0];
-                let name = tool_call
-                    .get("name")
-                    .or_else(|| tool_call.get("_tool_name"))
-                    .and_then(|v| v.as_str());
-                assert_eq!(name, Some("calculate"));
+                let tc = ToolCall::from_provider_format(
+                    response.tool_calls[0].clone(),
+                    reson_agentic::types::Provider::OpenRouter,
+                )
+                .expect("Failed to parse tool call");
+                assert_eq!(tc.tool_name, "calculate");
             } else {
                 // Might get text response if model chooses not to use tool
                 println!("Got text response: {}", response.content);
@@ -465,9 +476,9 @@ async fn test_parallel_execution_pattern() {
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
         .with_tools(vec![
-            weather_tool_schema(),
-            calculate_tool_schema(),
-            get_time_tool_schema(),
+            tool_schema_for("openrouter", &weather_tool_schema()),
+            tool_schema_for("openrouter", &calculate_tool_schema()),
+            tool_schema_for("openrouter", &get_time_tool_schema()),
         ])
         .with_native_tools(true);
 
@@ -544,9 +555,9 @@ async fn test_mixed_parallel_tool_types() {
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
         .with_tools(vec![
-            calculate_tool_schema(), // Requires a, b params
-            get_time_tool_schema(),  // No params required
-            weather_tool_schema(),   // Requires location
+            tool_schema_for("openrouter", &calculate_tool_schema()), // Requires a, b params
+            tool_schema_for("openrouter", &get_time_tool_schema()),  // No params required
+            tool_schema_for("openrouter", &weather_tool_schema()),   // Requires location
         ])
         .with_native_tools(true);
 
@@ -611,9 +622,9 @@ async fn test_google_compositional_chaining() {
     let config = GenerationConfig::new("gemini-flash-latest")
         .with_max_tokens(1024)
         .with_tools(vec![
-            calculate_tool_schema(),
-            convert_currency_tool_schema(),
-            weather_tool_schema(),
+            tool_schema_for("google-genai", &calculate_tool_schema()),
+            tool_schema_for("google-genai", &convert_currency_tool_schema()),
+            tool_schema_for("google-genai", &weather_tool_schema()),
         ])
         .with_native_tools(true);
 
@@ -678,7 +689,10 @@ async fn test_multi_turn_parallel_tools() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![weather_tool_schema(), calculate_tool_schema()])
+        .with_tools(vec![
+            tool_schema_for("openrouter", &weather_tool_schema()),
+            tool_schema_for("openrouter", &calculate_tool_schema()),
+        ])
         .with_native_tools(true);
 
     let result = client.get_generation(&messages, &config).await.unwrap();

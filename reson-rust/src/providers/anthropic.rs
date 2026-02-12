@@ -190,6 +190,22 @@ impl AnthropicClient {
         String::new()
     }
 
+    /// Extract reasoning/thinking content from response
+    fn extract_reasoning(&self, content: &serde_json::Value) -> Option<String> {
+        if let Some(blocks) = content.as_array() {
+            let thinking: Vec<String> = blocks
+                .iter()
+                .filter(|block| block["type"] == "thinking")
+                .filter_map(|block| block["thinking"].as_str().map(|s| s.to_string()))
+                .collect();
+
+            if !thinking.is_empty() {
+                return Some(thinking.join("\n"));
+            }
+        }
+        None
+    }
+
     /// Extract tool calls from response content
     fn extract_tool_calls(&self, content: &serde_json::Value) -> Vec<serde_json::Value> {
         let mut tool_calls = Vec::new();
@@ -303,6 +319,7 @@ impl InferenceClient for AnthropicClient {
         // Extract content
         let content_value = &body["content"];
         let text_content = self.extract_text_content(content_value);
+        let reasoning = self.extract_reasoning(content_value);
         let tool_calls = self.extract_tool_calls(content_value);
 
         // If tools were provided, return full response for tool extraction
@@ -311,7 +328,7 @@ impl InferenceClient for AnthropicClient {
 
         Ok(GenerationResponse {
             content: text_content,
-            reasoning: None, // Will be populated from thinking blocks if present
+            reasoning,
             tool_calls,
             reasoning_segments: Vec::new(),
             usage,

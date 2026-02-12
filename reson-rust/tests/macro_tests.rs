@@ -217,7 +217,6 @@ fn test_tool_macro_with_nested_arrays() {
 mod agentic_macro_tests {
     use reson_agentic::agentic;
     use reson_agentic::error::Result;
-    use reson_agentic::runtime::Runtime;
 
     // Test that the macro compiles and generates a function without runtime param
     #[agentic(model = "anthropic:claude-3-5-sonnet-20241022")]

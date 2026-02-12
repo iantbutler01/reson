@@ -578,6 +578,54 @@ impl Runtime {
         let mut current_args = self.current_call_args.write().await;
         *current_args = args;
     }
+
+    /// Connect to an MCP server and register all its tools into this runtime.
+    ///
+    /// Auto-detects transport from the URI:
+    /// - `http://` or `https://` → HTTP streaming
+    /// - `ws://` or `wss://` → WebSocket
+    /// - Anything else → stdio (treated as a command to spawn)
+    ///
+    /// Discovered tools become available alongside locally registered tools.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use reson_agentic::runtime::Runtime;
+    /// # async fn example() -> reson_agentic::error::Result<()> {
+    /// # let runtime = Runtime::new();
+    /// runtime.mcp("http://localhost:8080/mcp").await?;
+    /// runtime.mcp("npx @modelcontextprotocol/server-filesystem /tmp").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "mcp")]
+    pub async fn mcp(&self, uri: impl Into<String>) -> Result<()> {
+        let _ = crate::mcp::connect_and_register(self, &uri.into(), None).await?;
+        Ok(())
+    }
+
+    /// Connect to an MCP server and register its tools with a namespace prefix.
+    ///
+    /// Tools are registered as `{label}_{tool_name}`. The original name is
+    /// still used when calling the remote server. Use this to avoid conflicts
+    /// when connecting to multiple MCP servers that expose tools with the
+    /// same name.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use reson_agentic::runtime::Runtime;
+    /// # async fn example() -> reson_agentic::error::Result<()> {
+    /// # let runtime = Runtime::new();
+    /// runtime.mcp_as("http://server1:8080", "s1").await?; // s1_search, s1_read
+    /// runtime.mcp_as("http://server2:8080", "s2").await?; // s2_search, s2_write
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "mcp")]
+    pub async fn mcp_as(&self, uri: impl Into<String>, label: &str) -> Result<()> {
+        let _ = crate::mcp::connect_and_register(self, &uri.into(), Some(label)).await?;
+        Ok(())
+    }
 }
 
 impl Default for Runtime {

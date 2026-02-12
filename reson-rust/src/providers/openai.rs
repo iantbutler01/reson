@@ -136,8 +136,14 @@ impl OAIClient {
             }
         }
 
-        // Add reasoning if configured
-        if let Some(ref reasoning) = self.reasoning {
+        // Add reasoning if configured (client-level, then config-level fallback)
+        let reasoning_value = self
+            .reasoning
+            .clone()
+            .or_else(|| config.reasoning_effort.clone())
+            .or_else(|| config.thinking_budget.map(|b| b.to_string()));
+
+        if let Some(ref reasoning) = reasoning_value {
             if reasoning.chars().all(|c| c.is_ascii_digit()) {
                 // Numeric: max_tokens
                 request["reasoning"] = serde_json::json!({

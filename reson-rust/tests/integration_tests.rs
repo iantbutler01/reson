@@ -628,7 +628,7 @@ async fn openai_responses_multi_turn_tool_agent(
     Ok(response_str)
 }
 
-#[agentic(model = "openrouter:resp:openai/o4-mini")]
+#[agentic(model = "openrouter:resp:openai/gpt-5.2")]
 async fn openrouter_responses_simple_agent(
     prompt: String,
     runtime: Runtime,
@@ -654,7 +654,7 @@ async fn openrouter_responses_simple_agent(
         .unwrap_or_else(|| response.to_string()))
 }
 
-#[agentic(model = "openrouter:resp:openai/o4-mini")]
+#[agentic(model = "openrouter:resp:openai/gpt-5.2")]
 async fn openrouter_responses_tool_agent(
     prompt: String,
     runtime: Runtime,
@@ -762,7 +762,7 @@ async fn openrouter_responses_tool_agent(
     Ok(response_str)
 }
 
-#[agentic(model = "openrouter:resp:openai/o4-mini")]
+#[agentic(model = "openrouter:resp:openai/gpt-5.2")]
 async fn openrouter_responses_multi_turn_tool_agent(
     prompt: String,
     runtime: Runtime,

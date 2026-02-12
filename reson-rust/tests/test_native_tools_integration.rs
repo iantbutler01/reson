@@ -10,6 +10,7 @@ use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenRouterClient,
 };
+use reson_agentic::schema::get_schema_generator;
 use reson_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
 use reson_agentic::utils::ConversationMessage;
 use std::env;
@@ -32,6 +33,17 @@ fn get_google_key() -> Option<String> {
 
 fn get_openrouter_key() -> Option<String> {
     env::var("OPENROUTER_API_KEY").ok()
+}
+
+/// Convert an Anthropic-format tool schema to the given provider format
+/// using the existing schema generators.
+fn tool_schema_for(provider: &str, schema: &serde_json::Value) -> serde_json::Value {
+    let gen = get_schema_generator(provider).unwrap();
+    gen.generate_schema(
+        schema["name"].as_str().unwrap(),
+        schema["description"].as_str().unwrap(),
+        schema["input_schema"].clone(),
+    )
 }
 
 /// Calculator tool schema (Anthropic format)
@@ -185,31 +197,9 @@ fn execute_mock_tool(tool_name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-/// Extract tool name from tool call response
-fn get_tool_name(tool_call: &serde_json::Value) -> Option<String> {
-    tool_call
-        .get("name")
-        .or_else(|| tool_call.get("_tool_name"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Extract tool ID from tool call response
-fn get_tool_id(tool_call: &serde_json::Value) -> Option<String> {
-    tool_call
-        .get("id")
-        .or_else(|| tool_call.get("_tool_use_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Extract tool input from tool call response
-fn get_tool_input(tool_call: &serde_json::Value) -> serde_json::Value {
-    tool_call
-        .get("input")
-        .or_else(|| tool_call.get("args"))
-        .cloned()
-        .unwrap_or(serde_json::json!({}))
+/// Parse a raw provider tool call JSON into a typed ToolCall
+fn parse_tool_call(raw: &serde_json::Value, provider: Provider) -> ToolCall {
+    ToolCall::from_provider_format(raw.clone(), provider).expect("Failed to parse tool call")
 }
 
 // ============================================================================
@@ -264,7 +254,10 @@ async fn test_openrouter_native_tools_single_call() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![search_tool_schema(), add_numbers_schema()])
+        .with_tools(vec![
+            tool_schema_for("openrouter", &search_tool_schema()),
+            tool_schema_for("openrouter", &add_numbers_schema()),
+        ])
         .with_native_tools(true);
 
     let response = client.get_generation(&messages, &config).await.unwrap();
@@ -277,20 +270,17 @@ async fn test_openrouter_native_tools_single_call() {
         "Expected tool call in response"
     );
 
-    let tool_call = &response.tool_calls[0];
-    let tool_name = get_tool_name(tool_call);
+    let tc = parse_tool_call(&response.tool_calls[0], Provider::OpenRouter);
 
-    println!("Tool call detected: {:?}", tool_name);
-    assert_eq!(tool_name, Some("search_database".to_string()));
+    println!("Tool call detected: {}", tc.tool_name);
+    assert_eq!(tc.tool_name, "search_database");
 
     // Verify tool ID is preserved
-    let tool_id = get_tool_id(tool_call);
-    assert!(tool_id.is_some(), "Tool ID should be preserved");
-    println!("Tool ID: {:?}", tool_id);
+    assert!(!tc.tool_use_id.is_empty(), "Tool ID should be preserved");
+    println!("Tool ID: {}", tc.tool_use_id);
 
     // Execute mock tool
-    let input = get_tool_input(tool_call);
-    let result = execute_mock_tool("search_database", &input);
+    let result = execute_mock_tool("search_database", &tc.args);
     println!("Tool result: {}", result);
     assert!(result.contains("python tutorials"));
 }
@@ -303,7 +293,7 @@ async fn test_openrouter_multi_turn_tool_conversation() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![add_numbers_schema()])
+        .with_tools(vec![tool_schema_for("openrouter", &add_numbers_schema())])
         .with_native_tools(true);
 
     // Turn 1: Ask to add numbers
@@ -315,18 +305,16 @@ async fn test_openrouter_multi_turn_tool_conversation() {
     println!("Turn 1: {:?}", response1);
 
     assert!(!response1.tool_calls.is_empty());
-    let tool_call = &response1.tool_calls[0];
-    let tool_name = get_tool_name(tool_call).unwrap();
-    let tool_id = get_tool_id(tool_call).unwrap();
-    let input = get_tool_input(tool_call);
+    let tc = parse_tool_call(&response1.tool_calls[0], Provider::OpenRouter);
 
     // Execute tool
-    let result = execute_mock_tool(&tool_name, &input);
+    let result = execute_mock_tool(&tc.tool_name, &tc.args);
     println!("Tool result: {}", result);
 
-    // Turn 2: Provide tool result
+    // Turn 2: Add assistant tool-call message, then tool result
+    history.push(ConversationMessage::ToolCall(tc.clone()));
     history.push(ConversationMessage::ToolResult(
-        ToolResult::success(&tool_id, &result).with_tool_name(&tool_name),
+        ToolResult::success(&tc.tool_use_id, &result).with_tool_name(&tc.tool_name),
     ));
 
     let response2 = client.get_generation(&history, &config).await.unwrap();
@@ -367,15 +355,14 @@ async fn test_google_native_tools_single_call() {
         "Expected tool call in response"
     );
 
-    let tool_call = &response.tool_calls[0];
-    let tool_name = get_tool_name(tool_call);
+    // Google client normalizes tool calls to Anthropic-like format (name/input at top level)
+    let tc = parse_tool_call(&response.tool_calls[0], Provider::Anthropic);
 
-    println!("Tool call detected: {:?}", tool_name);
-    assert_eq!(tool_name, Some("get_weather".to_string()));
+    println!("Tool call detected: {}", tc.tool_name);
+    assert_eq!(tc.tool_name, "get_weather");
 
     // Execute mock tool
-    let input = get_tool_input(tool_call);
-    let result = execute_mock_tool("get_weather", &input);
+    let result = execute_mock_tool("get_weather", &tc.args);
     println!("Tool result: {}", result);
     assert!(result.contains("New York"));
 }
@@ -400,24 +387,105 @@ async fn test_google_multi_turn_tool_conversation() {
     println!("Turn 1: {:?}", response1);
 
     assert!(!response1.tool_calls.is_empty());
-    let tool_call = &response1.tool_calls[0];
-    let tool_name = get_tool_name(tool_call).unwrap();
-    let tool_id = get_tool_id(tool_call).unwrap_or_else(|| "google_call_1".to_string());
-    let input = get_tool_input(tool_call);
+    // Google client normalizes tool calls to Anthropic-like format (name/input at top level)
+    let tc = parse_tool_call(&response1.tool_calls[0], Provider::Anthropic);
 
     // Execute tool
-    let result = execute_mock_tool(&tool_name, &input);
+    let result = execute_mock_tool(&tc.tool_name, &tc.args);
     println!("Tool result: {}", result);
 
-    // Turn 2: Provide tool result
+    // Turn 2: Add assistant tool-call message, then tool result
+    history.push(ConversationMessage::ToolCall(tc.clone()));
+    let tool_id = if tc.tool_use_id.is_empty() { "google_call_1".to_string() } else { tc.tool_use_id.clone() };
     history.push(ConversationMessage::ToolResult(
-        ToolResult::success(&tool_id, &result).with_tool_name(&tool_name),
+        ToolResult::success(&tool_id, &result).with_tool_name(&tc.tool_name),
     ));
 
     let response2 = client.get_generation(&history, &config).await.unwrap();
     println!("Turn 2: {}", response2.content);
 
     // Should mention 42 (25 + 17)
+    assert!(
+        response2.content.contains("42"),
+        "Response should contain the result 42"
+    );
+}
+
+// ============================================================================
+// OpenAI Direct Native Tools Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "Requires OPENAI_API_KEY"]
+async fn test_openai_native_tools_single_call() {
+    let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
+    let client = OAIClient::new(api_key, "gpt-4o-mini");
+
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user(
+        "Use the add_numbers tool to add 15 and 27",
+    ))];
+
+    let config = GenerationConfig::new("gpt-4o-mini")
+        .with_max_tokens(1024)
+        .with_tools(vec![tool_schema_for("openai", &add_numbers_schema())])
+        .with_native_tools(true);
+
+    let response = client.get_generation(&messages, &config).await.unwrap();
+
+    println!("Response: {:?}", response);
+
+    assert!(
+        !response.tool_calls.is_empty(),
+        "Expected tool call in response"
+    );
+
+    let tc = parse_tool_call(&response.tool_calls[0], Provider::OpenAI);
+
+    println!("Tool call detected: {}", tc.tool_name);
+    assert_eq!(tc.tool_name, "add_numbers");
+
+    // Execute mock tool and verify
+    let result = execute_mock_tool("add_numbers", &tc.args);
+    println!("Tool result: {}", result);
+    assert_eq!(result, "42");
+}
+
+#[tokio::test]
+#[ignore = "Requires OPENAI_API_KEY"]
+async fn test_openai_multi_turn_tool_conversation() {
+    let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
+    let client = OAIClient::new(api_key, "gpt-4o-mini");
+
+    let config = GenerationConfig::new("gpt-4o-mini")
+        .with_max_tokens(1024)
+        .with_tools(vec![tool_schema_for("openai", &add_numbers_schema())])
+        .with_native_tools(true);
+
+    // Turn 1: Ask to add numbers
+    let mut history: Vec<ConversationMessage> = vec![ConversationMessage::Chat(ChatMessage::user(
+        "Please add 15 and 27 using the add_numbers tool",
+    ))];
+
+    let response1 = client.get_generation(&history, &config).await.unwrap();
+    println!("Turn 1: {:?}", response1);
+
+    assert!(!response1.tool_calls.is_empty());
+    let tc = parse_tool_call(&response1.tool_calls[0], Provider::OpenAI);
+
+    // Execute tool
+    let result = execute_mock_tool(&tc.tool_name, &tc.args);
+    println!("Tool result: {}", result);
+
+    // Turn 2: Add assistant tool-call message, then tool result
+    history.push(ConversationMessage::ToolCall(tc.clone()));
+    history.push(ConversationMessage::ToolResult(
+        ToolResult::success(&tc.tool_use_id, &result).with_tool_name(&tc.tool_name),
+    ));
+
+    let response2 = client.get_generation(&history, &config).await.unwrap();
+    println!("Turn 2: {}", response2.content);
+
+    // Should mention 42 (15 + 27)
     assert!(
         response2.content.contains("42"),
         "Response should contain the result 42"
@@ -452,16 +520,14 @@ async fn test_anthropic_native_tools_single_call() {
         "Expected tool call in response"
     );
 
-    let tool_call = &response.tool_calls[0];
-    let tool_name = get_tool_name(tool_call);
+    let tc = parse_tool_call(&response.tool_calls[0], Provider::Anthropic);
 
-    println!("Tool call detected: {:?}", tool_name);
-    assert_eq!(tool_name, Some("calculate".to_string()));
+    println!("Tool call detected: {}", tc.tool_name);
+    assert_eq!(tc.tool_name, "calculate");
 
     // Verify input has correct operation
-    let input = get_tool_input(tool_call);
     assert_eq!(
-        input.get("operation").and_then(|v| v.as_str()),
+        tc.args.get("operation").and_then(|v| v.as_str()),
         Some("multiply")
     );
 }
@@ -479,9 +545,9 @@ async fn test_native_5_turn_conversation() {
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
         .with_tools(vec![
-            add_numbers_schema(),
-            multiply_numbers_schema(),
-            search_tool_schema(),
+            tool_schema_for("openrouter", &add_numbers_schema()),
+            tool_schema_for("openrouter", &multiply_numbers_schema()),
+            tool_schema_for("openrouter", &search_tool_schema()),
         ])
         .with_native_tools(true);
 
@@ -507,21 +573,19 @@ async fn test_native_5_turn_conversation() {
         }
 
         // Process tool call
-        let tool_call = &response.tool_calls[0];
-        let tool_name = get_tool_name(tool_call).unwrap();
-        let tool_id = get_tool_id(tool_call).unwrap();
-        let input = get_tool_input(tool_call);
+        let tc = parse_tool_call(&response.tool_calls[0], Provider::OpenRouter);
 
-        println!("Tool: {} with input: {:?}", tool_name, input);
-        tool_calls_made.push(tool_name.clone());
+        println!("Tool: {} with input: {:?}", tc.tool_name, tc.args);
+        tool_calls_made.push(tc.tool_name.clone());
 
         // Execute tool
-        let result = execute_mock_tool(&tool_name, &input);
+        let result = execute_mock_tool(&tc.tool_name, &tc.args);
         println!("Result: {}", result);
 
-        // Add tool result to history
+        // Add assistant tool-call message, then tool result to history
+        history.push(ConversationMessage::ToolCall(tc.clone()));
         history.push(ConversationMessage::ToolResult(
-            ToolResult::success(&tool_id, &result).with_tool_name(&tool_name),
+            ToolResult::success(&tc.tool_use_id, &result).with_tool_name(&tc.tool_name),
         ));
 
         // Add continuation prompt
@@ -554,21 +618,19 @@ async fn test_backwards_compatibility_single_tool() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![add_numbers_schema()])
+        .with_tools(vec![tool_schema_for("openrouter", &add_numbers_schema())])
         .with_native_tools(true);
 
     let response = client.get_generation(&messages, &config).await.unwrap();
 
     // Should get either a tool call or text response
     if !response.tool_calls.is_empty() {
-        let tool_call = &response.tool_calls[0];
-        let tool_name = get_tool_name(tool_call);
-        println!("Got tool call: {:?}", tool_name);
-        assert_eq!(tool_name, Some("add_numbers".to_string()));
+        let tc = parse_tool_call(&response.tool_calls[0], Provider::OpenRouter);
+        println!("Got tool call: {}", tc.tool_name);
+        assert_eq!(tc.tool_name, "add_numbers");
 
         // Execute tool
-        let input = get_tool_input(tool_call);
-        let result = execute_mock_tool("add_numbers", &input);
+        let result = execute_mock_tool("add_numbers", &tc.args);
         println!("Tool result: {}", result);
         assert_eq!(result, "15");
     } else {

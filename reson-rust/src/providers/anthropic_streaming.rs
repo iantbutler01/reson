@@ -63,16 +63,11 @@ impl ToolCallAccumulator {
     /// Complete and remove a tool call
     pub fn complete_tool(&mut self, index: usize) -> Option<Value> {
         if let Some(tool) = self.current_tool_blocks.remove(&index) {
-            // Parse and re-serialize JSON to ensure validity
+            // Parse JSON into Value (consistent with OpenAI accumulator)
             let arguments = if tool.input.is_empty() {
-                "{}".to_string()
+                json!({})
             } else {
-                match parse_json_value_strict_str(&tool.input) {
-                    Ok(parsed) => {
-                        serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_string())
-                    }
-                    Err(_) => "{}".to_string(),
-                }
+                parse_json_value_strict_str(&tool.input).unwrap_or_else(|_| json!({}))
             };
 
             // Return OpenAI-format complete tool call
@@ -123,6 +118,11 @@ pub fn parse_anthropic_chunk(
                         }
                     }
                 }
+                "thinking_delta" => {
+                    if let Some(thinking) = delta["thinking"].as_str() {
+                        results.push(StreamChunk::Reasoning(thinking.to_string()));
+                    }
+                }
                 "signature_delta" => {
                     if let Some(signature) = delta["signature"].as_str() {
                         results.push(StreamChunk::Signature(signature.to_string()));
@@ -151,7 +151,36 @@ pub fn parse_anthropic_chunk(
             }
         }
 
-        // message_start and message_delta are handled for usage tracking but don't emit chunks
+        "message_delta" => {
+            let usage = &chunk_json["usage"];
+            if usage.is_object() {
+                let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                // message_delta carries output_tokens; input comes from message_start
+                if output_tokens > 0 || input_tokens > 0 {
+                    results.push(StreamChunk::Usage {
+                        input_tokens,
+                        output_tokens,
+                        cached_tokens: 0,
+                    });
+                }
+            }
+        }
+
+        "message_start" => {
+            if let Some(usage) = chunk_json["message"]["usage"].as_object() {
+                let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cached_tokens = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                if input_tokens > 0 {
+                    results.push(StreamChunk::Usage {
+                        input_tokens,
+                        output_tokens: 0,
+                        cached_tokens,
+                    });
+                }
+            }
+        }
+
         _ => {}
     }
 
@@ -193,7 +222,7 @@ mod tests {
         let complete = acc.complete_tool(0).unwrap();
         assert_eq!(complete["id"], "toolu_123");
         assert_eq!(complete["function"]["name"], "get_weather");
-        assert_eq!(complete["function"]["arguments"], "{\"city\":\"SF\"}");
+        assert_eq!(complete["function"]["arguments"]["city"], "SF");
         assert_eq!(acc.current_tool_blocks.len(), 0); // Removed
     }
 
@@ -265,6 +294,25 @@ mod tests {
                 assert_eq!(tool["function"]["name"], "get_weather");
             }
             _ => panic!("Expected ToolCallComplete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_thinking_delta() {
+        let mut acc = ToolCallAccumulator::new();
+        let chunk = json!({
+            "type": "content_block_delta",
+            "delta": {
+                "type": "thinking_delta",
+                "thinking": "Let me think about this..."
+            }
+        });
+
+        let chunks = parse_anthropic_chunk(&chunk, &mut acc, false);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::Reasoning(text) => assert_eq!(text, "Let me think about this..."),
+            _ => panic!("Expected Reasoning chunk"),
         }
     }
 

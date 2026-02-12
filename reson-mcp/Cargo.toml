@@ -1,0 +1,52 @@
+[package]
+name = "reson-mcp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Reson Contributors"]
+description = "MCP (Model Context Protocol) support for reson - includes client, server, and MCP Apps extension"
+license = "Apache-2.0"
+repository = "https://github.com/iantbutler01/reson"
+homepage = "https://github.com/iantbutler01/reson"
+documentation = "https://docs.rs/reson-mcp"
+readme = "README.md"
+
+[dependencies]
+# Core MCP protocol
+rmcp = { version = "0.15", features = ["client", "server", "macros", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "transport-child-process", "transport-io"] }
+
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+
+# WebSocket transport (rmcp does NOT provide this)
+tokio-tungstenite = "0.28"
+pin-project-lite = "0.2"
+
+# Logging
+tracing = "0.1"
+
+# HTTP server (for streamable HTTP transport)
+axum = "0.8"
+tokio-util = "0.7"
+url = { version = "2.5.8", features = ["serde"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["client", "server"]
+client = []
+server = []
+apps = []
+full = ["client", "server", "apps"]
+
+[lints.rust]
+warnings = "deny"
