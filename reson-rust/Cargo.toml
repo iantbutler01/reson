@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "reson-agentic"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 authors = ["Reson Contributors"]
 description = "Agents are just functions - production-grade LLM agent framework"
@@ -68,7 +68,7 @@ opentelemetry_sdk = { version = "0.24", optional = true }
 gcp_auth = { version = "0.12", optional = true }
 
 # Optional: MCP support
-reson-mcp = { path = "../reson-mcp", optional = true, default-features = false, features = ["client", "server"] }
+reson-mcp = { version = "0.1.0", path = "../reson-mcp", optional = true, default-features = false, features = ["client", "server"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
