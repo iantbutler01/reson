@@ -101,11 +101,12 @@ where
     let start_time = std::time::Instant::now();
     let mut attempt = 0;
     let mut current_backoff = config.initial_backoff;
+    let mut last_error = String::from("unknown error");
 
     loop {
         // Check if we've exceeded max time
         if start_time.elapsed() > config.max_time {
-            return Err(Error::RetriesExceeded);
+            return Err(Error::RetriesExceeded(last_error));
         }
 
         // Try the operation
@@ -117,10 +118,12 @@ where
                     return Err(err);
                 }
 
+                last_error = err.to_string();
+
                 // Check if we've exceeded max retries
                 attempt += 1;
                 if attempt > config.max_retries {
-                    return Err(Error::RetriesExceeded);
+                    return Err(Error::RetriesExceeded(last_error));
                 }
 
                 // Wait with exponential backoff
@@ -257,7 +260,7 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::RetriesExceeded));
+        assert!(matches!(result.unwrap_err(), Error::RetriesExceeded(_)));
         assert_eq!(*call_count.lock().unwrap(), 3); // Initial + 2 retries
     }
 
@@ -273,7 +276,7 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), Error::RetriesExceeded));
+        assert!(matches!(result.unwrap_err(), Error::RetriesExceeded(_)));
     }
 
     #[tokio::test]

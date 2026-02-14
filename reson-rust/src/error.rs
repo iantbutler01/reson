@@ -19,9 +19,9 @@ pub enum Error {
     #[error("Context length exceeded: {0}")]
     ContextLengthExceeded(String),
 
-    /// Maximum retries exhausted
-    #[error("Retries exceeded")]
-    RetriesExceeded,
+    /// Maximum retries exhausted (includes last error for context)
+    #[error("Retries exceeded: {0}")]
+    RetriesExceeded(String),
 
     /// Non-retryable error (validation, 4xx errors)
     #[error("Non-retryable error: {0}")]
@@ -80,7 +80,7 @@ impl Error {
 
     /// Check if error indicates retries were exceeded
     pub fn is_retries_exceeded(&self) -> bool {
-        matches!(self, Error::RetriesExceeded)
+        matches!(self, Error::RetriesExceeded(_))
     }
 
     /// Check if error indicates incomplete/partial data (for streaming)
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_is_retries_exceeded() {
-        assert!(Error::RetriesExceeded.is_retries_exceeded());
+        assert!(Error::RetriesExceeded("test".to_string()).is_retries_exceeded());
         assert!(!Error::Inference("test".to_string()).is_retries_exceeded());
     }
 

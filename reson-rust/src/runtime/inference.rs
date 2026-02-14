@@ -280,12 +280,20 @@ fn resolve_provider_key(model: &str) -> String {
 /// Create an inference client from model string
 ///
 /// Format: `provider:model@param=value` or `provider:resp:model@param=value`
+///
+/// Parameters:
+/// - `@reasoning=<value>` - reasoning effort (numeric budget or level like `high`)
+/// - `@server_url=<url>` - custom API endpoint (required for `custom-openai`, optional for `openai`)
+/// - `@api_key=<key>` - inline API key (overrides env var and `api_key` parameter)
+///
 /// Examples:
 /// - `anthropic:claude-3-5-sonnet-20241022`
 /// - `openrouter:openai/gpt-4o@reasoning=high`
 /// - `openai:gpt-4o`
 /// - `openai:resp:gpt-4o`
 /// - `openrouter:resp:openai/o4-mini`
+/// - `custom-openai:llama-3@server_url=http://localhost:8000/v1`
+/// - `custom-openai:my-model@server_url=http://localhost:11434/v1@api_key=ollama`
 pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
@@ -304,14 +312,20 @@ pub fn create_inference_client(
         (parts[0].to_string(), parts[1..].join(":"))
     };
 
-    // Parse parameters (e.g., @reasoning=1024)
+    // Parse parameters (e.g., @reasoning=1024, @server_url=http://localhost:8000/v1, @api_key=sk-...)
     let mut reasoning = None;
+    let mut server_url = None;
+    let mut inline_api_key = None;
     let model_name = if model_part.contains('@') {
         let model_parts: Vec<&str> = model_part.split('@').collect();
 
         for param in &model_parts[1..] {
             if param.starts_with("reasoning=") {
                 reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
+            } else if param.starts_with("server_url=") {
+                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
+            } else if param.starts_with("api_key=") {
+                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
             }
         }
 
@@ -320,10 +334,13 @@ pub fn create_inference_client(
         model_part.to_string()
     };
 
-    // Get API key from env if not provided
-    let key = match api_key {
-        Some(k) => k.to_string(),
-        None => match provider.as_str() {
+    // Resolve API key: @api_key= > api_key parameter > env var
+    let key = if let Some(k) = inline_api_key {
+        k
+    } else if let Some(k) = api_key {
+        k.to_string()
+    } else {
+        match provider.as_str() {
             "anthropic" => std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| Error::NonRetryable("ANTHROPIC_API_KEY not set".to_string()))?,
             "openai" => std::env::var("OPENAI_API_KEY")
@@ -340,13 +357,15 @@ pub fn create_inference_client(
                 std::env::var("GOOGLE_GEMINI_API_KEY")
                     .map_err(|_| Error::NonRetryable("GOOGLE_GEMINI_API_KEY not set".to_string()))?
             }
+            "custom-openai" => std::env::var("OPENAI_API_KEY")
+                .unwrap_or_else(|_| "not-needed".to_string()),
             _ => {
                 return Err(Error::NonRetryable(format!(
                     "Unknown provider: {}",
                     provider
                 )))
             }
-        },
+        }
     };
 
     // Create client
@@ -362,6 +381,11 @@ pub fn create_inference_client(
         }
         "openai" => {
             let mut client = OAIClient::new(key, model_name);
+            if let Some(url) = server_url {
+                client = client.with_api_url(url);
+            } else if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                client = client.with_api_url(base_url);
+            }
             if let Some(r) = reasoning {
                 client = client.with_reasoning(r);
             }
@@ -394,6 +418,18 @@ pub fn create_inference_client(
                 if let Ok(budget) = r.parse::<u32>() {
                     client = client.with_thinking_budget(budget);
                 }
+            }
+            Box::new(client)
+        }
+        "custom-openai" => {
+            let url = server_url.ok_or_else(|| {
+                Error::NonRetryable(
+                    "custom-openai requires @server_url= parameter (e.g., custom-openai:model@server_url=http://localhost:8000/v1)".to_string(),
+                )
+            })?;
+            let mut client = OAIClient::new(key, model_name).with_api_url(url);
+            if let Some(r) = reasoning {
+                client = client.with_reasoning(r);
             }
             Box::new(client)
         }

@@ -344,7 +344,7 @@ impl InferenceClient for TracingInferenceClient {
         let result = client.get_generation(messages, config).await;
 
         // Handle fallback on retries exceeded
-        if let Err(Error::RetriesExceeded) = result {
+        if let Err(Error::RetriesExceeded(_)) = result {
             if let Some(fallback) = self.fallback_client.as_ref() {
                 log::info!("Switching to fallback client after retries exceeded");
                 let mut state = self.fallback_state.write().await;
@@ -383,7 +383,7 @@ impl InferenceClient for TracingInferenceClient {
 
                 return Ok(response);
             } else {
-                return Err(Error::RetriesExceeded);
+                return result;
             }
         }
 
@@ -437,7 +437,7 @@ impl InferenceClient for TracingInferenceClient {
         let result = client.connect_and_listen(messages, config).await;
 
         // Handle fallback on retries exceeded
-        if let Err(Error::RetriesExceeded) = result {
+        if let Err(Error::RetriesExceeded(_)) = result {
             if let Some(fallback) = self.fallback_client.as_ref() {
                 log::info!("Switching to fallback client for streaming after retries exceeded");
                 let mut state = self.fallback_state.write().await;
@@ -448,7 +448,7 @@ impl InferenceClient for TracingInferenceClient {
                 let stream = fallback.connect_and_listen(messages, config).await?;
                 return Ok(self.wrap_stream_for_cost_tracking(stream, config.model.clone()));
             } else {
-                return Err(Error::RetriesExceeded);
+                return result;
             }
         }
 
@@ -489,7 +489,7 @@ mod tests {
             _config: &GenerationConfig,
         ) -> Result<GenerationResponse> {
             if self.should_fail {
-                Err(Error::RetriesExceeded)
+                Err(Error::RetriesExceeded("mock failure".to_string()))
             } else {
                 Ok(GenerationResponse {
                     content: "test".to_string(),

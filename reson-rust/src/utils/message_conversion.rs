@@ -271,7 +271,11 @@ fn media_part_to_openai_format(part: &MediaPart) -> Value {
             }),
         },
 
-        // OpenAI doesn't support video/documents in chat
+        // Video URL support (vLLM-compatible format for Qwen2-VL, etc.)
+        MediaPart::Video { source: MediaSource::Url { url }, .. } => json!({
+            "type": "video_url",
+            "video_url": { "url": url }
+        }),
         MediaPart::Video { .. } | MediaPart::Document { .. } => json!({
             "type": "text",
             "text": "[Video/Document not supported by this provider]"
