@@ -459,6 +459,7 @@ pub async fn call_llm(
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
+    timeout: Option<std::time::Duration>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 ) -> Result<CallResult> {
     // Create client
@@ -515,6 +516,7 @@ pub async fn call_llm(
         thinking_budget: None,
         output_schema: fixed_output_schema,
         output_type_name,
+        timeout,
     };
 
     // Make API call
@@ -615,6 +617,7 @@ pub async fn call_llm_stream(
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
+    timeout: Option<std::time::Duration>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
     _accumulators: Arc<RwLock<Accumulators>>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value)>> + Send>>> {
@@ -672,6 +675,7 @@ pub async fn call_llm_stream(
         thinking_budget: None,
         output_schema: fixed_output_schema,
         output_type_name,
+        timeout,
     };
 
     // Get streaming response

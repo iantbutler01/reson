@@ -865,6 +865,7 @@ impl GoogleGenAIClient {
         &self,
         body: serde_json::Value,
         stream: bool,
+        timeout: Option<std::time::Duration>,
     ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
         if google_debug_enabled() {
@@ -877,7 +878,7 @@ impl GoogleGenAIClient {
         #[allow(unused_mut)] // mut needed only with google-adc feature
         let mut request = client
             .post(self.get_endpoint(stream))
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(timeout.unwrap_or(std::time::Duration::from_secs(300)))
             .header("Content-Type", "application/json");
 
         // Add authorization header for ADC
@@ -912,11 +913,15 @@ impl GoogleGenAIClient {
     }
 
     /// Make request with retry and exponential backoff
-    async fn make_request_with_retry(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+    async fn make_request_with_retry(
+        &self,
+        body: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<serde_json::Value> {
         let config = RetryConfig::default();
 
         retry_with_backoff(config, || async {
-            let response = self.make_request(body.clone(), false).await?;
+            let response = self.make_request(body.clone(), false, timeout).await?;
             let status = response.status();
 
             if !status.is_success() {
@@ -946,7 +951,7 @@ impl InferenceClient for GoogleGenAIClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config)?;
-        let body = self.make_request_with_retry(request_body).await?;
+        let body = self.make_request_with_retry(request_body, config.timeout).await?;
 
         // Parse response
         let candidates = &body["candidates"];
@@ -982,11 +987,12 @@ impl InferenceClient for GoogleGenAIClient {
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let request_body = self.build_request_body(messages, config)?;
+        let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
-            let resp = self.make_request(request_body.clone(), true).await?;
+            let resp = self.make_request(request_body.clone(), true, timeout).await?;
             let status = resp.status();
 
             if !status.is_success() {

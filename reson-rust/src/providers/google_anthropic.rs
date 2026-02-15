@@ -303,13 +303,17 @@ impl GoogleAnthropicClient {
     }
 
     /// Make HTTP request to Vertex AI endpoint
-    async fn make_request(&self, body: serde_json::Value) -> Result<reqwest::Response> {
+    async fn make_request(
+        &self,
+        body: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
         let token = self.get_token().await?;
         let client = reqwest::Client::new();
 
         let response = client
             .post(self.get_endpoint_url())
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(timeout.unwrap_or(std::time::Duration::from_secs(300)))
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -340,11 +344,15 @@ impl GoogleAnthropicClient {
 
     /// Make request with retry and exponential backoff
     #[cfg(feature = "google-adc")]
-    async fn make_request_with_retry(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+    async fn make_request_with_retry(
+        &self,
+        body: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<serde_json::Value> {
         let config = RetryConfig::default();
 
         retry_with_backoff(config, || async {
-            let response = self.make_request(body.clone()).await?;
+            let response = self.make_request(body.clone(), timeout).await?;
             let status = response.status();
 
             if !status.is_success() {
@@ -367,7 +375,7 @@ impl InferenceClient for GoogleAnthropicClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
-        let body = self.make_request_with_retry(request_body).await?;
+        let body = self.make_request_with_retry(request_body, config.timeout).await?;
 
         // Parse usage statistics
         let usage = self.parse_usage(&body["usage"]);
@@ -405,11 +413,12 @@ impl InferenceClient for GoogleAnthropicClient {
         use crate::utils::parse_sse_stream;
 
         let request_body = self.build_request_body(messages, config, true)?;
+        let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
-            let resp = self.make_request(request_body.clone()).await?;
+            let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();
 
             if !status.is_success() {

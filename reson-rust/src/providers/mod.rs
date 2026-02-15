@@ -61,7 +61,7 @@ pub struct GenerationConfig {
     /// Whether to use native tool calling
     pub native_tools: bool,
 
-    /// Reasoning effort (for o-series models)
+    /// Reasoning effort
     pub reasoning_effort: Option<String>,
 
     /// Thinking budget tokens (for Claude extended thinking)
@@ -72,6 +72,9 @@ pub struct GenerationConfig {
 
     /// Name for the output type (used in schema wrapper)
     pub output_type_name: Option<String>,
+
+    /// Request timeout (overrides provider default)
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl Default for GenerationConfig {
@@ -87,6 +90,7 @@ impl Default for GenerationConfig {
             thinking_budget: None,
             output_schema: None,
             output_type_name: None,
+            timeout: None,
         }
     }
 }
@@ -144,6 +148,12 @@ impl GenerationConfig {
     ) -> Self {
         self.output_schema = Some(schema);
         self.output_type_name = Some(type_name.into());
+        self
+    }
+
+    /// Set request timeout
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }

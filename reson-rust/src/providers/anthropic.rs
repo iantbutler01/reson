@@ -233,6 +233,7 @@ impl AnthropicClient {
         &self,
         body: serde_json::Value,
         use_structured_outputs: bool,
+        timeout: Option<std::time::Duration>,
     ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
 
@@ -245,7 +246,7 @@ impl AnthropicClient {
 
         let response = client
             .post(&self.api_url)
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(timeout.unwrap_or(std::time::Duration::from_secs(300)))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", beta_header)
@@ -280,12 +281,13 @@ impl AnthropicClient {
         &self,
         body: serde_json::Value,
         use_structured_outputs: bool,
+        timeout: Option<std::time::Duration>,
     ) -> Result<serde_json::Value> {
         let config = RetryConfig::default();
 
         retry_with_backoff(config, || async {
             let response = self
-                .make_request(body.clone(), use_structured_outputs)
+                .make_request(body.clone(), use_structured_outputs, timeout)
                 .await?;
             let status = response.status();
 
@@ -310,7 +312,7 @@ impl InferenceClient for AnthropicClient {
         let use_structured_outputs = config.output_schema.is_some();
         let request_body = self.build_request_body(messages, config, false)?;
         let body = self
-            .make_request_with_retry(request_body, use_structured_outputs)
+            .make_request_with_retry(request_body, use_structured_outputs, config.timeout)
             .await?;
 
         // Parse usage statistics
@@ -351,12 +353,13 @@ impl InferenceClient for AnthropicClient {
 
         let use_structured_outputs = config.output_schema.is_some();
         let request_body = self.build_request_body(messages, config, true)?;
+        let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self
-                .make_request(request_body.clone(), use_structured_outputs)
+                .make_request(request_body.clone(), use_structured_outputs, timeout)
                 .await?;
             let status = resp.status();
 

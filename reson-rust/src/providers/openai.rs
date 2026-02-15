@@ -187,11 +187,15 @@ impl OAIClient {
     }
 
     /// Make HTTP request to OpenAI API
-    async fn make_request(&self, body: serde_json::Value) -> Result<reqwest::Response> {
+    async fn make_request(
+        &self,
+        body: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<reqwest::Response> {
         let client = reqwest::Client::new();
         let mut req = client
             .post(&self.api_url)
-            .timeout(std::time::Duration::from_secs(180))
+            .timeout(timeout.unwrap_or(std::time::Duration::from_secs(180)))
             .header("Content-Type", "application/json")
             .json(&body);
 
@@ -232,11 +236,15 @@ impl OAIClient {
     }
 
     /// Make request with retry and exponential backoff
-    async fn make_request_with_retry(&self, body: serde_json::Value) -> Result<String> {
+    async fn make_request_with_retry(
+        &self,
+        body: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<String> {
         let config = RetryConfig::default();
 
         retry_with_backoff(config, || async {
-            let response = self.make_request(body.clone()).await?;
+            let response = self.make_request(body.clone(), timeout).await?;
             let status = response.status();
             let response_text = response.text().await.unwrap_or_default();
 
@@ -258,7 +266,7 @@ impl InferenceClient for OAIClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
-        let response_text = self.make_request_with_retry(request_body).await?;
+        let response_text = self.make_request_with_retry(request_body, config.timeout).await?;
 
         // Parse JSON - provide better error context if it fails
         let body: serde_json::Value = parse_json_value_strict_str(&response_text).map_err(|e| {
@@ -346,11 +354,12 @@ impl InferenceClient for OAIClient {
         use crate::utils::parse_sse_stream;
 
         let request_body = self.build_request_body(messages, config, true)?;
+        let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
-            let resp = self.make_request(request_body.clone()).await?;
+            let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();
 
             if !status.is_success() {

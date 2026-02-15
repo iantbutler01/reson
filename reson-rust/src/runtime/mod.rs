@@ -74,6 +74,22 @@ pub enum ToolFunction {
     ),
 }
 
+/// Parameters for `Runtime::run()` and `Runtime::run_stream()`
+#[derive(Debug, Default, Clone)]
+pub struct RunParams {
+    pub prompt: Option<String>,
+    pub system: Option<String>,
+    pub history: Option<Vec<ConversationMessage>>,
+    pub output_type: Option<String>,
+    pub output_schema: Option<serde_json::Value>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub timeout: Option<std::time::Duration>,
+}
+
 /// Metadata about a tool call for execution context
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
@@ -356,32 +372,7 @@ impl Runtime {
     }
 
     /// Execute a non-streaming LLM call
-    ///
-    /// # Arguments
-    /// * `prompt` - User prompt (optional, uses default if None)
-    /// * `system` - System message (optional)
-    /// * `history` - Previous messages (optional)
-    /// * `output_type` - Expected output type name (optional)
-    /// * `output_schema` - JSON schema for structured output (optional)
-    /// * `temperature`, `top_p`, `max_tokens` - Generation parameters (optional)
-    /// * `model` - Override model (optional)
-    /// * `api_key` - Override API key (optional)
-    ///
-    /// # Returns
-    /// Parsed response as JSON value
-    pub async fn run(
-        &mut self,
-        prompt: Option<&str>,
-        system: Option<&str>,
-        history: Option<Vec<ConversationMessage>>,
-        output_type: Option<String>,
-        output_schema: Option<serde_json::Value>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        max_tokens: Option<u32>,
-        model: Option<String>,
-        api_key: Option<String>,
-    ) -> Result<serde_json::Value> {
+    pub async fn run(&mut self, params: RunParams) -> Result<serde_json::Value> {
         // Mark as used
         self.used = true;
 
@@ -390,16 +381,17 @@ impl Runtime {
         self.clear_reasoning().await;
 
         // Get effective values
-        let prompt_text = match prompt {
-            Some(p) => p.to_string(),
+        let prompt_text = match params.prompt {
+            Some(p) => p,
             None => self.default_prompt.read().await.clone(),
         };
 
-        let effective_model = model
+        let effective_model = params
+            .model
             .or_else(|| self.model.clone())
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
 
-        let effective_api_key = api_key.or_else(|| self.api_key.clone());
+        let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
 
         // Call inference utilities
         let result = inference::call_llm(
@@ -407,14 +399,15 @@ impl Runtime {
             &effective_model,
             self.tools.clone(),
             self.tool_schemas.clone(),
-            output_type,
-            output_schema,
+            params.output_type,
+            params.output_schema,
             effective_api_key.as_deref(),
-            system,
-            history,
-            temperature,
-            top_p,
-            max_tokens,
+            params.system.as_deref(),
+            params.history,
+            params.temperature,
+            params.top_p,
+            params.max_tokens,
+            params.timeout,
             self.current_call_args.clone(),
         )
         .await?;
@@ -438,16 +431,7 @@ impl Runtime {
     /// Returns an async stream of (chunk_type, chunk_value) tuples
     pub async fn run_stream(
         &mut self,
-        prompt: Option<&str>,
-        system: Option<&str>,
-        history: Option<Vec<ConversationMessage>>,
-        output_type: Option<String>,
-        output_schema: Option<serde_json::Value>,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        max_tokens: Option<u32>,
-        model: Option<String>,
-        api_key: Option<String>,
+        params: RunParams,
     ) -> Result<impl futures::stream::Stream<Item = Result<(String, serde_json::Value)>>> {
         // Mark as used
         self.used = true;
@@ -458,16 +442,17 @@ impl Runtime {
         self.clear_reasoning_segments().await;
 
         // Get effective values
-        let prompt_text = match prompt {
-            Some(p) => p.to_string(),
+        let prompt_text = match params.prompt {
+            Some(p) => p,
             None => self.default_prompt.read().await.clone(),
         };
 
-        let effective_model = model
+        let effective_model = params
+            .model
             .or_else(|| self.model.clone())
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
 
-        let effective_api_key = api_key.or_else(|| self.api_key.clone());
+        let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
 
         // Call streaming inference
         inference::call_llm_stream(
@@ -475,14 +460,15 @@ impl Runtime {
             &effective_model,
             self.tools.clone(),
             self.tool_schemas.clone(),
-            output_type,
-            output_schema,
+            params.output_type,
+            params.output_schema,
             effective_api_key.as_deref(),
-            system,
-            history,
-            temperature,
-            top_p,
-            max_tokens,
+            params.system.as_deref(),
+            params.history,
+            params.temperature,
+            params.top_p,
+            params.max_tokens,
+            params.timeout,
             self.current_call_args.clone(),
             self.accumulators.clone(),
         )

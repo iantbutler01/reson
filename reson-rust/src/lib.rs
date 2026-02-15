@@ -41,7 +41,7 @@ pub use crate::mcp::McpServer;
 // Prelude for convenient imports
 pub mod prelude {
     pub use crate::error::{Error, Result};
-    pub use crate::runtime::Runtime;
+    pub use crate::runtime::{RunParams, Runtime};
     pub use crate::types::{
         CacheMarker, ChatMessage, ChatRole, CreateResult, Provider, ReasoningSegment, TokenUsage,
         ToolCall, ToolResult,
