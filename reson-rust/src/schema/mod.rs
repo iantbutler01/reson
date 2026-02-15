@@ -260,6 +260,7 @@ pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> 
         "anthropic" => Ok(Box::new(AnthropicSchemaGenerator)),
         "openai" => Ok(Box::new(OpenAISchemaGenerator)),
         "openrouter" => Ok(Box::new(OpenAISchemaGenerator)), // OpenRouter uses OpenAI format
+        "custom-openai" => Ok(Box::new(OpenAISchemaGenerator)), // custom-openai uses OpenAI format
         "openai-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "openrouter-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
