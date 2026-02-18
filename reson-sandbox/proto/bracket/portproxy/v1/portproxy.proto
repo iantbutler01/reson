@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package bracket.portproxy.v1;
+option go_package = "github.com/BracketDevelopers/OpenBracket/proto/bracket/portproxy/v1;portproxyv1";
+
+import "google/protobuf/empty.proto";
+
+service PortProxy {
+  rpc PrepareShutdown(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
+  rpc WriteFile(WriteFileRequest) returns (google.protobuf.Empty);
+  rpc ListDirectory(ListDirectoryRequest) returns (ListDirectoryResponse);
+  rpc DeletePath(DeletePathRequest) returns (google.protobuf.Empty);
+}
+
+service ShellExec {
+  rpc Exec(stream ExecRequest) returns (stream ExecResponse);
+  rpc InteractiveShell(stream InteractiveShellRequest)
+      returns (stream InteractiveShellResponse);
+}
+
+service DaemonManager {
+  rpc ExecDaemon(ExecDaemonRequest) returns (ExecDaemonResponse);
+  rpc AttachDaemon(stream AttachDaemonRequest)
+      returns (stream AttachDaemonResponse);
+}
+
+message ExecDaemonRequest {
+  string name = 1;
+  repeated string args = 2;
+  map<string, string> env = 3;
+}
+
+message ExecDaemonResponse { bool is_new = 1; }
+
+message AttachDaemonRequest {
+  oneof request {
+    AttachDaemonStart start = 1;
+    bytes stdin_data = 2;
+  }
+}
+
+message AttachDaemonStart { string name = 1; }
+
+message AttachDaemonResponse {
+  oneof response {
+    bytes stdout_data = 1;
+    bytes stderr_data = 2;
+  }
+}
+
+message ExecRequest {
+  oneof request {
+    ExecStart start = 1;
+    bytes stdin_data = 2;
+  }
+}
+
+message ExecStart {
+  repeated string args = 1;
+  map<string, string> env = 2;
+  bool detach = 3;
+  optional int32 timeout = 4;
+}
+
+message ExecResponse {
+  oneof response {
+    bytes stdout_data = 1;
+    bytes stderr_data = 2;
+    int32 exit_code = 3;
+  }
+}
+
+message InteractiveShellRequest {
+  oneof request {
+    InteractiveShellStart start = 1;
+    bytes stdin_data = 2;
+  }
+}
+
+message InteractiveShellStart {
+  string shell = 1;
+  repeated string args = 2;
+  map<string, string> env = 3;
+  string cwd = 4;
+}
+
+message InteractiveShellResponse {
+  oneof response {
+    bytes output_data = 1;
+    int32 exit_code = 2;
+  }
+}
+
+message ReadFileRequest {
+  string path = 1;
+}
+
+message ReadFileResponse {
+  bytes data = 1;
+}
+
+message WriteFileRequest {
+  string path = 1;
+  bytes data = 2;
+  bool create_parents = 3;
+}
+
+message ListDirectoryRequest {
+  string path = 1;
+}
+
+message DirectoryEntry {
+  string name = 1;
+  bool is_dir = 2;
+  bool is_symlink = 3;
+}
+
+message ListDirectoryResponse {
+  repeated DirectoryEntry entries = 1;
+}
+
+message DeletePathRequest {
+  string path = 1;
+}

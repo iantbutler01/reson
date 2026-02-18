@@ -1,0 +1,864 @@
+use std::convert::TryFrom;
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Utc};
+use futures::Stream;
+use http::{Request as HttpRequest, Response as HttpResponse};
+use prost_types::Timestamp;
+use tokio::{fs, signal, sync::mpsc};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tonic::transport::Server;
+use tonic::{GrpcMethod, Request, Response, Status};
+use tower_http::classify::GrpcFailureClass;
+use tower_http::trace::TraceLayer;
+use tracing::{Level, Span, debug, info};
+
+use crate::config::Config;
+use crate::image::{self, PrebuiltImageStatus};
+use crate::proto::v1::{
+    CreateSnapshotRequest, CreateVmPhase, CreateVmProgress, CreateVmRequest,
+    CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest, GetSnapshotRequest,
+    GetVmRequest, HealthRequest, HealthResponse, InfoRequest, InfoResponse, ForkVmRequest,
+    ForkVmResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse,
+    PreDownloadVmImagePhase, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
+    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest,
+    VmSource, VmSourceType as ProtoVmSourceType, VmState as ProtoVmState,
+    create_vm_stream_response,
+    vmd_service_server::{VmdService, VmdServiceServer},
+};
+use crate::state::manager::{CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage};
+use crate::state::{
+    CreateVmParams, ForkVmParams, Manager, ManagerError, SnapshotMetadata, SnapshotParams,
+    UpdateVmParams, VmMetadata, VmSource as StateVmSource, VmSourceType as StateVmSourceType,
+    VmState,
+};
+
+pub async fn run_server(config: Config) -> Result<()> {
+    let addr: SocketAddr = config
+        .listen_address
+        .parse()
+        .with_context(|| format!("parse listen address {}", config.listen_address))?;
+
+    let manager = Arc::new(Manager::new(config.clone()).await.map_err(|e| anyhow!(e))?);
+    let svc = GrpcService {
+        manager: Arc::clone(&manager),
+        cfg: config.clone(),
+    };
+
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<VmdServiceServer<GrpcService>>()
+        .await;
+
+    let grpc_trace = TraceLayer::new_for_grpc()
+        .make_span_with(|request: &HttpRequest<_>| {
+            let grpc_method = request
+                .extensions()
+                .get::<GrpcMethod>()
+                .map(|method| format!("{}.{}", method.service(), method.method()));
+            match grpc_method {
+                Some(name) => tracing::span!(
+                    Level::DEBUG,
+                    "grpc",
+                    http_method = %request.method(),
+                    path = %request.uri().path(),
+                    grpc_method = %name
+                ),
+                None => tracing::span!(
+                    Level::DEBUG,
+                    "grpc",
+                    http_method = %request.method(),
+                    path = %request.uri().path()
+                ),
+            }
+        })
+        .on_request(|_request: &HttpRequest<_>, span: &Span| {
+            debug!(parent: span, "gRPC request received");
+        })
+        .on_response(
+            |response: &HttpResponse<_>, latency: Duration, span: &Span| {
+                debug!(
+                    parent: span,
+                    status = %response.status(),
+                    elapsed = ?latency,
+                    "gRPC response sent"
+                );
+            },
+        )
+        .on_failure(|class: GrpcFailureClass, latency: Duration, span: &Span| {
+            debug!(
+                parent: span,
+                classification = %class,
+                elapsed = ?latency,
+                "gRPC request failed"
+            );
+        });
+
+    info!(listen = %addr, "starting vmd gRPC server");
+
+    Server::builder()
+        .layer(grpc_trace)
+        .add_service(health_service)
+        .add_service(VmdServiceServer::new(svc))
+        .serve_with_shutdown(addr, shutdown_signal())
+        .await
+        .context("serve gRPC")?;
+
+    info!("vmd gRPC server stopped");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let mut term = signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
+        term.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+#[derive(Clone)]
+struct GrpcService {
+    manager: Arc<Manager>,
+    cfg: Config,
+}
+
+type GrpcResult<T> = Result<Response<T>, Status>;
+
+#[tonic::async_trait]
+impl VmdService for GrpcService {
+    type CreateVMStream =
+        Pin<Box<dyn Stream<Item = Result<CreateVmStreamResponse, Status>> + Send>>;
+    type PreDownloadVmImageStream =
+        Pin<Box<dyn Stream<Item = Result<PreDownloadVmImageResponse, Status>> + Send>>;
+
+    async fn health(&self, _request: Request<HealthRequest>) -> GrpcResult<HealthResponse> {
+        Ok(Response::new(HealthResponse {
+            status: "ok".to_string(),
+        }))
+    }
+
+    async fn info(&self, _request: Request<InfoRequest>) -> GrpcResult<InfoResponse> {
+        Ok(Response::new(InfoResponse {
+            listen: self.cfg.listen_address.clone(),
+            data_dir: self.cfg.data_dir.clone(),
+            qemu_bin: self.cfg.qemu_bin.clone(),
+            qemu_img: self.cfg.qemu_img_bin.clone(),
+            docker_bin: self.cfg.docker_bin.clone(),
+            log_level: self.cfg.log_level.clone(),
+        }))
+    }
+
+    async fn list_v_ms(&self, request: Request<ListVMsRequest>) -> GrpcResult<ListVMsResponse> {
+        let include_snapshots = request.into_inner().include_snapshots;
+        let vms = self.manager.list().await;
+        let mut response = Vec::with_capacity(vms.len());
+        for meta in vms {
+            let (detail, runtime) = self
+                .manager
+                .get_with_runtime(&meta.id)
+                .await
+                .map_err(status_from_error)?;
+            response.push(build_vm(&detail, Some(&runtime), include_snapshots));
+        }
+        Ok(Response::new(ListVMsResponse { vms: response }))
+    }
+
+    async fn get_vm(&self, request: Request<GetVmRequest>) -> GrpcResult<Vm> {
+        let vm_id = request.into_inner().vm_id;
+        if vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        let (meta, runtime) = self
+            .manager
+            .get_with_runtime(&vm_id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_vm(&meta, Some(&runtime), true)))
+    }
+
+    async fn create_vm(
+        &self,
+        request: Request<CreateVmRequest>,
+    ) -> Result<Response<Self::CreateVMStream>, Status> {
+        let req = request.into_inner();
+        let source = req
+            .source
+            .ok_or_else(|| Status::invalid_argument("source must be provided"))?;
+        let source_type = map_source_type(source.r#type)?;
+        if source.reference.is_empty() {
+            return Err(Status::invalid_argument(
+                "source reference must be provided",
+            ));
+        }
+
+        let resources = req.resources.unwrap_or_default();
+        let params = CreateVmParams {
+            name: req.name,
+            source: StateVmSource {
+                source_type,
+                reference: source.reference,
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: resources.vcpu.max(0),
+                memory_mb: resources.memory_mb.max(0),
+                disk_gb: resources.disk_gb.max(0),
+            },
+            metadata: req.metadata.map_or_else(Default::default, |m| m.entries),
+            auto_start: req.auto_start,
+            architecture: req.architecture,
+        };
+
+        let manager = Arc::clone(&self.manager);
+        let (tx, rx) = mpsc::unbounded_channel::<Result<CreateVmStreamResponse, Status>>();
+
+        tokio::spawn(async move {
+            let download_percent = Arc::new(Mutex::new(None::<u32>));
+            let progress_tx = tx.clone();
+            let progress_callback: CreateVmProgressCallback = {
+                let progress_tx = progress_tx.clone();
+                let download_percent = Arc::clone(&download_percent);
+                Arc::new(move |event: CreateVmProgressEvent| {
+                    handle_create_vm_progress(&progress_tx, &download_percent, event);
+                })
+            };
+
+            let result = manager.create_vm(params, Some(progress_callback)).await;
+            match result {
+                Ok(meta) => match manager.get_with_runtime(&meta.id).await {
+                    Ok((detail, runtime)) => {
+                        publish_progress(
+                            &progress_tx,
+                            CreateVmPhase::Complete,
+                            100,
+                            format!("VM {} ready", detail.name),
+                        );
+                        let vm = build_vm(&detail, Some(&runtime), true);
+                        let response = CreateVmStreamResponse {
+                            event: Some(create_vm_stream_response::Event::Vm(vm)),
+                        };
+                        let _ = progress_tx.send(Ok(response));
+                    }
+                    Err(err) => {
+                        let status = status_from_error(err);
+                        let _ = progress_tx.send(Err(status));
+                    }
+                },
+                Err(err) => {
+                    let status = status_from_error(err);
+                    let _ = tx.send(Err(status));
+                }
+            }
+        });
+
+        Ok(Response::new(
+            Box::pin(UnboundedReceiverStream::new(rx)) as Self::CreateVMStream
+        ))
+    }
+
+    async fn update_vm(&self, request: Request<UpdateVmRequest>) -> GrpcResult<Vm> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        let mut params = UpdateVmParams::default();
+        if let Some(name) = req.name {
+            params.name = Some(name);
+        }
+        if let Some(meta) = req.metadata {
+            params.metadata = Some(meta.entries);
+        }
+        let meta = self
+            .manager
+            .update_vm(&req.vm_id, params)
+            .await
+            .map_err(status_from_error)?;
+        let (detail, runtime) = self
+            .manager
+            .get_with_runtime(&meta.id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_vm(&detail, Some(&runtime), true)))
+    }
+
+    async fn delete_vm(&self, request: Request<DeleteVmRequest>) -> GrpcResult<()> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        self.manager
+            .delete_vm(&req.vm_id, req.purge_snapshots)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(()))
+    }
+
+    async fn fork_vm(&self, request: Request<ForkVmRequest>) -> GrpcResult<ForkVmResponse> {
+        let req = request.into_inner();
+        if req.parent_vm_id.trim().is_empty() {
+            return Err(Status::invalid_argument("parent_vm_id is required"));
+        }
+
+        let params = ForkVmParams {
+            child_name: if req.child_name.trim().is_empty() {
+                None
+            } else {
+                Some(req.child_name)
+            },
+            child_metadata: req.child_metadata.map_or_else(HashMap::new, |m| m.entries),
+            auto_start_child: req.auto_start_child,
+        };
+
+        let (parent_meta, child_meta, fork_id) = self
+            .manager
+            .fork_vm(&req.parent_vm_id, params)
+            .await
+            .map_err(status_from_error)?;
+        let (parent_detail, parent_runtime) = self
+            .manager
+            .get_with_runtime(&parent_meta.id)
+            .await
+            .map_err(status_from_error)?;
+        let (child_detail, child_runtime) = self
+            .manager
+            .get_with_runtime(&child_meta.id)
+            .await
+            .map_err(status_from_error)?;
+
+        Ok(Response::new(ForkVmResponse {
+            parent_vm: Some(build_vm(&parent_detail, Some(&parent_runtime), true)),
+            child_vm: Some(build_vm(&child_detail, Some(&child_runtime), true)),
+            fork_id,
+        }))
+    }
+
+    async fn start_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.vm_action(request.into_inner(), Action::Start).await
+    }
+
+    async fn stop_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.vm_action(request.into_inner(), Action::Stop).await
+    }
+
+    async fn restart_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.vm_action(request.into_inner(), Action::Restart).await
+    }
+
+    async fn pause_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.vm_action(request.into_inner(), Action::Pause).await
+    }
+
+    async fn resume_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.vm_action(request.into_inner(), Action::Resume).await
+    }
+
+    async fn force_stop_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.vm_action(request.into_inner(), Action::ForceStop)
+            .await
+    }
+
+    async fn pre_download_vm_image(
+        &self,
+        request: Request<PreDownloadVmImageRequest>,
+    ) -> Result<Response<Self::PreDownloadVmImageStream>, Status> {
+        let req = request.into_inner();
+        if req.reference.trim().is_empty() {
+            return Err(Status::invalid_argument("reference is required"));
+        }
+
+        let arch = if req.architecture.trim().is_empty() {
+            self.manager.host_architecture().to_string()
+        } else {
+            self.manager
+                .normalize_architecture(&req.architecture)
+                .map_err(status_from_error)?
+        };
+        if arch.is_empty() {
+            return Err(Status::failed_precondition(
+                "daemon host architecture is unknown",
+            ));
+        }
+
+        let reference = req.reference;
+        let target = image::default_base_image_path(&self.cfg, &reference, &arch);
+        let force = req.force;
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(build_pre_download_response(
+                    PreDownloadVmImagePhase::CheckingCache,
+                    format!("checking cache for {}", reference),
+                    0,
+                    None,
+                )))
+                .is_err()
+            {
+                return;
+            }
+
+            match fs::metadata(&target).await {
+                Ok(metadata) if metadata.len() > 0 && !force => {
+                    let size = metadata.len();
+                    let message = format!("base image already present at {}", target.display());
+                    let _ = tx.send(Ok(build_pre_download_response(
+                        PreDownloadVmImagePhase::AlreadyPresent,
+                        message.clone(),
+                        size,
+                        Some(size),
+                    )));
+                    let _ = tx.send(Ok(build_pre_download_response(
+                        PreDownloadVmImagePhase::Complete,
+                        message,
+                        size,
+                        Some(size),
+                    )));
+                    return;
+                }
+                Ok(metadata) if metadata.len() > 0 && force => {
+                    let _ = tx.send(Ok(build_pre_download_response(
+                        PreDownloadVmImagePhase::CheckingCache,
+                        format!("replacing existing image at {}", target.display()),
+                        metadata.len(),
+                        Some(metadata.len()),
+                    )));
+                    if let Err(err) = fs::remove_file(&target).await {
+                        let status = Status::internal(format!(
+                            "failed to remove existing image {}: {err}",
+                            target.display()
+                        ));
+                        let _ = tx.send(Err(status));
+                        return;
+                    }
+                }
+                Ok(_) => {
+                    if let Err(err) = fs::remove_file(&target).await {
+                        if err.kind() != ErrorKind::NotFound {
+                            let status = Status::internal(format!(
+                                "failed to remove empty image {}: {err}",
+                                target.display()
+                            ));
+                            let _ = tx.send(Err(status));
+                            return;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    let status = Status::internal(format!(
+                        "failed to inspect image {}: {err}",
+                        target.display()
+                    ));
+                    let _ = tx.send(Err(status));
+                    return;
+                }
+            }
+
+            let download_message = format!("downloading {} for {}", reference, arch);
+            let _ = tx.send(Ok(build_pre_download_response(
+                PreDownloadVmImagePhase::Downloading,
+                download_message.clone(),
+                0,
+                None,
+            )));
+
+            let progress_sender = tx.clone();
+            let download_result = image::download_prebuilt_image_with_progress(
+                &reference,
+                &arch,
+                target.as_path(),
+                move |progress| {
+                    let _ = progress_sender.send(Ok(build_pre_download_response(
+                        PreDownloadVmImagePhase::Downloading,
+                        String::new(),
+                        progress.downloaded_bytes,
+                        progress.total_bytes,
+                    )));
+                },
+            )
+            .await;
+
+            match download_result {
+                Ok(PrebuiltImageStatus::Downloaded { bytes }) => {
+                    let message = format!("stored VM image at {}", target.display());
+                    let _ = tx.send(Ok(build_pre_download_response(
+                        PreDownloadVmImagePhase::Complete,
+                        message,
+                        bytes,
+                        Some(bytes),
+                    )));
+                }
+                Ok(PrebuiltImageStatus::NotFound) => {
+                    let status = Status::not_found(format!(
+                        "no prebuilt VM image found for {reference} ({arch})"
+                    ));
+                    let _ = tx.send(Err(status));
+                }
+                Err(err) => {
+                    let status = Status::internal(format!(
+                        "failed to download VM image {reference} ({arch}): {err}"
+                    ));
+                    let _ = tx.send(Err(status));
+                }
+            }
+        });
+
+        let stream = UnboundedReceiverStream::new(rx);
+        Ok(Response::new(
+            Box::pin(stream) as Self::PreDownloadVmImageStream
+        ))
+    }
+
+    async fn list_snapshots(
+        &self,
+        request: Request<ListSnapshotsRequest>,
+    ) -> GrpcResult<ListSnapshotsResponse> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        let snaps = self
+            .manager
+            .list_snapshots(&req.vm_id)
+            .await
+            .map_err(status_from_error)?;
+        let response = ListSnapshotsResponse {
+            snapshots: snaps.into_iter().map(build_snapshot).collect(),
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn create_snapshot(
+        &self,
+        request: Request<CreateSnapshotRequest>,
+    ) -> GrpcResult<Snapshot> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        let params = SnapshotParams {
+            label: req.label,
+            description: req.description,
+        };
+        let snap = self
+            .manager
+            .create_snapshot(&req.vm_id, params)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_snapshot(snap)))
+    }
+
+    async fn get_snapshot(&self, request: Request<GetSnapshotRequest>) -> GrpcResult<Snapshot> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_id and snapshot_id are required",
+            ));
+        }
+        let snap = self
+            .manager
+            .snapshot(&req.vm_id, &req.snapshot_id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_snapshot(snap)))
+    }
+
+    async fn restore_snapshot(&self, request: Request<RestoreSnapshotRequest>) -> GrpcResult<Vm> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_id and snapshot_id are required",
+            ));
+        }
+        let meta = self
+            .manager
+            .restore_snapshot(&req.vm_id, &req.snapshot_id)
+            .await
+            .map_err(status_from_error)?;
+        let (detail, runtime) = self
+            .manager
+            .get_with_runtime(&meta.id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_vm(&detail, Some(&runtime), true)))
+    }
+
+    async fn delete_snapshot(&self, request: Request<DeleteSnapshotRequest>) -> GrpcResult<()> {
+        let req = request.into_inner();
+        if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "vm_id and snapshot_id are required",
+            ));
+        }
+        self.manager
+            .delete_snapshot(&req.vm_id, &req.snapshot_id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(()))
+    }
+}
+
+enum Action {
+    Start,
+    Stop,
+    Restart,
+    Pause,
+    Resume,
+    ForceStop,
+}
+
+impl GrpcService {
+    async fn vm_action(&self, req: VmActionRequest, action: Action) -> GrpcResult<Vm> {
+        let vm_id = req.vm_id.clone();
+        if vm_id.is_empty() {
+            return Err(Status::invalid_argument("vm_id is required"));
+        }
+        let meta = match action {
+            Action::Start => self.manager.start_vm(&vm_id).await,
+            Action::Stop => self.manager.stop_vm(&vm_id).await,
+            Action::Restart => self.manager.restart_vm(&vm_id).await,
+            Action::Pause => self.manager.pause_vm(&vm_id).await,
+            Action::Resume => self.manager.resume_vm(&vm_id).await,
+            Action::ForceStop => self.manager.force_stop_vm(&vm_id).await,
+        }
+        .map_err(status_from_error)?;
+        let (detail, runtime) = self
+            .manager
+            .get_with_runtime(&meta.id)
+            .await
+            .map_err(status_from_error)?;
+        Ok(Response::new(build_vm(&detail, Some(&runtime), true)))
+    }
+}
+
+fn build_pre_download_response(
+    phase: PreDownloadVmImagePhase,
+    message: String,
+    downloaded: u64,
+    total: Option<u64>,
+) -> PreDownloadVmImageResponse {
+    PreDownloadVmImageResponse {
+        phase: phase as i32,
+        message,
+        downloaded_bytes: downloaded,
+        total_bytes: total.unwrap_or(0),
+    }
+}
+
+fn handle_create_vm_progress(
+    sender: &mpsc::UnboundedSender<Result<CreateVmStreamResponse, Status>>,
+    download_percent: &Mutex<Option<u32>>,
+    event: CreateVmProgressEvent,
+) {
+    match event {
+        CreateVmProgressEvent::DownloadBytes {
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            if let Some(total) = total_bytes {
+                if total == 0 {
+                    publish_progress(
+                        sender,
+                        CreateVmPhase::DownloadingImage,
+                        0,
+                        format!("downloading VM image: {downloaded_bytes} bytes"),
+                    );
+                } else {
+                    let mut percent = (downloaded_bytes as f64 / total as f64) * 100.0;
+                    if percent > 100.0 {
+                        percent = 100.0;
+                    }
+                    let percent_u32 = percent.round() as u32;
+                    let mut guard = download_percent
+                        .lock()
+                        .expect("download percent lock poisoned");
+                    if guard.map(|p| percent_u32 > p).unwrap_or(true) {
+                        *guard = Some(percent_u32);
+                        publish_progress(
+                            sender,
+                            CreateVmPhase::DownloadingImage,
+                            percent_u32,
+                            format!(
+                                "downloading VM image: {} / {} bytes",
+                                downloaded_bytes, total
+                            ),
+                        );
+                    }
+                }
+            } else {
+                publish_progress(
+                    sender,
+                    CreateVmPhase::DownloadingImage,
+                    0,
+                    format!("downloading VM image: {} bytes", downloaded_bytes),
+                );
+            }
+        }
+        CreateVmProgressEvent::StageProgress {
+            stage,
+            percent,
+            message,
+        } => {
+            let phase = map_stage_to_phase(stage);
+            let msg = message
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| default_progress_message(phase).to_string());
+            publish_progress(sender, phase, percent, msg);
+        }
+    }
+}
+
+fn publish_progress(
+    sender: &mpsc::UnboundedSender<Result<CreateVmStreamResponse, Status>>,
+    phase: CreateVmPhase,
+    percent: u32,
+    message: String,
+) {
+    let response = CreateVmStreamResponse {
+        event: Some(create_vm_stream_response::Event::Progress(
+            CreateVmProgress {
+                phase: phase as i32,
+                message,
+                percent,
+            },
+        )),
+    };
+    let _ = sender.send(Ok(response));
+}
+
+fn map_stage_to_phase(stage: CreateVmStage) -> CreateVmPhase {
+    match stage {
+        CreateVmStage::DownloadImage => CreateVmPhase::DownloadingImage,
+        CreateVmStage::ConvertImage => CreateVmPhase::ConvertingImage,
+        CreateVmStage::StartVm => CreateVmPhase::StartingVm,
+    }
+}
+
+fn default_progress_message(phase: CreateVmPhase) -> &'static str {
+    match phase {
+        CreateVmPhase::DownloadingImage => "downloading VM image",
+        CreateVmPhase::ConvertingImage => "converting VM disk",
+        CreateVmPhase::StartingVm => "starting VM",
+        CreateVmPhase::Complete => "VM ready",
+        CreateVmPhase::Unspecified => "working",
+    }
+}
+
+fn build_vm(
+    meta: &VmMetadata,
+    runtime: Option<&crate::state::VmRuntime>,
+    include_snapshots: bool,
+) -> Vm {
+    let mut vm = Vm {
+        id: meta.id.clone(),
+        name: meta.name.clone(),
+        state: map_vm_state(meta.state.clone()),
+        architecture: meta.architecture.clone(),
+        created_at: Some(to_timestamp(meta.created_at)),
+        updated_at: Some(to_timestamp(meta.updated_at)),
+        source: Some(VmSource {
+            r#type: map_source_type_proto(&meta.source.source_type),
+            reference: meta.source.reference.clone(),
+        }),
+        resources: Some(ResourceSpec {
+            vcpu: meta.resources.vcpu,
+            memory_mb: meta.resources.memory_mb,
+            disk_gb: meta.resources.disk_gb,
+        }),
+        network: Some(crate::proto::v1::NetworkSpec {
+            mac: meta.network.mac.clone(),
+            portproxy_ports: Some(crate::proto::v1::PortProxyPorts {
+                proxy_port: meta.network.proxy_port,
+                rpc_port: meta.network.rpc_port,
+            }),
+        }),
+        metadata: meta.metadata.clone(),
+        snapshots: Vec::new(),
+        started_at: meta.started_at.map(to_timestamp),
+    };
+
+    if let Some(runtime) = runtime {
+        vm.state = map_vm_state(runtime.state.clone());
+        if let Some(started) = runtime.started_at {
+            if runtime.state == VmState::Running {
+                vm.started_at = Some(to_timestamp(started));
+            }
+        }
+    }
+
+    if include_snapshots {
+        vm.snapshots = meta.snapshots.iter().cloned().map(build_snapshot).collect();
+    }
+
+    vm
+}
+
+fn build_snapshot(meta: SnapshotMetadata) -> Snapshot {
+    Snapshot {
+        id: meta.id,
+        name: meta.name,
+        label: meta.label,
+        description: meta.description,
+        created_at: Some(to_timestamp(meta.created_at)),
+    }
+}
+
+fn map_vm_state(state: VmState) -> i32 {
+    match state {
+        VmState::Creating => ProtoVmState::Creating as i32,
+        VmState::Stopped => ProtoVmState::Stopped as i32,
+        VmState::Running => ProtoVmState::Running as i32,
+        VmState::Paused => ProtoVmState::Paused as i32,
+        VmState::Error => ProtoVmState::Error as i32,
+    }
+}
+
+fn map_source_type_proto(source_type: &StateVmSourceType) -> i32 {
+    match source_type {
+        StateVmSourceType::Docker => ProtoVmSourceType::Docker as i32,
+        StateVmSourceType::Snapshot => ProtoVmSourceType::Snapshot as i32,
+    }
+}
+
+fn map_source_type(value: i32) -> Result<StateVmSourceType, Status> {
+    match ProtoVmSourceType::try_from(value) {
+        Ok(ProtoVmSourceType::Docker) => Ok(StateVmSourceType::Docker),
+        Ok(ProtoVmSourceType::Snapshot) => Ok(StateVmSourceType::Snapshot),
+        Ok(ProtoVmSourceType::Unspecified) | Err(_) => {
+            Err(Status::invalid_argument("source type must be provided"))
+        }
+    }
+}
+
+fn to_timestamp(ts: DateTime<Utc>) -> Timestamp {
+    Timestamp {
+        seconds: ts.timestamp(),
+        nanos: ts.timestamp_subsec_nanos() as i32,
+    }
+}
+
+fn status_from_error(err: ManagerError) -> Status {
+    match err {
+        ManagerError::VmNotFound => Status::not_found(err.to_string()),
+        ManagerError::SnapshotNotFound => Status::not_found(err.to_string()),
+        ManagerError::InvalidState => Status::failed_precondition(err.to_string()),
+        ManagerError::Cancelled => Status::cancelled(err.to_string()),
+        ManagerError::Other(e) => Status::internal(e.to_string()),
+        ManagerError::Io(e) => Status::internal(e.to_string()),
+    }
+}

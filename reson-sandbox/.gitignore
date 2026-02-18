@@ -1,0 +1,12 @@
+# Build outputs
+/target/
+**/target/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Temp and logs
+.tmp/
+*.log

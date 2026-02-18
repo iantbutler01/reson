@@ -1,0 +1,13 @@
+[workspace]
+members = [
+  "vmd",
+  "portproxy",
+  "crates/reson-sandbox",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.lints.rust]
+warnings = "deny"

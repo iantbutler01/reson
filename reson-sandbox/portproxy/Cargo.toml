@@ -1,0 +1,30 @@
+[package]
+name = "portproxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.51", features = ["derive"] }
+futures = "0.3.31"
+nix = { version = "0.30.1", features = ["signal", "process"] }
+portable-pty = "0.9.0"
+prost = "0.14.1"
+prost-types = "0.14.1"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "process", "fs", "io-util", "net", "time", "sync"] }
+tokio-stream = "0.1.17"
+tonic = { version = "0.14.2", features = ["transport"] }
+tonic-health = "0.14.2"
+tonic-prost = "0.14.2"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+
+[[bin]]
+name = "portproxy"
+path = "src/main.rs"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-build = "0.14.2"
+tonic-prost-build = "0.14.2"

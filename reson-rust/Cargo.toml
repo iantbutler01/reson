@@ -69,6 +69,7 @@ gcp_auth = { version = "0.12", optional = true }
 
 # Optional: MCP support
 reson-mcp = { version = "0.1.0", path = "../reson-mcp", optional = true, default-features = false, features = ["client", "server"] }
+reson-sandbox = { version = "0.1.0", path = "../reson-sandbox/crates/reson-sandbox" }
 
 [dev-dependencies]
 tokio-test = "0.4"

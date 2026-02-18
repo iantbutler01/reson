@@ -1,0 +1,237 @@
+syntax = "proto3";
+
+package vmd.v1;
+
+option go_package = "github.com/BracketDevelopers/vmd/internal/api/v1;vmdpb";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
+
+message InfoRequest {}
+
+message InfoResponse {
+  string listen = 1;
+  string data_dir = 2;
+  string qemu_bin = 3;
+  string qemu_img = 4;
+  string docker_bin = 5;
+  string log_level = 6;
+}
+
+enum VMState {
+  VM_STATE_UNSPECIFIED = 0;
+  VM_STATE_CREATING = 1;
+  VM_STATE_STOPPED = 2;
+  VM_STATE_RUNNING = 3;
+  VM_STATE_PAUSED = 4;
+  VM_STATE_ERROR = 5;
+}
+
+enum VMSourceType {
+  VM_SOURCE_TYPE_UNSPECIFIED = 0;
+  VM_SOURCE_TYPE_DOCKER = 1;
+  VM_SOURCE_TYPE_SNAPSHOT = 2;
+}
+
+message VMSource {
+  VMSourceType type = 1;
+  string reference = 2;
+}
+
+message ResourceSpec {
+  int32 vcpu = 1;
+  int32 memory_mb = 2;
+  int32 disk_gb = 3;
+}
+
+message PortProxyPorts {
+  int32 proxy_port = 1;
+  int32 rpc_port = 2;
+}
+
+message NetworkSpec {
+  string mac = 1;
+  PortProxyPorts portproxy_ports = 4;
+}
+
+message Snapshot {
+  string id = 1;
+  string name = 2;
+  string label = 3;
+  string description = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message VM {
+  string id = 1;
+  string name = 2;
+  VMState state = 3;
+  string architecture = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  VMSource source = 7;
+  ResourceSpec resources = 8;
+  NetworkSpec network = 9;
+  map<string, string> metadata = 10;
+  repeated Snapshot snapshots = 11;
+  google.protobuf.Timestamp started_at = 12;
+}
+
+message ListVMsRequest {
+  bool include_snapshots = 1;
+}
+
+message ListVMsResponse {
+  repeated VM vms = 1;
+}
+
+message GetVMRequest {
+  string vm_id = 1;
+}
+
+message CreateVMRequest {
+  string name = 1;
+  VMSource source = 2;
+  ResourceSpec resources = 3;
+  Metadata metadata = 4;
+  bool auto_start = 5;
+  string architecture = 6;
+}
+
+enum CreateVmPhase {
+  CREATE_VM_PHASE_UNSPECIFIED = 0;
+  CREATE_VM_PHASE_DOWNLOADING_IMAGE = 1;
+  CREATE_VM_PHASE_CONVERTING_IMAGE = 2;
+  CREATE_VM_PHASE_STARTING_VM = 3;
+  CREATE_VM_PHASE_COMPLETE = 4;
+}
+
+message CreateVmProgress {
+  CreateVmPhase phase = 1;
+  string message = 2;
+  uint32 percent = 3;
+}
+
+message CreateVmStreamResponse {
+  oneof event {
+    CreateVmProgress progress = 1;
+    VM vm = 2;
+  }
+}
+
+message Metadata {
+  map<string, string> entries = 1;
+}
+
+message UpdateVMRequest {
+  string vm_id = 1;
+  google.protobuf.StringValue name = 2;
+  Metadata metadata = 3;
+}
+
+message DeleteVMRequest {
+  string vm_id = 1;
+  bool purge_snapshots = 2;
+}
+
+message ForkVMRequest {
+  string parent_vm_id = 1;
+  string child_name = 2;
+  Metadata child_metadata = 3;
+  bool auto_start_child = 4;
+}
+
+message ForkVMResponse {
+  VM parent_vm = 1;
+  VM child_vm = 2;
+  string fork_id = 3;
+}
+
+message VMActionRequest {
+  string vm_id = 1;
+}
+
+message ListSnapshotsRequest {
+  string vm_id = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+}
+
+message CreateSnapshotRequest {
+  string vm_id = 1;
+  string label = 2;
+  string description = 3;
+}
+
+message GetSnapshotRequest {
+  string vm_id = 1;
+  string snapshot_id = 2;
+}
+
+message RestoreSnapshotRequest {
+  string vm_id = 1;
+  string snapshot_id = 2;
+}
+
+message DeleteSnapshotRequest {
+  string vm_id = 1;
+  string snapshot_id = 2;
+}
+
+message PreDownloadVmImageRequest {
+  string reference = 1;
+  string architecture = 2;
+  bool force = 3;
+}
+
+enum PreDownloadVmImagePhase {
+  PRE_DOWNLOAD_VM_IMAGE_PHASE_UNSPECIFIED = 0;
+  PRE_DOWNLOAD_VM_IMAGE_PHASE_CHECKING_CACHE = 1;
+  PRE_DOWNLOAD_VM_IMAGE_PHASE_ALREADY_PRESENT = 2;
+  PRE_DOWNLOAD_VM_IMAGE_PHASE_DOWNLOADING = 3;
+  PRE_DOWNLOAD_VM_IMAGE_PHASE_COMPLETE = 4;
+}
+
+message PreDownloadVmImageResponse {
+  PreDownloadVmImagePhase phase = 1;
+  string message = 2;
+  uint64 downloaded_bytes = 3;
+  uint64 total_bytes = 4;
+}
+
+service VMDService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Info(InfoRequest) returns (InfoResponse);
+
+  rpc ListVMs(ListVMsRequest) returns (ListVMsResponse);
+  rpc GetVM(GetVMRequest) returns (VM);
+  rpc CreateVM(CreateVMRequest) returns (stream CreateVmStreamResponse);
+  rpc UpdateVM(UpdateVMRequest) returns (VM);
+  rpc DeleteVM(DeleteVMRequest) returns (google.protobuf.Empty);
+  rpc ForkVM(ForkVMRequest) returns (ForkVMResponse);
+
+  rpc StartVM(VMActionRequest) returns (VM);
+  rpc StopVM(VMActionRequest) returns (VM);
+  rpc RestartVM(VMActionRequest) returns (VM);
+  rpc PauseVM(VMActionRequest) returns (VM);
+  rpc ResumeVM(VMActionRequest) returns (VM);
+  rpc ForceStopVM(VMActionRequest) returns (VM);
+
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (Snapshot);
+  rpc GetSnapshot(GetSnapshotRequest) returns (Snapshot);
+  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (VM);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
+
+  rpc PreDownloadVmImage(PreDownloadVmImageRequest)
+      returns (stream PreDownloadVmImageResponse);
+}

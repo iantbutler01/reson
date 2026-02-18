@@ -1,0 +1,268 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::state::runtime::VmRuntime;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VmState {
+    Creating,
+    Stopped,
+    Running,
+    Paused,
+    Error,
+}
+
+impl Default for VmState {
+    fn default() -> Self {
+        VmState::Stopped
+    }
+}
+
+impl VmState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VmState::Creating => "creating",
+            VmState::Stopped => "stopped",
+            VmState::Running => "running",
+            VmState::Paused => "paused",
+            VmState::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VmSourceType {
+    Docker,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmSource {
+    #[serde(rename = "type")]
+    pub source_type: VmSourceType,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceSpec {
+    pub vcpu: i32,
+    #[serde(rename = "memory_mb")]
+    pub memory_mb: i32,
+    #[serde(rename = "disk_gb")]
+    pub disk_gb: i32,
+}
+
+impl Default for ResourceSpec {
+    fn default() -> Self {
+        Self {
+            vcpu: 1,
+            memory_mb: 1024,
+            disk_gb: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSpec {
+    pub mac: String,
+    #[serde(default)]
+    pub proxy_port: i32,
+    #[serde(default)]
+    pub rpc_port: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMetadata {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(with = "iso8601")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub disk_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmMetadata {
+    pub id: String,
+    pub name: String,
+    #[serde(with = "iso8601")]
+    pub created_at: DateTime<Utc>,
+    #[serde(with = "iso8601")]
+    pub updated_at: DateTime<Utc>,
+    pub state: VmState,
+    #[serde(default)]
+    pub architecture: String,
+    pub source: VmSource,
+    pub resources: ResourceSpec,
+    pub network: NetworkSpec,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+    #[serde(default)]
+    pub snapshots: Vec<SnapshotMetadata>,
+    #[serde(default)]
+    pub suspended_snapshot: String,
+    #[serde(default)]
+    pub suspended_boot_snapshot: String,
+    #[serde(default)]
+    pub boot_snapshot: String,
+    #[serde(default, with = "iso8601::option")]
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+impl VmMetadata {
+    pub fn snapshot_dir(&self, vm_dir: &PathBuf) -> PathBuf {
+        vm_dir.join("snapshots")
+    }
+}
+
+#[derive(Debug)]
+pub struct VmInner {
+    pub metadata: VmMetadata,
+    pub runtime: VmRuntime,
+}
+
+#[derive(Debug)]
+pub struct Vm {
+    inner: Arc<tokio::sync::Mutex<VmInner>>,
+    pub dir: PathBuf,
+}
+
+impl Vm {
+    pub fn new(metadata: VmMetadata, runtime: VmRuntime, dir: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(VmInner { metadata, runtime })),
+            dir,
+        }
+    }
+
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, VmInner> {
+        self.inner.lock().await
+    }
+
+    pub async fn lock_owned(&self) -> tokio::sync::OwnedMutexGuard<VmInner> {
+        self.inner.clone().lock_owned().await
+    }
+
+    pub fn disk_path(&self) -> PathBuf {
+        self.dir.join("disk.qcow2")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SnapshotRecord {
+    pub vm_id: String,
+    pub snapshot: SnapshotMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateVmParams {
+    pub name: String,
+    pub source: VmSource,
+    pub resources: ResourceSpec,
+    pub metadata: HashMap<String, String>,
+    pub auto_start: bool,
+    pub architecture: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateVmParams {
+    pub name: Option<String>,
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ForkVmParams {
+    pub child_name: Option<String>,
+    pub child_metadata: HashMap<String, String>,
+    pub auto_start_child: bool,
+}
+
+pub mod iso8601 {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        DateTime::parse_from_rfc3339(&s)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(serde::de::Error::custom)
+    }
+
+    pub mod option {
+        use chrono::{DateTime, SecondsFormat, Utc};
+        use serde::{self, Deserialize, Deserializer, Serializer};
+
+        pub fn serialize<S>(value: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match value {
+                Some(ts) => {
+                    serializer.serialize_some(&ts.to_rfc3339_opts(SecondsFormat::Millis, true))
+                }
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let opt = Option::<String>::deserialize(deserializer)?;
+            match opt {
+                Some(s) => {
+                    let dt = DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(Some(dt))
+                }
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+pub fn new_snapshot_metadata(label: String, description: String) -> SnapshotMetadata {
+    let id = Uuid::new_v4().to_string();
+    SnapshotMetadata {
+        name: format!("snap-{id}"),
+        id,
+        label,
+        description,
+        created_at: Utc::now(),
+        disk_only: false,
+    }
+}
+
+pub fn sanitize_name(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        format!(
+            "vm-{}",
+            Uuid::new_v4().to_string().split('-').next().unwrap()
+        )
+    } else {
+        trimmed.to_string()
+    }
+}
