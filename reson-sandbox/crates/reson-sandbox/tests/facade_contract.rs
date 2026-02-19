@@ -1,20 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs;
-use std::io::Write;
 use std::pin::Pin;
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use futures::{Stream, StreamExt};
-use reson_sandbox::{
-    ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
-    SessionOptions, ShellEvent, ShellInput,
-};
 use reson_sandbox::proto::bracket::portproxy::v1::port_proxy_server::{PortProxy, PortProxyServer};
 use reson_sandbox::proto::bracket::portproxy::v1::shell_exec_server::{ShellExec, ShellExecServer};
 use reson_sandbox::proto::bracket::portproxy::v1::{
@@ -29,12 +18,16 @@ use reson_sandbox::proto::vmd::v1::{
     CreateSnapshotRequest, CreateVmRequest, CreateVmStreamResponse, DeleteSnapshotRequest,
     DeleteVmRequest, ForkVmRequest, ForkVmResponse, GetSnapshotRequest, GetVmRequest,
     HealthRequest, HealthResponse, InfoRequest, InfoResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec,
-    PortProxyPorts, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
-    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
-    VmSourceType, VmState, create_vm_stream_response,
+    ListSnapshotsResponse, ListVMsRequest, ListVMsResponse, NetworkSpec, PortProxyPorts,
+    PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec, RestoreSnapshotRequest,
+    Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource, VmSourceType, VmState,
+    create_vm_stream_response,
 };
-use tokio::net::TcpListener;
+use reson_sandbox::{
+    ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
+    SessionOptions, ShellEvent, ShellInput,
+};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -65,9 +58,11 @@ impl MockVmd {
         state: i32,
         mut metadata: HashMap<String, String>,
     ) -> Vm {
-        if !metadata.contains_key("reson.branch_id")
-            && let Some(session_id) = metadata.get("reson.session_id").cloned()
-        {
+        let branch_id = metadata
+            .get("reson.session_id")
+            .cloned()
+            .filter(|_| !metadata.contains_key("reson.branch_id"));
+        if let Some(session_id) = branch_id {
             metadata.insert("reson.branch_id".to_string(), session_id);
         }
 
@@ -100,12 +95,7 @@ impl MockVmd {
         }
     }
 
-    async fn vm_mutate(
-        &self,
-        vm_id: &str,
-        state: i32,
-        increment_stop: bool,
-    ) -> Result<Vm, Status> {
+    async fn vm_mutate(&self, vm_id: &str, state: i32, increment_stop: bool) -> Result<Vm, Status> {
         let mut guard = self.state.lock().await;
         let vm = guard
             .vms
@@ -122,11 +112,15 @@ impl MockVmd {
 
 #[tonic::async_trait]
 impl VmdService for MockVmd {
-    type CreateVMStream = Pin<Box<dyn Stream<Item = Result<CreateVmStreamResponse, Status>> + Send>>;
+    type CreateVMStream =
+        Pin<Box<dyn Stream<Item = Result<CreateVmStreamResponse, Status>> + Send>>;
     type PreDownloadVmImageStream =
         Pin<Box<dyn Stream<Item = Result<PreDownloadVmImageResponse, Status>> + Send>>;
 
-    async fn health(&self, _request: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
+    async fn health(
+        &self,
+        _request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
             status: "ok".to_string(),
         }))
@@ -136,7 +130,10 @@ impl VmdService for MockVmd {
         Ok(Response::new(InfoResponse::default()))
     }
 
-    async fn list_v_ms(&self, _request: Request<ListVMsRequest>) -> Result<Response<ListVMsResponse>, Status> {
+    async fn list_v_ms(
+        &self,
+        _request: Request<ListVMsRequest>,
+    ) -> Result<Response<ListVMsResponse>, Status> {
         let guard = self.state.lock().await;
         Ok(Response::new(ListVMsResponse {
             vms: guard.vms.values().cloned().collect(),
@@ -187,10 +184,15 @@ impl VmdService for MockVmd {
     }
 
     async fn update_vm(&self, _request: Request<UpdateVmRequest>) -> Result<Response<Vm>, Status> {
-        Err(Status::unimplemented("update_vm is not required for this test"))
+        Err(Status::unimplemented(
+            "update_vm is not required for this test",
+        ))
     }
 
-    async fn delete_vm(&self, request: Request<DeleteVmRequest>) -> Result<Response<Empty>, Status> {
+    async fn delete_vm(
+        &self,
+        request: Request<DeleteVmRequest>,
+    ) -> Result<Response<Empty>, Status> {
         let vm_id = request.into_inner().vm_id;
         let mut guard = self.state.lock().await;
         guard.vms.remove(&vm_id);
@@ -198,7 +200,10 @@ impl VmdService for MockVmd {
         Ok(Response::new(Empty {}))
     }
 
-    async fn fork_vm(&self, request: Request<ForkVmRequest>) -> Result<Response<ForkVmResponse>, Status> {
+    async fn fork_vm(
+        &self,
+        request: Request<ForkVmRequest>,
+    ) -> Result<Response<ForkVmResponse>, Status> {
         let req = request.into_inner();
 
         let mut guard = self.state.lock().await;
@@ -284,7 +289,10 @@ impl VmdService for MockVmd {
         Ok(Response::new(vm))
     }
 
-    async fn force_stop_vm(&self, request: Request<VmActionRequest>) -> Result<Response<Vm>, Status> {
+    async fn force_stop_vm(
+        &self,
+        request: Request<VmActionRequest>,
+    ) -> Result<Response<Vm>, Status> {
         let vm = self
             .vm_mutate(&request.into_inner().vm_id, VmState::Stopped as i32, true)
             .await?;
@@ -300,19 +308,28 @@ impl VmdService for MockVmd {
         }))
     }
 
-    async fn create_snapshot(&self, _request: Request<CreateSnapshotRequest>) -> Result<Response<Snapshot>, Status> {
+    async fn create_snapshot(
+        &self,
+        _request: Request<CreateSnapshotRequest>,
+    ) -> Result<Response<Snapshot>, Status> {
         Err(Status::unimplemented(
             "create_snapshot is not required for this test",
         ))
     }
 
-    async fn get_snapshot(&self, _request: Request<GetSnapshotRequest>) -> Result<Response<Snapshot>, Status> {
+    async fn get_snapshot(
+        &self,
+        _request: Request<GetSnapshotRequest>,
+    ) -> Result<Response<Snapshot>, Status> {
         Err(Status::unimplemented(
             "get_snapshot is not required for this test",
         ))
     }
 
-    async fn restore_snapshot(&self, _request: Request<RestoreSnapshotRequest>) -> Result<Response<Vm>, Status> {
+    async fn restore_snapshot(
+        &self,
+        _request: Request<RestoreSnapshotRequest>,
+    ) -> Result<Response<Vm>, Status> {
         Err(Status::unimplemented(
             "restore_snapshot is not required for this test",
         ))
@@ -350,7 +367,10 @@ impl PortProxy for MockPortProxy {
         Ok(Response::new(Empty {}))
     }
 
-    async fn read_file(&self, request: Request<ReadFileRequest>) -> Result<Response<ReadFileResponse>, Status> {
+    async fn read_file(
+        &self,
+        request: Request<ReadFileRequest>,
+    ) -> Result<Response<ReadFileResponse>, Status> {
         let path = request.into_inner().path;
         let guard = self.state.lock().await;
         let data = guard
@@ -361,7 +381,10 @@ impl PortProxy for MockPortProxy {
         Ok(Response::new(ReadFileResponse { data }))
     }
 
-    async fn write_file(&self, request: Request<WriteFileRequest>) -> Result<Response<Empty>, Status> {
+    async fn write_file(
+        &self,
+        request: Request<WriteFileRequest>,
+    ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
         self.state.lock().await.files.insert(req.path, req.data);
         Ok(Response::new(Empty {}))
@@ -404,7 +427,10 @@ impl PortProxy for MockPortProxy {
         Ok(Response::new(ListDirectoryResponse { entries }))
     }
 
-    async fn delete_path(&self, request: Request<DeletePathRequest>) -> Result<Response<Empty>, Status> {
+    async fn delete_path(
+        &self,
+        request: Request<DeletePathRequest>,
+    ) -> Result<Response<Empty>, Status> {
         let path = request.into_inner().path;
         self.state.lock().await.files.remove(&path);
         Ok(Response::new(Empty {}))
@@ -438,10 +464,14 @@ impl ShellExec for MockShellExec {
 
         let mut frames = vec![
             Ok(ExecResponse {
-                response: Some(exec_response::Response::StdoutData(b"stdout:ready".to_vec())),
+                response: Some(exec_response::Response::StdoutData(
+                    b"stdout:ready".to_vec(),
+                )),
             }),
             Ok(ExecResponse {
-                response: Some(exec_response::Response::StderrData(b"stderr:ready".to_vec())),
+                response: Some(exec_response::Response::StderrData(
+                    b"stderr:ready".to_vec(),
+                )),
             }),
         ];
 
@@ -514,12 +544,9 @@ impl TestHarness {
             Server::builder()
                 .add_service(PortProxyServer::new(portproxy_server))
                 .add_service(ShellExecServer::new(shell_exec_server))
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(portproxy_listener),
-                    async {
-                        let _ = portproxy_shutdown_rx.await;
-                    },
-                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(portproxy_listener), async {
+                    let _ = portproxy_shutdown_rx.await;
+                })
                 .await
                 .expect("serve mock portproxy/shell grpc");
         });
@@ -527,7 +554,9 @@ impl TestHarness {
         let vmd_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock vmd listener");
-        let vmd_addr = vmd_listener.local_addr().expect("get mock vmd listener addr");
+        let vmd_addr = vmd_listener
+            .local_addr()
+            .expect("get mock vmd listener addr");
         let (vmd_shutdown_tx, vmd_shutdown_rx) = oneshot::channel::<()>();
 
         let vmd_server = MockVmd {
@@ -539,12 +568,9 @@ impl TestHarness {
         let vmd_join = tokio::spawn(async move {
             Server::builder()
                 .add_service(VmdServiceServer::new(vmd_server))
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(vmd_listener),
-                    async {
-                        let _ = vmd_shutdown_rx.await;
-                    },
-                )
+                .serve_with_incoming_shutdown(TcpListenerStream::new(vmd_listener), async {
+                    let _ = vmd_shutdown_rx.await;
+                })
                 .await
                 .expect("serve mock vmd grpc");
         });
@@ -552,17 +578,18 @@ impl TestHarness {
         let vmd_endpoint = format!("http://{}", vmd_addr);
 
         for _ in 0..40 {
-            let mut client = match reson_sandbox::proto::vmd::v1::vmd_service_client::VmdServiceClient::connect(
-                vmd_endpoint.clone(),
-            )
-            .await
-            {
-                Ok(client) => client,
-                Err(_) => {
-                    sleep(Duration::from_millis(25)).await;
-                    continue;
-                }
-            };
+            let mut client =
+                match reson_sandbox::proto::vmd::v1::vmd_service_client::VmdServiceClient::connect(
+                    vmd_endpoint.clone(),
+                )
+                .await
+                {
+                    Ok(client) => client,
+                    Err(_) => {
+                        sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                };
 
             if client
                 .health(Request::new(HealthRequest::default()))
@@ -606,35 +633,24 @@ fn sandbox_config() -> SandboxConfig {
     }
 }
 
-async fn wait_for_file(path: &Path) {
-    for _ in 0..80 {
-        if path.exists() {
+async fn wait_for_port_open(port: u16) {
+    for _ in 0..120 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return;
         }
         sleep(Duration::from_millis(25)).await;
     }
-    panic!("timed out waiting for file: {}", path.display());
+    panic!("timed out waiting for port to open: {port}");
 }
 
-fn process_alive(pid: &str) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-async fn wait_for_process_exit(pid: &str) {
-    for _ in 0..80 {
-        if !process_alive(pid) {
+async fn wait_for_port_closed(port: u16) {
+    for _ in 0..120 {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
             return;
         }
         sleep(Duration::from_millis(25)).await;
     }
-    panic!("timed out waiting for process to exit: {pid}");
+    panic!("timed out waiting for port to close: {port}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -706,8 +722,14 @@ async fn session_reuse_and_fork_lineage_contract() {
         .expect("child branch should discard independently");
 
     let guard = harness.vmd_state.lock().await;
-    assert!(guard.stop_calls >= 2, "discard should stop VMs before delete");
-    assert!(guard.delete_calls >= 2, "parent and child should both delete");
+    assert!(
+        guard.stop_calls >= 2,
+        "discard should stop VMs before delete"
+    );
+    assert!(
+        guard.delete_calls >= 2,
+        "parent and child should both delete"
+    );
     drop(guard);
 
     timeout(Duration::from_secs(3), harness.shutdown())
@@ -842,6 +864,41 @@ async fn bidi_exec_shell_and_file_contract() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn control_gateway_failover_prefers_healthy_secondary_endpoint() {
+    let harness = TestHarness::start().await;
+
+    let mut cfg = sandbox_config();
+    cfg.endpoint = "http://127.0.0.1:65534".to_string();
+    cfg.control_gateway_endpoints = vec![harness.vmd_endpoint.clone()];
+
+    let sandbox = Sandbox::new(cfg)
+        .await
+        .expect("sandbox should fail over to healthy secondary control endpoint");
+
+    let session = sandbox
+        .session(SessionOptions {
+            session_id: Some("gateway-failover-session".to_string()),
+            auto_start: false,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("session creation should use healthy secondary endpoint");
+
+    let sessions = sandbox.list_sessions().await.expect("list sessions after failover");
+    assert!(
+        sessions
+            .iter()
+            .any(|entry| entry.session_id == "gateway-failover-session"),
+        "session created through secondary endpoint should be discoverable"
+    );
+
+    session.discard().await.expect("discard failover session");
+    timeout(Duration::from_secs(3), harness.shutdown())
+        .await
+        .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_starts_stopped_vm_and_sessions_are_isolated() {
     let harness = TestHarness::start().await;
 
@@ -901,36 +958,9 @@ async fn attach_starts_stopped_vm_and_sessions_are_isolated() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
-async fn forward_port_handle_tears_down_child_process() {
+async fn forward_port_handle_releases_multiplexer_binding() {
     let harness = TestHarness::start().await;
-
-    let tmp = tempfile::tempdir().expect("create temp dir for fake portproxy");
-    let script_path = tmp.path().join("fake-portproxy.sh");
-    let mut script = fs::File::create(&script_path).expect("create fake portproxy script");
-    script
-        .write_all(
-            br#"#!/usr/bin/env bash
-set -euo pipefail
-listen_port=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --listen-port) listen_port="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-pid_file="/tmp/reson-forward-${listen_port}.pid"
-echo "$$" > "$pid_file"
-while true; do sleep 1; done
-"#,
-        )
-        .expect("write fake portproxy script");
-    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-        .expect("make fake script executable");
-
-    let mut cfg = sandbox_config();
-    cfg.portproxy_client_bin = Some(script_path.clone());
-
-    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), cfg)
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
         .await
         .expect("connect sandbox facade to mock vmd");
 
@@ -948,24 +978,15 @@ while true; do sleep 1; done
             .forward_port(8080)
             .await
             .expect("start forward handle");
-
-        let pid_file = PathBuf::from(format!("/tmp/reson-forward-{}.pid", handle.host_port));
-
-        wait_for_file(&pid_file).await;
-        let pid = fs::read_to_string(&pid_file)
-            .expect("read child pid file")
-            .trim()
-            .to_string();
-        assert!(process_alive(&pid), "forward child should be alive before release");
+        let host_port = handle.host_port;
+        wait_for_port_open(host_port).await;
 
         if index % 2 == 0 {
             handle.close().await.expect("close forward handle");
         } else {
             drop(handle);
         }
-        wait_for_process_exit(&pid).await;
-
-        let _ = fs::remove_file(&pid_file);
+        wait_for_port_closed(host_port).await;
     }
 
     session.discard().await.expect("discard forwarding session");

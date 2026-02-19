@@ -23,8 +23,7 @@ use crate::state::metadata::{load_metadata, save_metadata};
 use crate::state::runtime::VmRuntime;
 use crate::state::types::{
     CreateVmParams, ForkVmParams, NetworkSpec, SnapshotMetadata, SnapshotRecord, UpdateVmParams,
-    Vm, VmInner, VmMetadata, VmSource, VmSourceType, VmState, new_snapshot_metadata,
-    sanitize_name,
+    Vm, VmInner, VmMetadata, VmSource, VmSourceType, VmState, new_snapshot_metadata, sanitize_name,
 };
 use crate::virt;
 
@@ -68,6 +67,12 @@ pub enum ManagerError {
     InvalidState,
     #[error("operation cancelled")]
     Cancelled,
+    #[error("capacity exceeded for {resource}: limit={limit} current={current}")]
+    CapacityExceeded {
+        resource: &'static str,
+        limit: usize,
+        current: usize,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -218,6 +223,36 @@ impl Manager {
         Ok((guard.metadata.clone(), guard.runtime.clone()))
     }
 
+    async fn active_vm_count(&self) -> usize {
+        let guard = self.vms.read().await;
+        let mut count = 0usize;
+        for vm in guard.values() {
+            let inner = vm.lock().await;
+            if matches!(
+                inner.metadata.state,
+                VmState::Running | VmState::Paused | VmState::Creating
+            ) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    async fn enforce_create_vm_capacity(&self) -> ManagerResult<()> {
+        let Some(limit) = self.cfg.max_active_vms else {
+            return Ok(());
+        };
+        let current = self.active_vm_count().await;
+        if current >= limit {
+            return Err(ManagerError::CapacityExceeded {
+                resource: "active_vms",
+                limit,
+                current,
+            });
+        }
+        Ok(())
+    }
+
     pub async fn create_vm(
         &self,
         params: CreateVmParams,
@@ -233,6 +268,7 @@ impl Manager {
         if params.resources.disk_gb <= 0 {
             params.resources.disk_gb = 10;
         }
+        self.enforce_create_vm_capacity().await?;
         let name = sanitize_name(&params.name);
 
         let mac = random_mac().map_err(ManagerError::Other)?;
@@ -530,7 +566,9 @@ impl Manager {
             }
 
             let child_disk = child_dir.join("disk.qcow2");
-            if let Err(err) = virt::clone_file_cow(parent_disk.as_path(), child_disk.as_path()).await {
+            if let Err(err) =
+                virt::clone_file_cow(parent_disk.as_path(), child_disk.as_path()).await
+            {
                 let _ = fs::remove_dir_all(&child_dir);
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Other(err));
@@ -686,10 +724,10 @@ impl Manager {
                     .metadata
                     .metadata
                     .insert(META_FORK_ID.to_string(), fork_id.clone());
-                inner
-                    .metadata
-                    .metadata
-                    .insert(META_FORK_BASE_PATH.to_string(), fork_base.to_string_lossy().to_string());
+                inner.metadata.metadata.insert(
+                    META_FORK_BASE_PATH.to_string(),
+                    fork_base.to_string_lossy().to_string(),
+                );
                 inner.metadata.metadata.remove(META_FORK_SNAPSHOT);
                 if let Err(err) = save_metadata(&parent_vm.dir, &mut inner.metadata) {
                     Self::rollback_stopped_fork_artifacts(
@@ -1542,21 +1580,28 @@ fn build_qemu_args(
         meta.architecture.as_str()
     };
 
+    let running_on_linux = cfg!(target_os = "linux");
+    let running_on_macos = cfg!(target_os = "macos");
+
     let (machine, cpu, bios) = match guest_arch {
         ARCH_AMD64 => {
-            let machine = "q35,accel=kvm:tcg";
-            let cpu = if host_arch == ARCH_AMD64 && cfg!(target_os = "linux") {
-                "host"
+            let (machine, cpu) = if host_arch == ARCH_AMD64 && running_on_linux {
+                ("q35,accel=kvm:tcg", "host")
+            } else if host_arch == ARCH_AMD64 && running_on_macos {
+                ("q35,accel=hvf:tcg", "host")
             } else {
-                "qemu64"
+                ("q35,accel=tcg", "qemu64")
             };
             (machine.to_string(), cpu.to_string(), None)
         }
         ARCH_ARM64 => {
-            let mut machine = "virt".to_string();
+            let mut machine = "virt,accel=tcg".to_string();
             let mut cpu = "cortex-a72".to_string();
-            if host_arch == ARCH_ARM64 && cfg!(target_os = "linux") {
+            if host_arch == ARCH_ARM64 && running_on_linux {
                 machine = "virt,accel=kvm:tcg".to_string();
+                cpu = "host".to_string();
+            } else if host_arch == ARCH_ARM64 && running_on_macos {
+                machine = "virt,accel=hvf:tcg".to_string();
                 cpu = "host".to_string();
             }
             (machine, cpu, Some("edk2-aarch64-code.fd".to_string()))
@@ -1602,11 +1647,6 @@ fn build_qemu_args(
     args.push(format!("unix:{},server=on,wait=off", qmp_path.display()));
     args.push("-pidfile".to_string());
     args.push(pid_path.display().to_string());
-
-    if guest_arch == ARCH_ARM64 && host_arch != ARCH_ARM64 {
-        args.push("-accel".to_string());
-        args.push("tcg".to_string());
-    }
 
     if let Some(bios) = bios {
         args.push("-bios".to_string());
@@ -1921,7 +1961,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let data_dir = tmp.path().to_path_buf();
-        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME)).expect("create base images");
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
 
         let cfg = Config {
             listen_address: "127.0.0.1:0".to_string(),
@@ -1932,6 +1973,10 @@ mod tests {
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
+            max_active_vms: None,
+            node_registry: None,
+            control_bus: None,
+            security: Default::default(),
         };
 
         let manager = Manager {
@@ -1943,10 +1988,16 @@ mod tests {
 
         let proxy_bin_dir = data_dir.join("proxy-bin");
         fs::create_dir_all(&proxy_bin_dir).expect("create proxy bin dir");
-        fs::write(proxy_bin_dir.join("portproxy-linux-amd64"), b"stub-portproxy-amd64")
-            .expect("write amd64 proxy stub");
-        fs::write(proxy_bin_dir.join("portproxy-linux-arm64"), b"stub-portproxy-arm64")
-            .expect("write arm64 proxy stub");
+        fs::write(
+            proxy_bin_dir.join("portproxy-linux-amd64"),
+            b"stub-portproxy-amd64",
+        )
+        .expect("write amd64 proxy stub");
+        fs::write(
+            proxy_bin_dir.join("portproxy-linux-arm64"),
+            b"stub-portproxy-arm64",
+        )
+        .expect("write arm64 proxy stub");
         unsafe {
             std::env::set_var("PROXY_BIN", &proxy_bin_dir);
         }
@@ -2027,7 +2078,10 @@ mod tests {
         assert_eq!(child_after.state, VmState::Stopped);
         assert_ne!(child_after.id, parent_after.id);
         assert_eq!(
-            child_after.metadata.get(META_PARENT_VM_ID).map(String::as_str),
+            child_after
+                .metadata
+                .get(META_PARENT_VM_ID)
+                .map(String::as_str),
             Some(parent_id.as_str())
         );
         assert_eq!(
@@ -2072,7 +2126,8 @@ mod tests {
     async fn discover_normalizes_running_state_to_stopped() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let data_dir = tmp.path().to_path_buf();
-        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME)).expect("create base images");
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
 
         let vm_id = "discover-vm".to_string();
         let vm_dir = data_dir.join(&vm_id);
@@ -2117,6 +2172,10 @@ mod tests {
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
+            max_active_vms: None,
+            node_registry: None,
+            control_bus: None,
+            security: Default::default(),
         };
 
         let manager = Manager {
@@ -2134,5 +2193,97 @@ mod tests {
 
         let persisted = load_metadata(&vm_dir).expect("reload persisted metadata");
         assert_eq!(persisted.state, VmState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn create_vm_capacity_limit_rejects_when_active_vm_limit_reached() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
+
+        let cfg = Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: data_dir.to_string_lossy().to_string(),
+            qemu_bin: "qemu-system-x86_64".to_string(),
+            qemu_arm64_bin: "qemu-system-aarch64".to_string(),
+            qemu_img_bin: "qemu-img".to_string(),
+            docker_bin: "docker".to_string(),
+            log_level: "info".to_string(),
+            force_local_build: false,
+            max_active_vms: Some(1),
+            node_registry: None,
+            control_bus: None,
+            security: Default::default(),
+        };
+
+        let manager = Manager {
+            cfg,
+            host_arch: ARCH_AMD64.to_string(),
+            vms: RwLock::new(HashMap::new()),
+            snapshots: RwLock::new(HashMap::new()),
+        };
+
+        let vm_id = "busy-vm".to_string();
+        let vm_dir = data_dir.join(&vm_id);
+        fs::create_dir_all(&vm_dir).expect("create vm dir");
+
+        let metadata = VmMetadata {
+            id: vm_id.clone(),
+            name: "busy".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Running,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:02".to_string(),
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            suspended_snapshot: String::new(),
+            suspended_boot_snapshot: String::new(),
+            boot_snapshot: String::new(),
+            started_at: None,
+        };
+        manager
+            .vms
+            .write()
+            .await
+            .insert(
+                vm_id,
+                Arc::new(Vm::new(
+                    metadata,
+                    VmRuntime::new(&vm_dir),
+                    vm_dir.clone(),
+                )),
+            );
+
+        let err = manager
+            .enforce_create_vm_capacity()
+            .await
+            .expect_err("capacity check should reject");
+        match err {
+            ManagerError::CapacityExceeded {
+                resource,
+                limit,
+                current,
+            } => {
+                assert_eq!(resource, "active_vms");
+                assert_eq!(limit, 1);
+                assert_eq!(current, 1);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }

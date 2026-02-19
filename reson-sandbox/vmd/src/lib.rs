@@ -4,7 +4,6 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::manual_div_ceil)]
 #![allow(clippy::manual_find)]
-#![allow(clippy::manual_is_multiple_of)]
 #![allow(clippy::nonminimal_bool)]
 #![allow(clippy::ptr_arg)]
 #![allow(clippy::unnecessary_cast)]
@@ -13,7 +12,10 @@ pub mod app;
 pub mod assets;
 pub mod bootstrap;
 pub mod config;
+pub mod control_bus;
 pub mod image;
+pub mod reconcile;
+pub mod registry;
 pub mod state;
 pub mod virt;
 

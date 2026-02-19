@@ -22,7 +22,6 @@ if [[ ! -x "$VMD_BIN_DEFAULT" ]]; then
 fi
 
 export RESON_SANDBOX_MODE="${RESON_SANDBOX_MODE:-local}"
-export RESON_SANDBOX_ENDPOINT="${RESON_SANDBOX_ENDPOINT:-http://127.0.0.1:18072}"
 export RESON_SANDBOX_IMAGE="${RESON_SANDBOX_IMAGE:-ghcr.io/bracketdevelopers/uv-builder:main}"
 export RESON_SANDBOX_DATA_DIR="${RESON_SANDBOX_DATA_DIR:-/tmp/reson-agent-tools-vmd}"
 export RESON_VMD_BIN="${RESON_VMD_BIN:-$VMD_BIN_DEFAULT}"

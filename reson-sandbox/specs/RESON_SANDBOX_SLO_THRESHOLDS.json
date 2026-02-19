@@ -1,0 +1,14 @@
+{
+  "version": "2026-02-19",
+  "metrics": {
+    "session.attach": { "p95_ms": 2000 },
+    "control.command.dispatch": { "p95_ms": 500, "p99_ms": 1500 },
+    "exec.stream.establish.warm_vm": { "p95_ms": 1500, "p99_ms": 4000 },
+    "session.create.warm_pool": { "p95_ms": 8000, "p99_ms": 20000 },
+    "session.create.cold_cache_hit": { "p95_ms": 30000 }
+  },
+  "policy": {
+    "ci_strict_mode_enforces_threshold_schema": true,
+    "nightly_mode_enforces_observed_metrics_against_thresholds": true
+  }
+}

@@ -68,46 +68,62 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         "running d2vm conversion"
     );
 
-    let mut cmd = Command::new(docker_bin);
-    cmd.arg("run")
-        .arg("--rm")
-        .arg("--privileged")
-        .arg("-v")
-        .arg("/var/run/docker.sock:/var/run/docker.sock")
-        .arg("-v")
-        .arg(format!("{}:{}", host_dir.display(), D2VM_CONTAINER_DIR))
-        .arg("-w")
-        .arg(D2VM_CONTAINER_DIR)
-        .arg(D2VM_IMAGE)
-        .arg("--verbose")
-        .arg("convert")
-        .arg(opts.image)
-        .arg("--output")
-        .arg(&output_name)
-        .arg("--size")
-        .arg(format!("{disk_gb}G"))
-        .arg("--password")
-        .arg("root");
+    let build_cmd = |include_bootstrap: bool| {
+        let mut cmd = Command::new(docker_bin);
+        cmd.arg("run")
+            .arg("--rm")
+            .arg("--privileged")
+            .arg("-v")
+            .arg("/var/run/docker.sock:/var/run/docker.sock")
+            .arg("-v")
+            .arg(format!("{}:{}", host_dir.display(), D2VM_CONTAINER_DIR))
+            .arg("-w")
+            .arg(D2VM_CONTAINER_DIR)
+            .arg(D2VM_IMAGE)
+            .arg("--verbose")
+            .arg("convert")
+            .arg(&opts.image)
+            .arg("--output")
+            .arg(&output_name)
+            .arg("--size")
+            .arg(format!("{disk_gb}G"))
+            .arg("--password")
+            .arg("root");
 
-    if opts.pull {
-        cmd.arg("--pull");
-    }
-    if let Some(platform) = &opts.platform {
-        if !platform.trim().is_empty() {
-            cmd.arg("--platform").arg(platform);
+        if opts.pull {
+            cmd.arg("--pull");
         }
-    }
-    if opts.include_bootstrap {
-        cmd.arg("--include-bootstrap");
-    }
+        if let Some(platform) = &opts.platform {
+            if !platform.trim().is_empty() {
+                cmd.arg("--platform").arg(platform);
+            }
+        }
+        if include_bootstrap {
+            cmd.arg("--include-bootstrap");
+        }
+        cmd
+    };
 
+    let mut cmd = build_cmd(opts.include_bootstrap);
     trace!(command = ?cmd, "spawning docker d2vm");
     let output = cmd.output().await.context("spawn docker d2vm")?;
     if !output.status.success() {
-        bail!(
-            "d2vm convert failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if opts.include_bootstrap && stderr.contains("Unknown flag: --include-bootstrap") {
+            debug!("d2vm image does not support --include-bootstrap; retrying without it");
+            let retry_output = build_cmd(false)
+                .output()
+                .await
+                .context("spawn docker d2vm retry without bootstrap")?;
+            if !retry_output.status.success() {
+                bail!(
+                    "d2vm convert failed: {}",
+                    String::from_utf8_lossy(&retry_output.stderr)
+                );
+            }
+        } else {
+            bail!("d2vm convert failed: {stderr}");
+        }
     }
     debug!(output = %output_name, "d2vm conversion complete");
     Ok(())

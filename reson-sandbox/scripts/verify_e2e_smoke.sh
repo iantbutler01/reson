@@ -10,12 +10,14 @@ usage() {
 Usage: verify_e2e_smoke.sh [--strict]
 
 Required env to execute smoke:
-  VMD_SMOKE_SOURCE_REF   Docker image reference for VM creation
+  VMD_SMOKE_SOURCE_REF   Docker image reference for VM creation (overrides default)
 
 Optional env:
+  VMD_SMOKE_DEFAULT_SOURCE_REF  Fallback source ref when VMD_SMOKE_SOURCE_REF is unset
   VMD_SMOKE_SERVER       gRPC URL for vmdctl (default: http://127.0.0.1:18052)
   VMD_SMOKE_LISTEN_ADDR  Listen addr for vmd (default: derived from VMD_SMOKE_SERVER)
   VMD_SMOKE_TIMEOUT_SECS Request timeout for vmdctl (default: 900)
+  VMD_SMOKE_STOP_TIMEOUT_SECS Timeout for graceful stop before force-stop fallback (default: 45)
   VMD_SMOKE_ARCH         VM architecture override (amd64/arm64)
   VMD_SMOKE_VCPU         VM vCPU count (default: 1)
   VMD_SMOKE_MEMORY_MB    VM memory MB (default: 1024)
@@ -54,13 +56,14 @@ fi
 
 require_cmd cargo
 
-SOURCE_REF="${VMD_SMOKE_SOURCE_REF:-}"
+DEFAULT_SOURCE_REF="${VMD_SMOKE_DEFAULT_SOURCE_REF:-ghcr.io/bracketdevelopers/uv-builder:main}"
+SOURCE_REF="${VMD_SMOKE_SOURCE_REF:-$DEFAULT_SOURCE_REF}"
 if [[ -z "$SOURCE_REF" ]]; then
   if [[ "$STRICT" -eq 1 ]]; then
-    err "VMD_SMOKE_SOURCE_REF is required in strict mode"
+    err "VMD_SMOKE_SOURCE_REF is required in strict mode (or set VMD_SMOKE_DEFAULT_SOURCE_REF)"
     exit 1
   fi
-  warn "VMD_SMOKE_SOURCE_REF not set; skipping e2e smoke gate"
+  warn "no smoke source ref configured; skipping e2e smoke gate"
   exit 0
 fi
 
@@ -77,6 +80,7 @@ SERVER_URL="${VMD_SMOKE_SERVER:-http://127.0.0.1:18052}"
 LISTEN_ADDR="${VMD_SMOKE_LISTEN_ADDR:-${SERVER_URL#http://}}"
 LISTEN_ADDR="${LISTEN_ADDR#https://}"
 TIMEOUT_SECS="${VMD_SMOKE_TIMEOUT_SECS:-900}"
+STOP_TIMEOUT_SECS="${VMD_SMOKE_STOP_TIMEOUT_SECS:-45}"
 SMOKE_ARCH="${VMD_SMOKE_ARCH:-}"
 SMOKE_VCPU="${VMD_SMOKE_VCPU:-1}"
 SMOKE_MEMORY_MB="${VMD_SMOKE_MEMORY_MB:-1024}"
@@ -167,6 +171,7 @@ fi
 
 VM_NAME="reson-smoke-$(date +%s)"
 log "creating VM via vmdctl create-vm (name=$VM_NAME)"
+log "using smoke source ref: $SOURCE_REF"
 create_cmd=(
   "$VMDCTL_BIN"
   --server "$SERVER_URL"
@@ -202,9 +207,9 @@ log "starting VM ($VM_ID)"
 "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" start-vm "$VM_ID" >/dev/null
 
 log "stopping VM ($VM_ID)"
-if ! "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" stop-vm "$VM_ID" >/dev/null 2>"$TMP_DIR/stop.stderr"; then
+if ! "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$STOP_TIMEOUT_SECS" stop-vm "$VM_ID" >/dev/null 2>"$TMP_DIR/stop.stderr"; then
   warn "stop-vm timed out or failed; falling back to force-stop-vm"
-  "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" force-stop-vm "$VM_ID" >/dev/null
+  "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$STOP_TIMEOUT_SECS" force-stop-vm "$VM_ID" >/dev/null
 fi
 
 log "deleting VM ($VM_ID)"

@@ -1,6 +1,5 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::default_constructed_unit_structs)]
-#![allow(clippy::io_other_error)]
 
 mod child_tracker;
 mod cli;

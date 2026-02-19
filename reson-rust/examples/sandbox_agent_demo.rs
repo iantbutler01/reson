@@ -107,8 +107,8 @@ async fn discard_with_retry(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::var("RESON_SANDBOX_MODE").unwrap_or_else(|_| "local".to_string());
-    let endpoint =
-        std::env::var("RESON_SANDBOX_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:18072".to_string());
+    let endpoint = std::env::var("RESON_SANDBOX_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:18072".to_string());
     let image = std::env::var("RESON_SANDBOX_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/bracketdevelopers/uv-builder:main".to_string());
     let attach_session_id = std::env::var("RESON_ATTACH_SESSION_ID").ok();
@@ -141,7 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.daemon_bin = Some(PathBuf::from(vmd_bin));
         cfg.daemon_data_dir = Some(PathBuf::from(data_dir));
 
-        println!("mode=local endpoint={} daemon_bin={:?}", cfg.endpoint, cfg.daemon_bin);
+        println!(
+            "mode=local endpoint={} daemon_bin={:?}",
+            cfg.endpoint, cfg.daemon_bin
+        );
         Sandbox::new(cfg).await?
     };
 
@@ -181,7 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .write_file("/tmp/demo_note.txt", b"hello-from-parent\n".to_vec())
         .await?;
     let note = parent.read_file("/tmp/demo_note.txt").await?;
-    println!("parent file readback={}", String::from_utf8_lossy(&note).trim());
+    println!(
+        "parent file readback={}",
+        String::from_utf8_lossy(&note).trim()
+    );
 
     println!("forking parent session");
     let fork = parent.fork(ForkOptions::default()).await?;

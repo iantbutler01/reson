@@ -1,0 +1,567 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, anyhow};
+use async_nats::jetstream;
+use async_nats::jetstream::AckKind;
+use async_nats::jetstream::consumer::{AckPolicy, pull};
+use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use crate::config::ControlBusConfig;
+
+pub struct CommandConsumerHandle {
+    stop_tx: Option<oneshot::Sender<()>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl CommandConsumerHandle {
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandEnvelope {
+    #[serde(default)]
+    command_id: String,
+    #[serde(default)]
+    idempotency_key: String,
+    #[serde(default)]
+    command_type: String,
+    #[serde(default)]
+    ordering_key: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DeadLetterEnvelope {
+    dead_letter_id: String,
+    #[serde(default)]
+    command_id: String,
+    #[serde(default)]
+    original_subject: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    details: String,
+    #[serde(default)]
+    delivered: i64,
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    captured_at_unix_ms: u64,
+    payload: Value,
+}
+
+#[derive(Clone)]
+struct EtcdDedupeStore {
+    etcd: std::sync::Arc<Mutex<EtcdClient>>,
+    key_prefix: String,
+}
+
+impl EtcdDedupeStore {
+    async fn connect(config: &ControlBusConfig) -> Result<Option<Self>> {
+        if config.dedupe_etcd_endpoints.is_empty() {
+            return Ok(None);
+        }
+        let client = EtcdClient::connect(config.dedupe_etcd_endpoints.clone(), None)
+            .await
+            .context("connect etcd for command dedupe")?;
+        Ok(Some(Self {
+            etcd: std::sync::Arc::new(Mutex::new(client)),
+            key_prefix: config.dedupe_prefix.trim_end_matches('/').to_string(),
+        }))
+    }
+
+    async fn mark_or_duplicate(&self, idempotency_key: &str) -> Result<bool> {
+        let key = format!("{}/{}", self.key_prefix, idempotency_key);
+        let mut client = self.etcd.lock().await;
+        let txn = Txn::new()
+            .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+            .and_then(vec![TxnOp::put(key, b"1", None)]);
+        let response = client.txn(txn).await.context("dedupe txn")?;
+        Ok(!response.succeeded())
+    }
+}
+
+pub async fn start(config: Option<ControlBusConfig>) -> Result<Option<CommandConsumerHandle>> {
+    start_with_trigger(config, None).await
+}
+
+pub async fn start_with_trigger(
+    config: Option<ControlBusConfig>,
+    reconcile_trigger: Option<mpsc::UnboundedSender<()>>,
+) -> Result<Option<CommandConsumerHandle>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let nats = async_nats::connect(config.nats_url.clone())
+        .await
+        .context("connect nats for command consumer")?;
+    let jetstream = jetstream::new(nats);
+    ensure_control_stream(&jetstream, &config).await?;
+
+    let command_subject = format!("{}.cmd.>", config.subject_prefix);
+    let control_stream = jetstream
+        .get_stream(config.stream_name.clone())
+        .await
+        .context("get control stream")?;
+    let consumer = control_stream
+        .get_or_create_consumer(
+            &config.command_consumer_durable,
+            pull::Config {
+                durable_name: Some(config.command_consumer_durable.clone()),
+                ack_policy: AckPolicy::Explicit,
+                ack_wait: Duration::from_millis(config.command_ack_wait_ms),
+                max_deliver: config.command_max_deliver,
+                filter_subject: command_subject.clone(),
+                max_ack_pending: 1_024,
+                ..Default::default()
+            },
+        )
+        .await
+        .context("get or create command consumer")?;
+    let mut messages = consumer
+        .messages()
+        .await
+        .context("start command consumer stream")?;
+
+    let dedupe_store = EtcdDedupeStore::connect(&config).await?;
+    let node_id = config.node_id.clone();
+    let log_node_id = config.node_id.clone();
+    let log_nats_url = config.nats_url.clone();
+    let log_stream_name = config.stream_name.clone();
+    let log_durable = config.command_consumer_durable.clone();
+    let log_max_deliver = config.command_max_deliver;
+    let log_dead_letter_subject = config.dead_letter_subject.clone();
+    let log_dedupe_endpoint_count = config.dedupe_etcd_endpoints.len();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let mut seen_commands: HashMap<String, Instant> = HashMap::new();
+
+    let join = tokio::spawn(async move {
+        const DEDUPE_TTL: Duration = Duration::from_secs(600);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                maybe_msg = messages.next() => {
+                    let Some(maybe_msg) = maybe_msg else {
+                        break;
+                    };
+                    match maybe_msg {
+                        Ok(message) => {
+                            process_command_message(
+                                message,
+                                &config,
+                                &node_id,
+                                dedupe_store.as_ref(),
+                                &mut seen_commands,
+                                reconcile_trigger.as_ref(),
+                                &jetstream,
+                                DEDUPE_TTL,
+                            ).await;
+                        }
+                        Err(err) => {
+                            warn!(
+                                node_id = %node_id,
+                                err = %err,
+                                "command consumer stream yielded an error"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    info!(
+        node_id = %log_node_id,
+        nats_url = %log_nats_url,
+        stream_name = %log_stream_name,
+        subject = %command_subject,
+        durable = %log_durable,
+        max_deliver = log_max_deliver,
+        dead_letter_subject = %log_dead_letter_subject,
+        dedupe_etcd_endpoints = log_dedupe_endpoint_count,
+        "control command consumer enabled"
+    );
+
+    Ok(Some(CommandConsumerHandle {
+        stop_tx: Some(stop_tx),
+        join: Some(join),
+    }))
+}
+
+pub async fn replay_dead_letters(config: ControlBusConfig, limit: usize) -> Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    let nats = async_nats::connect(config.nats_url.clone())
+        .await
+        .context("connect nats for dead-letter replay")?;
+    let jetstream = jetstream::new(nats);
+    ensure_control_stream(&jetstream, &config).await?;
+
+    let control_stream = jetstream
+        .get_stream(config.stream_name.clone())
+        .await
+        .context("get control stream for replay")?;
+    let replay_consumer_name = format!("{}-dlq-replay", config.command_consumer_durable);
+    let consumer = control_stream
+        .get_or_create_consumer(
+            &replay_consumer_name,
+            pull::Config {
+                durable_name: Some(replay_consumer_name.clone()),
+                ack_policy: AckPolicy::Explicit,
+                ack_wait: Duration::from_millis(config.command_ack_wait_ms),
+                max_deliver: config.command_max_deliver,
+                filter_subject: config.dead_letter_subject.clone(),
+                max_ack_pending: 256,
+                ..Default::default()
+            },
+        )
+        .await
+        .context("get or create dead-letter replay consumer")?;
+
+    let mut messages = consumer
+        .messages()
+        .await
+        .context("start dead-letter replay stream")?;
+
+    let mut replayed = 0usize;
+    let mut idle_timeouts = 0usize;
+    while replayed < limit {
+        let next = tokio::time::timeout(Duration::from_millis(500), messages.next()).await;
+        let maybe_msg = match next {
+            Ok(value) => {
+                idle_timeouts = 0;
+                value
+            }
+            Err(_) => {
+                idle_timeouts += 1;
+                if idle_timeouts >= 3 {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let Some(maybe_msg) = maybe_msg else {
+            break;
+        };
+
+        let message = match maybe_msg {
+            Ok(message) => message,
+            Err(err) => {
+                warn!(err = %err, "dead-letter replay stream yielded error");
+                continue;
+            }
+        };
+
+        match serde_json::from_slice::<DeadLetterEnvelope>(&message.payload) {
+            Ok(envelope) => {
+                if envelope.original_subject.trim().is_empty() {
+                    warn!("dead-letter envelope missing original subject; dropping");
+                    let _ = message.ack_with(AckKind::Term).await;
+                    continue;
+                }
+
+                let payload_bytes = serde_json::to_vec(&envelope.payload)
+                    .context("serialize replay payload")?;
+                let replay_id = if envelope.command_id.trim().is_empty() {
+                    format!("replay-{}", Uuid::new_v4())
+                } else {
+                    format!("replay-{}-{}", envelope.command_id, unix_millis())
+                };
+
+                let publish_ack = jetstream
+                    .send_publish(
+                        envelope.original_subject.clone(),
+                        jetstream::context::Publish::build()
+                            .message_id(replay_id)
+                            .payload(payload_bytes.into()),
+                    )
+                    .await
+                    .context("publish replay command")?;
+                publish_ack.await.context("await replay publish ack")?;
+
+                let replay_event = json!({
+                    "replayed_at_unix_ms": unix_millis(),
+                    "dead_letter_id": envelope.dead_letter_id,
+                    "command_id": envelope.command_id,
+                    "original_subject": envelope.original_subject,
+                });
+                let replay_event_payload = serde_json::to_vec(&replay_event)
+                    .context("serialize replay event payload")?;
+                let event_ack = jetstream
+                    .publish(config.replay_subject.clone(), replay_event_payload.into())
+                    .await
+                    .context("publish replay event")?;
+                event_ack.await.context("await replay event ack")?;
+
+                message
+                    .ack()
+                    .await
+                    .map_err(|err| anyhow!("ack dead-letter message: {err}"))?;
+                replayed += 1;
+            }
+            Err(err) => {
+                warn!(err = %err, "invalid dead-letter payload; terminating message");
+                let _ = message.ack_with(AckKind::Term).await;
+            }
+        }
+    }
+
+    Ok(replayed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_command_message(
+    message: jetstream::Message,
+    config: &ControlBusConfig,
+    node_id: &str,
+    dedupe_store: Option<&EtcdDedupeStore>,
+    seen_commands: &mut HashMap<String, Instant>,
+    reconcile_trigger: Option<&mpsc::UnboundedSender<()>>,
+    jetstream: &jetstream::Context,
+    dedupe_ttl: Duration,
+) {
+    let parsed = serde_json::from_slice::<CommandEnvelope>(&message.payload);
+    let envelope = match parsed {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            handle_failed_command_message(
+                &message,
+                config,
+                node_id,
+                jetstream,
+                "invalid_envelope",
+                &err.to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let now = Instant::now();
+    seen_commands.retain(|_, ts| now.duration_since(*ts) < dedupe_ttl);
+
+    let dedupe_key = dedupe_key(&envelope);
+    if let Some(store) = dedupe_store {
+        match store.mark_or_duplicate(&dedupe_key).await {
+            Ok(true) => {
+                debug!(
+                    node_id = %node_id,
+                    subject = %message.subject,
+                    command_id = %envelope.command_id,
+                    idempotency_key = %dedupe_key,
+                    "dropping duplicate control command (etcd dedupe)"
+                );
+                let _ = message.ack().await;
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    node_id = %node_id,
+                    subject = %message.subject,
+                    idempotency_key = %dedupe_key,
+                    err = %err,
+                    "etcd dedupe check failed; falling back to local dedupe"
+                );
+            }
+        }
+    }
+
+    if seen_commands.contains_key(&dedupe_key) {
+        debug!(
+            node_id = %node_id,
+            subject = %message.subject,
+            command_id = %envelope.command_id,
+            idempotency_key = %dedupe_key,
+            "dropping duplicate control command"
+        );
+        let _ = message.ack().await;
+        return;
+    }
+    seen_commands.insert(dedupe_key.clone(), now);
+
+    debug!(
+        node_id = %node_id,
+        subject = %message.subject,
+        command_id = %envelope.command_id,
+        idempotency_key = %dedupe_key,
+        command_type = %envelope.command_type,
+        ordering_key = %envelope.ordering_key,
+        "received control command"
+    );
+
+    if envelope.command_type == "reconcile.run" {
+        if let Some(tx) = reconcile_trigger {
+            if tx.send(()).is_err() {
+                warn!(
+                    node_id = %node_id,
+                    command_id = %envelope.command_id,
+                    "reconcile trigger receiver dropped"
+                );
+            }
+        }
+    }
+
+    if let Err(err) = message.ack().await {
+        warn!(
+            node_id = %node_id,
+            command_id = %envelope.command_id,
+            err = %err,
+            "failed to ack control command"
+        );
+    }
+}
+
+async fn handle_failed_command_message(
+    message: &jetstream::Message,
+    config: &ControlBusConfig,
+    node_id: &str,
+    jetstream: &jetstream::Context,
+    reason: &str,
+    details: &str,
+) {
+    let delivered = message
+        .info()
+        .map(|info| info.delivered)
+        .unwrap_or(1)
+        .max(1);
+    let max_deliver = config.command_max_deliver.max(1);
+
+    if delivered >= max_deliver {
+        if let Err(err) = publish_dead_letter(message, config, node_id, jetstream, reason, details).await {
+            warn!(
+                node_id = %node_id,
+                reason = %reason,
+                err = %err,
+                "failed publishing control command dead-letter"
+            );
+        }
+        if let Err(err) = message.ack_with(AckKind::Term).await {
+            warn!(
+                node_id = %node_id,
+                reason = %reason,
+                err = %err,
+                "failed to terminate poison control command"
+            );
+        }
+        return;
+    }
+
+    if let Err(err) = message.ack_with(AckKind::Nak(None)).await {
+        warn!(
+            node_id = %node_id,
+            reason = %reason,
+            err = %err,
+            "failed to nack control command"
+        );
+    }
+}
+
+async fn publish_dead_letter(
+    message: &jetstream::Message,
+    config: &ControlBusConfig,
+    node_id: &str,
+    jetstream: &jetstream::Context,
+    reason: &str,
+    details: &str,
+) -> Result<()> {
+    let delivered = message.info().map(|info| info.delivered).unwrap_or(1).max(1);
+    let payload = serde_json::from_slice::<Value>(&message.payload).unwrap_or_else(|_| {
+        json!({
+            "raw_payload": String::from_utf8_lossy(&message.payload).to_string(),
+        })
+    });
+
+    let dead_letter = DeadLetterEnvelope {
+        dead_letter_id: Uuid::new_v4().to_string(),
+        command_id: serde_json::from_slice::<CommandEnvelope>(&message.payload)
+            .map(|envelope| envelope.command_id)
+            .unwrap_or_default(),
+        original_subject: message.subject.to_string(),
+        reason: reason.to_string(),
+        details: details.to_string(),
+        delivered,
+        node_id: node_id.to_string(),
+        captured_at_unix_ms: unix_millis(),
+        payload,
+    };
+    let bytes = serde_json::to_vec(&dead_letter).context("serialize dead-letter envelope")?;
+
+    let publish_ack = jetstream
+        .send_publish(
+            config.dead_letter_subject.clone(),
+            jetstream::context::Publish::build()
+                .message_id(dead_letter.dead_letter_id.clone())
+                .payload(bytes.into()),
+        )
+        .await
+        .context("publish dead-letter envelope")?;
+    publish_ack
+        .await
+        .context("await dead-letter publish acknowledgement")?;
+
+    Ok(())
+}
+
+async fn ensure_control_stream(
+    jetstream: &jetstream::Context,
+    config: &ControlBusConfig,
+) -> Result<()> {
+    let mut subjects = vec![
+        format!("{}.cmd.>", config.subject_prefix),
+        format!("{}.evt.>", config.subject_prefix),
+        config.dead_letter_subject.clone(),
+        config.replay_subject.clone(),
+    ];
+    subjects.sort();
+    subjects.dedup();
+
+    jetstream
+        .get_or_create_stream(jetstream::stream::Config {
+            name: config.stream_name.clone(),
+            subjects,
+            max_age: Duration::from_secs(config.stream_max_age_secs.max(60)),
+            storage: jetstream::stream::StorageType::File,
+            num_replicas: config.stream_replicas.max(1),
+            ..Default::default()
+        })
+        .await
+        .context("ensure control stream")?;
+
+    Ok(())
+}
+
+fn dedupe_key(envelope: &CommandEnvelope) -> String {
+    if !envelope.idempotency_key.trim().is_empty() {
+        return envelope.idempotency_key.trim().to_string();
+    }
+    if !envelope.command_id.trim().is_empty() {
+        return envelope.command_id.trim().to_string();
+    }
+    format!("anon-{}", Uuid::new_v4())
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}

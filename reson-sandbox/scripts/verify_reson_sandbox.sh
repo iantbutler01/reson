@@ -56,9 +56,19 @@ for required_path in \
   "scripts/verify_proto_clean.sh" \
   "scripts/verify_e2e_smoke.sh" \
   "scripts/verify_no_leaks.sh" \
+  "scripts/verify_mq_control.sh" \
+  "scripts/verify_reconcile.sh" \
+  "scripts/verify_distributed_chaos.sh" \
+  "scripts/verify_distributed_soak.sh" \
+  "scripts/verify_security_profile.sh" \
+  "scripts/verify_slo_profile.sh" \
+  "scripts/verify_outbox.sh" \
+  "scripts/verify_control_gateway_failover.sh" \
+  "scripts/replay_mq_dead_letters.sh" \
   "scripts/verify_api_facade.sh" \
   "scripts/verify_fork_cow.sh" \
   "specs/RESON_SANDBOX_MIGRATION_CHECKLIST.md" \
+  "specs/RESON_SANDBOX_SLO_THRESHOLDS.json" \
   "crates/reson-sandbox/Cargo.toml"; do
   if [[ ! -f "$REPO_ROOT/$required_path" ]]; then
     err "missing required file: $required_path"
@@ -126,6 +136,62 @@ if [[ "$STRICT" -eq 1 ]]; then
   "$REPO_ROOT/scripts/verify_fork_cow.sh" --strict
 else
   "$REPO_ROOT/scripts/verify_fork_cow.sh"
+fi
+
+log "gate 9: mq control contract"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_mq_control.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_mq_control.sh"
+fi
+
+log "gate 10: reconciliation convergence"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_reconcile.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_reconcile.sh"
+fi
+
+log "gate 11: distributed chaos"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_distributed_chaos.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_distributed_chaos.sh"
+fi
+
+log "gate 12: distributed soak"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_distributed_soak.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_distributed_soak.sh"
+fi
+
+log "gate 13: security profile"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_security_profile.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_security_profile.sh"
+fi
+
+log "gate 14: slo profile"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_slo_profile.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_slo_profile.sh"
+fi
+
+log "gate 15: transactional outbox"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_outbox.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_outbox.sh"
+fi
+
+log "gate 16: control gateway failover"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_control_gateway_failover.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_control_gateway_failover.sh"
 fi
 
 log "all enabled gates passed"

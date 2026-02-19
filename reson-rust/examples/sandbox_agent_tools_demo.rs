@@ -25,10 +25,10 @@ use reson_agentic::runtime::{RunParams, Runtime, ToolFunction};
 use reson_agentic::types::{ChatMessage, CreateResult, ToolCall, ToolResult};
 use reson_agentic::utils::ConversationMessage;
 use reson_sandbox::{
-    ExecEvent, ExecHandle, ExecInput, ExecOptions, Sandbox, SandboxConfig, SandboxError, Session,
-    SessionOptions,
+    DistributedControlConfig, ExecEvent, ExecHandle, ExecInput, ExecOptions, Sandbox,
+    SandboxConfig, SandboxError, Session, SessionOptions,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -95,7 +95,10 @@ fn resolve_agent_model() -> Result<String, Box<dyn std::error::Error>> {
     Err("missing model config: set RESON_AGENT_MODEL or LOCAL_LLM".into())
 }
 
-async fn start_exec_with_retry(session: &Session, command: &str) -> Result<ExecHandle, SandboxError> {
+async fn start_exec_with_retry(
+    session: &Session,
+    command: &str,
+) -> Result<ExecHandle, SandboxError> {
     const EXEC_RETRY_DELAY_SECS: u64 = 2;
     let deadline = Instant::now() + Duration::from_secs(exec_ready_timeout_secs());
 
@@ -151,13 +154,16 @@ fn tool_output_json(tool_name: &str, raw: &str) -> Value {
 }
 
 fn response_to_assistant_text(response: &Value) -> String {
-    response
-        .as_str()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| serde_json::to_string_pretty(response).unwrap_or_else(|_| response.to_string()))
+    response.as_str().map(ToOwned::to_owned).unwrap_or_else(|| {
+        serde_json::to_string_pretty(response).unwrap_or_else(|_| response.to_string())
+    })
 }
 
-async fn register_sandbox_tools(runtime: &Runtime, session: Session, jobs: JobStore) -> ResonResult<()> {
+async fn register_sandbox_tools(
+    runtime: &Runtime,
+    session: Session,
+    jobs: JobStore,
+) -> ResonResult<()> {
     let session_for_exec = session.clone();
     runtime
         .register_tool_with_schema(
@@ -176,10 +182,9 @@ async fn register_sandbox_tools(runtime: &Runtime, session: Session, jobs: JobSt
             ToolFunction::Async(Box::new(move |args: Value| {
                 let session = session_for_exec.clone();
                 Box::pin(async move {
-                    let command = args
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| tool_err("run_in_sandbox requires string field `command`"))?;
+                    let command = args.get("command").and_then(Value::as_str).ok_or_else(|| {
+                        tool_err("run_in_sandbox requires string field `command`")
+                    })?;
 
                     let outcome = exec_collect(&session, command)
                         .await
@@ -221,7 +226,9 @@ async fn register_sandbox_tools(runtime: &Runtime, session: Session, jobs: JobSt
                     let command = args
                         .get("command")
                         .and_then(Value::as_str)
-                        .ok_or_else(|| tool_err("start_sandbox_job requires string field `command`"))?
+                        .ok_or_else(|| {
+                            tool_err("start_sandbox_job requires string field `command`")
+                        })?
                         .to_string();
                     let job_id = Uuid::new_v4().to_string();
 
@@ -231,9 +238,12 @@ async fn register_sandbox_tools(runtime: &Runtime, session: Session, jobs: JobSt
                     }));
                     jobs.write().await.insert(job_id.clone(), snapshot.clone());
 
-                    let handle = start_exec_with_retry(&session, &command)
-                        .await
-                        .map_err(|err| tool_err(format!("failed to start async sandbox job: {err}")))?;
+                    let handle =
+                        start_exec_with_retry(&session, &command)
+                            .await
+                            .map_err(|err| {
+                                tool_err(format!("failed to start async sandbox job: {err}"))
+                            })?;
                     let _ = handle.input.send(ExecInput::Eof).await;
 
                     {
@@ -385,8 +395,7 @@ fn collect_tool_call_values(runtime: &Runtime, response: &Value) -> Vec<Value> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::var("RESON_SANDBOX_MODE").unwrap_or_else(|_| "local".to_string());
-    let endpoint = std::env::var("RESON_SANDBOX_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:18072".to_string());
+    let endpoint = std::env::var("RESON_SANDBOX_ENDPOINT").ok();
     let image = std::env::var("RESON_SANDBOX_IMAGE")
         .unwrap_or_else(|_| "ghcr.io/bracketdevelopers/uv-builder:main".to_string());
     let attach_session_id = std::env::var("RESON_ATTACH_SESSION_ID").ok();
@@ -395,10 +404,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg = SandboxConfig::default();
     cfg.connect_timeout = Duration::from_secs(20);
     cfg.daemon_start_timeout = Duration::from_secs(120);
+    if std::env::var("RESON_SANDBOX_DISTRIBUTED").ok().as_deref() == Some("1") {
+        let etcd_endpoints = std::env::var("RESON_SANDBOX_ETCD_ENDPOINTS")
+            .unwrap_or_else(|_| "http://127.0.0.1:2379".to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let subject_prefix = std::env::var("RESON_SANDBOX_NATS_SUBJECT_PREFIX")
+            .unwrap_or_else(|_| "reson.sandbox.control".to_string());
+        let dist_cfg = DistributedControlConfig {
+            etcd_endpoints,
+            etcd_prefix: std::env::var("RESON_SANDBOX_ETCD_PREFIX")
+                .unwrap_or_else(|_| "/reson-sandbox".to_string()),
+            nats_url: std::env::var("RESON_SANDBOX_NATS_URL")
+                .unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string()),
+            nats_subject_prefix: subject_prefix.clone(),
+            nats_stream_name: std::env::var("RESON_SANDBOX_NATS_STREAM")
+                .unwrap_or_else(|_| "RESON_SANDBOX_CONTROL".to_string()),
+            nats_stream_max_age_secs: std::env::var("RESON_SANDBOX_NATS_STREAM_MAX_AGE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60 * 60 * 24 * 7),
+            nats_stream_replicas: std::env::var("RESON_SANDBOX_NATS_STREAM_REPLICAS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value >= 1)
+                .unwrap_or(1),
+            nats_dead_letter_subject: std::env::var("RESON_SANDBOX_NATS_DEAD_LETTER_SUBJECT")
+                .unwrap_or_else(|_| format!("{subject_prefix}.dlq.commands")),
+        };
+        cfg.distributed_control = Some(dist_cfg);
+    }
 
     let sandbox = if mode == "remote" {
+        let endpoint = endpoint.ok_or_else(|| {
+            "RESON_SANDBOX_ENDPOINT is required when RESON_SANDBOX_MODE=remote".to_string()
+        })?;
         println!("mode=remote endpoint={endpoint}");
-        Sandbox::connect(endpoint.clone(), cfg).await?
+        Sandbox::connect(endpoint, cfg).await?
     } else {
         let vmd_bin = std::env::var("RESON_VMD_BIN")
             .unwrap_or_else(|_| "../reson-sandbox/target/debug/vmd".to_string());
@@ -411,16 +456,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var("PROXY_BIN", &proxy_bin_dir);
         }
 
-        cfg.endpoint = endpoint.clone();
         cfg.auto_spawn = true;
-        cfg.daemon_listen = endpoint
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
+        if let Some(endpoint) = endpoint {
+            cfg.endpoint = endpoint.clone();
+            cfg.daemon_listen = endpoint
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_string();
+        }
         cfg.daemon_bin = Some(PathBuf::from(vmd_bin));
         cfg.daemon_data_dir = Some(PathBuf::from(data_dir));
 
-        println!("mode=local endpoint={} daemon_bin={:?}", cfg.endpoint, cfg.daemon_bin);
+        println!(
+            "mode=local endpoint={} daemon_bin={:?}",
+            cfg.endpoint, cfg.daemon_bin
+        );
         Sandbox::new(cfg).await?
     };
 
@@ -470,7 +520,8 @@ Never claim completion without tool evidence."#;
 
     let user_task = "Execute the required plan now and provide a final report.";
 
-    let mut history: Vec<ConversationMessage> = vec![ConversationMessage::Chat(ChatMessage::user(user_task))];
+    let mut history: Vec<ConversationMessage> =
+        vec![ConversationMessage::Chat(ChatMessage::user(user_task))];
     let mut final_answer: Option<String> = None;
 
     for turn in 0..MAX_TURNS {
@@ -507,7 +558,11 @@ Never claim completion without tool evidence."#;
                     let execution_result = runtime.execute_tool(call_value).await;
                     let tool_result = match execution_result {
                         Ok(content) => {
-                            println!("[tool:{}] {}", tool_call.tool_name, tool_output_json(&tool_call.tool_name, &content));
+                            println!(
+                                "[tool:{}] {}",
+                                tool_call.tool_name,
+                                tool_output_json(&tool_call.tool_name, &content)
+                            );
                             ToolResult::success_with_name(
                                 tool_call.tool_use_id.clone(),
                                 tool_call.tool_name.clone(),

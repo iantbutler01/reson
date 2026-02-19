@@ -1,5 +1,5 @@
-use std::convert::TryFrom;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -13,23 +13,23 @@ use http::{Request as HttpRequest, Response as HttpResponse};
 use prost_types::Timestamp;
 use tokio::{fs, signal, sync::mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::Server;
+use tonic::metadata::MetadataMap;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{GrpcMethod, Request, Response, Status};
 use tower_http::classify::GrpcFailureClass;
 use tower_http::trace::TraceLayer;
-use tracing::{Level, Span, debug, info};
+use tracing::{Level, Span, debug, error, info};
 
-use crate::config::Config;
+use crate::config::{Config, TlsServerConfig};
 use crate::image::{self, PrebuiltImageStatus};
 use crate::proto::v1::{
     CreateSnapshotRequest, CreateVmPhase, CreateVmProgress, CreateVmRequest,
-    CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest, GetSnapshotRequest,
-    GetVmRequest, HealthRequest, HealthResponse, InfoRequest, InfoResponse, ForkVmRequest,
-    ForkVmResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse,
+    CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest, ForkVmRequest, ForkVmResponse,
+    GetSnapshotRequest, GetVmRequest, HealthRequest, HealthResponse, InfoRequest, InfoResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVMsRequest, ListVMsResponse,
     PreDownloadVmImagePhase, PreDownloadVmImageRequest, PreDownloadVmImageResponse, ResourceSpec,
-    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest,
-    VmSource, VmSourceType as ProtoVmSourceType, VmState as ProtoVmState,
-    create_vm_stream_response,
+    RestoreSnapshotRequest, Snapshot, UpdateVmRequest, Vm, VmActionRequest, VmSource,
+    VmSourceType as ProtoVmSourceType, VmState as ProtoVmState, create_vm_stream_response,
     vmd_service_server::{VmdService, VmdServiceServer},
 };
 use crate::state::manager::{CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage};
@@ -37,6 +37,10 @@ use crate::state::{
     CreateVmParams, ForkVmParams, Manager, ManagerError, SnapshotMetadata, SnapshotParams,
     UpdateVmParams, VmMetadata, VmSource as StateVmSource, VmSourceType as StateVmSourceType,
     VmState,
+};
+use crate::{
+    config::{ControlBusConfig, NodeRegistryConfig},
+    control_bus, reconcile, registry,
 };
 
 pub async fn run_server(config: Config) -> Result<()> {
@@ -102,16 +106,94 @@ pub async fn run_server(config: Config) -> Result<()> {
 
     info!(listen = %addr, "starting vmd gRPC server");
 
-    Server::builder()
-        .layer(grpc_trace)
+    let (reconcile_trigger_tx, reconcile_trigger_rx) = mpsc::unbounded_channel::<()>();
+    let _reconcile_trigger_guard = reconcile_trigger_tx.clone();
+    let registry_handle = start_node_registry(config.node_registry.clone()).await?;
+    let reconcile_handle = start_reconcile_worker(
+        Arc::clone(&manager),
+        config.node_registry.clone(),
+        config.control_bus.clone(),
+        reconcile_trigger_rx,
+    )
+    .await?;
+    let command_consumer_handle =
+        start_control_bus(config.control_bus.clone(), Some(reconcile_trigger_tx)).await?;
+
+    let mut server = Server::builder().layer(grpc_trace);
+    if let Some(tls_cfg) = config.security.tls.as_ref() {
+        let tls = load_server_tls_config(tls_cfg)?;
+        server = server.tls_config(tls)?;
+    }
+
+    server
         .add_service(health_service)
         .add_service(VmdServiceServer::new(svc))
         .serve_with_shutdown(addr, shutdown_signal())
         .await
         .context("serve gRPC")?;
 
+    if let Some(handle) = registry_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = command_consumer_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = reconcile_handle {
+        handle.shutdown().await;
+    }
+
     info!("vmd gRPC server stopped");
     Ok(())
+}
+
+fn load_server_tls_config(cfg: &TlsServerConfig) -> Result<ServerTlsConfig> {
+    let cert = std::fs::read(&cfg.cert_path)
+        .with_context(|| format!("read tls cert {}", cfg.cert_path))?;
+    let key =
+        std::fs::read(&cfg.key_path).with_context(|| format!("read tls key {}", cfg.key_path))?;
+    let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(cert, key));
+    if let Some(client_ca_path) = &cfg.client_ca_path {
+        let client_ca = std::fs::read(client_ca_path)
+            .with_context(|| format!("read tls client ca {client_ca_path}"))?;
+        tls = tls.client_ca_root(Certificate::from_pem(client_ca));
+        if !cfg.require_client_cert {
+            tls = tls.client_auth_optional(true);
+        }
+    }
+    Ok(tls)
+}
+
+async fn start_node_registry(
+    node_registry: Option<NodeRegistryConfig>,
+) -> Result<Option<registry::NodeRegistryHandle>> {
+    registry::start(node_registry)
+        .await
+        .context("start node registry heartbeat task")
+}
+
+async fn start_control_bus(
+    control_bus_cfg: Option<ControlBusConfig>,
+    reconcile_trigger_tx: Option<mpsc::UnboundedSender<()>>,
+) -> Result<Option<control_bus::CommandConsumerHandle>> {
+    control_bus::start_with_trigger(control_bus_cfg, reconcile_trigger_tx)
+        .await
+        .context("start control command consumer")
+}
+
+async fn start_reconcile_worker(
+    manager: Arc<Manager>,
+    node_registry: Option<NodeRegistryConfig>,
+    control_bus_cfg: Option<ControlBusConfig>,
+    reconcile_trigger_rx: mpsc::UnboundedReceiver<()>,
+) -> Result<Option<reconcile::ReconcileHandle>> {
+    reconcile::start(
+        manager,
+        node_registry,
+        control_bus_cfg,
+        reconcile_trigger_rx,
+    )
+    .await
+    .context("start reconcile worker")
 }
 
 async fn shutdown_signal() {
@@ -138,6 +220,82 @@ struct GrpcService {
     cfg: Config,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessLevel {
+    Read,
+    Write,
+}
+
+impl GrpcService {
+    fn authorize<T>(&self, request: &Request<T>, required: AccessLevel) -> Result<(), Status> {
+        authorize_metadata(
+            self.cfg.security.auth.as_ref(),
+            request.metadata(),
+            required,
+        )
+    }
+}
+
+fn authorize_metadata(
+    auth_cfg: Option<&crate::config::AuthConfig>,
+    metadata: &MetadataMap,
+    required: AccessLevel,
+) -> Result<(), Status> {
+    let Some(auth_cfg) = auth_cfg else {
+        return Ok(());
+    };
+
+    let token = extract_bearer_token(metadata)?;
+    if token == auth_cfg.admin_token {
+        return Ok(());
+    }
+
+    if required == AccessLevel::Read
+        && auth_cfg
+            .readonly_token
+            .as_ref()
+            .is_some_and(|readonly| token == *readonly)
+    {
+        return Ok(());
+    }
+
+    Err(Status::permission_denied(
+        "token does not have sufficient permissions for this operation",
+    ))
+}
+
+fn extract_bearer_token(metadata: &MetadataMap) -> Result<String, Status> {
+    if let Some(token) = metadata.get("x-reson-auth-token") {
+        let value = token
+            .to_str()
+            .map_err(|_| Status::unauthenticated("x-reson-auth-token is not valid ASCII"))?;
+        if !value.trim().is_empty() {
+            return Ok(value.trim().to_string());
+        }
+    }
+
+    let value = metadata
+        .get("authorization")
+        .ok_or_else(|| Status::unauthenticated("authorization token is required"))?
+        .to_str()
+        .map_err(|_| Status::unauthenticated("authorization header is not valid ASCII"))?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Status::unauthenticated("authorization header is empty"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("Bearer ") {
+        let token = rest.trim();
+        if token.is_empty() {
+            return Err(Status::unauthenticated(
+                "authorization bearer token is empty",
+            ));
+        }
+        return Ok(token.to_string());
+    }
+
+    Ok(trimmed.to_string())
+}
+
 type GrpcResult<T> = Result<Response<T>, Status>;
 
 #[tonic::async_trait]
@@ -147,13 +305,15 @@ impl VmdService for GrpcService {
     type PreDownloadVmImageStream =
         Pin<Box<dyn Stream<Item = Result<PreDownloadVmImageResponse, Status>> + Send>>;
 
-    async fn health(&self, _request: Request<HealthRequest>) -> GrpcResult<HealthResponse> {
+    async fn health(&self, request: Request<HealthRequest>) -> GrpcResult<HealthResponse> {
+        self.authorize(&request, AccessLevel::Read)?;
         Ok(Response::new(HealthResponse {
             status: "ok".to_string(),
         }))
     }
 
-    async fn info(&self, _request: Request<InfoRequest>) -> GrpcResult<InfoResponse> {
+    async fn info(&self, request: Request<InfoRequest>) -> GrpcResult<InfoResponse> {
+        self.authorize(&request, AccessLevel::Read)?;
         Ok(Response::new(InfoResponse {
             listen: self.cfg.listen_address.clone(),
             data_dir: self.cfg.data_dir.clone(),
@@ -165,6 +325,7 @@ impl VmdService for GrpcService {
     }
 
     async fn list_v_ms(&self, request: Request<ListVMsRequest>) -> GrpcResult<ListVMsResponse> {
+        self.authorize(&request, AccessLevel::Read)?;
         let include_snapshots = request.into_inner().include_snapshots;
         let vms = self.manager.list().await;
         let mut response = Vec::with_capacity(vms.len());
@@ -180,6 +341,7 @@ impl VmdService for GrpcService {
     }
 
     async fn get_vm(&self, request: Request<GetVmRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Read)?;
         let vm_id = request.into_inner().vm_id;
         if vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -196,6 +358,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<CreateVmRequest>,
     ) -> Result<Response<Self::CreateVMStream>, Status> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         let source = req
             .source
@@ -272,6 +435,7 @@ impl VmdService for GrpcService {
     }
 
     async fn update_vm(&self, request: Request<UpdateVmRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -297,6 +461,7 @@ impl VmdService for GrpcService {
     }
 
     async fn delete_vm(&self, request: Request<DeleteVmRequest>) -> GrpcResult<()> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -309,6 +474,7 @@ impl VmdService for GrpcService {
     }
 
     async fn fork_vm(&self, request: Request<ForkVmRequest>) -> GrpcResult<ForkVmResponse> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.parent_vm_id.trim().is_empty() {
             return Err(Status::invalid_argument("parent_vm_id is required"));
@@ -348,26 +514,32 @@ impl VmdService for GrpcService {
     }
 
     async fn start_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         self.vm_action(request.into_inner(), Action::Start).await
     }
 
     async fn stop_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         self.vm_action(request.into_inner(), Action::Stop).await
     }
 
     async fn restart_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         self.vm_action(request.into_inner(), Action::Restart).await
     }
 
     async fn pause_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         self.vm_action(request.into_inner(), Action::Pause).await
     }
 
     async fn resume_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         self.vm_action(request.into_inner(), Action::Resume).await
     }
 
     async fn force_stop_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         self.vm_action(request.into_inner(), Action::ForceStop)
             .await
     }
@@ -376,6 +548,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<PreDownloadVmImageRequest>,
     ) -> Result<Response<Self::PreDownloadVmImageStream>, Status> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.reference.trim().is_empty() {
             return Err(Status::invalid_argument("reference is required"));
@@ -528,6 +701,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<ListSnapshotsRequest>,
     ) -> GrpcResult<ListSnapshotsResponse> {
+        self.authorize(&request, AccessLevel::Read)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -547,6 +721,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<CreateSnapshotRequest>,
     ) -> GrpcResult<Snapshot> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -564,6 +739,7 @@ impl VmdService for GrpcService {
     }
 
     async fn get_snapshot(&self, request: Request<GetSnapshotRequest>) -> GrpcResult<Snapshot> {
+        self.authorize(&request, AccessLevel::Read)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -579,6 +755,7 @@ impl VmdService for GrpcService {
     }
 
     async fn restore_snapshot(&self, request: Request<RestoreSnapshotRequest>) -> GrpcResult<Vm> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -599,6 +776,7 @@ impl VmdService for GrpcService {
     }
 
     async fn delete_snapshot(&self, request: Request<DeleteSnapshotRequest>) -> GrpcResult<()> {
+        self.authorize(&request, AccessLevel::Write)?;
         let req = request.into_inner();
         if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -858,7 +1036,93 @@ fn status_from_error(err: ManagerError) -> Status {
         ManagerError::SnapshotNotFound => Status::not_found(err.to_string()),
         ManagerError::InvalidState => Status::failed_precondition(err.to_string()),
         ManagerError::Cancelled => Status::cancelled(err.to_string()),
-        ManagerError::Other(e) => Status::internal(e.to_string()),
-        ManagerError::Io(e) => Status::internal(e.to_string()),
+        ManagerError::CapacityExceeded { .. } => Status::resource_exhausted(err.to_string()),
+        ManagerError::Other(e) => {
+            let message = sanitize_status_message(&e.to_string());
+            error!(error = ?e, status_message = %message, "manager operation failed");
+            Status::internal(message)
+        }
+        ManagerError::Io(e) => {
+            let message = sanitize_status_message(&e.to_string());
+            error!(error = ?e, status_message = %message, "manager io operation failed");
+            Status::internal(message)
+        }
+    }
+}
+
+fn sanitize_status_message(raw: &str) -> String {
+    const MAX_LEN: usize = 1024;
+    let mut out = String::with_capacity(raw.len().min(MAX_LEN));
+    let mut truncated = false;
+
+    for ch in raw.chars() {
+        let mapped = match ch {
+            '\n' | '\r' | '\t' => ' ',
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if out.len() + mapped.len_utf8() > MAX_LEN {
+            truncated = true;
+            break;
+        }
+        out.push(mapped);
+    }
+
+    let compact = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "internal error".to_string()
+    } else if truncated {
+        format!("{compact} ...(truncated)")
+    } else {
+        compact
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn extract_bearer_token_supports_authorization_header() {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer super-secret").expect("valid metadata value"),
+        );
+
+        let token = extract_bearer_token(req.metadata()).expect("token should parse");
+        assert_eq!(token, "super-secret");
+    }
+
+    #[test]
+    fn authorize_metadata_enforces_readonly_vs_write() {
+        let auth = crate::config::AuthConfig {
+            admin_token: "admin".to_string(),
+            readonly_token: Some("readonly".to_string()),
+        };
+
+        let mut read_req = Request::new(());
+        read_req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer readonly").expect("valid metadata value"),
+        );
+        assert!(authorize_metadata(Some(&auth), read_req.metadata(), AccessLevel::Read).is_ok());
+        assert!(authorize_metadata(Some(&auth), read_req.metadata(), AccessLevel::Write).is_err());
+    }
+
+    #[test]
+    fn authorize_metadata_accepts_admin_for_write() {
+        let auth = crate::config::AuthConfig {
+            admin_token: "admin".to_string(),
+            readonly_token: Some("readonly".to_string()),
+        };
+
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from("Bearer admin").expect("valid metadata value"),
+        );
+        assert!(authorize_metadata(Some(&auth), req.metadata(), AccessLevel::Write).is_ok());
     }
 }

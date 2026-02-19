@@ -15,6 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use prost_types::Timestamp;
 use serde_json::json;
 use tonic::Request;
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
 use vmd_rs::config::{self, Config};
@@ -36,6 +37,10 @@ struct Cli {
     server: String,
     #[arg(long, default_value = "300")]
     timeout_secs: u64,
+    #[arg(long)]
+    auth_token: Option<String>,
+    #[arg(long)]
+    auth_token_file: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -182,6 +187,10 @@ enum SourceType {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let auth_header = compile_auth_header(resolve_secret(
+        cli.auth_token.clone(),
+        cli.auth_token_file.as_deref(),
+    )?)?;
     match cli.command {
         Commands::ConvertImage {
             image,
@@ -190,23 +199,17 @@ async fn main() -> Result<()> {
             data_dir,
             docker_bin,
             force_local_build,
-        } => convert_image(
-            image,
-            arch,
-            output,
-            data_dir,
-            docker_bin,
-            force_local_build,
-        )
-        .await,
+        } => convert_image(image, arch, output, data_dir, docker_bin, force_local_build).await,
         other => {
             let mut client = connect(&cli.server, cli.timeout_secs).await?;
             match other {
                 Commands::ListVms {
                     json,
                     include_snapshots,
-                } => list_vms(&mut client, include_snapshots, json).await?,
-                Commands::GetVm { vm_id, json } => get_vm(&mut client, &vm_id, json).await?,
+                } => list_vms(&mut client, include_snapshots, json, auth_header.as_ref()).await?,
+                Commands::GetVm { vm_id, json } => {
+                    get_vm(&mut client, &vm_id, json, auth_header.as_ref()).await?
+                }
                 Commands::CreateVm {
                     source_ref,
                     source_type,
@@ -231,6 +234,7 @@ async fn main() -> Result<()> {
                         auto_start,
                         arch,
                         json,
+                        auth_header.as_ref(),
                     )
                     .await?
                 }
@@ -238,11 +242,14 @@ async fn main() -> Result<()> {
                     source_ref,
                     arch,
                     force,
-                } => pre_download_image(&mut client, source_ref, arch, force).await?,
+                } => {
+                    pre_download_image(&mut client, source_ref, arch, force, auth_header.as_ref())
+                        .await?
+                }
                 Commands::DeleteVm {
                     vm_id,
                     purge_snapshots,
-                } => delete_vm(&mut client, &vm_id, purge_snapshots).await?,
+                } => delete_vm(&mut client, &vm_id, purge_snapshots, auth_header.as_ref()).await?,
                 Commands::ForkVm {
                     parent_vm_id,
                     child_name,
@@ -257,43 +264,105 @@ async fn main() -> Result<()> {
                         child_metadata,
                         auto_start_child,
                         json,
+                        auth_header.as_ref(),
                     )
                     .await?
                 }
                 Commands::StartVm { vm_id, json } => {
-                    vm_action(&mut client, &vm_id, Action::Start, json).await?
+                    vm_action(
+                        &mut client,
+                        &vm_id,
+                        Action::Start,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
                 }
                 Commands::StopVm { vm_id, json } => {
-                    vm_action(&mut client, &vm_id, Action::Stop, json).await?
+                    vm_action(
+                        &mut client,
+                        &vm_id,
+                        Action::Stop,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
                 }
                 Commands::RestartVm { vm_id, json } => {
-                    vm_action(&mut client, &vm_id, Action::Restart, json).await?
+                    vm_action(
+                        &mut client,
+                        &vm_id,
+                        Action::Restart,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
                 }
                 Commands::PauseVm { vm_id, json } => {
-                    vm_action(&mut client, &vm_id, Action::Pause, json).await?
+                    vm_action(
+                        &mut client,
+                        &vm_id,
+                        Action::Pause,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
                 }
                 Commands::ResumeVm { vm_id, json } => {
-                    vm_action(&mut client, &vm_id, Action::Resume, json).await?
+                    vm_action(
+                        &mut client,
+                        &vm_id,
+                        Action::Resume,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
                 }
                 Commands::ForceStopVm { vm_id, json } => {
-                    vm_action(&mut client, &vm_id, Action::ForceStop, json).await?
+                    vm_action(
+                        &mut client,
+                        &vm_id,
+                        Action::ForceStop,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
                 }
                 Commands::ListSnapshots { vm_id, json } => {
-                    list_snapshots(&mut client, &vm_id, json).await?
+                    list_snapshots(&mut client, &vm_id, json, auth_header.as_ref()).await?
                 }
                 Commands::CreateSnapshot {
                     vm_id,
                     label,
                     description,
                     json,
-                } => create_snapshot(&mut client, &vm_id, label, description, json).await?,
+                } => {
+                    create_snapshot(
+                        &mut client,
+                        &vm_id,
+                        label,
+                        description,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
+                }
                 Commands::RestoreSnapshot {
                     vm_id,
                     snapshot_id,
                     json,
-                } => restore_snapshot(&mut client, &vm_id, &snapshot_id, json).await?,
+                } => {
+                    restore_snapshot(
+                        &mut client,
+                        &vm_id,
+                        &snapshot_id,
+                        json,
+                        auth_header.as_ref(),
+                    )
+                    .await?
+                }
                 Commands::DeleteSnapshot { vm_id, snapshot_id } => {
-                    delete_snapshot(&mut client, &vm_id, &snapshot_id).await?
+                    delete_snapshot(&mut client, &vm_id, &snapshot_id, auth_header.as_ref()).await?
                 }
                 Commands::ConvertImage { .. } => unreachable!(),
             }
@@ -309,13 +378,66 @@ async fn connect(server: &str, timeout_secs: u64) -> Result<VmdServiceClient<Cha
     Ok(VmdServiceClient::connect(endpoint).await?)
 }
 
+fn request_with_auth<T>(message: T, auth_header: Option<&MetadataValue<Ascii>>) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(value) = auth_header {
+        request
+            .metadata_mut()
+            .insert("authorization", value.clone());
+    }
+    request
+}
+
+fn resolve_secret(inline: Option<String>, file_path: Option<&str>) -> Result<Option<String>> {
+    if let Some(value) = inline {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed));
+        }
+    }
+    let Some(file_path) = file_path else {
+        return Ok(None);
+    };
+    let value = std::fs::read_to_string(file_path)?;
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed))
+}
+
+fn compile_auth_header(raw_token: Option<String>) -> Result<Option<MetadataValue<Ascii>>> {
+    let token = raw_token
+        .or_else(|| env::var("RESON_SANDBOX_AUTH_TOKEN").ok())
+        .or_else(|| env::var("BRACKET_SANDBOX_AUTH_TOKEN").ok());
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value = if trimmed.starts_with("Bearer ") {
+        trimmed.to_string()
+    } else {
+        format!("Bearer {trimmed}")
+    };
+    let metadata = MetadataValue::try_from(value.as_str())
+        .with_context(|| "authorization token is not valid ASCII metadata")?;
+    Ok(Some(metadata))
+}
+
 async fn list_vms(
     client: &mut VmdServiceClient<Channel>,
     include_snapshots: bool,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let response = client
-        .list_v_ms(Request::new(ListVMsRequest { include_snapshots }))
+        .list_v_ms(request_with_auth(
+            ListVMsRequest { include_snapshots },
+            auth_header,
+        ))
         .await?
         .into_inner();
     if json {
@@ -330,11 +452,19 @@ async fn list_vms(
     Ok(())
 }
 
-async fn get_vm(client: &mut VmdServiceClient<Channel>, vm_id: &str, json: bool) -> Result<()> {
+async fn get_vm(
+    client: &mut VmdServiceClient<Channel>,
+    vm_id: &str,
+    json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
+) -> Result<()> {
     let response = client
-        .get_vm(Request::new(GetVmRequest {
-            vm_id: vm_id.to_string(),
-        }))
+        .get_vm(request_with_auth(
+            GetVmRequest {
+                vm_id: vm_id.to_string(),
+            },
+            auth_header,
+        ))
         .await?
         .into_inner();
     if json {
@@ -357,6 +487,7 @@ async fn create_vm(
     auto_start: bool,
     arch: Option<String>,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let mut meta_map = HashMap::new();
     for entry in metadata {
@@ -389,7 +520,10 @@ async fn create_vm(
         architecture: arch.unwrap_or_default(),
     };
 
-    let mut stream = client.create_vm(Request::new(request)).await?.into_inner();
+    let mut stream = client
+        .create_vm(request_with_auth(request, auth_header))
+        .await?
+        .into_inner();
     let pb = ProgressBar::new(100);
     pb.set_style(
         ProgressStyle::with_template("{spinner:.green} {msg} {percent:>3}%")
@@ -453,6 +587,7 @@ async fn pre_download_image(
     source_ref: String,
     arch: Option<String>,
     force: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     if source_ref.trim().is_empty() {
         bail!("--source-ref must be provided");
@@ -470,7 +605,7 @@ async fn pre_download_image(
     };
 
     let mut stream = client
-        .pre_download_vm_image(Request::new(request))
+        .pre_download_vm_image(request_with_auth(request, auth_header))
         .await?
         .into_inner();
 
@@ -561,12 +696,16 @@ async fn delete_vm(
     client: &mut VmdServiceClient<Channel>,
     vm_id: &str,
     purge_snapshots: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     client
-        .delete_vm(Request::new(DeleteVmRequest {
-            vm_id: vm_id.to_string(),
-            purge_snapshots,
-        }))
+        .delete_vm(request_with_auth(
+            DeleteVmRequest {
+                vm_id: vm_id.to_string(),
+                purge_snapshots,
+            },
+            auth_header,
+        ))
         .await?;
     println!("deleted vm {vm_id}");
     Ok(())
@@ -579,6 +718,7 @@ async fn fork_vm(
     child_metadata: Vec<String>,
     auto_start_child: bool,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let mut child_metadata_map = HashMap::new();
     for entry in child_metadata {
@@ -590,18 +730,21 @@ async fn fork_vm(
     }
 
     let response = client
-        .fork_vm(Request::new(ForkVmRequest {
-            parent_vm_id: parent_vm_id.to_string(),
-            child_name: child_name.unwrap_or_default(),
-            child_metadata: if child_metadata_map.is_empty() {
-                None
-            } else {
-                Some(Metadata {
-                    entries: child_metadata_map,
-                })
+        .fork_vm(request_with_auth(
+            ForkVmRequest {
+                parent_vm_id: parent_vm_id.to_string(),
+                child_name: child_name.unwrap_or_default(),
+                child_metadata: if child_metadata_map.is_empty() {
+                    None
+                } else {
+                    Some(Metadata {
+                        entries: child_metadata_map,
+                    })
+                },
+                auto_start_child,
             },
-            auto_start_child,
-        }))
+            auth_header,
+        ))
         .await?
         .into_inner();
 
@@ -641,18 +784,43 @@ async fn vm_action(
     vm_id: &str,
     action: Action,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let payload = VmActionRequest {
         vm_id: vm_id.to_string(),
     };
 
     let response = match action {
-        Action::Start => client.start_vm(Request::new(payload.clone())).await?,
-        Action::Stop => client.stop_vm(Request::new(payload.clone())).await?,
-        Action::Restart => client.restart_vm(Request::new(payload.clone())).await?,
-        Action::Pause => client.pause_vm(Request::new(payload.clone())).await?,
-        Action::Resume => client.resume_vm(Request::new(payload.clone())).await?,
-        Action::ForceStop => client.force_stop_vm(Request::new(payload)).await?,
+        Action::Start => {
+            client
+                .start_vm(request_with_auth(payload.clone(), auth_header))
+                .await?
+        }
+        Action::Stop => {
+            client
+                .stop_vm(request_with_auth(payload.clone(), auth_header))
+                .await?
+        }
+        Action::Restart => {
+            client
+                .restart_vm(request_with_auth(payload.clone(), auth_header))
+                .await?
+        }
+        Action::Pause => {
+            client
+                .pause_vm(request_with_auth(payload.clone(), auth_header))
+                .await?
+        }
+        Action::Resume => {
+            client
+                .resume_vm(request_with_auth(payload.clone(), auth_header))
+                .await?
+        }
+        Action::ForceStop => {
+            client
+                .force_stop_vm(request_with_auth(payload, auth_header))
+                .await?
+        }
     }
     .into_inner();
 
@@ -668,11 +836,15 @@ async fn list_snapshots(
     client: &mut VmdServiceClient<Channel>,
     vm_id: &str,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let response = client
-        .list_snapshots(Request::new(ListSnapshotsRequest {
-            vm_id: vm_id.to_string(),
-        }))
+        .list_snapshots(request_with_auth(
+            ListSnapshotsRequest {
+                vm_id: vm_id.to_string(),
+            },
+            auth_header,
+        ))
         .await?
         .into_inner();
     if json {
@@ -692,13 +864,17 @@ async fn create_snapshot(
     label: Option<String>,
     description: Option<String>,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let response = client
-        .create_snapshot(Request::new(CreateSnapshotRequest {
-            vm_id: vm_id.to_string(),
-            label: label.unwrap_or_default(),
-            description: description.unwrap_or_default(),
-        }))
+        .create_snapshot(request_with_auth(
+            CreateSnapshotRequest {
+                vm_id: vm_id.to_string(),
+                label: label.unwrap_or_default(),
+                description: description.unwrap_or_default(),
+            },
+            auth_header,
+        ))
         .await?
         .into_inner();
     if json {
@@ -717,12 +893,16 @@ async fn restore_snapshot(
     vm_id: &str,
     snapshot_id: &str,
     json: bool,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     let response = client
-        .restore_snapshot(Request::new(RestoreSnapshotRequest {
-            vm_id: vm_id.to_string(),
-            snapshot_id: snapshot_id.to_string(),
-        }))
+        .restore_snapshot(request_with_auth(
+            RestoreSnapshotRequest {
+                vm_id: vm_id.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+            },
+            auth_header,
+        ))
         .await?
         .into_inner();
     if json {
@@ -737,12 +917,16 @@ async fn delete_snapshot(
     client: &mut VmdServiceClient<Channel>,
     vm_id: &str,
     snapshot_id: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
 ) -> Result<()> {
     client
-        .delete_snapshot(Request::new(DeleteSnapshotRequest {
-            vm_id: vm_id.to_string(),
-            snapshot_id: snapshot_id.to_string(),
-        }))
+        .delete_snapshot(request_with_auth(
+            DeleteSnapshotRequest {
+                vm_id: vm_id.to_string(),
+                snapshot_id: snapshot_id.to_string(),
+            },
+            auth_header,
+        ))
         .await?;
     println!("deleted snapshot {snapshot_id}");
     Ok(())

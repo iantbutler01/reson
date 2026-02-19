@@ -428,7 +428,8 @@ fn build_directory_record(
     ts: DateTime<Utc>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(33 + ident.len());
-    buf.push(33 + ident.len() as u8 + (ident.len() % 2 == 0) as u8);
+    let ident_is_even = ident.len() % 2 == 0;
+    buf.push(33 + ident.len() as u8 + ident_is_even as u8);
     buf.push(0);
     buf.extend_from_slice(&extent.to_le_bytes());
     buf.extend_from_slice(&extent.to_be_bytes());
@@ -442,7 +443,7 @@ fn build_directory_record(
     buf.extend_from_slice(&1u16.to_be_bytes());
     buf.push(ident.len() as u8);
     buf.extend_from_slice(ident);
-    if ident.len() % 2 == 0 {
+    if ident_is_even {
         buf.push(0);
     }
     buf

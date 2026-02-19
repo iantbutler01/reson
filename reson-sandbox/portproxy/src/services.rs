@@ -344,7 +344,7 @@ impl ShellExec for ShellExecService {
                             let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                                 let mut guard = writer
                                     .lock()
-                                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writer poisoned"))?;
+                                    .map_err(|_| std::io::Error::other("writer poisoned"))?;
                                 guard.write_all(&data)?;
                                 guard.flush()
                             })
@@ -378,7 +378,7 @@ impl ShellExec for ShellExecService {
         tokio::spawn(async move {
             let status = match tokio::task::spawn_blocking(move || child.wait()).await {
                 Ok(res) => res,
-                Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err)),
+                Err(err) => Err(std::io::Error::other(err)),
             };
 
             if pid > 0 {

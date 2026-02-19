@@ -37,13 +37,14 @@ require_cmd cargo
 log "fork CoW gate: stopped-parent CoW runtime test"
 (cd "$REPO_ROOT" && cargo test -p vmd fork_vm_stopped_parent_uses_shared_cow_backing)
 
-SOURCE_REF="${VMD_SMOKE_SOURCE_REF:-}"
+DEFAULT_SOURCE_REF="${VMD_SMOKE_DEFAULT_SOURCE_REF:-ghcr.io/bracketdevelopers/uv-builder:main}"
+SOURCE_REF="${VMD_SMOKE_SOURCE_REF:-$DEFAULT_SOURCE_REF}"
 if [[ -z "$SOURCE_REF" ]]; then
   if [[ "$STRICT" -eq 1 ]]; then
-    err "VMD_SMOKE_SOURCE_REF is required for strict fork CoW verification"
+    err "VMD_SMOKE_SOURCE_REF is required for strict fork CoW verification (or set VMD_SMOKE_DEFAULT_SOURCE_REF)"
     exit 1
   fi
-  warn "VMD_SMOKE_SOURCE_REF not set; static checks only"
+  warn "no smoke source ref configured; static checks only"
   log "fork CoW gate: passed (static only)"
   exit 0
 fi
@@ -122,6 +123,7 @@ SERVER_URL="${VMD_SMOKE_SERVER:-http://127.0.0.1:18053}"
 LISTEN_ADDR="${VMD_SMOKE_LISTEN_ADDR:-${SERVER_URL#http://}}"
 LISTEN_ADDR="${LISTEN_ADDR#https://}"
 TIMEOUT_SECS="${VMD_SMOKE_TIMEOUT_SECS:-900}"
+STOP_TIMEOUT_SECS="${VMD_SMOKE_STOP_TIMEOUT_SECS:-45}"
 
 TMP_DIR="$(mktemp -d "/tmp/rsbfk.XXXXXX")"
 DATA_DIR="$TMP_DIR/vmd-data"
@@ -193,6 +195,7 @@ fi
 
 VM_NAME="reson-fork-parent-$(date +%s)"
 log "fork CoW gate: creating running parent VM"
+log "fork CoW gate: using source ref $SOURCE_REF"
 CREATE_OUT="$($VMDCTL_BIN --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" create-vm --source-ref "$SOURCE_REF" --source-type docker --name "$VM_NAME" --auto-start --json 2>"$TMP_DIR/create.stderr")" || {
   err "create-vm failed"
   cat "$TMP_DIR/create.stderr" >&2 || true
@@ -234,9 +237,9 @@ fi
 
 log "fork CoW gate: starting child VM from captured snapshot"
 "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" start-vm "$CHILD_VM_ID" >/dev/null
-if ! "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" stop-vm "$CHILD_VM_ID" >/dev/null 2>"$TMP_DIR/child-stop.stderr"; then
+if ! "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$STOP_TIMEOUT_SECS" stop-vm "$CHILD_VM_ID" >/dev/null 2>"$TMP_DIR/child-stop.stderr"; then
   warn "child stop-vm failed; forcing stop"
-  "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$TIMEOUT_SECS" force-stop-vm "$CHILD_VM_ID" >/dev/null
+  "$VMDCTL_BIN" --server "$SERVER_URL" --timeout-secs "$STOP_TIMEOUT_SECS" force-stop-vm "$CHILD_VM_ID" >/dev/null
 fi
 
 if [[ ! -s "$CHILD_DISK" ]]; then
