@@ -9,6 +9,7 @@ use crate::types::{ChatMessage, ToolCall, ToolResult, ReasoningSegment};
 /// Inference provider enum matching the Python InferenceProvider
 #[pyclass(eq, eq_int)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(non_camel_case_types)]
 pub enum InferenceProvider {
     OPENAI,
     OPENAI_RESPONSES,

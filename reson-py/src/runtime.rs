@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::errors::to_py_err;
-use crate::types::{ChatMessage, ReasoningSegment, ToolCall, ToolResult};
+use crate::types::{ChatMessage, ReasoningSegment, ToolResult};
 
 type ChunkStream = Pin<
     Box<dyn Stream<Item = Result<(String, serde_json::Value), reson_agentic::error::Error>> + Send>,
@@ -307,6 +307,7 @@ impl StreamIterator {
                         p.temperature,
                         p.top_p,
                         p.max_tokens,
+                        None,
                         call_context,
                         accumulators,
                     )
@@ -378,8 +379,6 @@ pub struct Runtime {
     raw_response: Arc<RwLock<Vec<String>>>,
     reasoning: Arc<RwLock<Vec<String>>>,
     reasoning_segments: Arc<RwLock<Vec<reson_agentic::types::ReasoningSegment>>>,
-    // Store
-    store: Arc<RwLock<reson_agentic::storage::MemoryKVStore>>,
 }
 
 #[pymethods]
@@ -388,7 +387,7 @@ impl Runtime {
     #[pyo3(signature = (model=None, store=None, used=false, api_key=None, native_tools=false))]
     fn new(
         model: Option<String>,
-        store: Option<&MemoryStore>,
+        store: Option<PyObject>,
         used: bool,
         api_key: Option<String>,
         native_tools: bool,
@@ -418,7 +417,6 @@ impl Runtime {
             raw_response: Arc::new(RwLock::new(Vec::new())),
             reasoning: Arc::new(RwLock::new(Vec::new())),
             reasoning_segments: Arc::new(RwLock::new(Vec::new())),
-            store: Arc::new(RwLock::new(reson_agentic::storage::MemoryKVStore::new())),
         })
     }
 
@@ -723,8 +721,6 @@ impl Runtime {
         let used = self.used.clone();
         let raw_response_acc = self.raw_response.clone();
         let reasoning_acc = self.reasoning.clone();
-        let tools = self.tools.clone();
-        let tool_schemas = self.tool_schemas.clone();
 
         // Get effective model
         let effective_model = model
@@ -815,6 +811,7 @@ impl Runtime {
                 temperature,
                 top_p,
                 max_tokens,
+                None,
                 call_context,
             )
             .await
@@ -971,7 +968,6 @@ impl Runtime {
             raw_response: Arc::new(RwLock::new(Vec::new())),
             reasoning: Arc::new(RwLock::new(Vec::new())),
             reasoning_segments: Arc::new(RwLock::new(Vec::new())),
-            store: Arc::new(RwLock::new(reson_agentic::storage::MemoryKVStore::new())),
         }
     }
 

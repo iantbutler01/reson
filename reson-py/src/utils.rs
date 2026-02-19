@@ -1,7 +1,7 @@
 //! Utils module - schema generators and helper functions
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 
 fn resolve_provider_name(provider: &str) -> String {
     let parts: Vec<&str> = provider.split(':').collect();

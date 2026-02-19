@@ -17,7 +17,7 @@ pyo3 = "0.23.3"
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # Core reson library
 reson-agentic = { path = "../reson-rust", features = ["full"] }
