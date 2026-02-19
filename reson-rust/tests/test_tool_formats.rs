@@ -306,7 +306,10 @@ async fn test_cross_provider_tool_call_format() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![tool_schema_for("openrouter", &calculate_tool_schema())])
+        .with_tools(vec![tool_schema_for(
+            "openrouter",
+            &calculate_tool_schema(),
+        )])
         .with_native_tools(true);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
@@ -320,11 +323,8 @@ async fn test_cross_provider_tool_call_format() {
                     println!("Tool call: {:?}", tool_call);
 
                     // Streaming emits OpenAI format {id, function: {name, arguments}}
-                    let tc = ToolCall::from_provider_format(
-                        tool_call.clone(),
-                        Provider::OpenAI,
-                    )
-                    .expect("Tool call should parse");
+                    let tc = ToolCall::from_provider_format(tool_call.clone(), Provider::OpenAI)
+                        .expect("Tool call should parse");
                     println!("Tool name: {}", tc.tool_name);
 
                     tool_calls.push(tool_call);
@@ -422,11 +422,8 @@ async fn test_mixed_tool_registration_formats() {
             Ok(chunk) => match chunk {
                 StreamChunk::ToolCallComplete(tool_call) => {
                     // Streaming emits OpenAI format {id, function: {name, arguments}}
-                    let tc = ToolCall::from_provider_format(
-                        tool_call.clone(),
-                        Provider::OpenAI,
-                    )
-                    .expect("Tool call should parse");
+                    let tc = ToolCall::from_provider_format(tool_call.clone(), Provider::OpenAI)
+                        .expect("Tool call should parse");
                     println!("Mixed tool: {}", tc.tool_name);
                     tool_names.push(tc.tool_name);
                     tool_calls.push(tool_call);
@@ -678,11 +675,8 @@ async fn test_anthropic_streaming_tool_call_format() {
                     println!("Anthropic tool call: {:?}", tool_call);
 
                     // Streaming accumulator emits OpenAI format {id, function: {name, arguments}}
-                    let tc = ToolCall::from_provider_format(
-                        tool_call.clone(),
-                        Provider::OpenAI,
-                    )
-                    .expect("Anthropic streaming tool call should parse");
+                    let tc = ToolCall::from_provider_format(tool_call.clone(), Provider::OpenAI)
+                        .expect("Anthropic streaming tool call should parse");
                     println!("Tool name: {}", tc.tool_name);
 
                     tool_calls.push(tool_call);
@@ -696,15 +690,19 @@ async fn test_anthropic_streaming_tool_call_format() {
         }
     }
 
-    println!("Partials: {}, Complete: {}", partial_count, tool_calls.len());
-    assert!(!tool_calls.is_empty(), "Should receive Anthropic tool calls");
+    println!(
+        "Partials: {}, Complete: {}",
+        partial_count,
+        tool_calls.len()
+    );
+    assert!(
+        !tool_calls.is_empty(),
+        "Should receive Anthropic tool calls"
+    );
 
     // Verify the tool call has expected structure
-    let tc = ToolCall::from_provider_format(
-        tool_calls[0].clone(),
-        Provider::OpenAI,
-    )
-    .expect("Should parse tool call");
+    let tc = ToolCall::from_provider_format(tool_calls[0].clone(), Provider::OpenAI)
+        .expect("Should parse tool call");
     assert_eq!(tc.tool_name, "calculate_function");
 }
 

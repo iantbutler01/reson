@@ -866,9 +866,7 @@ impl ToolCall {
                 })
             }
             Provider::OpenAIResponses | Provider::OpenRouterResponses => {
-                let args_str = provider_format["arguments"]
-                    .as_str()
-                    .unwrap_or("");
+                let args_str = provider_format["arguments"].as_str().unwrap_or("");
                 let call_id = provider_format
                     .get("call_id")
                     .and_then(|v| v.as_str())
@@ -950,10 +948,9 @@ impl ToolCall {
                 })
             }
             Provider::OpenAIResponses | Provider::OpenRouterResponses => {
-                let args_str = self
-                    .raw_arguments
-                    .clone()
-                    .unwrap_or_else(|| serde_json::to_string(&self.args).unwrap_or_else(|_| "{}".to_string()));
+                let args_str = self.raw_arguments.clone().unwrap_or_else(|| {
+                    serde_json::to_string(&self.args).unwrap_or_else(|_| "{}".to_string())
+                });
                 serde_json::json!({
                     "type": "function_call",
                     "id": format!("fc_{}", self.tool_use_id),
@@ -1230,7 +1227,8 @@ mod tests {
         assert_eq!(provider, Provider::OpenAIResponses);
         assert_eq!(model, "gpt-4");
 
-        let (provider, model) = Provider::from_model_string("openrouter:resp:openai/o4-mini").unwrap();
+        let (provider, model) =
+            Provider::from_model_string("openrouter:resp:openai/o4-mini").unwrap();
         assert_eq!(provider, Provider::OpenRouterResponses);
         assert_eq!(model, "openai/o4-mini");
 

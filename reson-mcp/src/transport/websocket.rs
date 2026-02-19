@@ -126,9 +126,9 @@ pub async fn connect(
     >,
     crate::error::Error,
 > {
-    let (stream, response) = tokio_tungstenite::connect_async(url)
-        .await
-        .map_err(|e| crate::error::Error::Transport(format!("WebSocket connection failed: {}", e)))?;
+    let (stream, response) = tokio_tungstenite::connect_async(url).await.map_err(|e| {
+        crate::error::Error::Transport(format!("WebSocket connection failed: {}", e))
+    })?;
 
     if response.status() != tungstenite::http::StatusCode::SWITCHING_PROTOCOLS {
         return Err(crate::error::Error::Transport(format!(

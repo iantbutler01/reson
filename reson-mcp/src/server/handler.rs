@@ -8,25 +8,24 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rmcp::{
-    ErrorData, RoleServer, ServerHandler, ServiceExt,
-    handler::server::tool::ToolCallContext,
     handler::server::router::tool::{ToolRoute, ToolRouter},
+    handler::server::tool::ToolCallContext,
     model::{
         CallToolRequestParams, CallToolResult, Implementation, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-        ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+        ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::transport::WebSocketTransport;
 use crate::error::{Error, Result};
+use crate::transport::WebSocketTransport;
 
 #[cfg(feature = "apps")]
 use crate::apps::{UiResource, UiResourceRegistry, UiToolMeta};
@@ -371,7 +370,10 @@ impl McpServerBuilder {
     /// and returns a CallToolResult.
     pub fn with_tool<F>(mut self, name: &str, description: &str, schema: Value, handler: F) -> Self
     where
-        F: Fn(String, Option<serde_json::Map<String, Value>>) -> BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
+        F: Fn(
+                String,
+                Option<serde_json::Map<String, Value>>,
+            ) -> BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
             + Send
             + Sync
             + 'static,
@@ -384,15 +386,12 @@ impl McpServerBuilder {
         let tool = Tool::new(name.to_string(), description.to_string(), input_schema);
 
         let handler = Arc::new(handler);
-        let route = ToolRoute::new_dyn(
-            tool,
-            move |tcc: ToolCallContext<'_, McpServer>| {
-                let name = tcc.name().to_string();
-                let args = tcc.arguments.clone();
-                let handler = handler.clone();
-                Box::pin(async move { handler(name, args).await })
-            },
-        );
+        let route = ToolRoute::new_dyn(tool, move |tcc: ToolCallContext<'_, McpServer>| {
+            let name = tcc.name().to_string();
+            let args = tcc.arguments.clone();
+            let handler = handler.clone();
+            Box::pin(async move { handler(name, args).await })
+        });
 
         self.tool_router.add_route(route);
 
@@ -428,7 +427,10 @@ impl McpServerBuilder {
                 visibility: None,
             };
             let ui_value = serde_json::to_value(&ui_meta).unwrap_or_default();
-            let meta = route.attr.meta.get_or_insert_with(|| Meta(serde_json::Map::new()));
+            let meta = route
+                .attr
+                .meta
+                .get_or_insert_with(|| Meta(serde_json::Map::new()));
             meta.0.insert("ui".to_string(), ui_value);
         }
 

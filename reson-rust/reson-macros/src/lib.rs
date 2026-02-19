@@ -593,7 +593,10 @@ fn get_array_item_type(ty: &syn::Type) -> Option<ArrayItemType> {
                     if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
                         let json_type = get_json_type(inner_ty);
                         // Primitive types just need "type": "string" etc
-                        if matches!(json_type.as_str(), "string" | "integer" | "number" | "boolean") {
+                        if matches!(
+                            json_type.as_str(),
+                            "string" | "integer" | "number" | "boolean"
+                        ) {
                             return Some(ArrayItemType::Primitive(json_type));
                         }
                         // Complex types need full schema from T::schema()

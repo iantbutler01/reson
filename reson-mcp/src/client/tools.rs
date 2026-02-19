@@ -19,7 +19,8 @@ impl From<&rmcp::model::Tool> for ToolInfo {
         Self {
             name: tool.name.to_string(),
             description: tool.description.as_ref().map(|s| s.to_string()),
-            input_schema: serde_json::to_value(&tool.input_schema).unwrap_or(Value::Object(Default::default())),
+            input_schema: serde_json::to_value(&tool.input_schema)
+                .unwrap_or(Value::Object(Default::default())),
         }
     }
 }

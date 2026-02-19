@@ -317,8 +317,7 @@ async fn test_google_streaming_tool_detection() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_streaming_with_thinking() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client =
-        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What is 17 * 23? Think through this step by step.",

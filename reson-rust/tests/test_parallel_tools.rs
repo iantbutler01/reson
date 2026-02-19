@@ -429,7 +429,10 @@ async fn test_backwards_compatibility_single_tool() {
 
     let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
         .with_max_tokens(1024)
-        .with_tools(vec![tool_schema_for("openrouter", &calculate_tool_schema())])
+        .with_tools(vec![tool_schema_for(
+            "openrouter",
+            &calculate_tool_schema(),
+        )])
         .with_native_tools(true);
 
     let result = client.get_generation(&messages, &config).await;

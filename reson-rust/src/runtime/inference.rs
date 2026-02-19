@@ -357,8 +357,9 @@ pub fn create_inference_client(
                 std::env::var("GOOGLE_GEMINI_API_KEY")
                     .map_err(|_| Error::NonRetryable("GOOGLE_GEMINI_API_KEY not set".to_string()))?
             }
-            "custom-openai" => std::env::var("OPENAI_API_KEY")
-                .unwrap_or_else(|_| "not-needed".to_string()),
+            "custom-openai" => {
+                std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "not-needed".to_string())
+            }
             _ => {
                 return Err(Error::NonRetryable(format!(
                     "Unknown provider: {}",

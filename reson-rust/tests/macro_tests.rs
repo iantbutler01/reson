@@ -187,17 +187,25 @@ fn test_tool_macro_with_nested_arrays() {
 
     // Test nested struct array schema
     let write_thread_schema = WriteThread::schema();
-    println!("WriteThread schema: {}", serde_json::to_string_pretty(&write_thread_schema).unwrap());
+    println!(
+        "WriteThread schema: {}",
+        serde_json::to_string_pretty(&write_thread_schema).unwrap()
+    );
 
     let thread_props = write_thread_schema["properties"].as_object().unwrap();
 
     // items should be array with full object schema
     assert_eq!(thread_props["items"]["type"], "array");
-    println!("items schema: {}", serde_json::to_string_pretty(&thread_props["items"]).unwrap());
+    println!(
+        "items schema: {}",
+        serde_json::to_string_pretty(&thread_props["items"]).unwrap()
+    );
     assert_eq!(thread_props["items"]["items"]["type"], "object");
 
     // The nested items schema should have properties
-    let nested_props = thread_props["items"]["items"]["properties"].as_object().unwrap();
+    let nested_props = thread_props["items"]["items"]["properties"]
+        .as_object()
+        .unwrap();
     assert!(nested_props.contains_key("text"));
     assert!(nested_props.contains_key("image_ids"));
 
@@ -218,6 +226,33 @@ mod agentic_macro_tests {
     use reson_agentic::agentic;
     use reson_agentic::error::Result;
 
+    fn run_params(
+        prompt: Option<&str>,
+        system: Option<&str>,
+        history: Option<Vec<reson_agentic::utils::ConversationMessage>>,
+        output_type: Option<&str>,
+        output_schema: Option<serde_json::Value>,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        max_tokens: Option<u32>,
+        model: Option<&str>,
+        api_key: Option<&str>,
+    ) -> reson_agentic::runtime::RunParams {
+        reson_agentic::runtime::RunParams {
+            prompt: prompt.map(|s| s.to_string()),
+            system: system.map(|s| s.to_string()),
+            history,
+            output_type: output_type.map(|s| s.to_string()),
+            output_schema,
+            temperature,
+            top_p,
+            max_tokens,
+            model: model.map(|s| s.to_string()),
+            api_key: api_key.map(|s| s.to_string()),
+            timeout: None,
+        }
+    }
+
     // Test that the macro compiles and generates a function without runtime param
     #[agentic(model = "anthropic:claude-3-5-sonnet-20241022")]
     async fn simple_agentic_fn(input: String, runtime: Runtime) -> Result<serde_json::Value> {
@@ -225,7 +260,7 @@ mod agentic_macro_tests {
         // Note: This won't actually call an LLM in tests, it will fail without API key
         // but the point is to verify the macro generates valid code
         runtime
-            .run(
+            .run(run_params(
                 Some(&input),
                 None,
                 None,
@@ -236,7 +271,7 @@ mod agentic_macro_tests {
                 None,
                 None,
                 None,
-            )
+            ))
             .await
     }
 
@@ -259,7 +294,7 @@ mod agentic_macro_tests {
     async fn no_model_agentic_fn(data: i32, runtime: Runtime) -> Result<serde_json::Value> {
         let _ = data; // Use the parameter
         runtime
-            .run(
+            .run(run_params(
                 Some("test"),
                 None,
                 None,
@@ -270,7 +305,7 @@ mod agentic_macro_tests {
                 None,
                 None,
                 None,
-            )
+            ))
             .await
     }
 
@@ -293,7 +328,7 @@ mod agentic_macro_tests {
     ) -> Result<serde_json::Value> {
         let prompt = format!("Name: {}, Count: {}", name, count);
         runtime
-            .run(
+            .run(run_params(
                 Some(&prompt),
                 None,
                 None,
@@ -304,7 +339,7 @@ mod agentic_macro_tests {
                 None,
                 None,
                 None,
-            )
+            ))
             .await
     }
 

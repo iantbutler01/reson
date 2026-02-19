@@ -10,6 +10,33 @@ use reson_agentic::parsers::Deserializable;
 use reson_agentic::types::ToolResult;
 use serde::{Deserialize, Serialize};
 
+fn run_params(
+    prompt: Option<&str>,
+    system: Option<&str>,
+    history: Option<Vec<reson_agentic::utils::ConversationMessage>>,
+    output_type: Option<&str>,
+    output_schema: Option<serde_json::Value>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+) -> reson_agentic::runtime::RunParams {
+    reson_agentic::runtime::RunParams {
+        prompt: prompt.map(|s| s.to_string()),
+        system: system.map(|s| s.to_string()),
+        history,
+        output_type: output_type.map(|s| s.to_string()),
+        output_schema,
+        temperature,
+        top_p,
+        max_tokens,
+        model: model.map(|s| s.to_string()),
+        api_key: api_key.map(|s| s.to_string()),
+        timeout: None,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SearchQuery {
     #[serde(default)]
@@ -185,7 +212,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
 
     let mut history = Vec::new();
     let mut result = runtime
-        .run(
+        .run(run_params(
             Some(&query),
             None,
             Some(history.clone()),
@@ -196,7 +223,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
             None,
             None,
             None,
-        )
+        ))
         .await?;
 
     println!("📞 Native initial call: {:?}", result);
@@ -233,7 +260,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
 
         // Continue conversation
         result = runtime
-            .run(
+            .run(run_params(
                 Some("Continue with the next step"),
                 None,
                 Some(history.clone()),
@@ -244,7 +271,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
                 None,
                 None,
                 None,
-            )
+            ))
             .await?;
 
         println!("📞 Native turn {} result: {:?}", turn_count + 1, result);
@@ -264,7 +291,7 @@ async fn single_tool_agent(query: String, runtime: Runtime) -> Result<String> {
         .await?;
 
     let result = runtime
-        .run(
+        .run(run_params(
             Some(&query),
             None,
             None,
@@ -275,7 +302,7 @@ async fn single_tool_agent(query: String, runtime: Runtime) -> Result<String> {
             None,
             None,
             None,
-        )
+        ))
         .await?;
     println!("📊 Result: {:?}", result);
 

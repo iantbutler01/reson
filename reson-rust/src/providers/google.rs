@@ -951,7 +951,9 @@ impl InferenceClient for GoogleGenAIClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config)?;
-        let body = self.make_request_with_retry(request_body, config.timeout).await?;
+        let body = self
+            .make_request_with_retry(request_body, config.timeout)
+            .await?;
 
         // Parse response
         let candidates = &body["candidates"];
@@ -992,7 +994,9 @@ impl InferenceClient for GoogleGenAIClient {
         // Retry the connection establishment with backoff
         let retry_config = RetryConfig::default();
         let response = retry_with_backoff(retry_config, || async {
-            let resp = self.make_request(request_body.clone(), true, timeout).await?;
+            let resp = self
+                .make_request(request_body.clone(), true, timeout)
+                .await?;
             let status = resp.status();
 
             if !status.is_success() {
@@ -1089,9 +1093,11 @@ impl InferenceClient for GoogleGenAIClient {
                                                             .get("thoughtSignature")
                                                             .and_then(|s| s.as_str())
                                                         {
-                                                            chunks.push(Ok(StreamChunk::Signature(
-                                                                sig.to_string(),
-                                                            )));
+                                                            chunks.push(Ok(
+                                                                StreamChunk::Signature(
+                                                                    sig.to_string(),
+                                                                ),
+                                                            ));
                                                         } else if let Some(text) =
                                                             part["text"].as_str()
                                                         {
@@ -1105,12 +1111,10 @@ impl InferenceClient for GoogleGenAIClient {
                                         }
 
                                         if let Some(usage) = json.get("usageMetadata") {
-                                            let input = usage["promptTokenCount"]
-                                                .as_u64()
-                                                .unwrap_or(0);
-                                            let output = usage["candidatesTokenCount"]
-                                                .as_u64()
-                                                .unwrap_or(0);
+                                            let input =
+                                                usage["promptTokenCount"].as_u64().unwrap_or(0);
+                                            let output =
+                                                usage["candidatesTokenCount"].as_u64().unwrap_or(0);
                                             let cached = usage["cachedContentTokenCount"]
                                                 .as_u64()
                                                 .unwrap_or(0);
@@ -1132,10 +1136,8 @@ impl InferenceClient for GoogleGenAIClient {
                             }
                         }
                         Err(e) => {
-                            chunks.push(Err(Error::Inference(format!(
-                                "Google stream error: {}",
-                                e
-                            ))));
+                            chunks
+                                .push(Err(Error::Inference(format!("Google stream error: {}", e))));
                         }
                     }
 

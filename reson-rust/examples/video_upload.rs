@@ -10,7 +10,7 @@
 
 use reson_agentic::agentic;
 use reson_agentic::providers::{FileState, GoogleGenAIClient};
-use reson_agentic::runtime::ToolFunction;
+use reson_agentic::runtime::{RunParams, ToolFunction};
 use reson_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
 use reson_agentic::utils::ConversationMessage;
 use reson_agentic::Tool;
@@ -142,20 +142,20 @@ async fn analyze_video(
     };
 
     // Run the agent with video context
-    // Parameters: prompt, system, history, output_type, temperature, top_p, max_tokens, model, api_key
     let response = runtime
-        .run(
-            None, // prompt is in the multimodal message
-            Some("You are a video analysis assistant. Use the available tools to analyze the video and answer the user's question."),
-            Some(vec![ConversationMessage::Multimodal(video_message)]),
-            None, // output_type_name
-            None, // output_schema
-            None, // temperature
-            None, // top_p
-            None, // max_tokens
-            None, // model (use default from agentic macro)
-            None, // api_key (use default from env)
-        )
+        .run(RunParams {
+            prompt: None, // prompt is in the multimodal message
+            system: Some("You are a video analysis assistant. Use the available tools to analyze the video and answer the user's question.".to_string()),
+            history: Some(vec![ConversationMessage::Multimodal(video_message)]),
+            output_type: None,
+            output_schema: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            model: None,   // use default from agentic macro
+            api_key: None, // use default from env
+            timeout: None,
+        })
         .await?;
 
     // Extract the text content from the response

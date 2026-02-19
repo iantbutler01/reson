@@ -14,7 +14,7 @@ use reson_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenRouterClient,
 };
-use reson_agentic::runtime::{Runtime, ToolFunction};
+use reson_agentic::runtime::{RunParams, Runtime, ToolFunction};
 use reson_agentic::schema::{
     AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator,
 };
@@ -42,6 +42,33 @@ fn get_google_key() -> Option<String> {
 
 fn get_openrouter_key() -> Option<String> {
     env::var("OPENROUTER_API_KEY").ok()
+}
+
+fn run_params(
+    prompt: Option<&str>,
+    system: Option<&str>,
+    history: Option<Vec<ConversationMessage>>,
+    output_type: Option<&str>,
+    output_schema: Option<serde_json::Value>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+) -> RunParams {
+    RunParams {
+        prompt: prompt.map(|s| s.to_string()),
+        system: system.map(|s| s.to_string()),
+        history,
+        output_type: output_type.map(|s| s.to_string()),
+        output_schema,
+        temperature,
+        top_p,
+        max_tokens,
+        model: model.map(|s| s.to_string()),
+        api_key: api_key.map(|s| s.to_string()),
+        timeout: None,
+    }
 }
 
 /// Common parameters for add_numbers tool
@@ -182,9 +209,7 @@ fn extract_tool_call_args(
     }
 
     if let Some(function) = tool_call.get("function") {
-        let nested_args = function
-            .get("arguments")
-            .or_else(|| function.get("input"));
+        let nested_args = function.get("arguments").or_else(|| function.get("input"));
         if let Some(args) = nested_args.and_then(parse_tool_call_args) {
             return Ok(args);
         }
@@ -208,16 +233,10 @@ fn tool_call_name(tool_call: &serde_json::Value) -> Option<&str> {
         })
 }
 
-fn require_i64_field(
-    value: &serde_json::Value,
-    field: &str,
-) -> reson_agentic::error::Result<i64> {
+fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::error::Result<i64> {
     if let Some(raw) = value.get(field) {
         return parse_i64_value(raw).ok_or_else(|| {
-            reson_agentic::error::Error::NonRetryable(format!(
-                "Invalid '{}' value: {}",
-                field, raw
-            ))
+            reson_agentic::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
         });
     }
 
@@ -226,10 +245,7 @@ fn require_i64_field(
         reson_agentic::error::Error::NonRetryable(format!("Missing '{}' field", field))
     })?;
     parse_i64_value(raw).ok_or_else(|| {
-        reson_agentic::error::Error::NonRetryable(format!(
-            "Invalid '{}' value: {}",
-            field, raw
-        ))
+        reson_agentic::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
     })
 }
 
@@ -250,7 +266,7 @@ async fn openai_responses_simple_agent(
     runtime: Runtime,
 ) -> reson_agentic::error::Result<String> {
     let response = runtime
-        .run(
+        .run(run_params(
             Some(&prompt),
             Some("You are helpful. Be concise."),
             None,
@@ -261,7 +277,7 @@ async fn openai_responses_simple_agent(
             Some(100),
             None,
             None,
-        )
+        ))
         .await?;
 
     Ok(response
@@ -278,7 +294,7 @@ async fn openai_responses_tool_agent(
     register_add_numbers_tool(&runtime).await?;
 
     let tool_call = runtime
-        .run(
+        .run(run_params(
             Some(&prompt),
             None,
             None,
@@ -289,7 +305,7 @@ async fn openai_responses_tool_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -298,9 +314,9 @@ async fn openai_responses_tool_agent(
         ));
     }
 
-    let tool_name = runtime
-        .get_tool_name(&tool_call)
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool name".to_string()))?;
+    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
+        reson_agentic::error::Error::NonRetryable("Missing tool name".to_string())
+    })?;
     if tool_name != "add_numbers" {
         return Err(reson_agentic::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
@@ -344,7 +360,7 @@ async fn openai_responses_tool_agent(
     ];
 
     let response = runtime
-        .run(
+        .run(run_params(
             Some("What was the result? Just the number."),
             Some("Respond with only the number."),
             Some(history),
@@ -355,7 +371,7 @@ async fn openai_responses_tool_agent(
             Some(128),
             None,
             None,
-        )
+        ))
         .await?;
 
     let response_str = response
@@ -388,7 +404,7 @@ async fn openai_responses_tool_stream_agent(
     register_add_numbers_tool(&runtime).await?;
 
     let mut stream = runtime
-        .run_stream(
+        .run_stream(run_params(
             Some(&prompt),
             None,
             None,
@@ -399,7 +415,7 @@ async fn openai_responses_tool_stream_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     let mut saw_tool = false;
@@ -408,10 +424,7 @@ async fn openai_responses_tool_stream_agent(
         match chunk_result {
             Ok((chunk_type, value)) => {
                 if chunk_type == "tool_call_complete" {
-                    let id = value
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     if id.is_empty() {
                         return Err(reson_agentic::error::Error::NonRetryable(
                             "Missing tool call id in stream".to_string(),
@@ -459,7 +472,7 @@ async fn openai_responses_multi_turn_tool_agent(
     register_multiply_numbers_tool(&runtime).await?;
 
     let tool_call = runtime
-        .run(
+        .run(run_params(
             Some(&prompt),
             None,
             None,
@@ -470,7 +483,7 @@ async fn openai_responses_multi_turn_tool_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -479,9 +492,9 @@ async fn openai_responses_multi_turn_tool_agent(
         ));
     }
 
-    let tool_name = runtime
-        .get_tool_name(&tool_call)
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool name".to_string()))?;
+    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
+        reson_agentic::error::Error::NonRetryable("Missing tool name".to_string())
+    })?;
     if tool_name != "add_numbers" {
         return Err(reson_agentic::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
@@ -527,7 +540,7 @@ async fn openai_responses_multi_turn_tool_agent(
 
     let followup_prompt = "Now multiply that result by 3 using multiply_numbers.";
     let tool_call = runtime
-        .run(
+        .run(run_params(
             Some(followup_prompt),
             None,
             Some(history.clone()),
@@ -538,7 +551,7 @@ async fn openai_responses_multi_turn_tool_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -547,9 +560,9 @@ async fn openai_responses_multi_turn_tool_agent(
         ));
     }
 
-    let tool_name = runtime
-        .get_tool_name(&tool_call)
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool name".to_string()))?;
+    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
+        reson_agentic::error::Error::NonRetryable("Missing tool name".to_string())
+    })?;
     if tool_name != "multiply_numbers" {
         return Err(reson_agentic::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
@@ -594,7 +607,7 @@ async fn openai_responses_multi_turn_tool_agent(
     ));
 
     let response = runtime
-        .run(
+        .run(run_params(
             Some("What is the final result? Just the number."),
             Some("Respond with only the number."),
             Some(history),
@@ -605,7 +618,7 @@ async fn openai_responses_multi_turn_tool_agent(
             Some(128),
             None,
             None,
-        )
+        ))
         .await?;
 
     let response_str = response
@@ -634,7 +647,7 @@ async fn openrouter_responses_simple_agent(
     runtime: Runtime,
 ) -> reson_agentic::error::Result<String> {
     let response = runtime
-        .run(
+        .run(run_params(
             Some(&prompt),
             None,
             None,
@@ -645,7 +658,7 @@ async fn openrouter_responses_simple_agent(
             Some(100),
             None,
             None,
-        )
+        ))
         .await?;
 
     Ok(response
@@ -662,7 +675,7 @@ async fn openrouter_responses_tool_agent(
     register_add_numbers_tool(&runtime).await?;
 
     let tool_call = runtime
-        .run(
+        .run(run_params(
             Some(&prompt),
             None,
             None,
@@ -673,7 +686,7 @@ async fn openrouter_responses_tool_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -682,9 +695,9 @@ async fn openrouter_responses_tool_agent(
         ));
     }
 
-    let tool_name = runtime
-        .get_tool_name(&tool_call)
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool name".to_string()))?;
+    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
+        reson_agentic::error::Error::NonRetryable("Missing tool name".to_string())
+    })?;
     if tool_name != "add_numbers" {
         return Err(reson_agentic::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
@@ -728,7 +741,7 @@ async fn openrouter_responses_tool_agent(
     ];
 
     let response = runtime
-        .run(
+        .run(run_params(
             Some("What was the result? Just the number."),
             Some("Respond with only the number."),
             Some(history),
@@ -739,7 +752,7 @@ async fn openrouter_responses_tool_agent(
             Some(128),
             None,
             None,
-        )
+        ))
         .await?;
 
     let response_str = response
@@ -771,7 +784,7 @@ async fn openrouter_responses_multi_turn_tool_agent(
     register_multiply_numbers_tool(&runtime).await?;
 
     let tool_call = runtime
-        .run(
+        .run(run_params(
             Some(&prompt),
             None,
             None,
@@ -782,7 +795,7 @@ async fn openrouter_responses_multi_turn_tool_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -791,9 +804,9 @@ async fn openrouter_responses_multi_turn_tool_agent(
         ));
     }
 
-    let tool_name = runtime
-        .get_tool_name(&tool_call)
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool name".to_string()))?;
+    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
+        reson_agentic::error::Error::NonRetryable("Missing tool name".to_string())
+    })?;
     if tool_name != "add_numbers" {
         return Err(reson_agentic::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
@@ -839,7 +852,7 @@ async fn openrouter_responses_multi_turn_tool_agent(
 
     let followup_prompt = "Now multiply that result by 3 using multiply_numbers.";
     let tool_call = runtime
-        .run(
+        .run(run_params(
             Some(followup_prompt),
             None,
             Some(history.clone()),
@@ -850,7 +863,7 @@ async fn openrouter_responses_multi_turn_tool_agent(
             Some(512),
             None,
             None,
-        )
+        ))
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -859,9 +872,9 @@ async fn openrouter_responses_multi_turn_tool_agent(
         ));
     }
 
-    let tool_name = runtime
-        .get_tool_name(&tool_call)
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool name".to_string()))?;
+    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
+        reson_agentic::error::Error::NonRetryable("Missing tool name".to_string())
+    })?;
     if tool_name != "multiply_numbers" {
         return Err(reson_agentic::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
@@ -906,7 +919,7 @@ async fn openrouter_responses_multi_turn_tool_agent(
     ));
 
     let response = runtime
-        .run(
+        .run(run_params(
             Some("What is the final result? Just the number."),
             Some("Respond with only the number."),
             Some(history),
@@ -917,7 +930,7 @@ async fn openrouter_responses_multi_turn_tool_agent(
             Some(128),
             None,
             None,
-        )
+        ))
         .await?;
 
     let response_str = response
@@ -1127,14 +1140,15 @@ async fn test_openai_with_tools() {
 async fn test_openai_responses_simple_generation() {
     let _ = get_openai_key().expect("OPENAI_API_KEY not set");
 
-    let response = openai_responses_simple_agent(
-        "What is 3+3? Just the number.".to_string(),
-    )
-    .await
-    .unwrap();
+    let response = openai_responses_simple_agent("What is 3+3? Just the number.".to_string())
+        .await
+        .unwrap();
 
     println!("Response: {}", response);
-    let value = response.trim().parse::<i64>().expect("Response should be an integer");
+    let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 6);
 }
 
@@ -1149,7 +1163,10 @@ async fn test_openai_responses_with_tools() {
         .unwrap();
 
     println!("Response: {}", response);
-    let value = response.trim().parse::<i64>().expect("Response should be an integer");
+    let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 60);
 }
 
@@ -1179,7 +1196,10 @@ async fn test_openai_responses_multi_turn_with_tools() {
     .unwrap();
 
     println!("Response: {}", response);
-    let value = response.trim().parse::<i64>().expect("Response should be an integer");
+    let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 90);
 }
 
@@ -1241,8 +1261,7 @@ async fn test_google_with_tools() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_with_thinking() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client =
-        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What are the prime factors of 360? Think through this step by step.",
@@ -1432,11 +1451,10 @@ async fn test_openrouter_openai_model() {
 async fn test_openrouter_responses_simple_generation() {
     let _ = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
 
-    let response = openrouter_responses_simple_agent(
-        "What is the capital of France? One word.".to_string(),
-    )
-    .await
-    .unwrap();
+    let response =
+        openrouter_responses_simple_agent("What is the capital of France? One word.".to_string())
+            .await
+            .unwrap();
 
     println!("Response: {}", response);
     assert_eq!(response.trim().to_lowercase(), "paris");
@@ -1453,7 +1471,10 @@ async fn test_openrouter_responses_with_tools() {
         .unwrap();
 
     println!("Response: {}", response);
-    let value = response.trim().parse::<i64>().expect("Response should be an integer");
+    let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 60);
 }
 
@@ -1469,7 +1490,10 @@ async fn test_openrouter_responses_multi_turn_with_tools() {
     .unwrap();
 
     println!("Response: {}", response);
-    let value = response.trim().parse::<i64>().expect("Response should be an integer");
+    let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 90);
 }
 

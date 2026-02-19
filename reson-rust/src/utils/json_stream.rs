@@ -58,7 +58,7 @@ impl JsonStreamAccumulator {
             let mut iter = deserializer.into_iter::<serde_json::Value>();
             let mut parsed_any = false;
 
-            while let Some(value_result) = iter.next() {
+            for value_result in iter.by_ref() {
                 match value_result {
                     Ok(value) => {
                         parsed_any = true;

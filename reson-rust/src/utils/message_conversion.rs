@@ -272,7 +272,10 @@ fn media_part_to_openai_format(part: &MediaPart) -> Value {
         },
 
         // Video URL support (vLLM-compatible format for Qwen2-VL, etc.)
-        MediaPart::Video { source: MediaSource::Url { url }, .. } => json!({
+        MediaPart::Video {
+            source: MediaSource::Url { url },
+            ..
+        } => json!({
             "type": "video_url",
             "video_url": { "url": url }
         }),
@@ -431,10 +434,9 @@ pub fn convert_messages_to_responses_input(
                 }
             },
             ConversationMessage::ToolCall(tool_call) => {
-                let args_str = tool_call
-                    .raw_arguments
-                    .clone()
-                    .unwrap_or_else(|| serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string()));
+                let args_str = tool_call.raw_arguments.clone().unwrap_or_else(|| {
+                    serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())
+                });
                 input_items.push(json!({
                     "type": "function_call",
                     "id": format!("fc_{}", tool_call.tool_use_id),
@@ -471,7 +473,10 @@ pub fn convert_messages_to_responses_input(
                     .parts
                     .iter()
                     .map(|part| {
-                        if matches!(provider, Provider::OpenAIResponses | Provider::OpenRouterResponses) {
+                        if matches!(
+                            provider,
+                            Provider::OpenAIResponses | Provider::OpenRouterResponses
+                        ) {
                             match part {
                                 MediaPart::Text { text } if role == "assistant" => json!({
                                     "type": "output_text",

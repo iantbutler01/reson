@@ -18,7 +18,9 @@ pub use reson_mcp::server::ServerTransport;
 
 // Re-export apps types when the mcp-apps feature is enabled
 #[cfg(feature = "mcp-apps")]
-pub use reson_mcp::apps::{UiResource, UiResourceCsp, UiResourceMeta, UiPermissions, DisplayMode, Visibility, ui_uri};
+pub use reson_mcp::apps::{
+    ui_uri, DisplayMode, UiPermissions, UiResource, UiResourceCsp, UiResourceMeta, Visibility,
+};
 
 /// An MCP server that exposes agentic functions and tools to MCP clients.
 ///
@@ -28,6 +30,7 @@ pub use reson_mcp::apps::{UiResource, UiResourceCsp, UiResourceMeta, UiPermissio
 /// # Example
 /// ```rust,no_run
 /// use reson_agentic::mcp::{McpServer, ServerTransport};
+/// use reson_mcp::{CallToolResult, Content};
 ///
 /// # async fn example() -> reson_agentic::error::Result<()> {
 /// McpServer::new("my-server")
@@ -106,7 +109,10 @@ impl McpServer {
     /// The handler signature matches reson-mcp's `McpServerBuilder::with_tool` directly.
     pub fn tool<F>(mut self, name: &str, description: &str, schema: Value, handler: F) -> Self
     where
-        F: Fn(String, Option<serde_json::Map<String, Value>>) -> BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
+        F: Fn(
+                String,
+                Option<serde_json::Map<String, Value>>,
+            ) -> BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
             + Send
             + Sync
             + 'static,
@@ -118,7 +124,10 @@ impl McpServer {
     /// Register multiple raw MCP tools in bulk.
     pub fn tools<F>(mut self, tools: Vec<(&str, &str, Value, F)>) -> Self
     where
-        F: Fn(String, Option<serde_json::Map<String, Value>>) -> BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
+        F: Fn(
+                String,
+                Option<serde_json::Map<String, Value>>,
+            ) -> BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
             + Send
             + Sync
             + 'static,
@@ -172,20 +181,22 @@ impl McpServer {
         F: Fn(Value) -> BoxFuture<'static, Result<String>> + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
-        self.builder = self.builder.with_tool(name, description, schema, move |_name, args| {
-            let handler = handler.clone();
-            Box::pin(async move {
-                // Convert Option<Map> to Value for the agent handler
-                let args_value = match args {
-                    Some(map) => Value::Object(map),
-                    None => Value::Object(serde_json::Map::new()),
-                };
-                match handler(args_value).await {
-                    Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
-                }
-            })
-        });
+        self.builder = self
+            .builder
+            .with_tool(name, description, schema, move |_name, args| {
+                let handler = handler.clone();
+                Box::pin(async move {
+                    // Convert Option<Map> to Value for the agent handler
+                    let args_value = match args {
+                        Some(map) => Value::Object(map),
+                        None => Value::Object(serde_json::Map::new()),
+                    };
+                    match handler(args_value).await {
+                        Ok(result) => Ok(CallToolResult::success(vec![Content::text(result)])),
+                        Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+                    }
+                })
+            });
         self
     }
 }
@@ -212,7 +223,9 @@ pub(crate) async fn connect_and_register(
     } else {
         reson_mcp::client::McpClient::stdio(uri).await
     }
-    .map_err(|e| Error::NonRetryable(format!("Failed to connect to MCP server '{}': {}", uri, e)))?;
+    .map_err(|e| {
+        Error::NonRetryable(format!("Failed to connect to MCP server '{}': {}", uri, e))
+    })?;
 
     let client = Arc::new(client);
 
@@ -236,7 +249,8 @@ pub(crate) async fn connect_and_register(
         let tool_description = tool.description.clone().unwrap_or_default();
 
         // Build schema from the tool's input_schema
-        let schema = serde_json::to_value(&tool.input_schema).unwrap_or(Value::Object(serde_json::Map::new()));
+        let schema = serde_json::to_value(&tool.input_schema)
+            .unwrap_or(Value::Object(serde_json::Map::new()));
 
         // Create async handler that delegates to the MCP client
         // Always use the original remote_name when calling the server
@@ -246,10 +260,9 @@ pub(crate) async fn connect_and_register(
             let client = client_ref.clone();
             let name = name_for_closure.clone();
             Box::pin(async move {
-                let result = client
-                    .call_tool(&name, args)
-                    .await
-                    .map_err(|e| Error::NonRetryable(format!("MCP tool '{}' failed: {}", name, e)))?;
+                let result = client.call_tool(&name, args).await.map_err(|e| {
+                    Error::NonRetryable(format!("MCP tool '{}' failed: {}", name, e))
+                })?;
 
                 // Extract text content from the result
                 let text: String = result
@@ -275,9 +288,15 @@ pub(crate) async fn connect_and_register(
 /// Per SEP-1865, default visibility (None) means ["model", "app"].
 fn is_app_only_tool(tool: &reson_mcp::McpTool) -> bool {
     let Some(meta) = &tool.meta else { return false };
-    let Some(ui) = meta.0.get("ui") else { return false };
-    let Some(visibility) = ui.get("visibility") else { return false };
-    let Some(arr) = visibility.as_array() else { return false };
+    let Some(ui) = meta.0.get("ui") else {
+        return false;
+    };
+    let Some(visibility) = ui.get("visibility") else {
+        return false;
+    };
+    let Some(arr) = visibility.as_array() else {
+        return false;
+    };
 
     // If visibility is specified and doesn't include "model", it's app-only
     !arr.iter().any(|v| v.as_str() == Some("model"))

@@ -168,8 +168,14 @@ impl OpenAIResponsesClient {
 
     fn parse_usage(&self, usage: &serde_json::Value) -> TokenUsage {
         TokenUsage {
-            input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
             cached_tokens: usage
                 .get("input_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
@@ -336,7 +342,9 @@ impl InferenceClient for OpenAIResponsesClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
-        let response_text = self.make_request_with_retry(request_body, config.timeout).await?;
+        let response_text = self
+            .make_request_with_retry(request_body, config.timeout)
+            .await?;
 
         let body: serde_json::Value = parse_json_value_strict_str(&response_text).map_err(|e| {
             Error::Inference(format!(
@@ -359,9 +367,7 @@ impl InferenceClient for OpenAIResponsesClient {
         }
 
         let usage_json = body.get("usage");
-        let usage = usage_json
-            .map(|u| self.parse_usage(u))
-            .unwrap_or_default();
+        let usage = usage_json.map(|u| self.parse_usage(u)).unwrap_or_default();
 
         // Extract provider cost if available (OpenRouter returns usage.cost in dollars)
         let provider_cost_dollars = if matches!(

@@ -31,8 +31,11 @@ pub enum Visibility {
 /// Returns a properly constructed URI following RFC 3986 semantics.
 pub fn ui_uri(server_name: &str, resource_name: &str) -> Url {
     // url crate handles custom schemes per RFC 3986
-    Url::parse(&format!("{}://{}/{}", UI_SCHEME, server_name, resource_name))
-        .expect("ui:// URI should always be valid")
+    Url::parse(&format!(
+        "{}://{}/{}",
+        UI_SCHEME, server_name, resource_name
+    ))
+    .expect("ui:// URI should always be valid")
 }
 
 /// Tool metadata that links a tool to a UI resource

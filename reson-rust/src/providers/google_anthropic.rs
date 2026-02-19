@@ -375,7 +375,9 @@ impl InferenceClient for GoogleAnthropicClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
-        let body = self.make_request_with_retry(request_body, config.timeout).await?;
+        let body = self
+            .make_request_with_retry(request_body, config.timeout)
+            .await?;
 
         // Parse usage statistics
         let usage = self.parse_usage(&body["usage"]);

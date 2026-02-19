@@ -1,8 +1,8 @@
 //! Integration tests for MCP Apps extension (SEP-1865)
 
-use rmcp::model::{CallToolResult, Content};
 use reson_mcp::apps::{UiResource, UiResourceCsp, UiToolMeta, Visibility, MCP_APP_MIME_TYPE};
 use reson_mcp::server::{McpServer, ServerTransport};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 
 const TEST_HTML: &str = "<html><body><h1>Chart</h1></body></html>";
@@ -75,7 +75,10 @@ async fn test_tool_has_ui_meta() {
 
     // The "chart" tool should have _meta.ui with resourceUri
     let chart_tool = tools.tools.iter().find(|t| t.name == "chart").unwrap();
-    let meta = chart_tool.meta.as_ref().expect("chart tool should have _meta");
+    let meta = chart_tool
+        .meta
+        .as_ref()
+        .expect("chart tool should have _meta");
     let ui_value = meta.0.get("ui").expect("_meta should have 'ui' key");
     let ui_meta: UiToolMeta =
         serde_json::from_value(ui_value.clone()).expect("should deserialize as UiToolMeta");
@@ -107,10 +110,7 @@ async fn test_list_resources() {
     let resource = &resources.resources[0];
     assert_eq!(resource.raw.name, "chart");
     assert!(resource.raw.uri.starts_with("ui://apps-test-server/"));
-    assert_eq!(
-        resource.raw.mime_type.as_deref(),
-        Some(MCP_APP_MIME_TYPE)
-    );
+    assert_eq!(resource.raw.mime_type.as_deref(), Some(MCP_APP_MIME_TYPE));
     assert_eq!(
         resource.raw.description.as_deref(),
         Some("Interactive chart UI")
@@ -157,7 +157,9 @@ async fn test_read_resource_not_found() {
         .await
         .expect("Failed to connect");
 
-    let result = client.read_resource("ui://apps-test-server/nonexistent").await;
+    let result = client
+        .read_resource("ui://apps-test-server/nonexistent")
+        .await;
     assert!(result.is_err(), "Reading nonexistent resource should fail");
 
     client.close().await.expect("Failed to close");
@@ -245,7 +247,10 @@ async fn test_tool_visibility_set_via_builder() {
 
     let addr = "127.0.0.1:18206";
     tokio::spawn(async move {
-        server.serve(ServerTransport::WebSocket(addr.into())).await.unwrap();
+        server
+            .serve(ServerTransport::WebSocket(addr.into()))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -306,7 +311,10 @@ async fn test_default_visibility_omitted() {
 
     let addr = "127.0.0.1:18207";
     tokio::spawn(async move {
-        server.serve(ServerTransport::WebSocket(addr.into())).await.unwrap();
+        server
+            .serve(ServerTransport::WebSocket(addr.into()))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -340,7 +348,14 @@ async fn test_e2e_tool_resource_uri_resolves() {
 
     // 2. Extract the resourceUri from _meta.ui
     let ui_meta: UiToolMeta = serde_json::from_value(
-        chart_tool.meta.as_ref().unwrap().0.get("ui").unwrap().clone(),
+        chart_tool
+            .meta
+            .as_ref()
+            .unwrap()
+            .0
+            .get("ui")
+            .unwrap()
+            .clone(),
     )
     .unwrap();
     let resource_uri = ui_meta.resource_uri.to_string();
@@ -351,7 +366,9 @@ async fn test_e2e_tool_resource_uri_resolves() {
 
     // 4. Verify we got the HTML
     match &read_result.contents[0] {
-        rmcp::model::ResourceContents::TextResourceContents { text, mime_type, .. } => {
+        rmcp::model::ResourceContents::TextResourceContents {
+            text, mime_type, ..
+        } => {
             assert_eq!(text, TEST_HTML);
             assert_eq!(mime_type.as_deref(), Some(MCP_APP_MIME_TYPE));
         }

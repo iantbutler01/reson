@@ -109,8 +109,7 @@ async fn test_anthropic_reasoning_via_openrouter() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_thinking_model() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client =
-        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Explain the process of photosynthesis in detail",
@@ -284,8 +283,7 @@ async fn test_anthropic_reasoning_stream() {
 #[ignore = "Requires GOOGLE_GEMINI_API_KEY"]
 async fn test_google_thinking_stream() {
     let api_key = get_google_key().expect("GOOGLE_GEMINI_API_KEY not set");
-    let client =
-        GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
+    let client = GoogleGenAIClient::new(api_key, "gemini-flash-latest").with_thinking_budget(1024);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What is 17 * 23? Think through this step by step.",

@@ -49,15 +49,11 @@ async fn main() -> reson_mcp::Result<()> {
     eprintln!("Step 1 - add(17, 25): {}", sum);
 
     // Step 2: Echo the result
-    let result = client
-        .call_tool("echo", json!({"message": sum}))
-        .await?;
+    let result = client.call_tool("echo", json!({"message": sum})).await?;
     eprintln!("Step 2 - echo: {}", extract_text(&result));
 
     // Step 3: Reverse it
-    let result = client
-        .call_tool("reverse", json!({"text": sum}))
-        .await?;
+    let result = client.call_tool("reverse", json!({"text": sum})).await?;
     eprintln!("Step 3 - reverse: {}", extract_text(&result));
 
     eprintln!("\n--- Done ---");

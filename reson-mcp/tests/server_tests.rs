@@ -1,7 +1,7 @@
 //! Integration tests for MCP server
 
-use rmcp::model::{CallToolResult, Content};
 use reson_mcp::server::{McpServer, ServerTransport};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 
 fn build_test_server() -> McpServer {
@@ -47,7 +47,9 @@ fn build_test_server() -> McpServer {
                         .get("message")
                         .and_then(|v| v.as_str())
                         .unwrap_or("no message");
-                    Ok(CallToolResult::success(vec![Content::text(msg.to_string())]))
+                    Ok(CallToolResult::success(vec![Content::text(
+                        msg.to_string(),
+                    )]))
                 })
             },
         )
@@ -186,8 +188,14 @@ async fn test_server_multiple_clients() {
         .await
         .expect("Client 2 call failed");
 
-    assert_eq!(r1.content.first().and_then(|c| c.as_text()).unwrap().text, "3");
-    assert_eq!(r2.content.first().and_then(|c| c.as_text()).unwrap().text, "30");
+    assert_eq!(
+        r1.content.first().and_then(|c| c.as_text()).unwrap().text,
+        "3"
+    );
+    assert_eq!(
+        r2.content.first().and_then(|c| c.as_text()).unwrap().text,
+        "30"
+    );
 
     client1.close().await.expect("Failed to close client 1");
     client2.close().await.expect("Failed to close client 2");

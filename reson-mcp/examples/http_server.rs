@@ -8,8 +8,8 @@
 //!
 //! Then connect with: http://localhost:8080
 
-use rmcp::model::{CallToolResult, Content};
 use reson_mcp::server::{McpServer, ServerTransport};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 
 #[tokio::main]
@@ -80,10 +80,7 @@ async fn main() -> reson_mcp::Result<()> {
             |_name, args| {
                 Box::pin(async move {
                     let args = args.unwrap_or_default();
-                    let text = args
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     let reversed: String = text.chars().rev().collect();
                     eprintln!("[reverse] \"{}\" -> \"{}\"", text, reversed);
                     Ok(CallToolResult::success(vec![Content::text(reversed)]))
@@ -93,7 +90,9 @@ async fn main() -> reson_mcp::Result<()> {
         .build();
 
     eprintln!("Starting MCP HTTP server on http://127.0.0.1:8080");
-    server.serve(ServerTransport::Http("127.0.0.1:8080".into())).await?;
+    server
+        .serve(ServerTransport::Http("127.0.0.1:8080".into()))
+        .await?;
 
     Ok(())
 }

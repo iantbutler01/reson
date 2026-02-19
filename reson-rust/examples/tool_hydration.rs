@@ -14,6 +14,33 @@ use reson_agentic::error::Result;
 use reson_agentic::parsers::{Deserializable, FieldDescription};
 use serde::{Deserialize, Serialize};
 
+fn run_params(
+    prompt: Option<&str>,
+    system: Option<&str>,
+    history: Option<Vec<reson_agentic::utils::ConversationMessage>>,
+    output_type: Option<&str>,
+    output_schema: Option<serde_json::Value>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_tokens: Option<u32>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+) -> reson_agentic::runtime::RunParams {
+    reson_agentic::runtime::RunParams {
+        prompt: prompt.map(|s| s.to_string()),
+        system: system.map(|s| s.to_string()),
+        history,
+        output_type: output_type.map(|s| s.to_string()),
+        output_schema,
+        temperature,
+        top_p,
+        max_tokens,
+        model: model.map(|s| s.to_string()),
+        api_key: api_key.map(|s| s.to_string()),
+        timeout: None,
+    }
+}
+
 // =============================================================================
 // Tool Input Types - implement Deserializable for hydration
 // =============================================================================
@@ -167,7 +194,7 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
 
     // Initial LLM call
     let mut result = runtime
-        .run(
+        .run(run_params(
             Some(&request),
             None,
             None,
@@ -178,7 +205,7 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
             None,
             None,
             None,
-        )
+        ))
         .await?;
 
     // Tool loop
@@ -193,7 +220,7 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
         // Continue with tool result
         let prompt = format!("Tool returned: {}. Respond to the user.", tool_output);
         result = runtime
-            .run(
+            .run(run_params(
                 Some(&prompt),
                 None,
                 None,
@@ -204,7 +231,7 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
                 None,
                 None,
                 None,
-            )
+            ))
             .await?;
     }
 

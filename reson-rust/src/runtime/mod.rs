@@ -633,10 +633,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_with_config() {
-        let runtime = Runtime::with_config(
-            Some("test-model".to_string()),
-            Some("test-key".to_string()),
-        );
+        let runtime =
+            Runtime::with_config(Some("test-model".to_string()), Some("test-key".to_string()));
 
         assert_eq!(runtime.model, Some("test-model".to_string()));
         assert_eq!(runtime.api_key, Some("test-key".to_string()));

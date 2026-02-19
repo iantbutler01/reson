@@ -1,12 +1,11 @@
 //! Integration tests for MCP client transports
 
+use reson_mcp::WebSocketTransport;
 use rmcp::{
-    RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    schemars, tool, tool_handler, tool_router, RoleServer, ServerHandler, ServiceExt,
 };
-use reson_mcp::WebSocketTransport;
 use serde_json::json;
 
 // Test Calculator server - same as rmcp example
@@ -185,7 +184,9 @@ async fn test_websocket_server_info() {
         .expect("Failed to connect");
 
     // Get server info
-    let info = client.server_info().expect("Server info should be available");
+    let info = client
+        .server_info()
+        .expect("Server info should be available");
 
     assert_eq!(info.instructions.as_deref(), Some("A simple calculator"));
 

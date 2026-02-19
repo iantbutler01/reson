@@ -266,7 +266,9 @@ impl InferenceClient for OAIClient {
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
-        let response_text = self.make_request_with_retry(request_body, config.timeout).await?;
+        let response_text = self
+            .make_request_with_retry(request_body, config.timeout)
+            .await?;
 
         // Parse JSON - provide better error context if it fails
         let body: serde_json::Value = parse_json_value_strict_str(&response_text).map_err(|e| {
@@ -292,9 +294,7 @@ impl InferenceClient for OAIClient {
 
         // Parse usage statistics
         let usage_json = body.get("usage");
-        let usage = usage_json
-            .map(|u| self.parse_usage(u))
-            .unwrap_or_default();
+        let usage = usage_json.map(|u| self.parse_usage(u)).unwrap_or_default();
 
         // Extract provider cost if available (OpenRouter returns usage.cost in dollars)
         let provider_cost_dollars = if matches!(

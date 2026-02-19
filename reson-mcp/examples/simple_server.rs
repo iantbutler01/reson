@@ -7,8 +7,8 @@
 //! cargo run --example simple_server
 //! ```
 
-use rmcp::model::{CallToolResult, Content};
 use reson_mcp::server::{McpServer, ServerTransport};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 
 #[tokio::main]
@@ -77,10 +77,7 @@ async fn main() -> reson_mcp::Result<()> {
             |_name, args| {
                 Box::pin(async move {
                     let args = args.unwrap_or_default();
-                    let text = args
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     let reversed: String = text.chars().rev().collect();
                     Ok(CallToolResult::success(vec![Content::text(reversed)]))
                 })

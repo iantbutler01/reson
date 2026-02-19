@@ -169,8 +169,14 @@ pub fn parse_anthropic_chunk(
 
         "message_start" => {
             if let Some(usage) = chunk_json["message"]["usage"].as_object() {
-                let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cached_tokens = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cached_tokens = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if input_tokens > 0 {
                     results.push(StreamChunk::Usage {
                         input_tokens,

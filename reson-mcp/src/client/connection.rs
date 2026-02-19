@@ -1,17 +1,16 @@
 //! MCP Client connection management
 
+#[cfg(feature = "apps")]
+use rmcp::model::ExtensionCapabilities;
 use rmcp::{
-    ClientHandler, RoleClient, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResult, ClientInfo, Implementation,
-        ListResourcesResult, ListToolsResult, ReadResourceRequestParams, ReadResourceResult,
-        ServerInfo,
+        CallToolRequestParams, CallToolResult, ClientInfo, Implementation, ListResourcesResult,
+        ListToolsResult, ReadResourceRequestParams, ReadResourceResult, ServerInfo,
     },
     service::RunningService,
     transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
+    ClientHandler, RoleClient, ServiceExt,
 };
-#[cfg(feature = "apps")]
-use rmcp::model::ExtensionCapabilities;
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -185,7 +184,10 @@ impl McpClient {
         let url = url.into();
         let transport = StreamableHttpClientTransport::from_uri(url.clone());
         let service = ResonClientHandler.serve(transport).await.map_err(|e| {
-            Error::Transport(format!("Failed to connect to HTTP MCP server at {}: {}", url, e))
+            Error::Transport(format!(
+                "Failed to connect to HTTP MCP server at {}: {}",
+                url, e
+            ))
         })?;
         Ok(Self {
             inner: ClientInner::Http(service),
@@ -332,7 +334,11 @@ impl McpClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn call_tool(&self, name: impl Into<String>, arguments: Value) -> Result<CallToolResult> {
+    pub async fn call_tool(
+        &self,
+        name: impl Into<String>,
+        arguments: Value,
+    ) -> Result<CallToolResult> {
         let name = name.into();
         let arguments = arguments.as_object().cloned();
 
@@ -370,7 +376,9 @@ impl McpClient {
     /// Gracefully close the connection
     pub async fn close(self) -> Result<()> {
         match self.inner {
-            ClientInner::Http(service) | ClientInner::WebSocket(service) | ClientInner::Stdio(service) => {
+            ClientInner::Http(service)
+            | ClientInner::WebSocket(service)
+            | ClientInner::Stdio(service) => {
                 service
                     .cancel()
                     .await

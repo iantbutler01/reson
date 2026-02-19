@@ -123,7 +123,10 @@ pub fn parse_openai_responses_event(
     has_tools: bool,
 ) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
-    let event_type = event_json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let event_type = event_json
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     match event_type {
         "response.content_part.delta" => {
@@ -226,8 +229,14 @@ pub fn parse_openai_responses_event(
             if let Some(response) = event_json.get("response") {
                 if let Some(usage) = response.get("usage") {
                     chunks.push(StreamChunk::Usage {
-                        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        input_tokens: usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        output_tokens: usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
                         cached_tokens: usage
                             .get("input_tokens_details")
                             .and_then(|d| d.get("cached_tokens"))
@@ -325,7 +334,11 @@ mod tests {
         let chunks = parse_openai_responses_event(&event, &mut acc, false);
         assert_eq!(chunks.len(), 1);
         match &chunks[0] {
-            StreamChunk::Usage { input_tokens, output_tokens, .. } => {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
                 assert_eq!(*input_tokens, 10);
                 assert_eq!(*output_tokens, 5);
             }

@@ -396,7 +396,11 @@ async fn test_google_multi_turn_tool_conversation() {
 
     // Turn 2: Add assistant tool-call message, then tool result
     history.push(ConversationMessage::ToolCall(tc.clone()));
-    let tool_id = if tc.tool_use_id.is_empty() { "google_call_1".to_string() } else { tc.tool_use_id.clone() };
+    let tool_id = if tc.tool_use_id.is_empty() {
+        "google_call_1".to_string()
+    } else {
+        tc.tool_use_id.clone()
+    };
     history.push(ConversationMessage::ToolResult(
         ToolResult::success(&tool_id, &result).with_tool_name(&tc.tool_name),
     ));

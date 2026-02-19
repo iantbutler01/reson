@@ -6,13 +6,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rmcp::model::{
-    Annotated, Meta, RawResource, ReadResourceResult, Resource, ResourceContents,
-};
+use rmcp::model::{Annotated, Meta, RawResource, ReadResourceResult, Resource, ResourceContents};
 use serde_json::{json, Value};
 use url::Url;
 
-use super::types::{MCP_APP_MIME_TYPE, UiResource, UiResourceMeta};
+use super::types::{UiResource, UiResourceMeta, MCP_APP_MIME_TYPE};
 
 /// Registry of UI resources available to MCP hosts.
 ///
@@ -92,7 +90,11 @@ fn resource_to_mcp(r: &UiResource) -> Resource {
             mime_type: Some(MCP_APP_MIME_TYPE.to_string()),
             size: None,
             icons: None,
-            meta: if meta.is_empty() { None } else { Some(Meta(meta)) },
+            meta: if meta.is_empty() {
+                None
+            } else {
+                Some(Meta(meta))
+            },
         },
         annotations: None,
     }

@@ -6,7 +6,7 @@
 
 use reson_agentic::agentic;
 use reson_agentic::mcp::{McpServer, ServerTransport};
-use reson_agentic::runtime::Runtime;
+use reson_agentic::runtime::{RunParams, Runtime};
 use reson_agentic::types::{ChatMessage, ToolCall, ToolResult};
 use reson_agentic::utils::ConversationMessage;
 use reson_mcp::{CallToolResult, Content};
@@ -119,7 +119,10 @@ async fn test_mcp_client_tool_execution() {
         "a": 7,
         "b": 3
     });
-    let result = runtime.execute_tool(&tool_call).await.expect("Tool execution failed");
+    let result = runtime
+        .execute_tool(&tool_call)
+        .await
+        .expect("Tool execution failed");
     assert_eq!(result, "10");
 
     let tool_call = json!({
@@ -127,7 +130,10 @@ async fn test_mcp_client_tool_execution() {
         "a": 6,
         "b": 4
     });
-    let result = runtime.execute_tool(&tool_call).await.expect("Tool execution failed");
+    let result = runtime
+        .execute_tool(&tool_call)
+        .await
+        .expect("Tool execution failed");
     assert_eq!(result, "24");
 }
 
@@ -193,10 +199,7 @@ async fn test_agent_server_single() {
             }),
             |args| {
                 Box::pin(async move {
-                    let name = args
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("world");
+                    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("world");
                     Ok(format!("Hello, {}!", name))
                 })
             },
@@ -204,7 +207,10 @@ async fn test_agent_server_single() {
 
     let addr = "127.0.0.1:19204";
     tokio::spawn(async move {
-        server.serve(ServerTransport::WebSocket(addr.into())).await.unwrap();
+        server
+            .serve(ServerTransport::WebSocket(addr.into()))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -253,15 +259,16 @@ async fn test_agent_server_with_raw_tool() {
             "Ping the server",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("pong")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("pong")])) })
             },
         );
 
     let addr = "127.0.0.1:19205";
     tokio::spawn(async move {
-        server.serve(ServerTransport::WebSocket(addr.into())).await.unwrap();
+        server
+            .serve(ServerTransport::WebSocket(addr.into()))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -293,28 +300,30 @@ async fn test_agent_server_with_raw_tool() {
 #[tokio::test]
 async fn test_end_to_end_agent_server_to_runtime() {
     // Serve an agent over MCP
-    let server = McpServer::new("e2e-server")
-        .agent(
-            "reverse",
-            "Reverse a string",
-            json!({
-                "type": "object",
-                "properties": {
-                    "input": { "type": "string", "description": "String to reverse" }
-                },
-                "required": ["input"]
-            }),
-            |args| {
-                Box::pin(async move {
-                    let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
-                    Ok(input.chars().rev().collect::<String>())
-                })
+    let server = McpServer::new("e2e-server").agent(
+        "reverse",
+        "Reverse a string",
+        json!({
+            "type": "object",
+            "properties": {
+                "input": { "type": "string", "description": "String to reverse" }
             },
-        );
+            "required": ["input"]
+        }),
+        |args| {
+            Box::pin(async move {
+                let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                Ok(input.chars().rev().collect::<String>())
+            })
+        },
+    );
 
     let addr = "127.0.0.1:19206";
     tokio::spawn(async move {
-        server.serve(ServerTransport::WebSocket(addr.into())).await.unwrap();
+        server
+            .serve(ServerTransport::WebSocket(addr.into()))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -437,8 +446,14 @@ async fn test_server_with_ui_resource() {
     assert_eq!(tools.tools[0].name.as_ref(), "add");
 
     // Tool metadata should contain ui.resourceUri
-    let tool_meta = tools.tools[0].meta.as_ref().expect("Tool should have _meta");
-    let ui_meta = tool_meta.0.get("ui").expect("Tool _meta should have 'ui' key");
+    let tool_meta = tools.tools[0]
+        .meta
+        .as_ref()
+        .expect("Tool should have _meta");
+    let ui_meta = tool_meta
+        .0
+        .get("ui")
+        .expect("Tool _meta should have 'ui' key");
     let resource_uri = ui_meta.get("resourceUri").and_then(|v| v.as_str()).unwrap();
     assert_eq!(resource_uri, "ui://calc-server/calculator-ui");
 
@@ -459,14 +474,23 @@ async fn test_server_with_ui_resource() {
     assert_eq!(read_result.contents.len(), 1);
     // Verify the HTML content via JSON serialization (avoid leaking rmcp types)
     let content_json = serde_json::to_value(&read_result.contents[0]).unwrap();
-    assert_eq!(content_json.get("text").and_then(|v| v.as_str()).unwrap(), html);
     assert_eq!(
-        content_json.get("mimeType").and_then(|v| v.as_str()).unwrap(),
+        content_json.get("text").and_then(|v| v.as_str()).unwrap(),
+        html
+    );
+    assert_eq!(
+        content_json
+            .get("mimeType")
+            .and_then(|v| v.as_str())
+            .unwrap(),
         "text/html;profile=mcp-app"
     );
 
     // Tool execution still works through the bridge
-    let result = client.call_tool("add", json!({"a": 5, "b": 3})).await.unwrap();
+    let result = client
+        .call_tool("add", json!({"a": 5, "b": 3}))
+        .await
+        .unwrap();
     let text = result.content.first().and_then(|c| c.as_text()).unwrap();
     assert_eq!(text.text, "8");
 
@@ -495,9 +519,7 @@ async fn test_ui_resource_with_csp_and_permissions() {
             "Get status",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("ok")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("ok")])) })
             },
         )
         .with_ui(ui);
@@ -526,7 +548,10 @@ async fn test_ui_resource_with_csp_and_permissions() {
     let ui_meta = resource_meta.0.get("ui").expect("Should have 'ui' meta");
 
     let csp_meta = ui_meta.get("csp").expect("Should have CSP");
-    let connect = csp_meta.get("connectDomains").and_then(|v| v.as_array()).unwrap();
+    let connect = csp_meta
+        .get("connectDomains")
+        .and_then(|v| v.as_array())
+        .unwrap();
     assert_eq!(connect[0].as_str().unwrap(), "api.example.com");
 
     let prefers_border = ui_meta.get("prefersBorder").and_then(|v| v.as_bool());
@@ -548,9 +573,7 @@ async fn test_runtime_skips_app_only_tools() {
             "Visible to model",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("model")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("model")])) })
             },
         )
         .with_ui(UiResource::new("vis-filter-server", "ui1", "<html></html>"))
@@ -560,9 +583,7 @@ async fn test_runtime_skips_app_only_tools() {
             "Only for iframe",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("app")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("app")])) })
             },
         )
         .with_ui(UiResource::new("vis-filter-server", "ui2", "<html></html>"))
@@ -572,9 +593,7 @@ async fn test_runtime_skips_app_only_tools() {
             "For both",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("both")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("both")])) })
             },
         )
         .with_ui(UiResource::new("vis-filter-server", "ui3", "<html></html>"))
@@ -612,9 +631,7 @@ async fn test_runtime_includes_tools_with_no_visibility() {
             "Default visibility",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("default")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("default")])) })
             },
         )
         .with_ui(UiResource::new("default-vis-server", "ui", "<html></html>"));
@@ -642,7 +659,10 @@ async fn test_runtime_includes_tools_with_no_visibility() {
 async fn test_connection_failure_returns_error() {
     let runtime = Runtime::new();
     let result = runtime.mcp("ws://127.0.0.1:19299").await;
-    assert!(result.is_err(), "Connecting to non-existent server should fail");
+    assert!(
+        result.is_err(),
+        "Connecting to non-existent server should fail"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("Failed to connect"),
@@ -699,9 +719,7 @@ async fn test_tool_with_no_parameters() {
             "Returns pong",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("pong")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("pong")])) })
             },
         )
         .build();
@@ -771,24 +789,23 @@ async fn test_tool_returning_multiple_content_blocks() {
 #[tokio::test]
 async fn test_mcp_as_with_agent_server_e2e() {
     // Use McpServer wrapper (reson-agentic's) with namespacing
-    let server = McpServer::new("math-service")
-        .agent(
-            "square",
-            "Square a number",
-            json!({
-                "type": "object",
-                "properties": {
-                    "n": { "type": "number", "description": "Number to square" }
-                },
-                "required": ["n"]
-            }),
-            |args| {
-                Box::pin(async move {
-                    let n = args.get("n").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    Ok((n * n).to_string())
-                })
+    let server = McpServer::new("math-service").agent(
+        "square",
+        "Square a number",
+        json!({
+            "type": "object",
+            "properties": {
+                "n": { "type": "number", "description": "Number to square" }
             },
-        );
+            "required": ["n"]
+        }),
+        |args| {
+            Box::pin(async move {
+                let n = args.get("n").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                Ok((n * n).to_string())
+            })
+        },
+    );
 
     let addr = "127.0.0.1:19225";
     tokio::spawn(async move {
@@ -800,7 +817,10 @@ async fn test_mcp_as_with_agent_server_e2e() {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     let runtime = Runtime::new();
-    runtime.mcp_as("ws://127.0.0.1:19225", "math").await.unwrap();
+    runtime
+        .mcp_as("ws://127.0.0.1:19225", "math")
+        .await
+        .unwrap();
 
     // Tool registered under namespaced name
     let schemas = runtime.get_tool_schemas().await;
@@ -824,9 +844,7 @@ async fn test_multiple_servers_without_namespace() {
             "Tool from server A",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("from A")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("from A")])) })
             },
         )
         .build();
@@ -837,9 +855,7 @@ async fn test_multiple_servers_without_namespace() {
             "Tool from server B",
             json!({"type": "object"}),
             |_name, _args| {
-                Box::pin(async move {
-                    Ok(CallToolResult::success(vec![Content::text("from B")]))
-                })
+                Box::pin(async move { Ok(CallToolResult::success(vec![Content::text("from B")])) })
             },
         )
         .build();
@@ -901,7 +917,9 @@ fn require_tool_call_id(tool_call: &serde_json::Value) -> reson_agentic::error::
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
         .map(|s| s.to_string())
-        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool call id".to_string()))
+        .ok_or_else(|| {
+            reson_agentic::error::Error::NonRetryable("Missing tool call id".to_string())
+        })
 }
 
 fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
@@ -912,10 +930,7 @@ fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn require_i64_field(
-    value: &serde_json::Value,
-    field: &str,
-) -> reson_agentic::error::Result<i64> {
+fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::error::Result<i64> {
     // Try top-level (args are flattened by call_llm)
     if let Some(raw) = value.get(field) {
         if let Some(v) = parse_i64_value(raw) {
@@ -961,18 +976,19 @@ async fn anthropic_mcp_tool_agent(
 
     // Ask the LLM to use the tool
     let tool_call = runtime
-        .run(
-            Some(&prompt),
-            Some("You have access to calculator tools. Use them when asked to do math. Always use the tools, never calculate yourself."),
-            None,
-            None,
-            None,
-            Some(0.0),
-            None,
-            Some(512),
-            None,
-            None,
-        )
+        .run(RunParams {
+            prompt: Some(prompt.clone()),
+            system: Some("You have access to calculator tools. Use them when asked to do math. Always use the tools, never calculate yourself.".to_string()),
+            history: None,
+            output_type: None,
+            output_schema: None,
+            temperature: Some(0.0),
+            top_p: None,
+            max_tokens: Some(512),
+            model: None,
+            api_key: None,
+            timeout: None,
+        })
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -1004,18 +1020,21 @@ async fn anthropic_mcp_tool_agent(
     ];
 
     let response = runtime
-        .run(
-            Some("What was the result? Reply with just the number, nothing else."),
-            Some("Respond with only the number."),
-            Some(history),
-            None,
-            None,
-            Some(0.0),
-            None,
-            Some(128),
-            None,
-            None,
-        )
+        .run(RunParams {
+            prompt: Some(
+                "What was the result? Reply with just the number, nothing else.".to_string(),
+            ),
+            system: Some("Respond with only the number.".to_string()),
+            history: Some(history),
+            output_type: None,
+            output_schema: None,
+            temperature: Some(0.0),
+            top_p: None,
+            max_tokens: Some(128),
+            model: None,
+            api_key: None,
+            timeout: None,
+        })
         .await?;
 
     Ok(response
@@ -1034,18 +1053,19 @@ async fn google_mcp_tool_agent(
     runtime.mcp(&mcp_url).await?;
 
     let tool_call = runtime
-        .run(
-            Some(&prompt),
-            Some("You have access to calculator tools. Use them when asked to do math. Always use the tools, never calculate yourself."),
-            None,
-            None,
-            None,
-            Some(0.0),
-            None,
-            Some(512),
-            None,
-            None,
-        )
+        .run(RunParams {
+            prompt: Some(prompt.clone()),
+            system: Some("You have access to calculator tools. Use them when asked to do math. Always use the tools, never calculate yourself.".to_string()),
+            history: None,
+            output_type: None,
+            output_schema: None,
+            temperature: Some(0.0),
+            top_p: None,
+            max_tokens: Some(512),
+            model: None,
+            api_key: None,
+            timeout: None,
+        })
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
@@ -1074,18 +1094,21 @@ async fn google_mcp_tool_agent(
     ];
 
     let response = runtime
-        .run(
-            Some("What was the result? Reply with just the number, nothing else."),
-            Some("Respond with only the number."),
-            Some(history),
-            None,
-            None,
-            Some(0.0),
-            None,
-            Some(128),
-            None,
-            None,
-        )
+        .run(RunParams {
+            prompt: Some(
+                "What was the result? Reply with just the number, nothing else.".to_string(),
+            ),
+            system: Some("Respond with only the number.".to_string()),
+            history: Some(history),
+            output_type: None,
+            output_schema: None,
+            temperature: Some(0.0),
+            top_p: None,
+            max_tokens: Some(128),
+            model: None,
+            api_key: None,
+            timeout: None,
+        })
         .await?;
 
     Ok(response
@@ -1111,7 +1134,10 @@ async fn test_anthropic_agent_with_mcp_tools() {
     .unwrap();
 
     println!("Anthropic MCP result: {}", result);
-    let value = result.trim().parse::<i64>().expect("Response should be an integer");
+    let value = result
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 42);
 }
 
@@ -1132,6 +1158,9 @@ async fn test_google_agent_with_mcp_tools() {
     .unwrap();
 
     println!("Google MCP result: {}", result);
-    let value = result.trim().parse::<i64>().expect("Response should be an integer");
+    let value = result
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
     assert_eq!(value, 42);
 }
