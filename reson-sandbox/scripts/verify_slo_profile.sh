@@ -6,6 +6,7 @@ source "$(cd "$(dirname "$0")" && pwd)/common.sh"
 STRICT=0
 THRESHOLDS_FILE="$REPO_ROOT/specs/RESON_SANDBOX_SLO_THRESHOLDS.json"
 OBSERVED_FILE="${RESON_SANDBOX_SLO_OBSERVED_FILE:-}"
+ROLLOUT_OBSERVED_FILE="${RESON_SANDBOX_ROLLOUT_OBSERVED_FILE:-}"
 
 usage() {
   cat <<'USAGE'
@@ -51,6 +52,10 @@ rg -n "\"control\\.command\\.dispatch\"" "$THRESHOLDS_FILE" >/dev/null
 rg -n "\"exec\\.stream\\.establish\\.warm_vm\"" "$THRESHOLDS_FILE" >/dev/null
 rg -n "\"session\\.create\\.warm_pool\"" "$THRESHOLDS_FILE" >/dev/null
 rg -n "\"session\\.create\\.cold_cache_hit\"" "$THRESHOLDS_FILE" >/dev/null
+rg -n "\"error_budget\"" "$THRESHOLDS_FILE" >/dev/null
+rg -n "\"projected_burn_percent_pause_threshold\"" "$THRESHOLDS_FILE" >/dev/null
+rg -n "\"projected_burn_percent_rollback_threshold\"" "$THRESHOLDS_FILE" >/dev/null
+rg -n "\"rollout_stages\"" "$THRESHOLDS_FILE" >/dev/null
 
 log "slo gate: instrumentation wiring checks"
 rg -n "log_slo_observation\\(\"session\\.create\"" "$REPO_ROOT/crates/reson-sandbox/src/lib.rs" >/dev/null
@@ -59,6 +64,33 @@ rg -n "log_slo_observation\\(\"exec\\.stream\\.establish\\.warm_vm\"" "$REPO_ROO
 
 log "slo gate: budget evaluator tests"
 (cd "$REPO_ROOT" && cargo test -p reson-sandbox slo_budget_ -- --nocapture)
+
+log "slo gate: rollout policy evaluator contract tests"
+tmp_dir="$(mktemp -d "/tmp/reson_sandbox_slo_gate.XXXXXX")"
+trap 'rm -rf "$tmp_dir"' EXIT
+cat >"$tmp_dir/observed_ok.json" <<'JSON'
+{
+  "error_budget": {
+    "projected_burn_percent": 80
+  }
+}
+JSON
+cat >"$tmp_dir/observed_rollback.json" <<'JSON'
+{
+  "error_budget": {
+    "projected_burn_percent": 140
+  }
+}
+JSON
+"$REPO_ROOT/scripts/evaluate_rollout_policy.sh" \
+  --thresholds "$THRESHOLDS_FILE" \
+  --observed "$tmp_dir/observed_ok.json" >/dev/null
+if "$REPO_ROOT/scripts/evaluate_rollout_policy.sh" \
+  --thresholds "$THRESHOLDS_FILE" \
+  --observed "$tmp_dir/observed_rollback.json" >/dev/null; then
+  err "rollout policy evaluator should fail when rollback threshold is exceeded"
+  exit 1
+fi
 
 if [[ -n "$OBSERVED_FILE" ]]; then
   require_cmd jq
@@ -86,6 +118,15 @@ if [[ -n "$OBSERVED_FILE" ]]; then
   done
 else
   warn "RESON_SANDBOX_SLO_OBSERVED_FILE is unset; observed threshold enforcement skipped (expected in local strict runs)"
+fi
+
+if [[ -n "$ROLLOUT_OBSERVED_FILE" ]]; then
+  log "slo gate: rollout pause/rollback policy enforcement"
+  "$REPO_ROOT/scripts/evaluate_rollout_policy.sh" \
+    --thresholds "$THRESHOLDS_FILE" \
+    --observed "$ROLLOUT_OBSERVED_FILE"
+else
+  warn "RESON_SANDBOX_ROLLOUT_OBSERVED_FILE is unset; rollout pause/rollback enforcement skipped (expected in local strict runs)"
 fi
 
 log "slo gate: passed"

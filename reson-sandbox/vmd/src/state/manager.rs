@@ -1,3 +1,6 @@
+// @dive-file: Core VM lifecycle manager handling create/start/stop/snapshot/fork flows and on-disk metadata invariants.
+// @dive-rel: Consumes policy limits from vmd/src/config.rs and enforces them on mutating VM operations.
+// @dive-rel: Implements fork CoW lineage behavior that underpins facade-level Session::fork semantics.
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
@@ -10,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use rand::RngCore;
+use serde_json::json;
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedMutexGuard, RwLock};
 use tokio::time::sleep;
@@ -34,6 +38,12 @@ const META_FORK_ID: &str = "reson.fork_id";
 const META_FORK_BASE_PATH: &str = "reson.fork_base_path";
 const META_PARENT_VM_ID: &str = "reson.parent_vm_id";
 const META_FORK_SNAPSHOT: &str = "reson.fork_snapshot";
+const META_FORK_DEPTH: &str = "reson.fork_depth";
+const META_STORAGE_PROFILE: &str = "reson.storage_profile";
+const META_FORK_DURABILITY_CLASS: &str = "reson.fork_durability_class";
+const META_FORK_RESTORE_SCOPE: &str = "reson.fork_restore_scope";
+const MAINTENANCE_DIR_NAME: &str = "_maintenance";
+const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
 
 #[derive(Clone, Copy, Debug)]
 pub enum CreateVmStage {
@@ -350,6 +360,10 @@ impl Manager {
             boot_snapshot: String::new(),
             started_at: None,
         };
+        meta.metadata.insert(
+            META_STORAGE_PROFILE.to_string(),
+            self.cfg.storage_profile.as_str().to_string(),
+        );
 
         save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
 
@@ -455,6 +469,7 @@ impl Manager {
             .await
             .retain(|_, record| record.vm_id != id);
         self.cleanup_fork_base_if_unreferenced(fork_base_path).await;
+        self.garbage_collect_orphaned_fork_roots().await;
         Ok(())
     }
 
@@ -494,22 +509,46 @@ impl Manager {
             self.force_stop_vm(parent_id).await?;
         }
 
-        let (parent_name, parent_arch, parent_resources, parent_source, parent_metadata) = {
+        let (
+            parent_name,
+            parent_arch,
+            parent_resources,
+            parent_source,
+            parent_metadata,
+            parent_depth,
+        ) = {
             let inner = parent_vm.lock().await;
             if !matches!(inner.runtime.state, VmState::Stopped) {
                 return Err(ManagerError::InvalidState);
             }
+            let parent_depth = inner
+                .metadata
+                .metadata
+                .get(META_FORK_DEPTH)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
             (
                 inner.metadata.name.clone(),
                 inner.metadata.architecture.clone(),
                 inner.metadata.resources.clone(),
                 inner.metadata.source.clone(),
                 inner.metadata.metadata.clone(),
+                parent_depth,
             )
         };
+        let child_depth = parent_depth.saturating_add(1);
+        if child_depth > self.cfg.max_fork_chain_depth {
+            return Err(ManagerError::CapacityExceeded {
+                resource: "fork_chain_depth",
+                limit: self.cfg.max_fork_chain_depth,
+                current: child_depth,
+            });
+        }
 
         let child_id = Uuid::new_v4().to_string();
         let fork_id = Uuid::new_v4().to_string();
+        let (fork_durability_class, fork_restore_scope) =
+            fork_snapshot_durability(self.cfg.storage_profile, parent_was_running);
         let child_name = sanitize_name(
             params
                 .child_name
@@ -520,6 +559,19 @@ impl Manager {
         child_metadata.extend(params.child_metadata);
         child_metadata.insert(META_FORK_ID.to_string(), fork_id.clone());
         child_metadata.insert(META_PARENT_VM_ID.to_string(), parent_id.to_string());
+        child_metadata.insert(META_FORK_DEPTH.to_string(), child_depth.to_string());
+        child_metadata.insert(
+            META_STORAGE_PROFILE.to_string(),
+            self.cfg.storage_profile.as_str().to_string(),
+        );
+        child_metadata.insert(
+            META_FORK_DURABILITY_CLASS.to_string(),
+            fork_durability_class.to_string(),
+        );
+        child_metadata.insert(
+            META_FORK_RESTORE_SCOPE.to_string(),
+            fork_restore_scope.to_string(),
+        );
         child_metadata.remove(META_FORK_BASE_PATH);
         if let Some(snapshot_name) = fork_snapshot_name.as_ref() {
             child_metadata.insert(META_FORK_SNAPSHOT.to_string(), snapshot_name.clone());
@@ -599,6 +651,22 @@ impl Manager {
                     .metadata
                     .metadata
                     .insert(META_FORK_ID.to_string(), fork_id.clone());
+                inner
+                    .metadata
+                    .metadata
+                    .insert(META_FORK_DEPTH.to_string(), parent_depth.to_string());
+                inner.metadata.metadata.insert(
+                    META_STORAGE_PROFILE.to_string(),
+                    self.cfg.storage_profile.as_str().to_string(),
+                );
+                inner.metadata.metadata.insert(
+                    META_FORK_DURABILITY_CLASS.to_string(),
+                    fork_durability_class.to_string(),
+                );
+                inner.metadata.metadata.insert(
+                    META_FORK_RESTORE_SCOPE.to_string(),
+                    fork_restore_scope.to_string(),
+                );
                 inner
                     .metadata
                     .metadata
@@ -724,6 +792,22 @@ impl Manager {
                     .metadata
                     .metadata
                     .insert(META_FORK_ID.to_string(), fork_id.clone());
+                inner
+                    .metadata
+                    .metadata
+                    .insert(META_FORK_DEPTH.to_string(), parent_depth.to_string());
+                inner.metadata.metadata.insert(
+                    META_STORAGE_PROFILE.to_string(),
+                    self.cfg.storage_profile.as_str().to_string(),
+                );
+                inner.metadata.metadata.insert(
+                    META_FORK_DURABILITY_CLASS.to_string(),
+                    fork_durability_class.to_string(),
+                );
+                inner.metadata.metadata.insert(
+                    META_FORK_RESTORE_SCOPE.to_string(),
+                    fork_restore_scope.to_string(),
+                );
                 inner.metadata.metadata.insert(
                     META_FORK_BASE_PATH.to_string(),
                     fork_base.to_string_lossy().to_string(),
@@ -754,6 +838,11 @@ impl Manager {
         } else {
             child_meta
         };
+
+        if child_depth >= self.cfg.fork_compaction_depth_threshold {
+            self.enqueue_fork_compaction_task(&fork_id, parent_id, &child_id, child_depth)
+                .await;
+        }
 
         Ok((parent_after, child_after, fork_id))
     }
@@ -1560,6 +1649,93 @@ impl Manager {
         }
     }
 
+    fn maintenance_root(&self) -> PathBuf {
+        PathBuf::from(&self.cfg.data_dir).join(MAINTENANCE_DIR_NAME)
+    }
+
+    fn fork_compaction_queue_root(&self) -> PathBuf {
+        self.maintenance_root().join(FORK_COMPACTION_QUEUE_DIR_NAME)
+    }
+
+    async fn enqueue_fork_compaction_task(
+        &self,
+        fork_id: &str,
+        parent_id: &str,
+        child_id: &str,
+        depth: usize,
+    ) {
+        // @dive: Fork compaction is queued as asynchronous maintenance intent so request-path fork latency remains metadata/overlay-only.
+        let queue_root = self.fork_compaction_queue_root();
+        if let Err(err) = fs::create_dir_all(&queue_root) {
+            warn!(
+                queue_root = %queue_root.display(),
+                error = %err,
+                "failed creating fork compaction queue root"
+            );
+            return;
+        }
+        let queue_id = format!("{}-{}-{}", unix_millis(), depth, fork_id);
+        let queue_path = queue_root.join(format!("{queue_id}.json"));
+        let payload = json!({
+            "queue_id": queue_id,
+            "fork_id": fork_id,
+            "parent_vm_id": parent_id,
+            "child_vm_id": child_id,
+            "fork_depth": depth,
+            "queued_at_unix_ms": unix_millis(),
+        });
+        if let Err(err) = fs::write(&queue_path, payload.to_string()) {
+            warn!(
+                queue_path = %queue_path.display(),
+                error = %err,
+                "failed writing fork compaction queue entry"
+            );
+        }
+    }
+
+    async fn garbage_collect_orphaned_fork_roots(&self) {
+        // @dive: GC only removes fork-base roots with zero metadata references, preserving live branch isolation guarantees.
+        let fork_root = self.fork_base_root();
+        if !fork_root.exists() {
+            return;
+        }
+
+        let vm_refs: Vec<_> = {
+            let guard = self.vms.read().await;
+            guard.values().cloned().collect()
+        };
+        let mut referenced_roots = HashSet::<PathBuf>::new();
+        for vm in vm_refs {
+            let inner = vm.lock().await;
+            if let Some(path) = inner.metadata.metadata.get(META_FORK_BASE_PATH) {
+                let base_path = PathBuf::from(path);
+                if let Some(parent) = base_path.parent() {
+                    referenced_roots.insert(parent.to_path_buf());
+                }
+            }
+        }
+
+        let Ok(entries) = fs::read_dir(&fork_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if referenced_roots.contains(&path) {
+                continue;
+            }
+            if let Err(err) = fs::remove_dir_all(&path) {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed removing orphaned fork-base root"
+                );
+            }
+        }
+    }
+
     async fn snapshot_by_id(&self, id: &str) -> ManagerResult<SnapshotRecord> {
         let guard = self.snapshots.read().await;
         guard.get(id).cloned().ok_or(ManagerError::SnapshotNotFound)
@@ -1768,6 +1944,13 @@ fn read_log_tail(path: &Path, limit: usize) -> Option<String> {
     Some(buf.trim().to_string())
 }
 
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
     tokio::spawn(async move {
         let wait_result = child.wait().await;
@@ -1909,6 +2092,29 @@ fn is_snapshot_not_found(err: &anyhow::Error) -> bool {
     msg.contains("snapshot") && msg.contains("not found")
 }
 
+fn fork_snapshot_durability(
+    storage_profile: config::StorageProfile,
+    parent_was_running: bool,
+) -> (&'static str, &'static str) {
+    match (storage_profile, parent_was_running) {
+        (config::StorageProfile::LocalEphemeral, false) => {
+            ("local-ephemeral-cow-overlay", "daemon-restart-same-node")
+        }
+        (config::StorageProfile::LocalEphemeral, true) => (
+            "local-ephemeral-running-snapshot",
+            "daemon-restart-same-node",
+        ),
+        (config::StorageProfile::DurableShared, false) => (
+            "durable-shared-cow-overlay",
+            "durable-storage-daemon-restart",
+        ),
+        (config::StorageProfile::DurableShared, true) => (
+            "durable-shared-running-snapshot",
+            "durable-storage-daemon-restart",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1974,6 +2180,10 @@ mod tests {
             log_level: "info".to_string(),
             force_local_build: false,
             max_active_vms: None,
+            max_fork_chain_depth: 32,
+            fork_compaction_depth_threshold: 8,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            ha_mode: false,
             node_registry: None,
             control_bus: None,
             security: Default::default(),
@@ -2088,6 +2298,27 @@ mod tests {
             child_after.metadata.get(META_FORK_ID).map(String::as_str),
             Some(fork_id.as_str())
         );
+        assert_eq!(
+            child_after
+                .metadata
+                .get(META_STORAGE_PROFILE)
+                .map(String::as_str),
+            Some(config::StorageProfile::LocalEphemeral.as_str())
+        );
+        assert_eq!(
+            child_after
+                .metadata
+                .get(META_FORK_DURABILITY_CLASS)
+                .map(String::as_str),
+            Some("local-ephemeral-cow-overlay")
+        );
+        assert_eq!(
+            child_after
+                .metadata
+                .get(META_FORK_RESTORE_SCOPE)
+                .map(String::as_str),
+            Some("daemon-restart-same-node")
+        );
 
         let fork_base_path = parent_after
             .metadata
@@ -2173,6 +2404,10 @@ mod tests {
             log_level: "info".to_string(),
             force_local_build: false,
             max_active_vms: None,
+            max_fork_chain_depth: 32,
+            fork_compaction_depth_threshold: 8,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            ha_mode: false,
             node_registry: None,
             control_bus: None,
             security: Default::default(),
@@ -2212,6 +2447,10 @@ mod tests {
             log_level: "info".to_string(),
             force_local_build: false,
             max_active_vms: Some(1),
+            max_fork_chain_depth: 32,
+            fork_compaction_depth_threshold: 8,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            ha_mode: false,
             node_registry: None,
             control_bus: None,
             security: Default::default(),
@@ -2256,18 +2495,10 @@ mod tests {
             boot_snapshot: String::new(),
             started_at: None,
         };
-        manager
-            .vms
-            .write()
-            .await
-            .insert(
-                vm_id,
-                Arc::new(Vm::new(
-                    metadata,
-                    VmRuntime::new(&vm_dir),
-                    vm_dir.clone(),
-                )),
-            );
+        manager.vms.write().await.insert(
+            vm_id,
+            Arc::new(Vm::new(metadata, VmRuntime::new(&vm_dir), vm_dir.clone())),
+        );
 
         let err = manager
             .enforce_create_vm_capacity()
@@ -2285,5 +2516,134 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fork_vm_rejects_when_chain_depth_limit_exceeded() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
+
+        let cfg = Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: data_dir.to_string_lossy().to_string(),
+            qemu_bin: "qemu-system-x86_64".to_string(),
+            qemu_arm64_bin: "qemu-system-aarch64".to_string(),
+            qemu_img_bin: "qemu-img".to_string(),
+            docker_bin: "docker".to_string(),
+            log_level: "info".to_string(),
+            force_local_build: false,
+            max_active_vms: None,
+            max_fork_chain_depth: 1,
+            fork_compaction_depth_threshold: 1,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            ha_mode: false,
+            node_registry: None,
+            control_bus: None,
+            security: Default::default(),
+        };
+
+        let manager = Manager {
+            cfg,
+            host_arch: ARCH_AMD64.to_string(),
+            vms: RwLock::new(HashMap::new()),
+            snapshots: RwLock::new(HashMap::new()),
+        };
+
+        let parent_id = "parent-depth-limit".to_string();
+        let parent_dir = data_dir.join(&parent_id);
+        fs::create_dir_all(&parent_dir).expect("create parent dir");
+
+        let mut metadata = VmMetadata {
+            id: parent_id.clone(),
+            name: "parent".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:03".to_string(),
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata: HashMap::from([(META_FORK_DEPTH.to_string(), "1".to_string())]),
+            snapshots: Vec::new(),
+            suspended_snapshot: String::new(),
+            suspended_boot_snapshot: String::new(),
+            boot_snapshot: String::new(),
+            started_at: None,
+        };
+        save_metadata(&parent_dir, &mut metadata).expect("save parent metadata");
+        manager.vms.write().await.insert(
+            parent_id.clone(),
+            Arc::new(Vm::new(
+                metadata,
+                VmRuntime::new(&parent_dir),
+                parent_dir.clone(),
+            )),
+        );
+
+        let err = manager
+            .fork_vm(
+                &parent_id,
+                ForkVmParams {
+                    child_name: Some("child".to_string()),
+                    child_metadata: HashMap::new(),
+                    auto_start_child: false,
+                },
+            )
+            .await
+            .expect_err("fork should reject once fork depth exceeds configured limit");
+        match err {
+            ManagerError::CapacityExceeded {
+                resource,
+                limit,
+                current,
+            } => {
+                assert_eq!(resource, "fork_chain_depth");
+                assert_eq!(limit, 1);
+                assert_eq!(current, 2);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_snapshot_durability_tracks_profile_and_parent_state() {
+        assert_eq!(
+            fork_snapshot_durability(config::StorageProfile::LocalEphemeral, false),
+            ("local-ephemeral-cow-overlay", "daemon-restart-same-node")
+        );
+        assert_eq!(
+            fork_snapshot_durability(config::StorageProfile::LocalEphemeral, true),
+            (
+                "local-ephemeral-running-snapshot",
+                "daemon-restart-same-node"
+            )
+        );
+        assert_eq!(
+            fork_snapshot_durability(config::StorageProfile::DurableShared, false),
+            (
+                "durable-shared-cow-overlay",
+                "durable-storage-daemon-restart"
+            )
+        );
+        assert_eq!(
+            fork_snapshot_durability(config::StorageProfile::DurableShared, true),
+            (
+                "durable-shared-running-snapshot",
+                "durable-storage-daemon-restart"
+            )
+        );
     }
 }

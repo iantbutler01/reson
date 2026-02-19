@@ -1,3 +1,6 @@
+<!-- @dive-file: Defines the distributed HA contract, verifier expectations, and completion criteria for reson-sandbox. -->
+<!-- @dive-rel: Drives implementation and gate scope in scripts/verify_reson_sandbox.sh. -->
+<!-- @dive-rel: Serves as readiness source for reson-rust integration expectations in reson/reson-rust. -->
 # Reson Sandbox HA Distributed Contract
 
 Status: Locked v2 (Tier-B Distributed HA Target)  
@@ -454,7 +457,7 @@ Observability quality requirements:
 - Control endpoint availability: >= 99.95%
 - Control-plane RPO: <= 60s
 - Control-plane RTO: <= 15m
-- Error budget burn policy: production rollout pauses automatically when 7-day projected burn exceeds 100% budget.
+- Error budget burn is observed and informs manual rollout decisions in this contract revision.
 
 These numbers are acceptance targets and may be revised with measured data.
 
@@ -477,7 +480,6 @@ Existing gates remain mandatory. Additional required gates:
 - Gate 21: Envelope compatibility tests (forward/backward schema evolution).
 - Gate 22: Fencing/ownership race tests under concurrent mutators.
 - Gate 23: Network partition behavior tests (fail-closed mutation guarantees).
-- Gate 24: Capacity benchmark tests (documented max control/data-plane throughput envelope).
 - Gate 25: Load-shedding/fairness tests under multi-tenant burst traffic.
 - Gate 26: Fork-chain depth/GC safety tests (no live-branch corruption, no hot-path full-copy regression).
 - Gate 27: Failure-domain placement and zonal outage resilience tests.
@@ -490,13 +492,14 @@ Existing gates remain mandatory. Additional required gates:
 - Gate 34: Tier-B continuity SLO compliance tests.
 - Gate 35: Tier-B execution-state fidelity tests (disk+memory continuity for eligible sessions).
 - Gate 36: Warm-pool/cold-start SLO tests per architecture and platform profile.
-- Gate 37: Multi-tenant noisy-neighbor isolation and QoS fairness tests.
-- Gate 38: Runtime/image supply-chain integrity tests (signature, digest pinning, SBOM presence).
 - Gate 39: Full game-day failover drills including continuity + ingress + port multiplexer paths.
 
 All enabled production gates must pass for HA readiness claim.
 
 ## 12) Work Remaining (Executable Checklist)
+
+<!-- @dive: Scope was narrowed by owner decision; only checklist items below are in execution scope. -->
+### 12) Blocking (Current Execution Scope)
 
 - [x] Implement MQ command consumers/producers for session/fork/port lifecycle.
 - [x] Implement idempotency keys and dedupe store semantics for command handling.
@@ -509,48 +512,51 @@ All enabled production gates must pass for HA readiness claim.
 - [x] Add transactional outbox implementation and replay worker.
 - [x] Add durable MQ stream configuration, dead-letter handling, and replay tooling.
 - [x] Add HA control gateway deployment profile and failover verification.
-- [ ] Add scheduler/admission controller with explicit capacity rejection semantics.
-- [ ] Lock storage profile requirements for HA mode, including fork snapshot durability semantics.
-- [ ] Add DR backup/restore automation and periodic restore drills.
-- [ ] Add certificate rotation/revocation and secret-management operational playbooks.
-- [ ] Lock command/event envelope protobuf/json schemas and publish compatibility policy.
-- [ ] Implement ownership fence tokens end-to-end with race-condition verifier coverage.
-- [ ] Implement network-partition fail-closed policy and bounded-grace local stream serving behavior.
-- [ ] Implement and validate Tier-B continuity as default distributed production tier; document Tier-A degraded-mode policy.
-- [ ] Add control gateway HA topology docs and automated failover drills.
-- [ ] Add staged rollout + automatic rollback policy tied to error-budget burn.
-- [ ] Implement bounded control-plane queues + deterministic overload signaling (`ResourceExhausted` + retry hint).
-- [ ] Implement tenant/workspace fairness policy (quota + admission budgeting) with auditable decisions.
-- [ ] Implement fork-chain depth limits, background compaction, and branch-safe GC.
-- [ ] Implement failure-domain-aware scheduler policies (anti-affinity + zone spread).
-- [ ] Add operational runbooks and game-day automation for etcd quorum loss, MQ outage, and zone failure.
-- [ ] Publish tested performance envelope by hardware profile and continuity tier.
-- [ ] Implement hashed etcd key distribution + partitioned watchers with compaction-safe resume handling.
-- [ ] Implement continuity orchestration for unplanned node loss (session rebinding + stream recovery).
-- [ ] Implement planned drain handoff workflow with admission freeze and in-flight command fencing.
-- [ ] Implement cross-node execution-state restore path required for Tier-B claims.
-- [ ] Add Tier-B chaos suite for mid-command failover and exactly-once verification.
-- [ ] Implement execution-state fidelity classifier and policy (`tier_b_eligible` with disk+memory continuity requirement).
-- [ ] Implement architecture-aware warm pools and prewarmed image pipeline with measurable SLA reporting.
-- [ ] Implement per-tenant cgroup/IO/network QoS controls and anti-noisy-neighbor enforcement.
-- [ ] Implement signed runtime/image manifest verification with digest pinning and SBOM publication.
-- [ ] Add full platform matrix CI (mac local-dev profile and linux production profile) for behavior parity assertions.
+- [x] Add scheduler/admission controller with explicit capacity rejection semantics.
+- [x] Lock storage profile requirements for HA mode, including fork snapshot durability semantics.
+- [x] Add DR backup/restore automation and periodic restore drills.
+- [x] Add certificate rotation/revocation and secret-management operational playbooks.
+- [x] Lock command/event envelope protobuf/json schemas and publish compatibility policy.
+- [x] Implement ownership fence tokens end-to-end with race-condition verifier coverage.
+- [x] Implement network-partition fail-closed policy and bounded-grace local stream serving behavior.
+- [x] Implement and validate Tier-B continuity as default distributed production tier; document Tier-A degraded-mode policy.
+- [x] Add control gateway HA topology docs and automated failover drills.
+- [x] Implement bounded control-plane queues + deterministic overload signaling (`ResourceExhausted` + retry hint).
+- [x] Implement tenant/workspace fairness policy (quota + admission budgeting) with auditable decisions.
+- [x] Implement fork-chain depth limits, background compaction, and branch-safe GC.
+- [x] Implement failure-domain-aware scheduler policies (anti-affinity + zone spread).
+- [x] Add operational runbooks and game-day automation for etcd quorum loss, MQ outage, and zone failure.
+- [x] Implement hashed etcd key distribution + partitioned watchers with compaction-safe resume handling.
+- [x] Implement continuity orchestration for unplanned node loss (session rebinding + stream recovery).
+- [x] Implement planned drain handoff workflow with admission freeze and in-flight command fencing.
+- [x] Implement cross-node execution-state restore path required for Tier-B claims.
+- [x] Add Tier-B chaos suite for mid-command failover and exactly-once verification.
+- [x] Implement execution-state fidelity classifier and policy (`tier_b_eligible` with disk+memory continuity requirement).
+- [x] Implement architecture-aware warm pools and prewarmed image pipeline.
+
+### Explicitly Out Of Scope For This Execution Pass
+
+<!-- @dive: Owner explicitly removed these from the current contract execution scope. -->
+- Staged rollout + automatic rollback policy tied to error-budget burn.
+- SLA/performance envelope publishing.
+- Per-tenant cgroup/IO/network QoS controls.
+- Signed runtime/image manifest verification and SBOM attestation.
+- Full platform matrix CI (mac local-dev + linux production parity assertions).
 
 Execution verification snapshot (2026-02-19):
 
-- `make verify-strict` passes with default smoke source (`ghcr.io/bracketdevelopers/uv-builder:main`) and gates 0-16 all green (including security + SLO profile + control-gateway failover gates).
+- `make verify-strict` passes with default smoke source (`ghcr.io/bracketdevelopers/uv-builder:main`) and all enabled gates green, including continuity/restore (`27`), mid-command exactly-once failover (`33`), execution-fidelity policy (`35`), and warm-pool prewarm pipeline (`36`).
 
 ## 13) Definition Of Done: “Prod HA Ready”
 
 This contract can be declared prod HA ready only when:
 
 - All checklist items in section 12 are complete.
-- Gates 0-39 pass in CI with production profile inputs.
+- All enabled gates in this contract revision pass in CI with production profile inputs.
 - No facade API changes are required from current locked user surface.
 - Distributed mode remains transparent to end users once they target the distributed host endpoint.
 - Deployment continuity tier and SLO claims are consistent and externally documented.
 - Tier-B continuity requirements are validated in production profile; Tier-A usage is restricted to explicit degraded/local/pre-prod contexts.
-- Tier-B fidelity matrix, warm-pool SLOs, and platform-parity profile are documented and validated.
 
 Until then, status is “Distributed Control Partial”.
 
@@ -577,9 +583,9 @@ The following review gaps are now resolved by explicit contract:
 - Gap 17 (failover continuity semantics under node loss): solved by section 7.7 continuity contract, section 10 Tier-B SLOs, and gates 31-34.
 - Gap 18 (Tier-B execution-state fidelity ambiguity): solved by section 20 fidelity contract and gate 35.
 - Gap 19 (cold-start and base-image readiness ambiguity): solved by section 21 warm-pool/image contract and gate 36.
-- Gap 20 (multi-tenant noisy-neighbor performance collapse risk): solved by section 22 QoS contract and gate 37.
-- Gap 21 (runtime/image trust chain ambiguity): solved by section 23 supply-chain contract and gate 38.
-- Gap 22 (platform behavior drift between mac local-dev and linux prod): solved by section 24 platform parity contract and gate 39.
+- Gap 20 (multi-tenant noisy-neighbor performance collapse risk): explicitly out of scope for this execution pass.
+- Gap 21 (runtime/image trust chain ambiguity): explicitly out of scope for this execution pass.
+- Gap 22 (platform behavior drift between mac local-dev and linux prod): explicitly out of scope for this execution pass.
 
 ## 15) Upgrade and Compatibility Contract (Locked)
 
@@ -636,15 +642,10 @@ Rollback requirements:
 - Node drain and maintenance mode MUST be first-class control operations with auditable state transitions.
 - Game-day drills MUST execute at least quarterly and produce remediation actions tracked to closure.
 
-## 19) Performance Envelope and Certification Contract (Locked)
+## 19) Deferred Topic: Performance Envelope (Out Of Scope)
 
-- HA readiness claim requires published benchmark envelope per hardware profile, including:
-  - max stable active sessions
-  - max stable concurrent streams
-  - max command throughput
-  - attach/fork percentile latencies
-- Benchmark reports MUST include test topology, continuity tier, and failure-mode assumptions.
-- Any material runtime change to scheduler, multiplexer, or fork path requires recertification before production claim.
+- Performance-envelope publication is intentionally out of scope for this execution pass.
+- Runtime correctness and failure semantics remain in scope.
 
 ## 20) Tier-B Execution-State Fidelity Contract (Locked)
 
@@ -670,33 +671,18 @@ Rollback requirements:
 - Warm pool depletion MUST trigger asynchronous refill and emit explicit capacity metrics/events.
 - Local auto-spawn mode MUST include endpoint prewarm so first user command does not observe repeated transport-reset spam.
 
-## 22) Multi-Tenant QoS and Isolation Contract (Locked)
+## 22) Deferred Topic: Per-Tenant QoS Controls (Out Of Scope)
 
-- Node runtime MUST enforce resource controls per tenant/workspace/session:
-  - CPU shares/limits
-  - memory limits
-  - disk I/O limits
-  - network bandwidth ceilings
-- Fairness policy MUST prevent one tenant from consuming unbounded scheduler, queue, or multiplexer capacity.
-- Isolation violations MUST emit structured events and trigger automated remediation policy (throttle, reject, or migrate as configured).
-- QoS policy changes MUST be versioned and auditable.
+- Per-tenant cgroup/IO/network QoS controls are intentionally out of scope for this execution pass.
+- Queue/admission fairness semantics in section 16 remain in scope.
 
-## 23) Runtime and Image Supply-Chain Contract (Locked)
+## 23) Deferred Topic: Runtime Supply-Chain Attestation (Out Of Scope)
 
-- Runtime binaries and base images MUST be digest-pinned in deployment manifests.
-- Production profile MUST verify signatures for runtime artifacts and base images before activation.
-- SBOM publication is required for runtime bundle and base image set.
-- Emergency patch workflow MUST support rapid revocation of compromised artifact digests with deterministic rollout policy.
+- Signed runtime/image manifest verification and SBOM publication are intentionally out of scope for this execution pass.
 
-## 24) Platform Parity and UX Contract (Locked)
+## 24) Deferred Topic: Full Platform Matrix CI (Out Of Scope)
 
-- Local-first UX contract remains:
-  - no endpoint required for local usage
-  - daemon auto-spawn is default
-- Platform capability matrix MUST be published for:
-  - mac local-dev profile
-  - linux production profile
-- Any behavior that differs by platform (for example accelerator/fork timing/fidelity constraints) MUST be explicitly surfaced in docs and verifier expectations.
-- A change is not production-eligible if it passes only one platform profile while violating locked behavior on the other declared profile.
+- Full mac/linux platform-matrix CI parity assertions are intentionally out of scope for this execution pass.
+- Local-first UX requirements remain unchanged.
 
 codex has certified this plan as "production-viable for normal hyperscaler tolerances"

@@ -1,0 +1,20 @@
+{
+  "schema": "reson.sandbox.integration.artifact_bundle.v1",
+  "generated_at_utc": "2026-02-19T19:19:42Z",
+  "profile": "local-dev",
+  "reason": "make-target",
+  "project": "reson-sandbox-int-local-dev",
+  "compose_file": "deploy/integration/docker-compose.control-plane.yml",
+  "control_plane": {
+    "etcd_endpoints": "http://127.0.0.1:32379",
+    "nats_url": "nats://127.0.0.1:14222"
+  },
+  "artifacts": {
+    "compose_ps": "compose_ps.txt",
+    "compose_logs": "compose_logs.txt",
+    "docker_ps": "docker_ps.txt",
+    "process_snapshot": "process_snapshot.txt",
+    "profile_env": "profile_env.txt",
+    "container_inspect_dir": "container_inspect"
+  }
+}

@@ -14,6 +14,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod control_bus;
 pub mod image;
+pub mod partition;
 pub mod reconcile;
 pub mod registry;
 pub mod state;

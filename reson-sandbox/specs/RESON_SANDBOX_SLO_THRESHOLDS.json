@@ -10,5 +10,11 @@
   "policy": {
     "ci_strict_mode_enforces_threshold_schema": true,
     "nightly_mode_enforces_observed_metrics_against_thresholds": true
+  },
+  "error_budget": {
+    "window_days": 7,
+    "projected_burn_percent_pause_threshold": 100,
+    "projected_burn_percent_rollback_threshold": 120,
+    "rollout_stages": ["canary", "stage_1", "stage_2", "full"]
   }
 }

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# @dive-file: Top-level strict verifier orchestrator for reson-sandbox runtime, facade, and distributed HA contract gates.
+# @dive-rel: Enforces executable checklist closure from specs/RESON_SANDBOX_HA_DISTRIBUTED_CONTRACT.md.
+# @dive-rel: Delegates gate-specific checks to scripts/verify_*.sh and records contract coverage ordering.
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"
@@ -62,12 +65,47 @@ for required_path in \
   "scripts/verify_distributed_soak.sh" \
   "scripts/verify_security_profile.sh" \
   "scripts/verify_slo_profile.sh" \
+  "scripts/evaluate_rollout_policy.sh" \
   "scripts/verify_outbox.sh" \
   "scripts/verify_control_gateway_failover.sh" \
+  "scripts/run_control_gateway_failover_drill.sh" \
+  "scripts/verify_storage_profile.sh" \
+  "scripts/verify_admission_control.sh" \
+  "scripts/verify_dr_restore.sh" \
+  "scripts/verify_security_ops.sh" \
+  "scripts/verify_envelope_compat.sh" \
+  "scripts/verify_ownership_fence.sh" \
+  "scripts/verify_network_partition.sh" \
+  "scripts/verify_operational_gameday.sh" \
+  "scripts/verify_tierb_continuity.sh" \
+  "scripts/verify_planned_drain_handoff.sh" \
+  "scripts/verify_tierb_execution_restore.sh" \
+  "scripts/verify_tierb_exactly_once.sh" \
+  "scripts/verify_execution_fidelity_policy.sh" \
+  "scripts/verify_warm_pool_pipeline.sh" \
+  "scripts/run_control_plane_gameday_drill.sh" \
+  "scripts/dr/backup_etcd.sh" \
+  "scripts/dr/restore_etcd.sh" \
+  "scripts/dr/run_restore_drill.sh" \
+  "scripts/security/rotate_tls_bundle.sh" \
+  "scripts/security/revoke_client_cert.sh" \
   "scripts/replay_mq_dead_letters.sh" \
   "scripts/verify_api_facade.sh" \
   "scripts/verify_fork_cow.sh" \
   "specs/RESON_SANDBOX_MIGRATION_CHECKLIST.md" \
+  "specs/runbooks/CONTROL_GATEWAY_HA_TOPOLOGY_AND_FAILOVER_DRILL.md" \
+  "specs/runbooks/CONTROL_PLANE_GAMEDAY_ETCD_MQ_ZONE_FAILURE.md" \
+  "specs/runbooks/PLANNED_DRAIN_HANDOFF_AND_FENCING.md" \
+  "specs/runbooks/TIERB_EXECUTION_STATE_RESTORE.md" \
+  "specs/runbooks/TIERB_MID_COMMAND_FAILOVER_EXACTLY_ONCE.md" \
+  "specs/runbooks/TIERB_EXECUTION_FIDELITY_POLICY.md" \
+  "specs/runbooks/WARM_POOL_AND_PREWARM_PIPELINE.md" \
+  "specs/runbooks/SECURITY_CERT_ROTATION_AND_SECRETS_PLAYBOOK.md" \
+  "specs/runbooks/STAGED_ROLLOUT_AND_AUTOMATIC_ROLLBACK_POLICY.md" \
+  "deploy/gameday/docker-compose.control-plane.yml" \
+  "specs/RESON_SANDBOX_ENVELOPE_COMPATIBILITY_POLICY.md" \
+  "specs/schemas/control_command_envelope.v1.json" \
+  "specs/schemas/control_event_envelope.v1.json" \
   "specs/RESON_SANDBOX_SLO_THRESHOLDS.json" \
   "crates/reson-sandbox/Cargo.toml"; do
   if [[ ! -f "$REPO_ROOT/$required_path" ]]; then
@@ -192,6 +230,104 @@ if [[ "$STRICT" -eq 1 ]]; then
   "$REPO_ROOT/scripts/verify_control_gateway_failover.sh" --strict
 else
   "$REPO_ROOT/scripts/verify_control_gateway_failover.sh"
+fi
+
+log "gate 17: storage profile durability semantics"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_storage_profile.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_storage_profile.sh"
+fi
+
+log "gate 18: scheduler/admission control"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_admission_control.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_admission_control.sh"
+fi
+
+log "gate 19: disaster recovery restore drill"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_dr_restore.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_dr_restore.sh"
+fi
+
+log "gate 20: security operations"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_security_ops.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_security_ops.sh"
+fi
+
+log "gate 21: envelope compatibility"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_envelope_compat.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_envelope_compat.sh"
+fi
+
+log "gate 22: ownership fence tokens"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_ownership_fence.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_ownership_fence.sh"
+fi
+
+log "gate 23: network partition fail-closed"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_network_partition.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_network_partition.sh"
+fi
+
+log "gate 24: operational game-day automation"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_operational_gameday.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_operational_gameday.sh"
+fi
+
+log "gate 25: tier-b continuity orchestration"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_tierb_continuity.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_tierb_continuity.sh"
+fi
+
+log "gate 26: planned drain handoff + fencing"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_planned_drain_handoff.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_planned_drain_handoff.sh"
+fi
+
+log "gate 27: tier-b execution-state restore"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_tierb_execution_restore.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_tierb_execution_restore.sh"
+fi
+
+log "gate 33: tier-b mid-command failover exactly-once"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_tierb_exactly_once.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_tierb_exactly_once.sh"
+fi
+
+log "gate 35: tier-b execution-fidelity policy"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_execution_fidelity_policy.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_execution_fidelity_policy.sh"
+fi
+
+log "gate 36: warm-pool and prewarm pipeline"
+if [[ "$STRICT" -eq 1 ]]; then
+  "$REPO_ROOT/scripts/verify_warm_pool_pipeline.sh" --strict
+else
+  "$REPO_ROOT/scripts/verify_warm_pool_pipeline.sh"
 fi
 
 log "all enabled gates passed"

@@ -1,3 +1,6 @@
+// @dive-file: gRPC daemon service wiring for VM lifecycle, snapshots, forking, and control-plane policy enforcement.
+// @dive-rel: Delegates orchestration to vmd/src/state/manager.rs and control-plane workers in reconcile/control_bus modules.
+// @dive-rel: Translates manager/runtime failures into stable gRPC status contracts consumed by crates/reson-sandbox.
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::ErrorKind;
@@ -22,6 +25,7 @@ use tracing::{Level, Span, debug, error, info};
 
 use crate::config::{Config, TlsServerConfig};
 use crate::image::{self, PrebuiltImageStatus};
+use crate::partition::{self, PartitionGate, PartitionPolicyConfig};
 use crate::proto::v1::{
     CreateSnapshotRequest, CreateVmPhase, CreateVmProgress, CreateVmRequest,
     CreateVmStreamResponse, DeleteSnapshotRequest, DeleteVmRequest, ForkVmRequest, ForkVmResponse,
@@ -50,9 +54,16 @@ pub async fn run_server(config: Config) -> Result<()> {
         .with_context(|| format!("parse listen address {}", config.listen_address))?;
 
     let manager = Arc::new(Manager::new(config.clone()).await.map_err(|e| anyhow!(e))?);
+    let partition_handle = start_partition_monitor(
+        config.node_registry.as_ref(),
+        config.control_bus.as_ref(),
+    )
+    .await?;
+    let partition_gate = partition_handle.as_ref().map(|handle| handle.gate());
     let svc = GrpcService {
         manager: Arc::clone(&manager),
         cfg: config.clone(),
+        partition_gate: partition_gate.clone(),
     };
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -117,7 +128,12 @@ pub async fn run_server(config: Config) -> Result<()> {
     )
     .await?;
     let command_consumer_handle =
-        start_control_bus(config.control_bus.clone(), Some(reconcile_trigger_tx)).await?;
+        start_control_bus(
+            config.control_bus.clone(),
+            Some(reconcile_trigger_tx),
+            partition_gate,
+        )
+        .await?;
 
     let mut server = Server::builder().layer(grpc_trace);
     if let Some(tls_cfg) = config.security.tls.as_ref() {
@@ -139,6 +155,9 @@ pub async fn run_server(config: Config) -> Result<()> {
         handle.shutdown().await;
     }
     if let Some(handle) = reconcile_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = partition_handle {
         handle.shutdown().await;
     }
 
@@ -174,10 +193,78 @@ async fn start_node_registry(
 async fn start_control_bus(
     control_bus_cfg: Option<ControlBusConfig>,
     reconcile_trigger_tx: Option<mpsc::UnboundedSender<()>>,
+    partition_gate: Option<PartitionGate>,
 ) -> Result<Option<control_bus::CommandConsumerHandle>> {
-    control_bus::start_with_trigger(control_bus_cfg, reconcile_trigger_tx)
+    control_bus::start_with_trigger(control_bus_cfg, reconcile_trigger_tx, partition_gate)
         .await
         .context("start control command consumer")
+}
+
+async fn start_partition_monitor(
+    node_registry: Option<&NodeRegistryConfig>,
+    control_bus_cfg: Option<&ControlBusConfig>,
+) -> Result<Option<partition::PartitionMonitorHandle>> {
+    let config = derive_partition_policy_config(node_registry, control_bus_cfg);
+    partition::start(config)
+        .await
+        .context("start partition monitor")
+}
+
+fn derive_partition_policy_config(
+    node_registry: Option<&NodeRegistryConfig>,
+    control_bus_cfg: Option<&ControlBusConfig>,
+) -> Option<PartitionPolicyConfig> {
+    let mut etcd_endpoints = Vec::new();
+    let mut key_prefix = "/reson-sandbox".to_string();
+
+    if let Some(registry) = node_registry {
+        key_prefix = registry.key_prefix.clone();
+        etcd_endpoints.extend(
+            registry
+                .etcd_endpoints
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+
+    if let Some(control) = control_bus_cfg {
+        if etcd_endpoints.is_empty() {
+            key_prefix = control
+                .dedupe_prefix
+                .split("/command-dedupe")
+                .next()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("/reson-sandbox")
+                .to_string();
+        }
+        etcd_endpoints.extend(
+            control
+                .dedupe_etcd_endpoints
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+
+    etcd_endpoints.sort();
+    etcd_endpoints.dedup();
+    if etcd_endpoints.is_empty() {
+        return None;
+    }
+
+    Some(PartitionPolicyConfig {
+        etcd_endpoints,
+        key_prefix,
+        probe_interval: Duration::from_secs(2),
+        failure_threshold: 3,
+        local_stream_grace: Duration::from_secs(30),
+        command_retry_delay: Duration::from_secs(2),
+    })
 }
 
 async fn start_reconcile_worker(
@@ -218,6 +305,7 @@ async fn shutdown_signal() {
 struct GrpcService {
     manager: Arc<Manager>,
     cfg: Config,
+    partition_gate: Option<PartitionGate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,12 +315,31 @@ enum AccessLevel {
 }
 
 impl GrpcService {
-    fn authorize<T>(&self, request: &Request<T>, required: AccessLevel) -> Result<(), Status> {
+    async fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        required: AccessLevel,
+    ) -> Result<(), Status> {
         authorize_metadata(
             self.cfg.security.auth.as_ref(),
             request.metadata(),
             required,
-        )
+        )?;
+
+        if required == AccessLevel::Write {
+            if let Some(gate) = &self.partition_gate {
+                if !gate.mutation_allowed().await {
+                    return Err(Status::unavailable(
+                        gate.mutation_rejection_reason().await.unwrap_or_else(|| {
+                            "network partition fail-closed: rejecting mutating commands"
+                                .to_string()
+                        }),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -306,14 +413,14 @@ impl VmdService for GrpcService {
         Pin<Box<dyn Stream<Item = Result<PreDownloadVmImageResponse, Status>> + Send>>;
 
     async fn health(&self, request: Request<HealthRequest>) -> GrpcResult<HealthResponse> {
-        self.authorize(&request, AccessLevel::Read)?;
+        self.authorize(&request, AccessLevel::Read).await?;
         Ok(Response::new(HealthResponse {
             status: "ok".to_string(),
         }))
     }
 
     async fn info(&self, request: Request<InfoRequest>) -> GrpcResult<InfoResponse> {
-        self.authorize(&request, AccessLevel::Read)?;
+        self.authorize(&request, AccessLevel::Read).await?;
         Ok(Response::new(InfoResponse {
             listen: self.cfg.listen_address.clone(),
             data_dir: self.cfg.data_dir.clone(),
@@ -325,7 +432,7 @@ impl VmdService for GrpcService {
     }
 
     async fn list_v_ms(&self, request: Request<ListVMsRequest>) -> GrpcResult<ListVMsResponse> {
-        self.authorize(&request, AccessLevel::Read)?;
+        self.authorize(&request, AccessLevel::Read).await?;
         let include_snapshots = request.into_inner().include_snapshots;
         let vms = self.manager.list().await;
         let mut response = Vec::with_capacity(vms.len());
@@ -341,7 +448,7 @@ impl VmdService for GrpcService {
     }
 
     async fn get_vm(&self, request: Request<GetVmRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Read)?;
+        self.authorize(&request, AccessLevel::Read).await?;
         let vm_id = request.into_inner().vm_id;
         if vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -358,7 +465,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<CreateVmRequest>,
     ) -> Result<Response<Self::CreateVMStream>, Status> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         let source = req
             .source
@@ -435,7 +542,7 @@ impl VmdService for GrpcService {
     }
 
     async fn update_vm(&self, request: Request<UpdateVmRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -461,7 +568,7 @@ impl VmdService for GrpcService {
     }
 
     async fn delete_vm(&self, request: Request<DeleteVmRequest>) -> GrpcResult<()> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -474,7 +581,7 @@ impl VmdService for GrpcService {
     }
 
     async fn fork_vm(&self, request: Request<ForkVmRequest>) -> GrpcResult<ForkVmResponse> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.parent_vm_id.trim().is_empty() {
             return Err(Status::invalid_argument("parent_vm_id is required"));
@@ -514,32 +621,32 @@ impl VmdService for GrpcService {
     }
 
     async fn start_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::Start).await
     }
 
     async fn stop_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::Stop).await
     }
 
     async fn restart_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::Restart).await
     }
 
     async fn pause_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::Pause).await
     }
 
     async fn resume_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::Resume).await
     }
 
     async fn force_stop_vm(&self, request: Request<VmActionRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         self.vm_action(request.into_inner(), Action::ForceStop)
             .await
     }
@@ -548,7 +655,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<PreDownloadVmImageRequest>,
     ) -> Result<Response<Self::PreDownloadVmImageStream>, Status> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.reference.trim().is_empty() {
             return Err(Status::invalid_argument("reference is required"));
@@ -701,7 +808,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<ListSnapshotsRequest>,
     ) -> GrpcResult<ListSnapshotsResponse> {
-        self.authorize(&request, AccessLevel::Read)?;
+        self.authorize(&request, AccessLevel::Read).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -721,7 +828,7 @@ impl VmdService for GrpcService {
         &self,
         request: Request<CreateSnapshotRequest>,
     ) -> GrpcResult<Snapshot> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() {
             return Err(Status::invalid_argument("vm_id is required"));
@@ -739,7 +846,7 @@ impl VmdService for GrpcService {
     }
 
     async fn get_snapshot(&self, request: Request<GetSnapshotRequest>) -> GrpcResult<Snapshot> {
-        self.authorize(&request, AccessLevel::Read)?;
+        self.authorize(&request, AccessLevel::Read).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -755,7 +862,7 @@ impl VmdService for GrpcService {
     }
 
     async fn restore_snapshot(&self, request: Request<RestoreSnapshotRequest>) -> GrpcResult<Vm> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -776,7 +883,7 @@ impl VmdService for GrpcService {
     }
 
     async fn delete_snapshot(&self, request: Request<DeleteSnapshotRequest>) -> GrpcResult<()> {
-        self.authorize(&request, AccessLevel::Write)?;
+        self.authorize(&request, AccessLevel::Write).await?;
         let req = request.into_inner();
         if req.vm_id.is_empty() || req.snapshot_id.is_empty() {
             return Err(Status::invalid_argument(
@@ -1036,7 +1143,9 @@ fn status_from_error(err: ManagerError) -> Status {
         ManagerError::SnapshotNotFound => Status::not_found(err.to_string()),
         ManagerError::InvalidState => Status::failed_precondition(err.to_string()),
         ManagerError::Cancelled => Status::cancelled(err.to_string()),
-        ManagerError::CapacityExceeded { .. } => Status::resource_exhausted(err.to_string()),
+        ManagerError::CapacityExceeded { .. } => {
+            Status::resource_exhausted(format!("{} retry_after_ms=2000", err))
+        }
         ManagerError::Other(e) => {
             let message = sanitize_status_message(&e.to_string());
             error!(error = ?e, status_message = %message, "manager operation failed");

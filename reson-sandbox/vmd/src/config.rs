@@ -1,3 +1,6 @@
+// @dive-file: Centralizes daemon runtime configuration, policy defaults, and environment parsing for HA/distributed behavior.
+// @dive-rel: Feeds control-plane queueing and node-label policies consumed by vmd/src/control_bus.rs and vmd/src/registry.rs.
+// @dive-rel: Provides normalized admission/scheduling inputs that must align with crates/reson-sandbox/src/distributed.rs.
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +18,52 @@ const DEFAULT_CONTROL_STREAM_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 7;
 const DEFAULT_CONTROL_STREAM_REPLICAS: usize = 1;
 const DEFAULT_CONTROL_COMMAND_MAX_DELIVER: i64 = 5;
 const DEFAULT_CONTROL_COMMAND_ACK_WAIT_MS: u64 = 30_000;
+const DEFAULT_CONTROL_MAX_INFLIGHT_COMMANDS: usize = 1024;
+const DEFAULT_CONTROL_OVERLOAD_RETRY_AFTER_MS: u64 = 2_000;
 const DEFAULT_REQUIRE_CLIENT_CERT: bool = true;
+const DEFAULT_MAX_FORK_CHAIN_DEPTH: usize = 32;
+const DEFAULT_FORK_COMPACTION_DEPTH_THRESHOLD: usize = 8;
+const STORAGE_PROFILE_LOCAL_EPHEMERAL: &str = "local-ephemeral";
+const STORAGE_PROFILE_DURABLE_SHARED: &str = "durable-shared";
+const CONTINUITY_TIER_A: &str = "tier-a";
+const CONTINUITY_TIER_B: &str = "tier-b";
+const DEFAULT_NODE_REGION: &str = "local-region";
+const DEFAULT_NODE_ZONE: &str = "local-zone";
+const DEFAULT_NODE_RACK: &str = "local-rack";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageProfile {
+    LocalEphemeral,
+    DurableShared,
+}
+
+impl StorageProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StorageProfile::LocalEphemeral => STORAGE_PROFILE_LOCAL_EPHEMERAL,
+            StorageProfile::DurableShared => STORAGE_PROFILE_DURABLE_SHARED,
+        }
+    }
+
+    pub fn is_durable_shared(self) -> bool {
+        matches!(self, StorageProfile::DurableShared)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinuityTier {
+    TierA,
+    TierB,
+}
+
+impl ContinuityTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContinuityTier::TierA => CONTINUITY_TIER_A,
+            ContinuityTier::TierB => CONTINUITY_TIER_B,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NodeRegistryConfig {
@@ -24,6 +72,14 @@ pub struct NodeRegistryConfig {
     pub node_id: String,
     pub advertise_endpoint: String,
     pub ttl_secs: i64,
+    pub max_active_vms: Option<usize>,
+    pub storage_profile: StorageProfile,
+    pub continuity_tier: ContinuityTier,
+    pub degraded_mode: bool,
+    pub admission_frozen: bool,
+    pub region: String,
+    pub zone: String,
+    pub rack: String,
 }
 
 impl NodeRegistryConfig {
@@ -34,6 +90,14 @@ impl NodeRegistryConfig {
             node_id: default_node_id(),
             advertise_endpoint: format!("http://{}", listen_address.trim()),
             ttl_secs: DEFAULT_NODE_REGISTRY_TTL_SECS,
+            max_active_vms: default_max_active_vms_from_env(),
+            storage_profile: default_storage_profile_from_env(),
+            continuity_tier: default_continuity_tier_from_env(),
+            degraded_mode: default_degraded_mode_from_env(),
+            admission_frozen: default_admission_frozen_from_env(),
+            region: default_node_region_from_env(),
+            zone: default_node_zone_from_env(),
+            rack: default_node_rack_from_env(),
         }
     }
 }
@@ -51,6 +115,8 @@ pub struct ControlBusConfig {
     pub command_consumer_durable: String,
     pub command_max_deliver: i64,
     pub command_ack_wait_ms: u64,
+    pub max_inflight_commands: usize,
+    pub overload_retry_after_ms: u64,
     pub dead_letter_subject: String,
     pub replay_subject: String,
 }
@@ -86,6 +152,10 @@ pub struct Config {
     pub log_level: String,
     pub force_local_build: bool,
     pub max_active_vms: Option<usize>,
+    pub max_fork_chain_depth: usize,
+    pub fork_compaction_depth_threshold: usize,
+    pub storage_profile: StorageProfile,
+    pub ha_mode: bool,
     pub node_registry: Option<NodeRegistryConfig>,
     pub control_bus: Option<ControlBusConfig>,
     pub security: SecurityConfig,
@@ -108,6 +178,10 @@ impl Default for Config {
             log_level: "info".to_string(),
             force_local_build: false,
             max_active_vms: default_max_active_vms_from_env(),
+            max_fork_chain_depth: default_max_fork_chain_depth_from_env(),
+            fork_compaction_depth_threshold: default_fork_compaction_depth_threshold_from_env(),
+            storage_profile: default_storage_profile_from_env(),
+            ha_mode: default_ha_mode_from_env(),
             node_registry: default_node_registry_from_env("127.0.0.1:8052"),
             control_bus: default_control_bus_from_env(),
             security: default_security_from_env(),
@@ -143,8 +217,34 @@ impl Config {
         if self.max_active_vms == Some(0) {
             self.max_active_vms = None;
         }
+        if self.max_fork_chain_depth == 0 {
+            self.max_fork_chain_depth = DEFAULT_MAX_FORK_CHAIN_DEPTH;
+        }
+        if self.fork_compaction_depth_threshold == 0 {
+            self.fork_compaction_depth_threshold = DEFAULT_FORK_COMPACTION_DEPTH_THRESHOLD;
+        }
+        if self.fork_compaction_depth_threshold > self.max_fork_chain_depth {
+            self.fork_compaction_depth_threshold = self.max_fork_chain_depth;
+        }
+        if self.ha_mode && !self.storage_profile.is_durable_shared() {
+            bail!(
+                "ha mode requires storage profile `{}` (got `{}`)",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                self.storage_profile.as_str()
+            );
+        }
+        if let Some(registry) = self.node_registry.as_mut() {
+            registry.storage_profile = self.storage_profile;
+        }
         self.normalize_node_registry();
         self.normalize_control_bus();
+        if self.ha_mode && self.node_registry.is_none() {
+            bail!("ha mode requires node registry configuration");
+        }
+        if self.ha_mode && self.control_bus.is_none() {
+            bail!("ha mode requires control bus configuration");
+        }
+        enforce_continuity_policy(self)?;
         self.normalize_security()?;
 
         Ok(())
@@ -187,6 +287,18 @@ impl Config {
 
         if registry.ttl_secs <= 0 {
             registry.ttl_secs = DEFAULT_NODE_REGISTRY_TTL_SECS;
+        }
+        if registry.max_active_vms == Some(0) {
+            registry.max_active_vms = None;
+        }
+        if registry.region.trim().is_empty() {
+            registry.region = DEFAULT_NODE_REGION.to_string();
+        }
+        if registry.zone.trim().is_empty() {
+            registry.zone = DEFAULT_NODE_ZONE.to_string();
+        }
+        if registry.rack.trim().is_empty() {
+            registry.rack = DEFAULT_NODE_RACK.to_string();
         }
     }
 
@@ -246,6 +358,12 @@ impl Config {
         }
         if control.command_ack_wait_ms == 0 {
             control.command_ack_wait_ms = DEFAULT_CONTROL_COMMAND_ACK_WAIT_MS;
+        }
+        if control.max_inflight_commands == 0 {
+            control.max_inflight_commands = DEFAULT_CONTROL_MAX_INFLIGHT_COMMANDS;
+        }
+        if control.overload_retry_after_ms == 0 {
+            control.overload_retry_after_ms = DEFAULT_CONTROL_OVERLOAD_RETRY_AFTER_MS;
         }
         if control.dead_letter_subject.trim().is_empty() {
             control.dead_letter_subject = format!("{}.dlq.commands", control.subject_prefix);
@@ -408,6 +526,36 @@ fn default_node_registry_from_env(listen_address: &str) -> Option<NodeRegistryCo
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_NODE_REGISTRY_TTL_SECS);
+    config.max_active_vms = env::var("RESON_SANDBOX_NODE_MAX_ACTIVE_VMS")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_MAX_ACTIVE_VMS"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .or_else(default_max_active_vms_from_env);
+    config.storage_profile = env::var("RESON_SANDBOX_NODE_STORAGE_PROFILE")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_STORAGE_PROFILE"))
+        .ok()
+        .and_then(|value| parse_storage_profile(&value))
+        .unwrap_or_else(default_storage_profile_from_env);
+    config.continuity_tier = env::var("RESON_SANDBOX_NODE_CONTINUITY_TIER")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_CONTINUITY_TIER"))
+        .or_else(|_| env::var("RESON_SANDBOX_CONTINUITY_TIER"))
+        .or_else(|_| env::var("BRACKET_SANDBOX_CONTINUITY_TIER"))
+        .ok()
+        .and_then(|value| parse_continuity_tier(&value))
+        .unwrap_or_else(default_continuity_tier_from_env);
+    config.degraded_mode = env::var("RESON_SANDBOX_NODE_DEGRADED_MODE")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_DEGRADED_MODE"))
+        .or_else(|_| env::var("RESON_SANDBOX_DEGRADED_MODE"))
+        .or_else(|_| env::var("BRACKET_SANDBOX_DEGRADED_MODE"))
+        .ok()
+        .and_then(|value| parse_bool_flag(&value))
+        .unwrap_or_else(default_degraded_mode_from_env);
+    config.admission_frozen = env::var("RESON_SANDBOX_NODE_ADMISSION_FROZEN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_ADMISSION_FROZEN"))
+        .ok()
+        .and_then(|value| parse_bool_flag(&value))
+        .unwrap_or_else(default_admission_frozen_from_env);
 
     Some(config)
 }
@@ -472,6 +620,18 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
     let replay_subject = env::var("RESON_SANDBOX_NATS_REPLAY_SUBJECT")
         .or_else(|_| env::var("BRACKET_SANDBOX_NATS_REPLAY_SUBJECT"))
         .unwrap_or_else(|_| format!("{}.replay.commands", subject_prefix));
+    let max_inflight_commands = env::var("RESON_SANDBOX_CONTROL_MAX_INFLIGHT")
+        .or_else(|_| env::var("BRACKET_SANDBOX_CONTROL_MAX_INFLIGHT"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CONTROL_MAX_INFLIGHT_COMMANDS);
+    let overload_retry_after_ms = env::var("RESON_SANDBOX_CONTROL_OVERLOAD_RETRY_AFTER_MS")
+        .or_else(|_| env::var("BRACKET_SANDBOX_CONTROL_OVERLOAD_RETRY_AFTER_MS"))
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CONTROL_OVERLOAD_RETRY_AFTER_MS);
 
     Some(ControlBusConfig {
         nats_url,
@@ -485,6 +645,8 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
         command_consumer_durable,
         command_max_deliver,
         command_ack_wait_ms,
+        max_inflight_commands,
+        overload_retry_after_ms,
         dead_letter_subject,
         replay_subject,
     })
@@ -496,6 +658,82 @@ fn default_max_active_vms_from_env() -> Option<usize> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn default_max_fork_chain_depth_from_env() -> usize {
+    env::var("RESON_SANDBOX_MAX_FORK_CHAIN_DEPTH")
+        .or_else(|_| env::var("BRACKET_SANDBOX_MAX_FORK_CHAIN_DEPTH"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_FORK_CHAIN_DEPTH)
+}
+
+fn default_fork_compaction_depth_threshold_from_env() -> usize {
+    env::var("RESON_SANDBOX_FORK_COMPACTION_DEPTH_THRESHOLD")
+        .or_else(|_| env::var("BRACKET_SANDBOX_FORK_COMPACTION_DEPTH_THRESHOLD"))
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_FORK_COMPACTION_DEPTH_THRESHOLD)
+}
+
+fn default_storage_profile_from_env() -> StorageProfile {
+    env::var("RESON_SANDBOX_STORAGE_PROFILE")
+        .or_else(|_| env::var("BRACKET_SANDBOX_STORAGE_PROFILE"))
+        .ok()
+        .and_then(|value| parse_storage_profile(&value))
+        .unwrap_or(StorageProfile::LocalEphemeral)
+}
+
+fn default_continuity_tier_from_env() -> ContinuityTier {
+    env::var("RESON_SANDBOX_CONTINUITY_TIER")
+        .or_else(|_| env::var("BRACKET_SANDBOX_CONTINUITY_TIER"))
+        .ok()
+        .and_then(|value| parse_continuity_tier(&value))
+        .unwrap_or(ContinuityTier::TierB)
+}
+
+fn default_degraded_mode_from_env() -> bool {
+    env::var("RESON_SANDBOX_DEGRADED_MODE")
+        .or_else(|_| env::var("BRACKET_SANDBOX_DEGRADED_MODE"))
+        .ok()
+        .and_then(|value| parse_bool_flag(&value))
+        .unwrap_or(false)
+}
+
+fn default_node_region_from_env() -> String {
+    env::var("RESON_SANDBOX_NODE_REGION")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_REGION"))
+        .unwrap_or_else(|_| DEFAULT_NODE_REGION.to_string())
+}
+
+fn default_node_zone_from_env() -> String {
+    env::var("RESON_SANDBOX_NODE_ZONE")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_ZONE"))
+        .unwrap_or_else(|_| DEFAULT_NODE_ZONE.to_string())
+}
+
+fn default_node_rack_from_env() -> String {
+    env::var("RESON_SANDBOX_NODE_RACK")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_RACK"))
+        .unwrap_or_else(|_| DEFAULT_NODE_RACK.to_string())
+}
+
+fn default_admission_frozen_from_env() -> bool {
+    env::var("RESON_SANDBOX_NODE_ADMISSION_FROZEN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_ADMISSION_FROZEN"))
+        .ok()
+        .and_then(|value| parse_bool_flag(&value))
+        .unwrap_or(false)
+}
+
+fn default_ha_mode_from_env() -> bool {
+    env::var("RESON_SANDBOX_HA_MODE")
+        .or_else(|_| env::var("BRACKET_SANDBOX_HA_MODE"))
+        .ok()
+        .and_then(|value| parse_bool_flag(&value))
+        .unwrap_or(false)
 }
 
 fn default_security_from_env() -> SecurityConfig {
@@ -617,5 +855,111 @@ fn parse_bool_flag(raw: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+fn parse_storage_profile(raw: &str) -> Option<StorageProfile> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "local-ephemeral" | "local_ephemeral" | "local" => Some(StorageProfile::LocalEphemeral),
+        "durable-shared" | "durable_shared" | "durable" => Some(StorageProfile::DurableShared),
+        _ => None,
+    }
+}
+
+fn parse_continuity_tier(raw: &str) -> Option<ContinuityTier> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tier-a" | "tier_a" | "a" => Some(ContinuityTier::TierA),
+        "tier-b" | "tier_b" | "b" => Some(ContinuityTier::TierB),
+        _ => None,
+    }
+}
+
+fn enforce_continuity_policy(config: &Config) -> Result<()> {
+    let Some(registry) = config.node_registry.as_ref() else {
+        return Ok(());
+    };
+
+    if registry.degraded_mode && registry.continuity_tier != ContinuityTier::TierA {
+        bail!(
+            "degraded mode requires continuity tier `{}` (got `{}`)",
+            CONTINUITY_TIER_A,
+            registry.continuity_tier.as_str()
+        );
+    }
+
+    if !config.ha_mode {
+        return Ok(());
+    }
+
+    match registry.continuity_tier {
+        ContinuityTier::TierB => {
+            if registry.degraded_mode {
+                bail!(
+                    "ha mode cannot advertise tier-b while degraded mode is enabled; set continuity tier to `{}`",
+                    CONTINUITY_TIER_A
+                );
+            }
+        }
+        ContinuityTier::TierA => {
+            if !registry.degraded_mode {
+                bail!(
+                    "ha mode defaults to continuity tier `{}`; tier-a requires explicit degraded mode",
+                    CONTINUITY_TIER_B
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(ha_mode: bool, tier: ContinuityTier, degraded_mode: bool) -> Config {
+        Config {
+            ha_mode,
+            node_registry: Some(NodeRegistryConfig {
+                etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
+                key_prefix: "/reson-sandbox".to_string(),
+                node_id: "node-test".to_string(),
+                advertise_endpoint: "http://127.0.0.1:8052".to_string(),
+                ttl_secs: 15,
+                max_active_vms: Some(10),
+                storage_profile: StorageProfile::DurableShared,
+                continuity_tier: tier,
+                degraded_mode,
+                admission_frozen: false,
+                region: "test-region".to_string(),
+                zone: "test-zone".to_string(),
+                rack: "test-rack".to_string(),
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn continuity_policy_allows_ha_tier_b_default() {
+        let cfg = make_config(true, ContinuityTier::TierB, false);
+        assert!(enforce_continuity_policy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn continuity_policy_rejects_ha_tier_a_without_degraded_mode() {
+        let cfg = make_config(true, ContinuityTier::TierA, false);
+        assert!(enforce_continuity_policy(&cfg).is_err());
+    }
+
+    #[test]
+    fn continuity_policy_allows_ha_tier_a_only_when_degraded_mode_enabled() {
+        let cfg = make_config(true, ContinuityTier::TierA, true);
+        assert!(enforce_continuity_policy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn continuity_policy_rejects_degraded_mode_with_tier_b() {
+        let cfg = make_config(true, ContinuityTier::TierB, true);
+        assert!(enforce_continuity_policy(&cfg).is_err());
     }
 }

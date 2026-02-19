@@ -25,9 +25,10 @@ rg -n "pub mod reconcile;" "$REPO_ROOT/vmd/src/lib.rs" >/dev/null
 rg -n "start_reconcile_worker\\(" "$REPO_ROOT/vmd/src/app.rs" >/dev/null
 rg -n "reconcile::start\\(" "$REPO_ROOT/vmd/src/app.rs" >/dev/null
 rg -n "reconcile\\.run" "$REPO_ROOT/vmd/src/control_bus.rs" >/dev/null
-rg -n "fn plan_reconcile\\(" "$REPO_ROOT/vmd/src/reconcile.rs" >/dev/null
+rg -n "fn plan_reconcile\\(|load_partitioned_session_routes|session_shard_count|reconcile_checkpoint_key|is_sharded_session_key" "$REPO_ROOT/vmd/src/reconcile.rs" >/dev/null
 
 log "reconcile gate: convergence unit tests"
 (cd "$REPO_ROOT" && cargo test -p vmd reconcile_plan_upserts_missing_and_deletes_stale --locked)
+(cd "$REPO_ROOT" && cargo test -p vmd sharded_session_key_detection_is_precise --locked)
 
 log "reconcile gate: passed"

@@ -434,6 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(1),
             nats_dead_letter_subject: std::env::var("RESON_SANDBOX_NATS_DEAD_LETTER_SUBJECT")
                 .unwrap_or_else(|_| format!("{subject_prefix}.dlq.commands")),
+            required_storage_profile: std::env::var("RESON_SANDBOX_REQUIRED_STORAGE_PROFILE").ok(),
         };
         cfg.distributed_control = Some(dist_cfg);
     }

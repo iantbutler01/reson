@@ -1,3 +1,6 @@
+// @dive-file: Public sandbox facade exposing local/dynamic and distributed control flows for session, exec/shell, and fork operations.
+// @dive-rel: Delegates distributed placement, admission, and routing semantics to crates/reson-sandbox/src/distributed.rs.
+// @dive-rel: Preserves locked consumer API while layering HA/distributed policy and node-level multiplexer behavior.
 #![allow(clippy::large_enum_variant)]
 
 use std::collections::{HashMap, HashSet};
@@ -58,7 +61,7 @@ use proto::bracket::portproxy::v1::{
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
     CreateVmRequest, ForkVmRequest, GetVmRequest, ListVMsRequest, Metadata, ResourceSpec, Vm,
-    VmActionRequest, VmSource, VmSourceType,
+    PreDownloadVmImageRequest, RestoreSnapshotRequest, VmActionRequest, VmSource, VmSourceType,
 };
 
 const META_SESSION_ID: &str = "reson.session_id";
@@ -66,6 +69,11 @@ const META_BRANCH_ID: &str = "reson.branch_id";
 const META_PARENT_SESSION_ID: &str = "reson.parent_session_id";
 const META_PARENT_VM_ID: &str = "reson.parent_vm_id";
 const META_FORK_ID: &str = "reson.fork_id";
+const META_FORK_SNAPSHOT: &str = "reson.fork_snapshot";
+const META_EXEC_RESTORE_SNAPSHOT_ID: &str = "reson.execution_restore_snapshot_id";
+const META_EXEC_RESTORE_SNAPSHOT_NAME: &str = "reson.execution_restore_snapshot_name";
+const META_TIER_B_ELIGIBLE: &str = "reson.tier_b_eligible";
+const META_EXECUTION_FIDELITY_REQUIREMENT: &str = "reson.execution_fidelity_requirement";
 
 #[derive(Clone, Debug)]
 pub struct DistributedControlConfig {
@@ -77,6 +85,12 @@ pub struct DistributedControlConfig {
     pub nats_stream_max_age_secs: u64,
     pub nats_stream_replicas: usize,
     pub nats_dead_letter_subject: String,
+    pub required_storage_profile: Option<String>,
+    pub required_continuity_tier: Option<String>,
+    pub allow_tier_a_degraded: bool,
+    pub tenant_session_quota: Option<usize>,
+    pub workspace_session_quota: Option<usize>,
+    pub admission_retry_after_ms: u64,
 }
 
 impl Default for DistributedControlConfig {
@@ -91,6 +105,12 @@ impl Default for DistributedControlConfig {
             nats_stream_max_age_secs: 60 * 60 * 24 * 7,
             nats_stream_replicas: 1,
             nats_dead_letter_subject: format!("{subject_prefix}.dlq.commands"),
+            required_storage_profile: None,
+            required_continuity_tier: Some("tier-b".to_string()),
+            allow_tier_a_degraded: false,
+            tenant_session_quota: Some(256),
+            workspace_session_quota: Some(64),
+            admission_retry_after_ms: 2_000,
         }
     }
 }
@@ -119,6 +139,10 @@ pub enum SandboxError {
     SessionNotFound(String),
     #[error("daemon unavailable: {0}")]
     DaemonUnavailable(String),
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
+    #[error("ownership fence conflict: {0}")]
+    FenceConflict(String),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
     #[error("invalid config: {0}")]
@@ -145,6 +169,22 @@ impl Default for ResourceLimits {
 }
 
 #[derive(Clone, Debug)]
+pub struct WarmPoolProfile {
+    pub image: String,
+    pub architecture: Option<String>,
+    pub min_inventory: usize,
+}
+
+impl WarmPoolProfile {
+    fn normalized_architecture(&self) -> Option<String> {
+        self.architecture
+            .as_deref()
+            .map(normalize_architecture_label)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SandboxConfig {
     pub endpoint: String,
     pub control_gateway_endpoints: Vec<String>,
@@ -160,6 +200,8 @@ pub struct SandboxConfig {
     pub default_resources: ResourceLimits,
     pub default_shell: String,
     pub portproxy_client_bin: Option<PathBuf>,
+    pub warm_pool_profiles: Vec<WarmPoolProfile>,
+    pub prewarm_on_start: bool,
     pub distributed_control: Option<DistributedControlConfig>,
     pub auth_token: Option<String>,
     pub tls: Option<TlsClientConfig>,
@@ -183,6 +225,8 @@ impl Default for SandboxConfig {
             default_resources: ResourceLimits::default(),
             default_shell: "bash".to_string(),
             portproxy_client_bin: None,
+            warm_pool_profiles: Vec::new(),
+            prewarm_on_start: true,
             distributed_control: None,
             auth_token: None,
             tls: None,
@@ -481,6 +525,7 @@ struct SandboxInner {
     managed_daemon: Mutex<Option<ManagedDaemon>>,
     ready_vm_rpc: Mutex<HashMap<String, i32>>,
     node_multiplexers: Mutex<HashMap<String, Arc<NodePortMultiplexer>>>,
+    warm_pool_ready: Mutex<HashSet<String>>,
 }
 
 enum ControlBackend {
@@ -494,7 +539,8 @@ pub struct Session {
     sandbox: Sandbox,
     session_id: String,
     vm_id: String,
-    node_endpoint: String,
+    node_endpoint: Arc<Mutex<String>>,
+    ownership_fence: Arc<Mutex<Option<String>>>,
 }
 
 impl Session {
@@ -506,13 +552,67 @@ impl Session {
         &self.vm_id
     }
 
+    async fn ownership_fence(&self) -> Option<String> {
+        self.ownership_fence.lock().await.clone()
+    }
+
+    async fn current_node_endpoint(&self) -> String {
+        self.node_endpoint.lock().await.clone()
+    }
+
+    async fn update_route_state(
+        &self,
+        previous_endpoint: &str,
+        resolved_endpoint: &str,
+        next_fence: Option<String>,
+    ) {
+        if previous_endpoint != resolved_endpoint {
+            let mut guard = self.node_endpoint.lock().await;
+            *guard = resolved_endpoint.to_string();
+        }
+        if let Some(fence) = next_fence {
+            let mut guard = self.ownership_fence.lock().await;
+            *guard = Some(fence);
+        }
+    }
+
+    async fn resolve_session_endpoint(&self) -> Result<String> {
+        let current_endpoint = self.current_node_endpoint().await;
+        let expected_fence = self.ownership_fence().await;
+        let (resolved_endpoint, next_fence) = self
+            .sandbox
+            .resolve_session_endpoint(
+                &self.session_id,
+                &self.vm_id,
+                &current_endpoint,
+                expected_fence.as_deref(),
+            )
+            .await?;
+        self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
+            .await;
+        Ok(resolved_endpoint)
+    }
+
+    async fn ensure_session_rpc_endpoint(&self) -> Result<String> {
+        let current_endpoint = self.current_node_endpoint().await;
+        let expected_fence = self.ownership_fence().await;
+        let (resolved_endpoint, rpc_port, next_fence) = self
+            .sandbox
+            .ensure_vm_and_get_rpc_port_for_session(
+                &self.session_id,
+                &self.vm_id,
+                &current_endpoint,
+                expected_fence.as_deref(),
+            )
+            .await?;
+        self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
+            .await;
+        Ok(format!("http://127.0.0.1:{rpc_port}"))
+    }
+
     pub async fn exec(&self, command: &str, opts: ExecOptions) -> Result<ExecHandle> {
         let started = Instant::now();
-        let rpc_port = self
-            .sandbox
-            .ensure_vm_and_get_rpc_port(&self.vm_id, &self.node_endpoint)
-            .await?;
-        let endpoint = format!("http://127.0.0.1:{rpc_port}");
+        let endpoint = self.ensure_session_rpc_endpoint().await?;
         let mut client = ShellExecClient::connect(endpoint).await?;
 
         let shell = opts
@@ -633,11 +733,7 @@ impl Session {
 
     pub async fn shell(&self, opts: ShellOptions) -> Result<ShellHandle> {
         let started = Instant::now();
-        let rpc_port = self
-            .sandbox
-            .ensure_vm_and_get_rpc_port(&self.vm_id, &self.node_endpoint)
-            .await?;
-        let endpoint = format!("http://127.0.0.1:{rpc_port}");
+        let endpoint = self.ensure_session_rpc_endpoint().await?;
         let mut client = ShellExecClient::connect(endpoint).await?;
 
         let shell = opts
@@ -730,9 +826,10 @@ impl Session {
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let endpoint = self.resolve_session_endpoint().await?;
         let mut client = self
             .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &self.node_endpoint)
+            .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
         let response = client
             .read_file(Request::new(ReadFileRequest {
@@ -744,9 +841,10 @@ impl Session {
     }
 
     pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<()> {
+        let endpoint = self.resolve_session_endpoint().await?;
         let mut client = self
             .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &self.node_endpoint)
+            .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
         client
             .write_file(Request::new(WriteFileRequest {
@@ -762,9 +860,10 @@ impl Session {
         &self,
         path: &str,
     ) -> Result<Vec<proto::bracket::portproxy::v1::DirectoryEntry>> {
+        let endpoint = self.resolve_session_endpoint().await?;
         let mut client = self
             .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &self.node_endpoint)
+            .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
         let response = client
             .list_directory(Request::new(ListDirectoryRequest {
@@ -776,9 +875,10 @@ impl Session {
     }
 
     pub async fn delete_path(&self, path: &str) -> Result<()> {
+        let endpoint = self.resolve_session_endpoint().await?;
         let mut client = self
             .sandbox
-            .portproxy_client_for_vm(&self.vm_id, &self.node_endpoint)
+            .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
         client
             .delete_path(Request::new(DeletePathRequest {
@@ -790,9 +890,10 @@ impl Session {
 
     pub async fn forward_port(&self, guest_port: u16) -> Result<ForwardHandle> {
         let started = Instant::now();
+        let node_endpoint = self.resolve_session_endpoint().await?;
         let vm = self
             .sandbox
-            .ensure_vm_running(&self.vm_id, &self.node_endpoint)
+            .ensure_vm_running(&self.vm_id, &node_endpoint)
             .await?;
         let proxy_port = vm
             .network
@@ -809,10 +910,10 @@ impl Session {
                 "VM reported zero proxy port for forwarding".into(),
             ));
         }
-        let proxy_addr = portproxy_server_addr(&self.node_endpoint, proxy_port)?;
+        let proxy_addr = portproxy_server_addr(&node_endpoint, proxy_port)?;
         let multiplexer = self
             .sandbox
-            .node_multiplexer_for_endpoint(&self.node_endpoint)
+            .node_multiplexer_for_endpoint(&node_endpoint)
             .await;
         let host_port = multiplexer.register(guest_port, proxy_addr).await?;
 
@@ -824,7 +925,7 @@ impl Session {
                         .acquire_port_lease(distributed::PortAllocation {
                             session_id: self.session_id.clone(),
                             vm_id: self.vm_id.clone(),
-                            endpoint: self.node_endpoint.clone(),
+                            endpoint: node_endpoint.clone(),
                             guest_port,
                             host_port,
                         })
@@ -842,7 +943,7 @@ impl Session {
                 json!({
                     "session_id": self.session_id.as_str(),
                     "vm_id": self.vm_id.as_str(),
-                    "endpoint": self.node_endpoint.as_str(),
+                    "endpoint": node_endpoint.as_str(),
                     "guest_port": guest_port,
                     "host_port": host_port,
                 }),
@@ -863,7 +964,7 @@ impl Session {
                 sandbox: self.sandbox.clone(),
                 session_id: self.session_id.clone(),
                 vm_id: self.vm_id.clone(),
-                node_endpoint: self.node_endpoint.clone(),
+                node_endpoint,
             }),
         };
         log_slo_observation("port.forward.establish", started.elapsed(), "ok");
@@ -872,7 +973,9 @@ impl Session {
 
     pub async fn fork(&self, opts: ForkOptions) -> Result<ForkResult> {
         let auto_start_child = opts.auto_start_child;
+        let node_endpoint = self.resolve_session_endpoint().await?;
         let child_session_id = Uuid::new_v4().to_string();
+        let ownership_fence = self.ownership_fence().await;
         let mut child_metadata = opts.child_metadata;
         child_metadata.insert(META_SESSION_ID.to_string(), child_session_id.clone());
         child_metadata.insert(META_PARENT_SESSION_ID.to_string(), self.session_id.clone());
@@ -888,15 +991,16 @@ impl Session {
                     "session_id": self.session_id.as_str(),
                     "vm_id": self.vm_id.as_str(),
                     "child_session_id": child_session_id.as_str(),
-                    "endpoint": self.node_endpoint.as_str(),
+                    "endpoint": node_endpoint.as_str(),
                     "auto_start_child": auto_start_child,
+                    "expected_fence": ownership_fence.as_deref(),
                 }),
             )
             .await?;
 
         let mut client = self
             .sandbox
-            .vmd_client_for_endpoint(&self.node_endpoint)
+            .vmd_client_for_endpoint(&node_endpoint)
             .await?;
         let response = client
             .fork_vm(self.sandbox.request_with_auth(ForkVmRequest {
@@ -917,16 +1021,24 @@ impl Session {
         if auto_start_child {
             let _ = self
                 .sandbox
-                .ensure_vm_and_get_rpc_port(&child_vm.id, &self.node_endpoint)
+                .ensure_vm_and_get_rpc_port(&child_vm.id, &node_endpoint)
                 .await?;
         }
+        let (tenant_id, workspace_id) = self
+            .sandbox
+            .current_session_scope(&self.session_id)
+            .await?;
 
-        self.sandbox
+        let child_fence = self
+            .sandbox
             .bind_session_route(
                 &child_session_id,
                 &child_vm.id,
-                &self.node_endpoint,
+                &node_endpoint,
                 Some(response.fork_id.as_str()),
+                Some(tenant_id.as_str()),
+                Some(workspace_id.as_str()),
+                None,
             )
             .await?;
 
@@ -934,7 +1046,8 @@ impl Session {
             sandbox: self.sandbox.clone(),
             session_id: child_session_id.clone(),
             vm_id: child_vm.id,
-            node_endpoint: self.node_endpoint.clone(),
+            node_endpoint: Arc::new(Mutex::new(node_endpoint)),
+            ownership_fence: Arc::new(Mutex::new(child_fence)),
         };
 
         Ok(ForkResult {
@@ -950,8 +1063,15 @@ impl Session {
     }
 
     pub async fn discard(self) -> Result<()> {
+        let ownership_fence = self.ownership_fence().await;
+        let node_endpoint = self.current_node_endpoint().await;
         self.sandbox
-            .discard_vm(&self.vm_id, &self.node_endpoint, Some(&self.session_id))
+            .discard_vm(
+                &self.vm_id,
+                &node_endpoint,
+                Some(&self.session_id),
+                ownership_fence.as_deref(),
+            )
             .await
     }
 }
@@ -982,10 +1102,12 @@ impl Sandbox {
                 managed_daemon: Mutex::new(None),
                 ready_vm_rpc: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
+                warm_pool_ready: Mutex::new(HashSet::new()),
             }),
         };
 
         sandbox.ensure_daemon_ready().await?;
+        sandbox.prewarm_warm_pool_profiles().await?;
         Ok(sandbox)
     }
 
@@ -1002,7 +1124,39 @@ impl Sandbox {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let auto_start = opts.auto_start;
 
+        let mut metadata = opts.metadata;
+        let tenant_id = metadata
+            .get("tenant_id")
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        let workspace_id = metadata
+            .get("workspace_id")
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+        metadata
+            .entry("tenant_id".to_string())
+            .or_insert_with(|| tenant_id.clone());
+        metadata
+            .entry("workspace_id".to_string())
+            .or_insert_with(|| workspace_id.clone());
+        let tier_b_eligible = resolve_tier_b_eligibility(&metadata);
+        metadata.insert(
+            META_TIER_B_ELIGIBLE.to_string(),
+            if tier_b_eligible { "true" } else { "false" }.to_string(),
+        );
+        metadata.insert(
+            META_EXECUTION_FIDELITY_REQUIREMENT.to_string(),
+            if tier_b_eligible {
+                "disk+memory".to_string()
+            } else {
+                "best-effort".to_string()
+            },
+        );
+
         if let Some((vm, node_endpoint)) = self.find_vm_by_session_id(&session_id).await? {
+            let expected_fence = self.current_session_fence(&session_id).await?;
+            let (attached_tenant_id, attached_workspace_id) =
+                self.current_session_scope(&session_id).await?;
             #[cfg(feature = "distributed-control")]
             self.publish_control_command(
                 "session.attach",
@@ -1011,27 +1165,49 @@ impl Sandbox {
                     "session_id": session_id.as_str(),
                     "vm_id": vm.id.as_str(),
                     "endpoint": node_endpoint.as_str(),
+                    "tenant_id": attached_tenant_id.as_str(),
+                    "workspace_id": attached_workspace_id.as_str(),
+                    "expected_fence": expected_fence.as_deref(),
                 }),
             )
             .await?;
 
+            // @dive: Reattach path replays execution snapshot restore hints before booting to preserve Tier-B state fidelity.
+            let _ = self
+                .restore_execution_state_if_needed(
+                    &session_id,
+                    &vm.id,
+                    &node_endpoint,
+                    &vm,
+                    false,
+                )
+                .await?;
             let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
             let _ = self
                 .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
                 .await?;
-            self.bind_session_route(&session_id, &vm.id, &node_endpoint, None)
+            let next_fence = self
+                .bind_session_route(
+                    &session_id,
+                    &vm.id,
+                    &node_endpoint,
+                    None,
+                    Some(attached_tenant_id.as_str()),
+                    Some(attached_workspace_id.as_str()),
+                    expected_fence.as_deref(),
+                )
                 .await?;
             let session = Session {
                 sandbox: self.clone(),
                 session_id,
                 vm_id: vm.id,
-                node_endpoint,
+                node_endpoint: Arc::new(Mutex::new(node_endpoint)),
+                ownership_fence: Arc::new(Mutex::new(next_fence)),
             };
             log_slo_observation("session.attach", started.elapsed(), "ok");
             return Ok(session);
         }
 
-        let mut metadata = opts.metadata;
         metadata.insert(META_SESSION_ID.to_string(), session_id.clone());
         metadata.insert(META_BRANCH_ID.to_string(), session_id.clone());
 
@@ -1044,12 +1220,20 @@ impl Sandbox {
         let image = opts
             .image
             .unwrap_or_else(|| self.inner.cfg.default_image.clone());
+        let architecture = opts.architecture.unwrap_or_else(|| {
+            self.inner
+                .cfg
+                .default_architecture
+                .clone()
+                .or_else(detect_host_architecture_label)
+                .unwrap_or_default()
+        });
 
         let request = CreateVmRequest {
             name,
             source: Some(VmSource {
                 r#type: VmSourceType::Docker as i32,
-                reference: image,
+                reference: image.clone(),
             }),
             resources: Some(ResourceSpec {
                 vcpu: resources.vcpu,
@@ -1058,16 +1242,14 @@ impl Sandbox {
             }),
             metadata: Some(Metadata { entries: metadata }),
             auto_start: opts.auto_start,
-            architecture: opts.architecture.unwrap_or_else(|| {
-                self.inner
-                    .cfg
-                    .default_architecture
-                    .clone()
-                    .unwrap_or_default()
-            }),
+            architecture: architecture.clone(),
         };
 
-        let node_endpoint = self.endpoint_for_new_session(&session_id).await?;
+        let node_endpoint = self
+            .endpoint_for_new_session(&session_id, &tenant_id, &workspace_id, tier_b_eligible)
+            .await?;
+        let warm_pool_key = warm_pool_key(&node_endpoint, image.as_str(), architecture.as_str());
+        let warm_pool_hit = self.warm_pool_contains_key(warm_pool_key.as_str()).await;
         #[cfg(feature = "distributed-control")]
         self.publish_control_command(
             "session.create",
@@ -1075,7 +1257,13 @@ impl Sandbox {
             json!({
                 "session_id": session_id.as_str(),
                 "endpoint": node_endpoint.as_str(),
+                "tenant_id": tenant_id.as_str(),
+                "workspace_id": workspace_id.as_str(),
                 "auto_start": auto_start,
+                "tier_b_eligible": tier_b_eligible,
+                "execution_fidelity_requirement": if tier_b_eligible { "disk+memory" } else { "best-effort" },
+                "warm_pool_hit": warm_pool_hit,
+                "architecture": architecture.as_str(),
             }),
         )
         .await?;
@@ -1096,7 +1284,16 @@ impl Sandbox {
         let vm = final_vm
             .ok_or_else(|| SandboxError::InvalidResponse("create_vm stream missing VM".into()))?;
 
-        self.bind_session_route(&session_id, &vm.id, &node_endpoint, None)
+        let next_fence = self
+            .bind_session_route(
+                &session_id,
+                &vm.id,
+                &node_endpoint,
+                None,
+                Some(tenant_id.as_str()),
+                Some(workspace_id.as_str()),
+                None,
+            )
             .await?;
 
         let running_state = proto::vmd::v1::VmState::Running as i32;
@@ -1110,8 +1307,29 @@ impl Sandbox {
             sandbox: self.clone(),
             session_id,
             vm_id: vm.id,
-            node_endpoint,
+            node_endpoint: Arc::new(Mutex::new(node_endpoint)),
+            ownership_fence: Arc::new(Mutex::new(next_fence)),
         };
+
+        if warm_pool_hit {
+            log_slo_observation("session.create.warm_pool", started.elapsed(), "ok");
+        } else {
+            log_slo_observation("session.create.cold_cache_hit", started.elapsed(), "ok");
+            let sandbox = self.clone();
+            let endpoint = session.current_node_endpoint().await;
+            let refill_profile = WarmPoolProfile {
+                image,
+                architecture: Some(architecture),
+                min_inventory: 1,
+            };
+            tokio::spawn(async move {
+                let profiles = vec![refill_profile];
+                let _ = sandbox
+                    .prewarm_profiles_on_endpoint(endpoint.as_str(), &profiles)
+                    .await;
+            });
+        }
+
         log_slo_observation("session.create", started.elapsed(), "ok");
         Ok(session)
     }
@@ -1122,6 +1340,8 @@ impl Sandbox {
             .find_vm_by_session_id(session_id)
             .await?
             .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?;
+        let expected_fence = self.current_session_fence(session_id).await?;
+        let (tenant_id, workspace_id) = self.current_session_scope(session_id).await?;
 
         #[cfg(feature = "distributed-control")]
         self.publish_control_command(
@@ -1131,22 +1351,39 @@ impl Sandbox {
                 "session_id": session_id,
                 "vm_id": vm.id.as_str(),
                 "endpoint": node_endpoint.as_str(),
+                "tenant_id": tenant_id.as_str(),
+                "workspace_id": workspace_id.as_str(),
+                "expected_fence": expected_fence.as_deref(),
             }),
         )
         .await?;
 
+        // @dive: Attach uses the same restore primitive as failover rebinding so execution-state recovery is deterministic.
+        let _ = self
+            .restore_execution_state_if_needed(session_id, &vm.id, &node_endpoint, &vm, false)
+            .await?;
         let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
         let _ = self
             .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
             .await?;
-        self.bind_session_route(session_id, &vm.id, &node_endpoint, None)
+        let next_fence = self
+            .bind_session_route(
+                session_id,
+                &vm.id,
+                &node_endpoint,
+                None,
+                Some(tenant_id.as_str()),
+                Some(workspace_id.as_str()),
+                expected_fence.as_deref(),
+            )
             .await?;
 
         let session = Session {
             sandbox: self.clone(),
             session_id: session_id.to_string(),
             vm_id: vm.id,
-            node_endpoint,
+            node_endpoint: Arc::new(Mutex::new(node_endpoint)),
+            ownership_fence: Arc::new(Mutex::new(next_fence)),
         };
         log_slo_observation("session.attach", started.elapsed(), "ok");
         Ok(session)
@@ -1267,6 +1504,101 @@ impl Sandbox {
             #[cfg(feature = "distributed-control")]
             ControlBackend::Distributed(_) => self.ensure_distributed_ready().await,
         }
+    }
+
+    async fn prewarm_warm_pool_profiles(&self) -> Result<()> {
+        if !self.inner.cfg.prewarm_on_start {
+            return Ok(());
+        }
+
+        let profiles = self.resolved_warm_pool_profiles();
+        if profiles.is_empty() {
+            return Ok(());
+        }
+
+        for endpoint in self.candidate_endpoints().await? {
+            if self.health_check_endpoint(&endpoint).await.is_err() {
+                continue;
+            }
+            self.prewarm_profiles_on_endpoint(&endpoint, &profiles).await?;
+        }
+        Ok(())
+    }
+
+    fn resolved_warm_pool_profiles(&self) -> Vec<WarmPoolProfile> {
+        if !self.inner.cfg.warm_pool_profiles.is_empty() {
+            return self.inner.cfg.warm_pool_profiles.clone();
+        }
+
+        let architecture = self
+            .inner
+            .cfg
+            .default_architecture
+            .as_deref()
+            .map(normalize_architecture_label)
+            .filter(|value| !value.is_empty())
+            .or_else(detect_host_architecture_label);
+
+        vec![WarmPoolProfile {
+            image: self.inner.cfg.default_image.clone(),
+            architecture,
+            min_inventory: 1,
+        }]
+    }
+
+    async fn prewarm_profiles_on_endpoint(
+        &self,
+        endpoint: &str,
+        profiles: &[WarmPoolProfile],
+    ) -> Result<()> {
+        for profile in profiles {
+            if profile.image.trim().is_empty() {
+                continue;
+            }
+            let architecture = profile
+                .normalized_architecture()
+                .or_else(detect_host_architecture_label)
+                .unwrap_or_default();
+            let key = warm_pool_key(endpoint, profile.image.as_str(), architecture.as_str());
+            if self.warm_pool_contains_key(key.as_str()).await {
+                continue;
+            }
+            if self
+                .prewarm_profile_on_endpoint(endpoint, profile, architecture.as_str())
+                .await
+                .is_ok()
+            {
+                self.warm_pool_mark_ready(key).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn prewarm_profile_on_endpoint(
+        &self,
+        endpoint: &str,
+        profile: &WarmPoolProfile,
+        architecture: &str,
+    ) -> Result<()> {
+        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
+        let mut stream = client
+            .pre_download_vm_image(self.request_with_auth(PreDownloadVmImageRequest {
+                reference: profile.image.clone(),
+                architecture: architecture.to_string(),
+                force: false,
+            }))
+            .await?
+            .into_inner();
+        while stream.message().await?.is_some() {}
+        Ok(())
+    }
+
+    async fn warm_pool_contains_key(&self, key: &str) -> bool {
+        self.inner.warm_pool_ready.lock().await.contains(key)
+    }
+
+    async fn warm_pool_mark_ready(&self, key: String) {
+        self.inner.warm_pool_ready.lock().await.insert(key);
     }
 
     fn build_client_tls_config(&self, endpoint: &str) -> Result<ClientTlsConfig> {
@@ -1409,7 +1741,13 @@ impl Sandbox {
         Ok(endpoints)
     }
 
-    async fn endpoint_for_new_session(&self, _session_id: &str) -> Result<String> {
+    async fn endpoint_for_new_session(
+        &self,
+        _session_id: &str,
+        _tenant_id: &str,
+        _workspace_id: &str,
+        _tier_b_eligible: bool,
+    ) -> Result<String> {
         #[cfg(feature = "distributed-control")]
         if let ControlBackend::Distributed(control) = &self.inner.control_backend {
             if let Some(endpoint) = control
@@ -1420,10 +1758,18 @@ impl Sandbox {
             {
                 return normalize_endpoint(&endpoint);
             }
-            let node = control.select_node_for_session(_session_id).await?;
+            let node = control
+                .select_node_for_session_with_eligibility(
+                    _session_id,
+                    _tenant_id,
+                    _workspace_id,
+                    _tier_b_eligible,
+                )
+                .await?;
             return normalize_endpoint(&node.endpoint);
         }
 
+        let _ = _tier_b_eligible;
         for endpoint in self.candidate_endpoints().await? {
             if self.health_check_endpoint(&endpoint).await.is_ok() {
                 return Ok(endpoint);
@@ -1448,24 +1794,37 @@ impl Sandbox {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn bind_session_route(
         &self,
         _session_id: &str,
         _vm_id: &str,
         _endpoint: &str,
         _fork_id: Option<&str>,
-    ) -> Result<()> {
+        _tenant_id: Option<&str>,
+        _workspace_id: Option<&str>,
+        _expected_fence: Option<&str>,
+    ) -> Result<Option<String>> {
         #[cfg(feature = "distributed-control")]
         if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-            control
-                .put_session_route(distributed::SessionRoute {
-                    session_id: _session_id.to_string(),
-                    vm_id: _vm_id.to_string(),
-                    endpoint: _endpoint.to_string(),
-                    node_id: None,
-                    fork_id: _fork_id.map(ToOwned::to_owned),
-                })
+            let route = control
+                .put_session_route(
+                    distributed::SessionRoute {
+                        session_id: _session_id.to_string(),
+                        vm_id: _vm_id.to_string(),
+                        endpoint: _endpoint.to_string(),
+                        node_id: None,
+                        fork_id: _fork_id.map(ToOwned::to_owned),
+                        ownership_fence: None,
+                        tenant_id: _tenant_id.unwrap_or("default").to_string(),
+                        workspace_id: _workspace_id.unwrap_or("default").to_string(),
+                    },
+                    _expected_fence,
+                )
                 .await?;
+            let fence = route.ownership_fence.clone();
+            let tenant_id = route.tenant_id.clone();
+            let workspace_id = route.workspace_id.clone();
             let _ = control
                 .publish_event(
                     "session.bound",
@@ -1474,6 +1833,50 @@ impl Sandbox {
                         "vm_id": _vm_id,
                         "endpoint": _endpoint,
                         "fork_id": _fork_id,
+                        "tenant_id": tenant_id,
+                        "workspace_id": workspace_id,
+                        "ownership_fence": fence,
+                    }),
+                )
+                .await;
+            return Ok(route.ownership_fence);
+        }
+        let _ = _expected_fence;
+        Ok(None)
+    }
+
+    async fn current_session_scope(&self, session_id: &str) -> Result<(String, String)> {
+        #[cfg(not(feature = "distributed-control"))]
+        let _ = session_id;
+        #[cfg(feature = "distributed-control")]
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route) = control.get_session_route(session_id).await? {
+                return Ok((route.tenant_id, route.workspace_id));
+            }
+        }
+        Ok(("default".to_string(), "default".to_string()))
+    }
+
+    async fn clear_session_route(
+        &self,
+        _session_id: Option<&str>,
+        _vm_id: &str,
+        _expected_fence: Option<&str>,
+    ) -> Result<()> {
+        #[cfg(feature = "distributed-control")]
+        if let (ControlBackend::Distributed(control), Some(session_id)) =
+            (&self.inner.control_backend, _session_id)
+        {
+            control
+                .delete_session_route(session_id, _expected_fence)
+                .await?;
+            let _ = control
+                .publish_event(
+                    "session.discarded",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "vm_id": _vm_id,
+                        "ownership_fence": _expected_fence,
                     }),
                 )
                 .await;
@@ -1481,23 +1884,293 @@ impl Sandbox {
         Ok(())
     }
 
-    async fn clear_session_route(&self, _session_id: Option<&str>, _vm_id: &str) -> Result<()> {
+    async fn current_session_fence(&self, session_id: &str) -> Result<Option<String>> {
         #[cfg(feature = "distributed-control")]
-        if let (ControlBackend::Distributed(control), Some(session_id)) =
-            (&self.inner.control_backend, _session_id)
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            return Ok(control
+                .get_session_route(session_id)
+                .await?
+                .and_then(|route| route.ownership_fence));
+        }
+        let _ = session_id;
+        Ok(None)
+    }
+
+    async fn ensure_vm_and_get_rpc_port_for_session(
+        &self,
+        session_id: &str,
+        vm_id: &str,
+        endpoint: &str,
+        expected_fence: Option<&str>,
+    ) -> Result<(String, i32, Option<String>)> {
+        let (resolved_endpoint, next_fence) = self
+            .resolve_session_endpoint(session_id, vm_id, endpoint, expected_fence)
+            .await?;
+        match self
+            .ensure_vm_and_get_rpc_port(vm_id, &resolved_endpoint)
+            .await
         {
-            let _ = control.delete_session_route(session_id).await;
+            Ok(rpc_port) => Ok((resolved_endpoint, rpc_port, next_fence)),
+            Err(err) => {
+                if !is_rebind_candidate_error(&err) {
+                    return Err(err);
+                }
+
+                // @dive: If guest RPC readiness fails due transport loss, try cross-node rebind before surfacing failure.
+                if let Some((candidate_endpoint, rebound_fence)) = self
+                    .rebind_session_endpoint(
+                        session_id,
+                        vm_id,
+                        &resolved_endpoint,
+                        next_fence.as_deref().or(expected_fence),
+                        "ensure_vm_and_get_rpc_port",
+                    )
+                    .await?
+                {
+                    let rpc_port = self
+                        .ensure_vm_and_get_rpc_port(vm_id, &candidate_endpoint)
+                        .await?;
+                    return Ok((candidate_endpoint, rpc_port, rebound_fence.or(next_fence)));
+                }
+
+                Err(err)
+            }
+        }
+    }
+
+    async fn resolve_session_endpoint(
+        &self,
+        session_id: &str,
+        vm_id: &str,
+        endpoint: &str,
+        expected_fence: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let normalized_endpoint = normalize_endpoint(endpoint)?;
+        match self.ensure_vm_running(vm_id, &normalized_endpoint).await {
+            Ok(_) => Ok((normalized_endpoint, None)),
+            Err(initial_err) => {
+                if let Some((rebound_endpoint, next_fence)) = self
+                    .rebind_session_endpoint(
+                        session_id,
+                        vm_id,
+                        &normalized_endpoint,
+                        expected_fence,
+                        "resolve_session_endpoint",
+                    )
+                    .await?
+                {
+                    return Ok((rebound_endpoint, next_fence));
+                }
+                Err(initial_err)
+            }
+        }
+    }
+
+    async fn rebind_session_endpoint(
+        &self,
+        session_id: &str,
+        vm_id: &str,
+        from_endpoint: &str,
+        expected_fence: Option<&str>,
+        reason: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        for candidate in self.candidate_endpoints().await? {
+            if candidate == from_endpoint {
+                continue;
+            }
+            let Some(candidate_vm) = self.find_vm_by_id_on_endpoint(vm_id, &candidate).await? else {
+                continue;
+            };
+
+            #[cfg(feature = "distributed-control")]
+            if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                // @dive: Rebind events include the trigger reason so failover behavior can be audited per stage.
+                let _ = control
+                    .publish_event(
+                        "stream.rebinding",
+                        json!({
+                            "session_id": session_id,
+                            "vm_id": vm_id,
+                            "from_endpoint": from_endpoint,
+                            "to_endpoint": candidate.clone(),
+                            "expected_fence": expected_fence,
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
+            }
+
+            let restore_snapshot_id = match self
+                .restore_execution_state_if_needed(session_id, vm_id, &candidate, &candidate_vm, true)
+                .await
+            {
+                Ok(snapshot_id) => snapshot_id,
+                Err(err) => {
+                    if matches!(err, SandboxError::InvalidResponse(_)) {
+                        return Err(err);
+                    }
+                    #[cfg(feature = "distributed-control")]
+                    if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                        let _ = control
+                            .publish_event(
+                                "stream.failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "vm_id": vm_id,
+                                    "from_endpoint": from_endpoint,
+                                    "to_endpoint": candidate.clone(),
+                                    "stage": "execution_state_restore",
+                                    "reason": reason,
+                                    "error": err.to_string(),
+                                }),
+                            )
+                            .await;
+                    }
+                    continue;
+                }
+            };
+
+            if self.ensure_vm_running(vm_id, &candidate).await.is_err() {
+                #[cfg(feature = "distributed-control")]
+                if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                    let _ = control
+                        .publish_event(
+                            "stream.failed",
+                            json!({
+                                "session_id": session_id,
+                                "vm_id": vm_id,
+                                "from_endpoint": from_endpoint,
+                                "to_endpoint": candidate.clone(),
+                                "stage": "ensure_vm_running",
+                                "reason": reason,
+                            }),
+                        )
+                        .await;
+                }
+                continue;
+            }
+
+            let mut next_fence = None;
+            #[cfg(feature = "distributed-control")]
+            if let ControlBackend::Distributed(_control) = &self.inner.control_backend {
+                let (tenant_id, workspace_id) = self.current_session_scope(session_id).await?;
+                next_fence = self
+                    .bind_session_route(
+                        session_id,
+                        vm_id,
+                        &candidate,
+                        None,
+                        Some(tenant_id.as_str()),
+                        Some(workspace_id.as_str()),
+                        expected_fence,
+                    )
+                    .await?;
+            }
+
+            let mut ready = self.inner.ready_vm_rpc.lock().await;
+            ready.remove(&ready_key(from_endpoint, vm_id));
+            drop(ready);
+
+            #[cfg(feature = "distributed-control")]
+            if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                let _ = control
+                    .publish_event(
+                        "session.rebound",
+                        json!({
+                            "session_id": session_id,
+                            "vm_id": vm_id,
+                            "from_endpoint": from_endpoint,
+                            "to_endpoint": candidate.clone(),
+                            "expected_fence": expected_fence,
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
+                let _ = control
+                    .publish_event(
+                        "stream.rebound",
+                        json!({
+                            "session_id": session_id,
+                            "vm_id": vm_id,
+                            "from_endpoint": from_endpoint,
+                            "to_endpoint": candidate.clone(),
+                            "restored_snapshot_id": restore_snapshot_id,
+                            "expected_fence": expected_fence,
+                            "reason": reason,
+                        }),
+                    )
+                    .await;
+            } else {
+                let _ = restore_snapshot_id;
+            }
+
+            return Ok(Some((candidate, next_fence)));
+        }
+
+        let _ = (expected_fence, reason);
+        Ok(None)
+    }
+
+    async fn restore_execution_state_if_needed(
+        &self,
+        _session_id: &str,
+        vm_id: &str,
+        endpoint: &str,
+        vm: &Vm,
+        enforce_tier_b: bool,
+    ) -> Result<Option<String>> {
+        let tier_b_eligible = vm_tier_b_eligible(vm);
+        let Some(snapshot_id) = execution_restore_snapshot_id(vm) else {
+            if enforce_tier_b && tier_b_eligible {
+                return Err(SandboxError::InvalidResponse(format!(
+                    "tier_b_eligible session `{_session_id}` requires execution restore snapshot marker"
+                )));
+            }
+            return Ok(None);
+        };
+
+        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
+        client
+            .restore_snapshot(self.request_with_auth(RestoreSnapshotRequest {
+                vm_id: vm_id.to_string(),
+                snapshot_id: snapshot_id.clone(),
+            }))
+            .await?;
+
+        #[cfg(feature = "distributed-control")]
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
             let _ = control
                 .publish_event(
-                    "session.discarded",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "vm_id": _vm_id,
+                    "execution_state.restored",
+                    json!({
+                        "session_id": _session_id,
+                        "vm_id": vm_id,
+                        "endpoint": endpoint,
+                        "snapshot_id": snapshot_id,
+                        "tier_b_eligible": tier_b_eligible,
                     }),
                 )
                 .await;
         }
-        Ok(())
+        let _ = (_session_id, enforce_tier_b);
+        Ok(Some(snapshot_id))
+    }
+
+    async fn find_vm_by_id_on_endpoint(&self, vm_id: &str, endpoint: &str) -> Result<Option<Vm>> {
+        let mut client = match self.vmd_client_for_endpoint(endpoint).await {
+            Ok(client) => client,
+            Err(_) => return Ok(None),
+        };
+        match client
+            .get_vm(self.request_with_auth(GetVmRequest {
+                vm_id: vm_id.to_string(),
+            }))
+            .await
+        {
+            Ok(response) => Ok(Some(response.into_inner())),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(_) => Ok(None),
+        }
     }
 
     async fn find_vm_by_session_id(&self, session_id: &str) -> Result<Option<(Vm, String)>> {
@@ -1605,11 +2278,18 @@ impl Sandbox {
         rpc_port: i32,
     ) -> Result<()> {
         let cache_key = ready_key(endpoint, vm_id);
-        {
+        let cached_ready = {
             let ready = self.inner.ready_vm_rpc.lock().await;
-            if ready.get(&cache_key).copied() == Some(rpc_port) {
+            ready.get(&cache_key).copied() == Some(rpc_port)
+        };
+        if cached_ready {
+            let probe_endpoint = format!("http://127.0.0.1:{rpc_port}");
+            if ShellExecClient::connect(probe_endpoint).await.is_ok() {
                 return Ok(());
             }
+            // @dive: Guest RPC readiness cache is invalidated on failed probe so failover/rebind logic can recover.
+            let mut ready = self.inner.ready_vm_rpc.lock().await;
+            ready.remove(&cache_key);
         }
 
         let endpoint = format!("http://127.0.0.1:{rpc_port}");
@@ -1743,6 +2423,7 @@ impl Sandbox {
         vm_id: &str,
         endpoint: &str,
         session_id: Option<&str>,
+        expected_fence: Option<&str>,
     ) -> Result<()> {
         #[cfg(feature = "distributed-control")]
         self.publish_control_command(
@@ -1752,6 +2433,7 @@ impl Sandbox {
                 "session_id": session_id,
                 "vm_id": vm_id,
                 "endpoint": endpoint,
+                "expected_fence": expected_fence,
             }),
         )
         .await?;
@@ -1771,7 +2453,8 @@ impl Sandbox {
         let mut ready = self.inner.ready_vm_rpc.lock().await;
         ready.remove(&ready_key(endpoint, vm_id));
         drop(ready);
-        self.clear_session_route(session_id, vm_id).await?;
+        self.clear_session_route(session_id, vm_id, expected_fence)
+            .await?;
         Ok(())
     }
 }
@@ -1877,6 +2560,114 @@ fn normalize_dial_host(host: &str) -> &str {
 
 fn ready_key(endpoint: &str, vm_id: &str) -> String {
     format!("{endpoint}::{vm_id}")
+}
+
+fn warm_pool_key(endpoint: &str, image: &str, architecture: &str) -> String {
+    format!("{endpoint}::{image}::{}", normalize_architecture_label(architecture))
+}
+
+fn normalize_architecture_label(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" => "amd64".to_string(),
+        "aarch64" | "arm64" => "arm64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn detect_host_architecture_label() -> Option<String> {
+    let detected = normalize_architecture_label(std::env::consts::ARCH);
+    if detected.is_empty() {
+        None
+    } else {
+        Some(detected.to_string())
+    }
+}
+
+fn resolve_tier_b_eligibility(metadata: &HashMap<String, String>) -> bool {
+    if let Some(raw) = metadata.get(META_TIER_B_ELIGIBLE).or_else(|| metadata.get("tier_b_eligible")) {
+        return parse_bool_like(raw).unwrap_or(true);
+    }
+    true
+}
+
+fn vm_tier_b_eligible(vm: &Vm) -> bool {
+    resolve_tier_b_eligibility(&vm.metadata)
+}
+
+fn parse_bool_like(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_rebind_candidate_error(err: &SandboxError) -> bool {
+    match err {
+        SandboxError::Grpc(status) => {
+            let message = status.message().to_ascii_lowercase();
+            status.code() == tonic::Code::Unavailable
+                || status.code() == tonic::Code::Unknown
+                || message.contains("transport error")
+                || message.contains("connection reset")
+                || message.contains("broken pipe")
+                || message.contains("connection refused")
+        }
+        SandboxError::DaemonUnavailable(message) => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("did not become ready")
+                || lower.contains("transport")
+                || lower.contains("connection reset")
+                || lower.contains("broken pipe")
+                || lower.contains("connection refused")
+        }
+        _ => false,
+    }
+}
+
+fn execution_restore_snapshot_id(vm: &Vm) -> Option<String> {
+    // @dive: Restore selection prefers explicit snapshot IDs, then resolves snapshot names to IDs for compatibility.
+    if let Some(snapshot_id) = vm
+        .metadata
+        .get(META_EXEC_RESTORE_SNAPSHOT_ID)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(snapshot_id.to_string());
+    }
+
+    let mut candidate_names = Vec::new();
+    if let Some(snapshot_name) = vm
+        .metadata
+        .get(META_EXEC_RESTORE_SNAPSHOT_NAME)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        candidate_names.push(snapshot_name.to_string());
+    }
+    if let Some(fork_snapshot_name) = vm
+        .metadata
+        .get(META_FORK_SNAPSHOT)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        candidate_names.push(fork_snapshot_name.to_string());
+    }
+    for snapshot_name in candidate_names {
+        if let Some(snapshot_id) = vm
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.name == snapshot_name)
+            .map(|snapshot| snapshot.id.clone())
+            .filter(|id| !id.trim().is_empty())
+        {
+            return Some(snapshot_id);
+        }
+    }
+    None
 }
 
 fn log_slo_observation(metric: &str, elapsed: Duration, outcome: &str) {

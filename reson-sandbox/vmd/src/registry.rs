@@ -1,3 +1,6 @@
+// @dive-file: Publishes node liveness and scheduling labels into etcd with lease-backed heartbeats.
+// @dive-rel: Emits node capability/placement metadata consumed by crates/reson-sandbox/src/distributed.rs for placement decisions.
+// @dive-rel: Uses vmd/src/config.rs NodeRegistryConfig as the authoritative source for node identity and failure-domain labels.
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -74,6 +77,13 @@ pub async fn start(config: Option<NodeRegistryConfig>) -> Result<Option<NodeRegi
     info!(
         key = %key,
         endpoint = %config.advertise_endpoint,
+        storage_profile = %config.storage_profile.as_str(),
+        continuity_tier = %config.continuity_tier.as_str(),
+        degraded_mode = config.degraded_mode,
+        admission_frozen = config.admission_frozen,
+        region = %config.region,
+        zone = %config.zone,
+        rack = %config.rack,
         ttl_secs = config.ttl_secs,
         "node registry heartbeat enabled"
     );
@@ -97,6 +107,14 @@ async fn register_once(config: &NodeRegistryConfig, key: &str) -> Result<()> {
     let payload = json!({
         "node_id": config.node_id,
         "endpoint": config.advertise_endpoint,
+        "max_active_vms": config.max_active_vms,
+        "storage_profile": config.storage_profile.as_str(),
+        "continuity_tier": config.continuity_tier.as_str(),
+        "degraded_mode": config.degraded_mode,
+        "admission_frozen": config.admission_frozen,
+        "region": config.region,
+        "zone": config.zone,
+        "rack": config.rack,
         "updated_at_unix_ms": unix_millis(),
     })
     .to_string();

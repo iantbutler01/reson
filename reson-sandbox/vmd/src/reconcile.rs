@@ -1,3 +1,6 @@
+// @dive-file: Reconciliation worker that converges etcd session-route state with local VM ownership and publishes completion events.
+// @dive-rel: Consumes node/control-bus config from vmd/src/config.rs and runs under orchestration in vmd/src/app.rs.
+// @dive-rel: Maintains partitioned session-route scanning + resume checkpoints to reduce hotspot risk with sharded etcd keyspaces.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,6 +18,7 @@ use crate::config::{ControlBusConfig, NodeRegistryConfig};
 use crate::state::Manager;
 
 const META_SESSION_ID: &str = "reson.session_id";
+const DEFAULT_SESSION_SHARD_COUNT: u8 = 16;
 
 #[derive(Clone)]
 pub struct ReconcileConfig {
@@ -25,6 +29,7 @@ pub struct ReconcileConfig {
     pub interval: Duration,
     pub nats_url: Option<String>,
     pub nats_subject_prefix: String,
+    pub session_shard_count: u8,
 }
 
 pub struct ReconcileHandle {
@@ -168,6 +173,7 @@ fn derive_config(
         interval: Duration::from_secs(30),
         nats_url,
         nats_subject_prefix,
+        session_shard_count: DEFAULT_SESSION_SHARD_COUNT,
     })
 }
 
@@ -181,20 +187,12 @@ async fn reconcile_once(
         .await
         .context("connect etcd for reconciliation")?;
 
-    let sessions_prefix = format!("{}/sessions/", config.etcd_prefix.trim_end_matches('/'));
-    let response = client
-        .get(sessions_prefix, Some(GetOptions::new().with_prefix()))
+    let checkpoint_key = reconcile_checkpoint_key(config);
+    let checkpoint_revision = read_reconcile_checkpoint_revision(&mut client, &checkpoint_key)
         .await
-        .context("read session routes for reconciliation")?;
-
-    let routes = response
-        .kvs()
-        .iter()
-        .filter_map(|kv| {
-            let key = String::from_utf8(kv.key().to_vec()).ok()?;
-            decode_route_entry(key, kv.value()).ok()
-        })
-        .collect::<Vec<_>>();
+        .unwrap_or(0);
+    let (routes, observed_revision) =
+        load_partitioned_session_routes(&mut client, config).await?;
 
     let plan = plan_reconcile(
         &config.node_endpoint,
@@ -232,6 +230,9 @@ async fn reconcile_once(
         "endpoint": config.node_endpoint,
         "deleted": plan.delete_keys.len(),
         "upserted": plan.upserts.len(),
+        "session_shards": config.session_shard_count,
+        "checkpoint_revision": checkpoint_revision,
+        "observed_revision": observed_revision,
         "updated_at_unix_ms": unix_millis(),
     });
     let reconcile_key = format!(
@@ -244,6 +245,7 @@ async fn reconcile_once(
         .put(reconcile_key, summary.to_string(), None)
         .await
         .context("write reconcile summary")?;
+    let _ = write_reconcile_checkpoint_revision(&mut client, &checkpoint_key, observed_revision).await;
 
     if let Some(nats) = nats {
         let subject = format!("{}.evt.reconcile.completed", config.nats_subject_prefix);
@@ -269,6 +271,115 @@ async fn collect_local_sessions(manager: &Manager) -> HashMap<String, String> {
         }
     }
     out
+}
+
+fn reconcile_checkpoint_key(config: &ReconcileConfig) -> String {
+    format!(
+        "{}/reconcile/checkpoints/{}",
+        config.etcd_prefix.trim_end_matches('/'),
+        config.node_id
+    )
+}
+
+async fn read_reconcile_checkpoint_revision(
+    client: &mut EtcdClient,
+    checkpoint_key: &str,
+) -> Result<i64> {
+    let response = client
+        .get(checkpoint_key.to_string(), None)
+        .await
+        .context("read reconcile checkpoint")?;
+    let Some(kv) = response.kvs().first() else {
+        return Ok(0);
+    };
+    if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(kv.value()) {
+        return Ok(payload
+            .get("revision")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0));
+    }
+    let raw = String::from_utf8(kv.value().to_vec()).unwrap_or_default();
+    Ok(raw.trim().parse::<i64>().unwrap_or(0))
+}
+
+async fn write_reconcile_checkpoint_revision(
+    client: &mut EtcdClient,
+    checkpoint_key: &str,
+    revision: i64,
+) -> Result<()> {
+    let payload = json!({
+        "revision": revision.max(0),
+        "updated_at_unix_ms": unix_millis(),
+    })
+    .to_string();
+    client
+        .put(checkpoint_key.to_string(), payload, None)
+        .await
+        .context("write reconcile checkpoint")?;
+    Ok(())
+}
+
+async fn load_partitioned_session_routes(
+    client: &mut EtcdClient,
+    config: &ReconcileConfig,
+) -> Result<(Vec<SessionRouteEntry>, i64)> {
+    let prefix_root = config.etcd_prefix.trim_end_matches('/');
+    let shard_count = config.session_shard_count.max(1);
+    let mut routes = Vec::new();
+    let mut max_revision = 0i64;
+
+    for shard in 0..shard_count {
+        let prefix = format!("{prefix_root}/sessions/{shard:02}/");
+        let response = client
+            .get(prefix, Some(GetOptions::new().with_prefix()))
+            .await
+            .context("read sharded session routes for reconciliation")?;
+        if let Some(header) = response.header() {
+            max_revision = max_revision.max(header.revision());
+        }
+        for kv in response.kvs() {
+            let key = match String::from_utf8(kv.key().to_vec()) {
+                Ok(key) => key,
+                Err(_) => continue,
+            };
+            if let Ok(route) = decode_route_entry(key, kv.value()) {
+                routes.push(route);
+            }
+        }
+    }
+
+    let legacy_prefix = format!("{prefix_root}/sessions/");
+    let legacy = client
+        .get(legacy_prefix.clone(), Some(GetOptions::new().with_prefix()))
+        .await
+        .context("read legacy session routes for reconciliation")?;
+    if let Some(header) = legacy.header() {
+        max_revision = max_revision.max(header.revision());
+    }
+    for kv in legacy.kvs() {
+        let key = match String::from_utf8(kv.key().to_vec()) {
+            Ok(key) => key,
+            Err(_) => continue,
+        };
+        if is_sharded_session_key(&legacy_prefix, &key) {
+            continue;
+        }
+        if let Ok(route) = decode_route_entry(key, kv.value()) {
+            routes.push(route);
+        }
+    }
+
+    Ok((routes, max_revision))
+}
+
+fn is_sharded_session_key(legacy_prefix: &str, key: &str) -> bool {
+    let Some(rest) = key.strip_prefix(legacy_prefix) else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    let shard = parts.next().unwrap_or_default();
+    let has_session_component = parts.next().is_some();
+    has_session_component && shard.len() == 2 && shard.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn decode_route_entry(key: String, raw: &[u8]) -> Result<SessionRouteEntry> {
@@ -378,5 +489,17 @@ mod tests {
         assert_eq!(plan.upserts[0].session_id, "s2");
         assert_eq!(plan.upserts[0].vm_id, "vm2");
         assert_eq!(plan.upserts[0].endpoint, "http://node-a");
+    }
+
+    #[test]
+    fn sharded_session_key_detection_is_precise() {
+        let prefix = "/reson-sandbox/sessions/";
+        assert!(is_sharded_session_key(prefix, "/reson-sandbox/sessions/03/session-a"));
+        assert!(is_sharded_session_key(prefix, "/reson-sandbox/sessions/15/session-b"));
+        assert!(!is_sharded_session_key(
+            prefix,
+            "/reson-sandbox/sessions/session-legacy"
+        ));
+        assert!(!is_sharded_session_key(prefix, "/reson-sandbox/sessions/ab/session-c"));
     }
 }

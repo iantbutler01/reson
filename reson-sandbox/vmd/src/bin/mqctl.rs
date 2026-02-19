@@ -1,3 +1,6 @@
+// @dive-file: CLI helper for MQ/dead-letter operational workflows in reson-sandbox distributed control.
+// @dive-rel: Uses vmd/src/control_bus.rs replay APIs to exercise durable stream and DLQ behavior.
+// @dive-rel: Mirrors ControlBusConfig defaults from vmd/src/config.rs for standalone operator usage.
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use vmd_rs::config::{Config, ControlBusConfig};
@@ -34,7 +37,10 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = Config::default();
-    let mut control = cfg.control_bus.take().unwrap_or_else(default_control_config);
+    let mut control = cfg
+        .control_bus
+        .take()
+        .unwrap_or_else(default_control_config);
 
     if let Some(nats_url) = cli.nats_url {
         control.nats_url = nats_url;
@@ -91,6 +97,8 @@ fn default_control_config() -> ControlBusConfig {
         command_consumer_durable: "mqctl-replay".to_string(),
         command_max_deliver: 5,
         command_ack_wait_ms: 30_000,
+        max_inflight_commands: 1024,
+        overload_retry_after_ms: 2_000,
         dead_letter_subject: format!("{subject_prefix}.dlq.commands"),
         replay_subject: format!("{subject_prefix}.replay.commands"),
     }

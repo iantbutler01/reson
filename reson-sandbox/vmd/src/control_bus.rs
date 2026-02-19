@@ -1,3 +1,6 @@
+// @dive-file: Runs distributed control-bus command consumption with idempotency, ownership fencing, and failure handling.
+// @dive-rel: Consumes ControlBusConfig from vmd/src/config.rs and enforces bounded in-flight command behavior.
+// @dive-rel: Publishes replay/dead-letter/overload signals consumed by operational gates in scripts/verify_reson_sandbox.sh.
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,12 +12,13 @@ use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::ControlBusConfig;
+use crate::partition::PartitionGate;
 
 pub struct CommandConsumerHandle {
     stop_tx: Option<oneshot::Sender<()>>,
@@ -42,6 +46,8 @@ struct CommandEnvelope {
     command_type: String,
     #[serde(default)]
     ordering_key: String,
+    #[serde(default)]
+    expected_fence: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -66,6 +72,12 @@ struct DeadLetterEnvelope {
 
 #[derive(Clone)]
 struct EtcdDedupeStore {
+    etcd: std::sync::Arc<Mutex<EtcdClient>>,
+    key_prefix: String,
+}
+
+#[derive(Clone)]
+struct EtcdOwnershipFenceStore {
     etcd: std::sync::Arc<Mutex<EtcdClient>>,
     key_prefix: String,
 }
@@ -95,13 +107,74 @@ impl EtcdDedupeStore {
     }
 }
 
+impl EtcdOwnershipFenceStore {
+    async fn connect(config: &ControlBusConfig) -> Result<Option<Self>> {
+        if config.dedupe_etcd_endpoints.is_empty() {
+            return Ok(None);
+        }
+        let client = EtcdClient::connect(config.dedupe_etcd_endpoints.clone(), None)
+            .await
+            .context("connect etcd for ownership fences")?;
+        Ok(Some(Self {
+            etcd: std::sync::Arc::new(Mutex::new(client)),
+            key_prefix: format!(
+                "{}/ownership-fences",
+                config.dedupe_prefix.trim_end_matches('/')
+            ),
+        }))
+    }
+
+    async fn check_and_rotate(
+        &self,
+        ordering_key: &str,
+        expected_fence: Option<&str>,
+    ) -> Result<String> {
+        let key = format!(
+            "{}/{}",
+            self.key_prefix,
+            sanitize_key_component(ordering_key)
+        );
+        let mut client = self.etcd.lock().await;
+        let current = read_fence_value(&mut client, &key).await?;
+        if !ownership_fence_allows_transition(current.as_deref(), expected_fence) {
+            let current_display = current.as_deref().unwrap_or("<none>");
+            let expected_display = expected_fence.unwrap_or("<none>");
+            return Err(anyhow!(
+                "ownership fence mismatch for ordering_key={ordering_key}: expected={expected_display} current={current_display}"
+            ));
+        }
+
+        let next_fence = Uuid::new_v4().to_string();
+        let compare = match expected_fence {
+            Some(expected) => Compare::value(key.clone(), CompareOp::Equal, expected),
+            None => Compare::version(key.clone(), CompareOp::Equal, 0),
+        };
+        let txn = Txn::new().when(vec![compare]).and_then(vec![TxnOp::put(
+            key.clone(),
+            next_fence.clone(),
+            None,
+        )]);
+        let response = client.txn(txn).await.context("ownership fence txn")?;
+        if !response.succeeded() {
+            let latest = read_fence_value(&mut client, &key).await?;
+            let current_display = latest.as_deref().unwrap_or("<none>");
+            let expected_display = expected_fence.unwrap_or("<none>");
+            return Err(anyhow!(
+                "ownership fence compare-and-swap failed: expected={expected_display} current={current_display}"
+            ));
+        }
+        Ok(next_fence)
+    }
+}
+
 pub async fn start(config: Option<ControlBusConfig>) -> Result<Option<CommandConsumerHandle>> {
-    start_with_trigger(config, None).await
+    start_with_trigger(config, None, None).await
 }
 
 pub async fn start_with_trigger(
     config: Option<ControlBusConfig>,
     reconcile_trigger: Option<mpsc::UnboundedSender<()>>,
+    partition_gate: Option<PartitionGate>,
 ) -> Result<Option<CommandConsumerHandle>> {
     let Some(config) = config else {
         return Ok(None);
@@ -139,6 +212,7 @@ pub async fn start_with_trigger(
         .context("start command consumer stream")?;
 
     let dedupe_store = EtcdDedupeStore::connect(&config).await?;
+    let fence_store = EtcdOwnershipFenceStore::connect(&config).await?;
     let node_id = config.node_id.clone();
     let log_node_id = config.node_id.clone();
     let log_nats_url = config.nats_url.clone();
@@ -148,7 +222,11 @@ pub async fn start_with_trigger(
     let log_dead_letter_subject = config.dead_letter_subject.clone();
     let log_dedupe_endpoint_count = config.dedupe_etcd_endpoints.len();
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-    let mut seen_commands: HashMap<String, Instant> = HashMap::new();
+    // @dive: Dedupe state is shared across spawned command workers so duplicate suppression remains cluster-node local and bounded by TTL.
+    let seen_commands: std::sync::Arc<Mutex<HashMap<String, Instant>>> =
+        std::sync::Arc::new(Mutex::new(HashMap::new()));
+    // @dive: Enforces a hard bound on in-flight control commands; overload is signaled deterministically via NAK+retry hint.
+    let inflight_limit = std::sync::Arc::new(Semaphore::new(config.max_inflight_commands));
 
     let join = tokio::spawn(async move {
         const DEDUPE_TTL: Duration = Duration::from_secs(600);
@@ -161,16 +239,43 @@ pub async fn start_with_trigger(
                     };
                     match maybe_msg {
                         Ok(message) => {
-                            process_command_message(
-                                message,
-                                &config,
-                                &node_id,
-                                dedupe_store.as_ref(),
-                                &mut seen_commands,
-                                reconcile_trigger.as_ref(),
-                                &jetstream,
-                                DEDUPE_TTL,
-                            ).await;
+                            let permit = match inflight_limit.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    handle_overloaded_command_message(
+                                        &message,
+                                        &config,
+                                        &node_id,
+                                        &jetstream,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            };
+                            let config = config.clone();
+                            let node_id = node_id.clone();
+                            let dedupe_store = dedupe_store.clone();
+                            let fence_store = fence_store.clone();
+                            let partition_gate = partition_gate.clone();
+                            let seen_commands = seen_commands.clone();
+                            let reconcile_trigger = reconcile_trigger.clone();
+                            let jetstream = jetstream.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                process_command_message(
+                                    message,
+                                    &config,
+                                    &node_id,
+                                    dedupe_store.as_ref(),
+                                    fence_store.as_ref(),
+                                    partition_gate.as_ref(),
+                                    &seen_commands,
+                                    reconcile_trigger.as_ref(),
+                                    &jetstream,
+                                    DEDUPE_TTL,
+                                )
+                                .await;
+                            });
                         }
                         Err(err) => {
                             warn!(
@@ -278,8 +383,8 @@ pub async fn replay_dead_letters(config: ControlBusConfig, limit: usize) -> Resu
                     continue;
                 }
 
-                let payload_bytes = serde_json::to_vec(&envelope.payload)
-                    .context("serialize replay payload")?;
+                let payload_bytes =
+                    serde_json::to_vec(&envelope.payload).context("serialize replay payload")?;
                 let replay_id = if envelope.command_id.trim().is_empty() {
                     format!("replay-{}", Uuid::new_v4())
                 } else {
@@ -303,8 +408,8 @@ pub async fn replay_dead_letters(config: ControlBusConfig, limit: usize) -> Resu
                     "command_id": envelope.command_id,
                     "original_subject": envelope.original_subject,
                 });
-                let replay_event_payload = serde_json::to_vec(&replay_event)
-                    .context("serialize replay event payload")?;
+                let replay_event_payload =
+                    serde_json::to_vec(&replay_event).context("serialize replay event payload")?;
                 let event_ack = jetstream
                     .publish(config.replay_subject.clone(), replay_event_payload.into())
                     .await
@@ -333,7 +438,9 @@ async fn process_command_message(
     config: &ControlBusConfig,
     node_id: &str,
     dedupe_store: Option<&EtcdDedupeStore>,
-    seen_commands: &mut HashMap<String, Instant>,
+    fence_store: Option<&EtcdOwnershipFenceStore>,
+    partition_gate: Option<&PartitionGate>,
+    seen_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
     reconcile_trigger: Option<&mpsc::UnboundedSender<()>>,
     jetstream: &jetstream::Context,
     dedupe_ttl: Duration,
@@ -355,8 +462,35 @@ async fn process_command_message(
         }
     };
 
+    if let Some(gate) = partition_gate {
+        if !gate.mutation_allowed().await {
+            let reason = gate.mutation_rejection_reason().await.unwrap_or_else(|| {
+                "network partition fail-closed: rejecting mutating commands".to_string()
+            });
+            warn!(
+                node_id = %node_id,
+                subject = %message.subject,
+                command_id = %envelope.command_id,
+                command_type = %envelope.command_type,
+                reason = %reason,
+                "rejecting control command while quorum visibility is lost"
+            );
+            if let Err(err) = message
+                .ack_with(AckKind::Nak(Some(gate.command_retry_delay())))
+                .await
+            {
+                warn!(
+                    node_id = %node_id,
+                    command_id = %envelope.command_id,
+                    err = %err,
+                    "failed to nack control command during partition fail-closed enforcement"
+                );
+            }
+            return;
+        }
+    }
+
     let now = Instant::now();
-    seen_commands.retain(|_, ts| now.duration_since(*ts) < dedupe_ttl);
 
     let dedupe_key = dedupe_key(&envelope);
     if let Some(store) = dedupe_store {
@@ -385,18 +519,41 @@ async fn process_command_message(
         }
     }
 
-    if seen_commands.contains_key(&dedupe_key) {
-        debug!(
-            node_id = %node_id,
-            subject = %message.subject,
-            command_id = %envelope.command_id,
-            idempotency_key = %dedupe_key,
-            "dropping duplicate control command"
-        );
-        let _ = message.ack().await;
-        return;
+    {
+        let mut seen = seen_commands.lock().await;
+        seen.retain(|_, ts| now.duration_since(*ts) < dedupe_ttl);
+        if seen.contains_key(&dedupe_key) {
+            debug!(
+                node_id = %node_id,
+                subject = %message.subject,
+                command_id = %envelope.command_id,
+                idempotency_key = %dedupe_key,
+                "dropping duplicate control command"
+            );
+            let _ = message.ack().await;
+            return;
+        }
+        seen.insert(dedupe_key.clone(), now);
     }
-    seen_commands.insert(dedupe_key.clone(), now);
+
+    if let Some(store) = fence_store {
+        let ordering_key = ownership_scope_key(&envelope);
+        if let Err(err) = store
+            .check_and_rotate(&ordering_key, envelope.expected_fence.as_deref())
+            .await
+        {
+            handle_failed_command_message(
+                &message,
+                config,
+                node_id,
+                jetstream,
+                "ownership_fence_conflict",
+                &err.to_string(),
+            )
+            .await;
+            return;
+        }
+    }
 
     debug!(
         node_id = %node_id,
@@ -430,6 +587,40 @@ async fn process_command_message(
     }
 }
 
+async fn handle_overloaded_command_message(
+    message: &jetstream::Message,
+    config: &ControlBusConfig,
+    node_id: &str,
+    jetstream: &jetstream::Context,
+) {
+    let retry_after_ms = config.overload_retry_after_ms.max(1);
+    let details = format!("ResourceExhausted retry_after_ms={retry_after_ms}");
+    let payload = json!({
+        "node_id": node_id,
+        "subject": message.subject.to_string(),
+        "reason": "resource_exhausted",
+        "retry_after_ms": retry_after_ms,
+        "captured_at_unix_ms": unix_millis(),
+    });
+    let subject = format!("{}.evt.command.overloaded", config.subject_prefix);
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        if let Ok(ack) = jetstream.publish(subject, bytes.into()).await {
+            let _ = ack.await;
+        }
+    }
+    if let Err(err) = message
+        .ack_with(AckKind::Nak(Some(Duration::from_millis(retry_after_ms))))
+        .await
+    {
+        warn!(
+            node_id = %node_id,
+            err = %err,
+            details = %details,
+            "failed to nack overloaded control command"
+        );
+    }
+}
+
 async fn handle_failed_command_message(
     message: &jetstream::Message,
     config: &ControlBusConfig,
@@ -446,7 +637,9 @@ async fn handle_failed_command_message(
     let max_deliver = config.command_max_deliver.max(1);
 
     if delivered >= max_deliver {
-        if let Err(err) = publish_dead_letter(message, config, node_id, jetstream, reason, details).await {
+        if let Err(err) =
+            publish_dead_letter(message, config, node_id, jetstream, reason, details).await
+        {
             warn!(
                 node_id = %node_id,
                 reason = %reason,
@@ -483,7 +676,11 @@ async fn publish_dead_letter(
     reason: &str,
     details: &str,
 ) -> Result<()> {
-    let delivered = message.info().map(|info| info.delivered).unwrap_or(1).max(1);
+    let delivered = message
+        .info()
+        .map(|info| info.delivered)
+        .unwrap_or(1)
+        .max(1);
     let payload = serde_json::from_slice::<Value>(&message.payload).unwrap_or_else(|_| {
         json!({
             "raw_payload": String::from_utf8_lossy(&message.payload).to_string(),
@@ -559,9 +756,89 @@ fn dedupe_key(envelope: &CommandEnvelope) -> String {
     format!("anon-{}", Uuid::new_v4())
 }
 
+fn ownership_scope_key(envelope: &CommandEnvelope) -> String {
+    if !envelope.ordering_key.trim().is_empty() {
+        return envelope.ordering_key.trim().to_string();
+    }
+    if !envelope.command_id.trim().is_empty() {
+        return envelope.command_id.trim().to_string();
+    }
+    format!("anon-owner-{}", Uuid::new_v4())
+}
+
+fn ownership_fence_allows_transition(current: Option<&str>, expected: Option<&str>) -> bool {
+    match expected {
+        Some(expected) => current.is_some_and(|value| value == expected),
+        None => current.is_none(),
+    }
+}
+
+fn sanitize_key_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "key".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+async fn read_fence_value(client: &mut EtcdClient, key: &str) -> Result<Option<String>> {
+    let response = client
+        .get(key.to_string(), None)
+        .await
+        .context("read ownership fence key")?;
+    let Some(kv) = response.kvs().first() else {
+        return Ok(None);
+    };
+    let value = String::from_utf8(kv.value().to_vec()).context("decode ownership fence value")?;
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
 fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ownership_scope_key_prefers_ordering_key() {
+        let envelope = CommandEnvelope {
+            command_id: "command-1".to_string(),
+            idempotency_key: String::new(),
+            command_type: "session.attach".to_string(),
+            ordering_key: "session-1".to_string(),
+            expected_fence: None,
+        };
+        assert_eq!(ownership_scope_key(&envelope), "session-1");
+    }
+
+    #[test]
+    fn ownership_fence_transition_rejects_stale_expectation() {
+        assert!(ownership_fence_allows_transition(None, None));
+        assert!(!ownership_fence_allows_transition(Some("fence-1"), None));
+        assert!(ownership_fence_allows_transition(
+            Some("fence-1"),
+            Some("fence-1")
+        ));
+        assert!(!ownership_fence_allows_transition(
+            Some("fence-2"),
+            Some("fence-1")
+        ));
+    }
 }

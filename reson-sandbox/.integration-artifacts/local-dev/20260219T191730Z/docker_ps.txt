@@ -1,0 +1,23 @@
+eba29d0a0b6e quay.io/coreos/etcd:v3.5.14 reson-sandbox-int-local-dev-etcd1-1 Up Less than a second
+c6549a62e7a0 nats:2.10-alpine reson-sandbox-int-local-dev-nats-1 Up Less than a second
+4baf253d3295 quay.io/coreos/etcd:v3.5.14 reson-sandbox-int-local-dev-etcd2-1 Up Less than a second
+4d72840f7974 quay.io/coreos/etcd:v3.5.14 reson-sandbox-int-local-dev-etcd3-1 Up Less than a second
+00b69fe09ff5 82dfa03f692f k8s_kube-scheduler_kube-scheduler-docker-desktop_kube-system_bfe797ff5a3ebaafbe14820f2b118e22_68 Up 10 days
+9cb116459a14 2f6c962e7b83 k8s_coredns_coredns-668d6bf9bc-4rt47_kube-system_a511a42c-684b-4fe9-bfd4-cc0d35d6fd11_22 Up 12 days
+1438a8da1497 2f6c962e7b83 k8s_coredns_coredns-668d6bf9bc-spl78_kube-system_034ff5a4-a75f-4780-81fa-468569d23ad9_21 Up 12 days
+fcd7c4e4f8b5 e5aac5df76d9 k8s_kube-proxy_kube-proxy-lskkm_kube-system_56d3a10b-0d1f-4df7-a5fe-33f6bcfc7526_21 Up 12 days
+fb93965eb4f7 registry.k8s.io/pause:3.10 k8s_POD_coredns-668d6bf9bc-spl78_kube-system_034ff5a4-a75f-4780-81fa-468569d23ad9_21 Up 12 days
+a41e3d51d613 registry.k8s.io/pause:3.10 k8s_POD_coredns-668d6bf9bc-4rt47_kube-system_a511a42c-684b-4fe9-bfd4-cc0d35d6fd11_21 Up 12 days
+ee532a1fca80 registry.k8s.io/pause:3.10 k8s_POD_kube-proxy-lskkm_kube-system_56d3a10b-0d1f-4df7-a5fe-33f6bcfc7526_21 Up 12 days
+b317736c67e1 6417e1437b6d k8s_kube-apiserver_kube-apiserver-docker-desktop_kube-system_38e3e129a91e81f2dc5057507c3ced19_26 Up 12 days
+7dd1d6c1156d 3c9285acfd2f k8s_kube-controller-manager_kube-controller-manager-docker-desktop_kube-system_91de249f0655ce84612a10ea4918cbe4_21 Up 12 days
+752f3e974487 7fc9d4aa817a k8s_etcd_etcd-docker-desktop_kube-system_7779af46bf0a91fe6ec7c175258b1edd_21 Up 12 days
+c371a119af35 registry.k8s.io/pause:3.10 k8s_POD_kube-apiserver-docker-desktop_kube-system_38e3e129a91e81f2dc5057507c3ced19_21 Up 12 days
+874aae7c0575 registry.k8s.io/pause:3.10 k8s_POD_etcd-docker-desktop_kube-system_7779af46bf0a91fe6ec7c175258b1edd_21 Up 12 days
+a8b51fb89ee5 registry.k8s.io/pause:3.10 k8s_POD_kube-controller-manager-docker-desktop_kube-system_91de249f0655ce84612a10ea4918cbe4_21 Up 12 days
+637b84d6e079 registry.k8s.io/pause:3.10 k8s_POD_kube-scheduler-docker-desktop_kube-system_bfe797ff5a3ebaafbe14820f2b118e22_21 Up 12 days
+868f8c9dad5f timescale/timescaledb:latest-pg16 api-timescaledb-1 Up 11 days
+89dd16bfaba9 mdillon/postgis:11 stratus-demo-app-db-1 Up 12 days
+cf076c4d2677 postgres:latest newsletter-db Up 12 days
+1b445b03bc05 public.ecr.aws/supabase/postgres:15.6.1.139 supabase_db_thankful Up 12 days (healthy)
+a64307f7ac05 81d8d61987f0 registry Up 12 days

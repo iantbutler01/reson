@@ -1,3 +1,6 @@
+// @dive-file: Facade-level contract tests covering session lifecycle, fork behavior, and distributed continuity paths.
+// @dive-rel: Exercises crates/reson-sandbox/src/lib.rs user-surface semantics against mock gRPC runtimes.
+// @dive-rel: Provides verifier-backed evidence for distributed checklist gates in scripts/verify_reson_sandbox.sh.
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,7 +28,7 @@ use reson_sandbox::proto::vmd::v1::{
 };
 use reson_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
-    SessionOptions, ShellEvent, ShellInput,
+    SessionOptions, ShellEvent, ShellInput, WarmPoolProfile,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
@@ -41,6 +44,9 @@ struct MockVmdState {
     start_calls: usize,
     stop_calls: usize,
     delete_calls: usize,
+    restore_calls: usize,
+    restored_snapshot_ids: Vec<String>,
+    predownload_requests: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -301,10 +307,17 @@ impl VmdService for MockVmd {
 
     async fn list_snapshots(
         &self,
-        _request: Request<ListSnapshotsRequest>,
+        request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        let vm_id = request.into_inner().vm_id;
+        let guard = self.state.lock().await;
+        let snapshots = guard
+            .vms
+            .get(&vm_id)
+            .map(|vm| vm.snapshots.clone())
+            .unwrap_or_default();
         Ok(Response::new(ListSnapshotsResponse {
-            snapshots: Vec::new(),
+            snapshots,
         }))
     }
 
@@ -328,11 +341,23 @@ impl VmdService for MockVmd {
 
     async fn restore_snapshot(
         &self,
-        _request: Request<RestoreSnapshotRequest>,
+        request: Request<RestoreSnapshotRequest>,
     ) -> Result<Response<Vm>, Status> {
-        Err(Status::unimplemented(
-            "restore_snapshot is not required for this test",
-        ))
+        let req = request.into_inner();
+        let mut guard = self.state.lock().await;
+        let vm = guard
+            .vms
+            .get_mut(&req.vm_id)
+            .ok_or_else(|| Status::not_found("vm not found"))?;
+        if !vm.snapshots.iter().any(|snap| snap.id == req.snapshot_id) {
+            return Err(Status::not_found("snapshot not found"));
+        }
+        // @dive: Snapshot restore is modeled as state recovery before resume/start in continuity tests.
+        vm.state = VmState::Stopped as i32;
+        let vm_clone = vm.clone();
+        guard.restore_calls += 1;
+        guard.restored_snapshot_ids.push(req.snapshot_id);
+        Ok(Response::new(vm_clone))
     }
 
     async fn delete_snapshot(
@@ -344,8 +369,13 @@ impl VmdService for MockVmd {
 
     async fn pre_download_vm_image(
         &self,
-        _request: Request<PreDownloadVmImageRequest>,
+        request: Request<PreDownloadVmImageRequest>,
     ) -> Result<Response<Self::PreDownloadVmImageStream>, Status> {
+        let req = request.into_inner();
+        let mut guard = self.state.lock().await;
+        guard
+            .predownload_requests
+            .push((req.reference, req.architecture));
         let stream = tokio_stream::iter(Vec::<Result<PreDownloadVmImageResponse, Status>>::new());
         Ok(Response::new(Box::pin(stream)))
     }
@@ -437,8 +467,15 @@ impl PortProxy for MockPortProxy {
     }
 }
 
-#[derive(Default, Clone)]
-struct MockShellExec;
+#[derive(Default)]
+struct MockShellExecState {
+    command_invocations: HashMap<String, usize>,
+}
+
+#[derive(Clone)]
+struct MockShellExec {
+    state: Arc<Mutex<MockShellExecState>>,
+}
 
 #[tonic::async_trait]
 impl ShellExec for MockShellExec {
@@ -461,6 +498,10 @@ impl ShellExec for MockShellExec {
         };
 
         let command = start.args.last().cloned().unwrap_or_default();
+        {
+            let mut guard = self.state.lock().await;
+            *guard.command_invocations.entry(command.clone()).or_insert(0) += 1;
+        }
 
         let mut frames = vec![
             Ok(ExecResponse {
@@ -514,8 +555,10 @@ impl ShellExec for MockShellExec {
 
 struct TestHarness {
     vmd_endpoint: String,
+    portproxy_port: i32,
     vmd_state: Arc<Mutex<MockVmdState>>,
     _portproxy_state: Arc<Mutex<MockPortProxyState>>,
+    shell_exec_state: Arc<Mutex<MockShellExecState>>,
     vmd_shutdown: Option<oneshot::Sender<()>>,
     portproxy_shutdown: Option<oneshot::Sender<()>>,
     vmd_join: tokio::task::JoinHandle<()>,
@@ -525,6 +568,7 @@ struct TestHarness {
 impl TestHarness {
     async fn start() -> Self {
         let portproxy_state = Arc::new(Mutex::new(MockPortProxyState::default()));
+        let shell_exec_state = Arc::new(Mutex::new(MockShellExecState::default()));
         let vmd_state = Arc::new(Mutex::new(MockVmdState::default()));
 
         let portproxy_listener = TcpListener::bind("127.0.0.1:0")
@@ -538,7 +582,9 @@ impl TestHarness {
         let portproxy_server = MockPortProxy {
             state: Arc::clone(&portproxy_state),
         };
-        let shell_exec_server = MockShellExec;
+        let shell_exec_server = MockShellExec {
+            state: Arc::clone(&shell_exec_state),
+        };
 
         let portproxy_join = tokio::spawn(async move {
             Server::builder()
@@ -598,8 +644,10 @@ impl TestHarness {
             {
                 return Self {
                     vmd_endpoint,
+                    portproxy_port: portproxy_addr.port() as i32,
                     vmd_state,
                     _portproxy_state: portproxy_state,
+                    shell_exec_state,
                     vmd_shutdown: Some(vmd_shutdown_tx),
                     portproxy_shutdown: Some(portproxy_shutdown_tx),
                     vmd_join,
@@ -629,6 +677,7 @@ fn sandbox_config() -> SandboxConfig {
         auto_spawn: false,
         connect_timeout: Duration::from_secs(2),
         daemon_start_timeout: Duration::from_secs(2),
+        portproxy_ready_timeout: Duration::from_millis(700),
         ..SandboxConfig::default()
     }
 }
@@ -884,7 +933,10 @@ async fn control_gateway_failover_prefers_healthy_secondary_endpoint() {
         .await
         .expect("session creation should use healthy secondary endpoint");
 
-    let sessions = sandbox.list_sessions().await.expect("list sessions after failover");
+    let sessions = sandbox
+        .list_sessions()
+        .await
+        .expect("list sessions after failover");
     assert!(
         sessions
             .iter()
@@ -954,6 +1006,448 @@ async fn attach_starts_stopped_vm_and_sessions_are_isolated() {
     timeout(Duration::from_secs(3), harness.shutdown())
         .await
         .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tier_b_eligibility_classifier_sets_metadata_policy() {
+    let harness = TestHarness::start().await;
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let default_session = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-tier-b-default".to_string()),
+            auto_start: false,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create default tier-b eligible session");
+
+    let mut metadata = HashMap::new();
+    metadata.insert("tier_b_eligible".to_string(), "false".to_string());
+    let ineligible_session = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-tier-b-ineligible".to_string()),
+            metadata,
+            auto_start: false,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create tier-b ineligible session");
+
+    let guard = harness.vmd_state.lock().await;
+    let default_vm = guard
+        .vms
+        .get(default_session.vm_id())
+        .expect("default session vm should exist");
+    assert_eq!(
+        default_vm
+            .metadata
+            .get("reson.tier_b_eligible")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        default_vm
+            .metadata
+            .get("reson.execution_fidelity_requirement")
+            .map(String::as_str),
+        Some("disk+memory")
+    );
+
+    let ineligible_vm = guard
+        .vms
+        .get(ineligible_session.vm_id())
+        .expect("ineligible session vm should exist");
+    assert_eq!(
+        ineligible_vm
+            .metadata
+            .get("reson.tier_b_eligible")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        ineligible_vm
+            .metadata
+            .get("reson.execution_fidelity_requirement")
+            .map(String::as_str),
+        Some("best-effort")
+    );
+    drop(guard);
+
+    default_session
+        .discard()
+        .await
+        .expect("discard default eligibility session");
+    ineligible_session
+        .discard()
+        .await
+        .expect("discard ineligible session");
+
+    timeout(Duration::from_secs(3), harness.shutdown())
+        .await
+        .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tier_b_eligible_failover_requires_restore_snapshot_marker() {
+    let mut primary = TestHarness::start().await;
+    let secondary = TestHarness::start().await;
+    wait_for_port_open(primary.portproxy_port as u16).await;
+    wait_for_port_open(secondary.portproxy_port as u16).await;
+
+    let mut cfg = sandbox_config();
+    cfg.control_gateway_endpoints = vec![secondary.vmd_endpoint.clone()];
+    let sandbox = Sandbox::connect(primary.vmd_endpoint.clone(), cfg)
+        .await
+        .expect("connect sandbox facade with primary and secondary endpoints");
+
+    let session = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-tier-b-restore-required".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create tier-b eligible session");
+
+    let vm_id = session.vm_id().to_string();
+    let vm_clone = {
+        let guard = primary.vmd_state.lock().await;
+        guard
+            .vms
+            .get(&vm_id)
+            .cloned()
+            .expect("vm should exist on primary")
+    };
+    let mut vm_clone = vm_clone;
+    vm_clone
+        .metadata
+        .remove("reson.execution_restore_snapshot_id");
+    vm_clone
+        .metadata
+        .remove("reson.execution_restore_snapshot_name");
+    vm_clone.metadata.remove("reson.fork_snapshot");
+    vm_clone.snapshots.clear();
+    if let Some(network) = vm_clone.network.as_mut() {
+        network.portproxy_ports = Some(PortProxyPorts {
+            proxy_port: secondary.portproxy_port,
+            rpc_port: secondary.portproxy_port,
+        });
+    }
+    {
+        let mut guard = secondary.vmd_state.lock().await;
+        guard.vms.insert(vm_id.clone(), vm_clone);
+    }
+
+    if let Some(tx) = primary.portproxy_shutdown.take() {
+        let _ = tx.send(());
+    }
+    wait_for_port_closed(primary.portproxy_port as u16).await;
+
+    match session.exec("echo should-fail", ExecOptions::default()).await {
+        Err(SandboxError::InvalidResponse(message)) => {
+            assert!(
+                message.contains("tier_b_eligible"),
+                "expected tier-b eligibility policy violation, got: {message}"
+            );
+        }
+        _ => panic!("expected tier-b restore policy failure"),
+    }
+
+    session
+        .discard()
+        .await
+        .expect("discard tier-b restore policy session");
+
+    timeout(Duration::from_secs(3), primary.shutdown())
+        .await
+        .expect("primary harness shutdown timed out");
+    timeout(Duration::from_secs(3), secondary.shutdown())
+        .await
+        .expect("secondary harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_pool_prewarms_profiles_by_architecture() {
+    let harness = TestHarness::start().await;
+    let mut cfg = sandbox_config();
+    cfg.warm_pool_profiles = vec![
+        WarmPoolProfile {
+            image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
+            architecture: Some("amd64".to_string()),
+            min_inventory: 1,
+        },
+        WarmPoolProfile {
+            image: "ghcr.io/bracketdevelopers/uv-builder:main".to_string(),
+            architecture: Some("arm64".to_string()),
+            min_inventory: 1,
+        },
+    ];
+    let _sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), cfg)
+        .await
+        .expect("connect sandbox and prewarm profiles");
+
+    let guard = harness.vmd_state.lock().await;
+    assert!(
+        guard
+            .predownload_requests
+            .iter()
+            .any(|(reference, arch)| {
+                reference == "ghcr.io/bracketdevelopers/uv-builder:main" && arch == "amd64"
+            }),
+        "warm pool should request predownload for amd64 profile"
+    );
+    assert!(
+        guard
+            .predownload_requests
+            .iter()
+            .any(|(reference, arch)| {
+                reference == "ghcr.io/bracketdevelopers/uv-builder:main" && arch == "arm64"
+            }),
+        "warm pool should request predownload for arm64 profile"
+    );
+    drop(guard);
+
+    timeout(Duration::from_secs(3), harness.shutdown())
+        .await
+        .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuity_rebinds_session_after_primary_vmd_loss() {
+    let mut primary = TestHarness::start().await;
+    let secondary = TestHarness::start().await;
+    wait_for_port_open(primary.portproxy_port as u16).await;
+    wait_for_port_open(secondary.portproxy_port as u16).await;
+
+    let mut cfg = sandbox_config();
+    cfg.control_gateway_endpoints = vec![secondary.vmd_endpoint.clone()];
+    let sandbox = Sandbox::connect(primary.vmd_endpoint.clone(), cfg)
+        .await
+        .expect("connect sandbox facade with primary and secondary endpoints");
+
+    let _session = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-continuity".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create continuity session");
+
+    let vm_id = _session.vm_id().to_string();
+    let vm_clone = {
+        let guard = primary.vmd_state.lock().await;
+        guard
+            .vms
+            .get(&vm_id)
+            .cloned()
+            .expect("vm should exist on primary")
+    };
+    let mut vm_clone = vm_clone;
+    vm_clone.metadata.insert(
+        "reson.execution_restore_snapshot_name".to_string(),
+        "continuity-snapshot".to_string(),
+    );
+    vm_clone.snapshots = vec![Snapshot {
+        id: "snap-continuity-1".to_string(),
+        name: "continuity-snapshot".to_string(),
+        label: "continuity".to_string(),
+        description: "test continuity restore".to_string(),
+        created_at: None,
+    }];
+    if let Some(network) = vm_clone.network.as_mut() {
+        network.portproxy_ports = Some(PortProxyPorts {
+            proxy_port: secondary.portproxy_port,
+            rpc_port: secondary.portproxy_port,
+        });
+    }
+    {
+        let mut guard = secondary.vmd_state.lock().await;
+        guard.vms.insert(vm_id.clone(), vm_clone);
+    }
+
+    if let Some(tx) = primary.vmd_shutdown.take() {
+        let _ = tx.send(());
+    }
+    sleep(Duration::from_millis(120)).await;
+
+    let rebound = sandbox
+        .attach_session("session-continuity")
+        .await
+        .expect("attach should recover session via secondary endpoint");
+
+    let exec = rebound
+        .exec("echo continuity", ExecOptions::default())
+        .await
+        .expect("exec should run from rebound session");
+    drop(exec.input);
+
+    let mut events = exec.events;
+    let mut saw_exit_zero = false;
+    loop {
+        let next = timeout(Duration::from_secs(3), events.next())
+            .await
+            .expect("timed out waiting for continuity exec event");
+        let Some(event) = next else {
+            break;
+        };
+        match event.expect("decode continuity exec event") {
+            ExecEvent::Exit(code) => {
+                saw_exit_zero = code == 0;
+                break;
+            }
+            ExecEvent::Stdout(_) | ExecEvent::Stderr(_) | ExecEvent::Timeout => {}
+        }
+    }
+    assert!(
+        saw_exit_zero,
+        "exec stream should finish with exit=0 after endpoint rebinding"
+    );
+    let secondary_guard = secondary.vmd_state.lock().await;
+    assert!(
+        secondary_guard.restore_calls >= 1,
+        "continuity handoff should invoke execution-state restore on secondary"
+    );
+    assert!(
+        secondary_guard
+            .restored_snapshot_ids
+            .iter()
+            .any(|id| id == "snap-continuity-1"),
+        "restore path should target continuity snapshot id"
+    );
+    drop(secondary_guard);
+
+    rebound.discard().await.expect("discard continuity session");
+
+    timeout(Duration::from_secs(3), primary.shutdown())
+        .await
+        .expect("primary harness shutdown timed out");
+    timeout(Duration::from_secs(3), secondary.shutdown())
+        .await
+        .expect("secondary harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inflight_exec_rebinds_on_rpc_loss_and_runs_exactly_once() {
+    let mut primary = TestHarness::start().await;
+    let secondary = TestHarness::start().await;
+    wait_for_port_open(primary.portproxy_port as u16).await;
+    wait_for_port_open(secondary.portproxy_port as u16).await;
+
+    let mut cfg = sandbox_config();
+    cfg.control_gateway_endpoints = vec![secondary.vmd_endpoint.clone()];
+    let sandbox = Sandbox::connect(primary.vmd_endpoint.clone(), cfg)
+        .await
+        .expect("connect sandbox facade with primary and secondary endpoints");
+
+    let session = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-exactly-once".to_string()),
+            auto_start: true,
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create session on primary");
+
+    let vm_id = session.vm_id().to_string();
+    let vm_clone = {
+        let guard = primary.vmd_state.lock().await;
+        guard
+            .vms
+            .get(&vm_id)
+            .cloned()
+            .expect("vm should exist on primary")
+    };
+    let mut vm_clone = vm_clone;
+    vm_clone.metadata.insert(
+        "reson.execution_restore_snapshot_name".to_string(),
+        "exactly-once-snapshot".to_string(),
+    );
+    vm_clone.snapshots = vec![Snapshot {
+        id: "snap-exactly-once-1".to_string(),
+        name: "exactly-once-snapshot".to_string(),
+        label: "exactly-once".to_string(),
+        description: "test exactly-once failover restore".to_string(),
+        created_at: None,
+    }];
+    if let Some(network) = vm_clone.network.as_mut() {
+        network.portproxy_ports = Some(PortProxyPorts {
+            proxy_port: secondary.portproxy_port,
+            rpc_port: secondary.portproxy_port,
+        });
+    }
+    {
+        let mut guard = secondary.vmd_state.lock().await;
+        guard.vms.insert(vm_id.clone(), vm_clone);
+    }
+
+    if let Some(tx) = primary.portproxy_shutdown.take() {
+        let _ = tx.send(());
+    }
+    wait_for_port_closed(primary.portproxy_port as u16).await;
+
+    let command = "echo exactly-once-marker";
+    let exec = session
+        .exec(command, ExecOptions::default())
+        .await
+        .expect("exec should recover by rebinding endpoint");
+    drop(exec.input);
+
+    let mut saw_exit_zero = false;
+    let mut events = exec.events;
+    loop {
+        let next = timeout(Duration::from_secs(3), events.next())
+            .await
+            .expect("timed out waiting for exec event");
+        let Some(event) = next else {
+            break;
+        };
+        match event.expect("decode exec event") {
+            ExecEvent::Exit(code) => {
+                saw_exit_zero = code == 0;
+                break;
+            }
+            ExecEvent::Stdout(_) | ExecEvent::Stderr(_) | ExecEvent::Timeout => {}
+        }
+    }
+    assert!(
+        saw_exit_zero,
+        "rebound exec should complete successfully after rpc endpoint loss"
+    );
+
+    let primary_count = {
+        let guard = primary.shell_exec_state.lock().await;
+        guard.command_invocations.get(command).copied().unwrap_or(0)
+    };
+    let secondary_count = {
+        let guard = secondary.shell_exec_state.lock().await;
+        guard.command_invocations.get(command).copied().unwrap_or(0)
+    };
+    // @dive: Exactly-once verification asserts command dispatch did not duplicate across primary->secondary failover.
+    assert_eq!(
+        primary_count + secondary_count,
+        1,
+        "command should be dispatched exactly once across failover"
+    );
+    assert_eq!(
+        secondary_count, 1,
+        "rebinding should land command execution on surviving secondary node"
+    );
+
+    session
+        .discard()
+        .await
+        .expect("discard exactly-once session");
+
+    timeout(Duration::from_secs(3), primary.shutdown())
+        .await
+        .expect("primary harness shutdown timed out");
+    timeout(Duration::from_secs(3), secondary.shutdown())
+        .await
+        .expect("secondary harness shutdown timed out");
 }
 
 #[tokio::test(flavor = "multi_thread")]

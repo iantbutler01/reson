@@ -1,10 +1,14 @@
+// @dive-file: Main daemon entrypoint and CLI override surface for runtime/distributed control settings.
+// @dive-rel: Produces Config consumed by vmd/src/app.rs and downstream control-bus/registry subsystems.
+// @dive-rel: Must stay aligned with vmd/src/config.rs defaults so CLI overrides preserve policy invariants.
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use vmd_rs::app;
 use vmd_rs::config::{
-    AuthConfig, Config, ControlBusConfig, NodeRegistryConfig, SecurityConfig, TlsServerConfig,
+    AuthConfig, Config, ContinuityTier, ControlBusConfig, NodeRegistryConfig, SecurityConfig,
+    StorageProfile, TlsServerConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -30,6 +34,21 @@ struct Args {
     /// Admission limit for concurrently active VMs on this node.
     #[arg(long)]
     max_active_vms: Option<usize>,
+    /// Storage profile for VM state durability semantics.
+    #[arg(long, value_enum)]
+    storage_profile: Option<StorageProfileArg>,
+    /// Enable HA mode guardrails (requires durable-shared storage profile + registry + control bus).
+    #[arg(long)]
+    ha_mode: bool,
+    /// Continuity tier contract for distributed operation.
+    #[arg(long, value_enum)]
+    continuity_tier: Option<ContinuityTierArg>,
+    /// Explicit degraded mode (Tier-A) escape hatch for incident response.
+    #[arg(long)]
+    degraded_mode: bool,
+    /// Freeze new admissions on this node (planned drain handoff).
+    #[arg(long)]
+    admission_frozen: bool,
     /// Enable node registry heartbeats by providing etcd endpoints (comma-separated).
     #[arg(long)]
     registry_etcd_endpoints: Option<String>,
@@ -45,6 +64,15 @@ struct Args {
     /// Registry key lease TTL in seconds.
     #[arg(long)]
     registry_ttl_secs: Option<i64>,
+    /// Failure-domain region label advertised for scheduler placement.
+    #[arg(long)]
+    region: Option<String>,
+    /// Failure-domain zone label advertised for scheduler placement.
+    #[arg(long)]
+    zone: Option<String>,
+    /// Failure-domain rack label advertised for scheduler placement.
+    #[arg(long)]
+    rack: Option<String>,
     /// Disable node registry heartbeats even when env vars are present.
     #[arg(long)]
     disable_node_registry: bool,
@@ -86,6 +114,36 @@ struct Args {
     tls_allow_optional_client_cert: bool,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum StorageProfileArg {
+    LocalEphemeral,
+    DurableShared,
+}
+
+impl From<StorageProfileArg> for StorageProfile {
+    fn from(value: StorageProfileArg) -> Self {
+        match value {
+            StorageProfileArg::LocalEphemeral => StorageProfile::LocalEphemeral,
+            StorageProfileArg::DurableShared => StorageProfile::DurableShared,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ContinuityTierArg {
+    TierA,
+    TierB,
+}
+
+impl From<ContinuityTierArg> for ContinuityTier {
+    fn from(value: ContinuityTierArg) -> Self {
+        match value {
+            ContinuityTierArg::TierA => ContinuityTier::TierA,
+            ContinuityTierArg::TierB => ContinuityTier::TierB,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -117,6 +175,33 @@ async fn main() -> Result<()> {
     }
     if let Some(limit) = args.max_active_vms {
         cfg.max_active_vms = if limit == 0 { None } else { Some(limit) };
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.max_active_vms = cfg.max_active_vms;
+        }
+    }
+    if let Some(storage_profile) = args.storage_profile {
+        cfg.storage_profile = storage_profile.into();
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.storage_profile = cfg.storage_profile;
+        }
+    }
+    if args.ha_mode {
+        cfg.ha_mode = true;
+    }
+    if let Some(continuity_tier) = args.continuity_tier {
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.continuity_tier = continuity_tier.into();
+        }
+    }
+    if args.degraded_mode {
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.degraded_mode = true;
+        }
+    }
+    if args.admission_frozen {
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.admission_frozen = true;
+        }
     }
     if args.disable_node_registry {
         cfg.node_registry = None;
@@ -129,7 +214,13 @@ async fn main() -> Result<()> {
         || args.registry_prefix.is_some()
         || args.node_id.is_some()
         || args.advertise_endpoint.is_some()
-        || args.registry_ttl_secs.is_some();
+        || args.registry_ttl_secs.is_some()
+        || args.region.is_some()
+        || args.zone.is_some()
+        || args.rack.is_some()
+        || args.continuity_tier.is_some()
+        || args.degraded_mode
+        || args.admission_frozen;
     if has_registry_overrides {
         let mut registry = cfg
             .node_registry
@@ -155,6 +246,24 @@ async fn main() -> Result<()> {
         if let Some(ttl_secs) = args.registry_ttl_secs {
             registry.ttl_secs = ttl_secs;
         }
+        if let Some(region) = args.region {
+            registry.region = region;
+        }
+        if let Some(zone) = args.zone {
+            registry.zone = zone;
+        }
+        if let Some(rack) = args.rack {
+            registry.rack = rack;
+        }
+        if let Some(continuity_tier) = args.continuity_tier {
+            registry.continuity_tier = continuity_tier.into();
+        }
+        if args.degraded_mode {
+            registry.degraded_mode = true;
+        }
+        if args.admission_frozen {
+            registry.admission_frozen = true;
+        }
         cfg.node_registry = Some(registry);
     }
 
@@ -174,6 +283,8 @@ async fn main() -> Result<()> {
             command_consumer_durable: "vmd-node-cmd".to_string(),
             command_max_deliver: 5,
             command_ack_wait_ms: 30_000,
+            max_inflight_commands: 1024,
+            overload_retry_after_ms: 2_000,
             dead_letter_subject: "reson.sandbox.control.dlq.commands".to_string(),
             replay_subject: "reson.sandbox.control.replay.commands".to_string(),
         });

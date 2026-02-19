@@ -32,10 +32,12 @@ if ! sed -n '/pub async fn fork_vm(/,/pub async fn restore_snapshot(/p' "$REPO_R
   err "running fork path must enforce CoW clone semantics (clone_file_cow missing)"
   exit 1
 fi
+rg -n "max_fork_chain_depth|fork_compaction_depth_threshold|META_FORK_DEPTH|enqueue_fork_compaction_task|garbage_collect_orphaned_fork_roots" "$REPO_ROOT/vmd/src/state/manager.rs" "$REPO_ROOT/vmd/src/config.rs" >/dev/null
 
 require_cmd cargo
 log "fork CoW gate: stopped-parent CoW runtime test"
 (cd "$REPO_ROOT" && cargo test -p vmd fork_vm_stopped_parent_uses_shared_cow_backing)
+(cd "$REPO_ROOT" && cargo test -p vmd fork_vm_rejects_when_chain_depth_limit_exceeded -- --nocapture)
 
 DEFAULT_SOURCE_REF="${VMD_SMOKE_DEFAULT_SOURCE_REF:-ghcr.io/bracketdevelopers/uv-builder:main}"
 SOURCE_REF="${VMD_SMOKE_SOURCE_REF:-$DEFAULT_SOURCE_REF}"

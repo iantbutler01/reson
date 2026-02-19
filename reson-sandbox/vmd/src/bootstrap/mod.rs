@@ -1,3 +1,6 @@
+// @dive-file: Builds bootstrap ISO images that seed guest init scripts and bundled portproxy binaries.
+// @dive-rel: Consumed by VM launch paths in vmd state manager to initialize guest runtime services.
+// @dive-rel: Depends on assets::portproxy binary selection for architecture-specific guest payloads.
 use std::fs;
 use std::io::{Seek, Write};
 use std::path::Path;

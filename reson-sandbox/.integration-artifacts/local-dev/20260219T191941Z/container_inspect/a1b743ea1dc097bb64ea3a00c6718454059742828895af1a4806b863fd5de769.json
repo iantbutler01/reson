@@ -1,0 +1,230 @@
+[
+    {
+        "Id": "a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769",
+        "Created": "2026-02-19T19:19:40.846633798Z",
+        "Path": "/usr/local/bin/etcd",
+        "Args": [
+            "--name=etcd2",
+            "--data-dir=/etcd-data",
+            "--listen-client-urls=http://0.0.0.0:2379",
+            "--advertise-client-urls=http://etcd2:2379",
+            "--listen-peer-urls=http://0.0.0.0:2380",
+            "--initial-advertise-peer-urls=http://etcd2:2380",
+            "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380",
+            "--initial-cluster-state=new",
+            "--initial-cluster-token=reson-sandbox-int-local"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 96060,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-02-19T19:19:41.009867882Z",
+            "FinishedAt": "0001-01-01T00:00:00Z"
+        },
+        "Image": "sha256:dd61691a139848b127b8b1650b90bd6811393ca6f140846b2f92369e644d76b3",
+        "ResolvConfPath": "/var/lib/docker/containers/a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769/hostname",
+        "HostsPath": "/var/lib/docker/containers/a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769/hosts",
+        "LogPath": "/var/lib/docker/containers/a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769/a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769-json.log",
+        "Name": "/reson-sandbox-int-local-dev-etcd2-1",
+        "RestartCount": 0,
+        "Driver": "overlay2",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": null,
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "reson-sandbox-int-local-dev_default",
+            "PortBindings": {},
+            "RestartPolicy": {
+                "Name": "unless-stopped",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": null,
+            "DnsSearch": null,
+            "ExtraHosts": [],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "a1b743ea1dc097bb64ea3a00c6718454059742828895af1a4806b863fd5de769",
+                "LowerDir": "/var/lib/docker/overlay2/39f89e7e4bd1f0e7e0360163ff9c693916e2f458951f94797673c173ab87fc94-init/diff:/var/lib/docker/overlay2/a92adf9809a72712c8510e6baa4c7120eff7b26362d43ca05f309a78d7a33d02/diff:/var/lib/docker/overlay2/eda73fdeff570c8f68716edf9896135cf38edfe9032e33ce564e7fde22e6f625/diff:/var/lib/docker/overlay2/37dc51464a735c9eeb2b631e546345f05d8826e6bccbd984bd278ebd31909b74/diff:/var/lib/docker/overlay2/e2be72344b166bd5f73a4303153caf3e3eef8c695373d7fab14e6f702bbaa324/diff:/var/lib/docker/overlay2/2621d4ae67e45bdd8f85f9925eecd17c760dbb8c23fb43f005c6687000c07e7a/diff:/var/lib/docker/overlay2/6e569622bdeb916ea84d7a9b6522117a42c88557850b53d70c180fcc6045a800/diff:/var/lib/docker/overlay2/aa0237824c133ef2e3435552f80217db963906ac3edb2b9cb811f53a08392ede/diff:/var/lib/docker/overlay2/412c22a7b5ce0adb60692c3ee5b48237fd289e4502e251e854fd1cb7862b3bca/diff:/var/lib/docker/overlay2/ff39e2e8b11a68882e128ed1b9f8a8c95e97a2b197981645d49ed009016cfb0f/diff:/var/lib/docker/overlay2/0c51514f9fdf3266ec1d72b56201a69328438752a318fc21be54b62ef8a36245/diff:/var/lib/docker/overlay2/56c079e4f56d4800e0ce622aee1660ed44fadf3fec0575cd2ed7162eba8d3265/diff:/var/lib/docker/overlay2/b0cb437d3c96d411c8fadd2132ca9f4603e10a3728fdbe6c86434d6f63ae78d6/diff:/var/lib/docker/overlay2/18c07870f0d0fa5c853ff6afedb8cbfd531eefb09b1f13154558d8f7b4cd1b10/diff:/var/lib/docker/overlay2/2efcbd1bec9cb4e744c0d300b5fb63d1a8d2b6cfbf6d97940fcbc994dcac988c/diff:/var/lib/docker/overlay2/a3c1d1a1075c8dbaa6301b366d039a53be6c5fd1ceee0b7f487f2280e691fe1a/diff:/var/lib/docker/overlay2/b17f98ff3ba165c23944b75796c97c19ec0efa8845e5062e3564440f4661749e/diff",
+                "MergedDir": "/var/lib/docker/overlay2/39f89e7e4bd1f0e7e0360163ff9c693916e2f458951f94797673c173ab87fc94/merged",
+                "UpperDir": "/var/lib/docker/overlay2/39f89e7e4bd1f0e7e0360163ff9c693916e2f458951f94797673c173ab87fc94/diff",
+                "WorkDir": "/var/lib/docker/overlay2/39f89e7e4bd1f0e7e0360163ff9c693916e2f458951f94797673c173ab87fc94/work"
+            },
+            "Name": "overlay2"
+        },
+        "Mounts": [],
+        "Config": {
+            "Hostname": "a1b743ea1dc0",
+            "Domainname": "",
+            "User": "0",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "ExposedPorts": {
+                "2379/tcp": {},
+                "2380/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+            ],
+            "Cmd": [
+                "/usr/local/bin/etcd",
+                "--name=etcd2",
+                "--data-dir=/etcd-data",
+                "--listen-client-urls=http://0.0.0.0:2379",
+                "--advertise-client-urls=http://etcd2:2379",
+                "--listen-peer-urls=http://0.0.0.0:2380",
+                "--initial-advertise-peer-urls=http://etcd2:2380",
+                "--initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380",
+                "--initial-cluster-state=new",
+                "--initial-cluster-token=reson-sandbox-int-local"
+            ],
+            "Image": "quay.io/coreos/etcd:v3.5.14",
+            "Volumes": null,
+            "WorkingDir": "/var/lib/etcd/",
+            "Entrypoint": null,
+            "Labels": {
+                "com.docker.compose.config-hash": "9dabcd868f620c9175455516056455d384e86ad68d6c79b3666676bad7f10760",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "",
+                "com.docker.compose.image": "sha256:dd61691a139848b127b8b1650b90bd6811393ca6f140846b2f92369e644d76b3",
+                "com.docker.compose.oneoff": "False",
+                "com.docker.compose.project": "reson-sandbox-int-local-dev",
+                "com.docker.compose.project.config_files": "/Users/crow/SoftwareProjects/reson/reson-sandbox/deploy/integration/docker-compose.control-plane.yml",
+                "com.docker.compose.project.working_dir": "/Users/crow/SoftwareProjects/reson/reson-sandbox/deploy/integration",
+                "com.docker.compose.service": "etcd2",
+                "com.docker.compose.version": "5.0.2"
+            },
+            "StopTimeout": 1
+        },
+        "NetworkSettings": {
+            "SandboxID": "b9fbac2440b29acfcc90b20c558327e7a6921641b9f18c5f1c5ef4059bb789b1",
+            "SandboxKey": "/var/run/docker/netns/b9fbac2440b2",
+            "Ports": {
+                "2379/tcp": null,
+                "2380/tcp": null
+            },
+            "Networks": {
+                "reson-sandbox-int-local-dev_default": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": [
+                        "reson-sandbox-int-local-dev-etcd2-1",
+                        "etcd2"
+                    ],
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "0496bb21e9afae1145b6c1ca538ade3b165861b468970cceb00767a9417d56b0",
+                    "EndpointID": "88c8cc91909b968eb1175d1336689dcf7ce7df9ec153f20ac9fbed713e89d405",
+                    "Gateway": "172.29.0.1",
+                    "IPAddress": "172.29.0.4",
+                    "MacAddress": "8a:d1:e2:d6:2e:4c",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "reson-sandbox-int-local-dev-etcd2-1",
+                        "etcd2",
+                        "a1b743ea1dc0"
+                    ]
+                }
+            }
+        }
+    }
+]
