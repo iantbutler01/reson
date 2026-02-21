@@ -36,7 +36,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  strict-real:
+  pr-subset:
+    if: github.event_name == 'pull_request'
+    # Requires a self-hosted Linux runner with docker/docker compose and /dev/kvm.
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show runner capabilities
+        run: |
+          set -euo pipefail
+          uname -a
+          docker --version
+          docker compose version || docker-compose --version
+          test -e /dev/kvm
+
+      - name: Run PR subset (strict preflight + core continuity probes)
+        run: |
+          set -euo pipefail
+          ./scripts/verify_reson_sandbox.sh --strict
+          ./scripts/verify_real_gate41.sh --profile ci-linux-kvm
+          ./scripts/verify_real_gate43.sh --profile ci-linux-kvm
+          ./scripts/integration/verify_real_failover.sh --profile ci-linux-kvm --distributed --selector distributed_stream_resume_from_checkpoint_is_forward_only_without_replay
+
+  strict-real-main:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     # Requires a self-hosted Linux runner with docker/docker compose and /dev/kvm.
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 180

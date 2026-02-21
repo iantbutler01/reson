@@ -40,6 +40,17 @@ Nightly soak posture:
 ./scripts/verify_strict_real.sh --profile nightly-soak --mock-preflight-strict
 ```
 
+## CI Merge Policy
+
+- `pull_request`: run a bounded subset suitable for iterative review on KVM runners:
+  - `./scripts/verify_reson_sandbox.sh --strict`
+  - `./scripts/verify_real_gate41.sh --profile ci-linux-kvm`
+  - `./scripts/verify_real_gate43.sh --profile ci-linux-kvm`
+  - `./scripts/integration/verify_real_failover.sh --profile ci-linux-kvm --distributed --selector distributed_stream_resume_from_checkpoint_is_forward_only_without_replay`
+- `push` to `main`: run full authoritative real verification:
+  - `./scripts/verify_strict_real.sh --profile ci-linux-kvm --mock-preflight-strict`
+- Branch protection must require this workflow before merge so `main` cannot advance without CI evidence.
+
 ## Environment Notes
 
 - `verify_strict_real.sh` runs fast mock preflight by default, then mandatory real gates `41-48`.
