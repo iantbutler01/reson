@@ -88,6 +88,7 @@ fn default_control_config() -> ControlBusConfig {
     ControlBusConfig {
         nats_url: "nats://127.0.0.1:4222".to_string(),
         subject_prefix: subject_prefix.clone(),
+        cluster_id: "reson-sandbox-cluster".to_string(),
         node_id: "mqctl".to_string(),
         dedupe_etcd_endpoints: Vec::new(),
         dedupe_prefix: "/reson-sandbox/command-dedupe".to_string(),

@@ -60,8 +60,9 @@ use proto::bracket::portproxy::v1::{
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
-    CreateVmRequest, ForkVmRequest, GetVmRequest, ListVMsRequest, Metadata, ResourceSpec, Vm,
-    PreDownloadVmImageRequest, RestoreSnapshotRequest, VmActionRequest, VmSource, VmSourceType,
+    CreateVmRequest, ForkVmRequest, GetVmRequest, ListVMsRequest, Metadata,
+    PreDownloadVmImageRequest, ResourceSpec, RestoreSnapshotRequest, Vm, VmActionRequest, VmSource,
+    VmSourceType,
 };
 
 const META_SESSION_ID: &str = "reson.session_id";
@@ -79,6 +80,7 @@ const META_EXECUTION_FIDELITY_REQUIREMENT: &str = "reson.execution_fidelity_requ
 pub struct DistributedControlConfig {
     pub etcd_endpoints: Vec<String>,
     pub etcd_prefix: String,
+    pub cluster_id: String,
     pub nats_url: String,
     pub nats_subject_prefix: String,
     pub nats_stream_name: String,
@@ -99,6 +101,7 @@ impl Default for DistributedControlConfig {
         Self {
             etcd_endpoints: vec!["http://127.0.0.1:2379".to_string()],
             etcd_prefix: "/reson-sandbox".to_string(),
+            cluster_id: "reson-sandbox-cluster".to_string(),
             nats_url: "nats://127.0.0.1:4222".to_string(),
             nats_subject_prefix: subject_prefix.clone(),
             nats_stream_name: "RESON_SANDBOX_CONTROL".to_string(),
@@ -317,6 +320,40 @@ pub struct ExecHandle {
     pub events: EventStream<ExecEvent>,
 }
 
+#[cfg(feature = "distributed-control")]
+struct DistributedExecStreamState {
+    endpoint: String,
+    target_node_id: String,
+    stream_id: String,
+    producer_epoch: u64,
+    events: mpsc::Receiver<Result<distributed::ExecStreamEvent>>,
+}
+
+#[cfg(feature = "distributed-control")]
+struct DistributedExecStartParams<'a> {
+    command: &'a str,
+    opts: &'a ExecOptions,
+    control: &'a distributed::DistributedControlPlane,
+    endpoint: String,
+    target_node_id: String,
+    start_wait: Duration,
+    idle_timeout: Duration,
+}
+
+#[cfg(feature = "distributed-control")]
+struct DistributedExecRebindParams<'a> {
+    control: &'a distributed::DistributedControlPlane,
+    command: &'a str,
+    opts: &'a ExecOptions,
+    start_wait: Duration,
+    current_endpoint: &'a str,
+    logical_stream_id: &'a str,
+    resume_after_event_seq: u64,
+    idle_timeout: Duration,
+    current_target_node_id: &'a str,
+    current_producer_epoch: u64,
+}
+
 pub struct ShellHandle {
     pub input: mpsc::Sender<ShellInput>,
     pub events: EventStream<ShellEvent>,
@@ -418,19 +455,19 @@ impl Drop for ForwardHandle {
         if let Ok(mut guard) = self.registration.try_lock() {
             let registration = guard.take();
             drop(guard);
-            if let Some(mut registration) = registration {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        registration
-                            .multiplexer
-                            .unregister(registration.host_port)
-                            .await;
-                        #[cfg(feature = "distributed-control")]
-                        if let Some(port_lease) = registration.port_lease.take() {
-                            port_lease.shutdown().await;
-                        }
-                    });
-                }
+            if let Some(mut registration) = registration
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                handle.spawn(async move {
+                    registration
+                        .multiplexer
+                        .unregister(registration.host_port)
+                        .await;
+                    #[cfg(feature = "distributed-control")]
+                    if let Some(port_lease) = registration.port_lease.take() {
+                        port_lease.shutdown().await;
+                    }
+                });
             }
         }
     }
@@ -610,55 +647,503 @@ impl Session {
         Ok(format!("http://127.0.0.1:{rpc_port}"))
     }
 
-    pub async fn exec(&self, command: &str, opts: ExecOptions) -> Result<ExecHandle> {
-        let started = Instant::now();
-        let endpoint = self.ensure_session_rpc_endpoint().await?;
-        let mut client = ShellExecClient::connect(endpoint).await?;
+    async fn invalidate_exec_transport_path(&self, endpoint: &str) {
+        self.sandbox
+            .invalidate_ready_vm_rpc(&self.vm_id, endpoint)
+            .await;
+    }
 
+    async fn recover_exec_transport_path(&self, endpoint: &str) {
+        self.invalidate_exec_transport_path(endpoint).await;
+        let _ = self
+            .sandbox
+            .restart_vm_on_endpoint(&self.vm_id, endpoint)
+            .await;
+    }
+
+    pub async fn exec(&self, command: &str, opts: ExecOptions) -> Result<ExecHandle> {
+        #[cfg(feature = "distributed-control")]
+        if let ControlBackend::Distributed(control) = &self.sandbox.inner.control_backend {
+            // @dive: Distributed mode keeps the facade API stable by routing exec via control commands/events instead of direct guest RPC sockets.
+            return self.exec_via_control_plane(command, opts, control).await;
+        }
+
+        let started = Instant::now();
+        for establish_attempt in 0..3 {
+            let endpoint = match self.ensure_session_rpc_endpoint().await {
+                Ok(endpoint) => endpoint,
+                Err(err) => {
+                    if is_rebind_candidate_error(&err) && establish_attempt < 2 {
+                        let fallback_endpoint = self.current_node_endpoint().await;
+                        if establish_attempt == 0 {
+                            self.invalidate_exec_transport_path(fallback_endpoint.as_str())
+                                .await;
+                        } else {
+                            self.recover_exec_transport_path(fallback_endpoint.as_str())
+                                .await;
+                        }
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let recovery_endpoint = self.current_node_endpoint().await;
+
+            let mut client = match ShellExecClient::connect(endpoint.clone()).await {
+                Ok(client) => client,
+                Err(err) => {
+                    let err = SandboxError::Transport(err);
+                    if is_rebind_candidate_error(&err) && establish_attempt < 2 {
+                        if establish_attempt == 0 {
+                            self.invalidate_exec_transport_path(recovery_endpoint.as_str())
+                                .await;
+                        } else {
+                            self.recover_exec_transport_path(recovery_endpoint.as_str())
+                                .await;
+                        }
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+
+            let shell = opts
+                .shell
+                .clone()
+                .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
+
+            let (req_tx, req_rx) = mpsc::channel(64);
+            req_tx
+                .send(ExecRequest {
+                    request: Some(exec_request::Request::Start(ExecStart {
+                        args: vec![shell, "-lc".to_string(), command.to_string()],
+                        env: opts.env.clone(),
+                        detach: opts.detach,
+                        timeout: opts.timeout_secs,
+                    })),
+                })
+                .await
+                .map_err(|_| {
+                    SandboxError::InvalidResponse("failed to enqueue exec start".into())
+                })?;
+
+            let exec_result = tokio::time::timeout(
+                self.sandbox.inner.cfg.connect_timeout,
+                client.exec(Request::new(ReceiverStream::new(req_rx))),
+            )
+            .await;
+
+            let exec_response = match exec_result {
+                Ok(Ok(response)) => response,
+                Ok(Err(status)) => {
+                    let err = SandboxError::Grpc(status);
+                    if is_rebind_candidate_error(&err) && establish_attempt < 2 {
+                        if establish_attempt == 0 {
+                            self.invalidate_exec_transport_path(recovery_endpoint.as_str())
+                                .await;
+                        } else {
+                            self.recover_exec_transport_path(recovery_endpoint.as_str())
+                                .await;
+                        }
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(_) => {
+                    let err = SandboxError::DaemonUnavailable(
+                        "timed out establishing exec stream against guest RPC".to_string(),
+                    );
+                    if establish_attempt < 2 {
+                        if establish_attempt == 0 {
+                            self.invalidate_exec_transport_path(recovery_endpoint.as_str())
+                                .await;
+                        } else {
+                            self.recover_exec_transport_path(recovery_endpoint.as_str())
+                                .await;
+                        }
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let mut stream = exec_response.into_inner();
+
+            let (input_tx, mut input_rx) = mpsc::channel(64);
+            let (event_tx, event_rx) = mpsc::channel(128);
+
+            let req_tx_for_input = req_tx.clone();
+            let event_tx_input = event_tx.clone();
+            tokio::spawn(async move {
+                let req_tx = req_tx_for_input;
+                while let Some(input) = input_rx.recv().await {
+                    match input {
+                        ExecInput::Data(data) => {
+                            if req_tx
+                                .send(ExecRequest {
+                                    request: Some(exec_request::Request::StdinData(data)),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        ExecInput::Eof => break,
+                        ExecInput::Signal(sig) => {
+                            let _ = event_tx_input
+                                .send(Err(SandboxError::Unsupported(format!(
+                                    "exec signal forwarding not supported by portproxy API: {sig}"
+                                ))))
+                                .await;
+                        }
+                        ExecInput::Resize { cols, rows } => {
+                            let _ = event_tx_input
+                                .send(Err(SandboxError::Unsupported(format!(
+                                    "exec resize not supported by portproxy API: {cols}x{rows}"
+                                ))))
+                                .await;
+                        }
+                    }
+                }
+                drop(req_tx);
+            });
+
+            let event_tx_stream = event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match stream.message().await {
+                        Ok(Some(ExecResponse {
+                            response: Some(exec_response::Response::StdoutData(data)),
+                        })) => {
+                            if event_tx_stream
+                                .send(Ok(ExecEvent::Stdout(data)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Some(ExecResponse {
+                            response: Some(exec_response::Response::StderrData(data)),
+                        })) => {
+                            if event_tx_stream
+                                .send(Ok(ExecEvent::Stderr(data)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Some(ExecResponse {
+                            response: Some(exec_response::Response::ExitCode(code)),
+                        })) => {
+                            if code == 124 {
+                                let _ = event_tx_stream.send(Ok(ExecEvent::Timeout)).await;
+                            }
+                            let _ = event_tx_stream.send(Ok(ExecEvent::Exit(code))).await;
+                            break;
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(status) => {
+                            let _ = event_tx_stream.send(Err(SandboxError::Grpc(status))).await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let handle = ExecHandle {
+                input: input_tx,
+                events: Box::pin(ReceiverStream::new(event_rx)),
+            };
+            log_slo_observation("exec.stream.establish.warm_vm", started.elapsed(), "ok");
+            return Ok(handle);
+        }
+
+        Err(SandboxError::DaemonUnavailable(
+            "failed to establish exec stream after transport recovery attempts".to_string(),
+        ))
+    }
+
+    #[cfg(feature = "distributed-control")]
+    async fn resolve_distributed_exec_target(
+        &self,
+        control: &distributed::DistributedControlPlane,
+        endpoint: &str,
+    ) -> Result<String> {
+        let route_node = control
+            .get_session_route(self.session_id.as_str())
+            .await?
+            .and_then(|route| route.node_id);
+        let endpoint_node = control.node_id_for_endpoint(endpoint).await?;
+        endpoint_node.or(route_node).ok_or_else(|| {
+            SandboxError::InvalidResponse(format!(
+                "unable to resolve target node for distributed exec session_id={} endpoint={endpoint}",
+                self.session_id
+            ))
+        })
+    }
+
+    #[cfg(feature = "distributed-control")]
+    async fn begin_distributed_exec_stream(
+        &self,
+        params: DistributedExecStartParams<'_>,
+    ) -> Result<DistributedExecStreamState> {
+        let DistributedExecStartParams {
+            command,
+            opts,
+            control,
+            endpoint,
+            target_node_id,
+            start_wait,
+            idle_timeout,
+        } = params;
+        let timeout_secs = opts.timeout_secs.unwrap_or(30).max(1);
         let shell = opts
             .shell
             .clone()
             .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
+        let stream_id = Uuid::new_v4().to_string();
+        let start_idempotency_key = format!("exec-stream-start-{stream_id}");
+        let distributed::ExecStreamSubscription {
+            events: stream_events,
+            started,
+        } = control
+            .subscribe_exec_stream_events(stream_id.as_str(), idle_timeout, None, true)
+            .await?;
+        let payload = json!({
+            "stream_id": stream_id.as_str(),
+            "logical_stream_id": stream_id.as_str(),
+            "cluster_id": control.cluster_id(),
+            "producer_epoch": 0u64,
+            "resume_after_event_seq": 0u64,
+            "session_id": self.session_id.as_str(),
+            "vm_id": self.vm_id.as_str(),
+            "endpoint": endpoint.as_str(),
+            "target_node_id": target_node_id.as_str(),
+            "command": command,
+            "env": opts.env.clone(),
+            "detach": opts.detach,
+            "shell": shell,
+            "timeout_secs": timeout_secs,
+            "timeout_ms": (timeout_secs as u64) * 1000,
+            "idempotency_key": start_idempotency_key.as_str(),
+        });
 
-        let (req_tx, req_rx) = mpsc::channel(64);
-        req_tx
-            .send(ExecRequest {
-                request: Some(exec_request::Request::Start(ExecStart {
-                    args: vec![shell, "-lc".to_string(), command.to_string()],
-                    env: opts.env,
-                    detach: opts.detach,
-                    timeout: opts.timeout_secs,
-                })),
-            })
+        let command_id = control
+            .publish_command(
+                "exec.stream.start",
+                format!("exec-stream-start:{stream_id}").as_str(),
+                payload,
+            )
+            .await?;
+        match tokio::time::timeout(start_wait, started).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err),
+            Ok(Err(_)) => {
+                return Err(SandboxError::DaemonUnavailable(format!(
+                    "distributed exec.stream.start dropped readiness signal command_id={command_id} stream_id={stream_id}"
+                )));
+            }
+            Err(_) => {
+                return Err(SandboxError::DaemonUnavailable(format!(
+                    "timed out waiting for distributed exec stream readiness command_id={command_id} stream_id={stream_id}"
+                )));
+            }
+        }
+
+        Ok(DistributedExecStreamState {
+            endpoint,
+            target_node_id,
+            stream_id,
+            producer_epoch: 0,
+            events: stream_events,
+        })
+    }
+
+    #[cfg(feature = "distributed-control")]
+    async fn try_rebind_distributed_exec_stream(
+        &self,
+        params: DistributedExecRebindParams<'_>,
+    ) -> Result<Option<DistributedExecStreamState>> {
+        let DistributedExecRebindParams {
+            control,
+            command,
+            opts,
+            start_wait,
+            current_endpoint,
+            logical_stream_id,
+            resume_after_event_seq,
+            idle_timeout,
+            current_target_node_id,
+            current_producer_epoch,
+        } = params;
+        let resolved_endpoint = self.resolve_session_endpoint().await?;
+        let target_node_id = self
+            .resolve_distributed_exec_target(control, resolved_endpoint.as_str())
             .await
-            .map_err(|_| SandboxError::InvalidResponse("failed to enqueue exec start".into()))?;
+            .unwrap_or_else(|_| current_target_node_id.to_string());
+        let endpoint_changed = resolved_endpoint != current_endpoint;
+        let target_changed = target_node_id != current_target_node_id;
+        let producer_epoch = if endpoint_changed || target_changed {
+            current_producer_epoch.saturating_add(1)
+        } else {
+            current_producer_epoch
+        };
+        let needs_command_resume = endpoint_changed || target_changed;
+        let distributed::ExecStreamSubscription {
+            events: stream_events,
+            started,
+        } = control
+            .subscribe_exec_stream_events(
+                logical_stream_id,
+                idle_timeout,
+                Some(resume_after_event_seq),
+                needs_command_resume,
+            )
+            .await?;
+        if !needs_command_resume {
+            return Ok(Some(DistributedExecStreamState {
+                endpoint: resolved_endpoint,
+                target_node_id,
+                stream_id: logical_stream_id.to_string(),
+                producer_epoch,
+                events: stream_events,
+            }));
+        }
+        let timeout_secs = opts.timeout_secs.unwrap_or(30).max(1);
+        let shell = opts
+            .shell
+            .clone()
+            .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
+        let resume_idempotency_key = format!(
+            "exec-stream-resume-{logical_stream_id}-{producer_epoch}-{resume_after_event_seq}"
+        );
+        let payload = json!({
+            "stream_id": logical_stream_id,
+            "logical_stream_id": logical_stream_id,
+            "cluster_id": control.cluster_id(),
+            "producer_epoch": producer_epoch,
+            "resume_after_event_seq": resume_after_event_seq,
+            "session_id": self.session_id.as_str(),
+            "vm_id": self.vm_id.as_str(),
+            "endpoint": resolved_endpoint.as_str(),
+            "target_node_id": target_node_id.as_str(),
+            "command": command,
+            "env": opts.env.clone(),
+            "detach": opts.detach,
+            "shell": shell,
+            "timeout_secs": timeout_secs,
+            "timeout_ms": (timeout_secs as u64) * 1000,
+            "idempotency_key": resume_idempotency_key.as_str(),
+        });
+        let command_id = control
+            .publish_command(
+                "exec.stream.start",
+                format!("exec-stream-resume:{logical_stream_id}:{resume_after_event_seq}").as_str(),
+                payload,
+            )
+            .await?;
+        match tokio::time::timeout(start_wait, started).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err),
+            Ok(Err(_)) => {
+                return Err(SandboxError::DaemonUnavailable(format!(
+                    "distributed exec stream resume dropped readiness signal logical_stream_id={logical_stream_id} command_id={command_id}"
+                )));
+            }
+            Err(_) => {
+                return Err(SandboxError::DaemonUnavailable(format!(
+                    "timed out waiting for distributed exec stream resume logical_stream_id={logical_stream_id} command_id={command_id}"
+                )));
+            }
+        }
+        Ok(Some(DistributedExecStreamState {
+            endpoint: resolved_endpoint,
+            target_node_id,
+            stream_id: logical_stream_id.to_string(),
+            producer_epoch,
+            events: stream_events,
+        }))
+    }
 
-        let mut stream = client
-            .exec(Request::new(ReceiverStream::new(req_rx)))
-            .await?
-            .into_inner();
+    #[cfg(feature = "distributed-control")]
+    async fn exec_via_control_plane(
+        &self,
+        command: &str,
+        opts: ExecOptions,
+        control: &distributed::DistributedControlPlane,
+    ) -> Result<ExecHandle> {
+        if command.trim().is_empty() {
+            return Err(SandboxError::InvalidResponse(
+                "exec command must be non-empty".to_string(),
+            ));
+        }
+
+        let endpoint = self.resolve_session_endpoint().await?;
+        let start_wait = self.sandbox.inner.cfg.connect_timeout + Duration::from_secs(15);
+        let timeout_secs = opts.timeout_secs.unwrap_or(30).max(1);
+        let idle_timeout = Duration::from_secs(timeout_secs as u64 + 90);
+        let target_node_id = self
+            .resolve_distributed_exec_target(control, endpoint.as_str())
+            .await?;
+        let initial_state = self
+            .begin_distributed_exec_stream(DistributedExecStartParams {
+                command,
+                opts: &opts,
+                control,
+                endpoint,
+                target_node_id,
+                start_wait,
+                idle_timeout,
+            })
+            .await?;
 
         let (input_tx, mut input_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
+        let routing_state = Arc::new(Mutex::new((
+            initial_state.stream_id.clone(),
+            initial_state.target_node_id.clone(),
+            initial_state.producer_epoch,
+        )));
 
-        let req_tx_for_input = req_tx.clone();
+        let control_for_input = control.clone();
+        let routing_for_input = routing_state.clone();
+        let session_id_input = self.session_id.clone();
+        let vm_id_input = self.vm_id.clone();
         let event_tx_input = event_tx.clone();
         tokio::spawn(async move {
-            let req_tx = req_tx_for_input;
+            let mut input_seq = 0u64;
             while let Some(input) = input_rx.recv().await {
+                let (stream_id_input, target_node_id_input, _producer_epoch_input) = {
+                    let guard = routing_for_input.lock().await;
+                    (guard.0.clone(), guard.1.clone(), guard.2)
+                };
                 match input {
-                    ExecInput::Data(data) => {
-                        if req_tx
-                            .send(ExecRequest {
-                                request: Some(exec_request::Request::StdinData(data)),
-                            })
+                    ExecInput::Eof => {
+                        input_seq = input_seq.saturating_add(1);
+                        let payload = json!({
+                            "stream_id": stream_id_input.as_str(),
+                            "session_id": session_id_input.as_str(),
+                            "vm_id": vm_id_input.as_str(),
+                            "target_node_id": target_node_id_input.as_str(),
+                            "input_seq": input_seq,
+                            "input_kind": "eof",
+                            "idempotency_key": format!("exec-stream-input-{stream_id_input}-{input_seq}"),
+                        });
+                        if let Err(err) = control_for_input
+                            .publish_command(
+                                "exec.stream.input",
+                                format!("exec-stream-input:{stream_id_input}:{input_seq}").as_str(),
+                                payload,
+                            )
                             .await
-                            .is_err()
                         {
-                            break;
+                            let _ = event_tx_input.send(Err(err)).await;
                         }
+                        break;
                     }
-                    ExecInput::Eof => break,
                     ExecInput::Signal(sig) => {
                         let _ = event_tx_input
                             .send(Err(SandboxError::Unsupported(format!(
@@ -673,62 +1158,298 @@ impl Session {
                             ))))
                             .await;
                     }
+                    ExecInput::Data(bytes) => {
+                        input_seq = input_seq.saturating_add(1);
+                        let payload = json!({
+                            "stream_id": stream_id_input.as_str(),
+                            "session_id": session_id_input.as_str(),
+                            "vm_id": vm_id_input.as_str(),
+                            "target_node_id": target_node_id_input.as_str(),
+                            "input_seq": input_seq,
+                            "input_kind": "stdin",
+                            "data": bytes,
+                            "idempotency_key": format!("exec-stream-input-{stream_id_input}-{input_seq}"),
+                        });
+                        if let Err(err) = control_for_input
+                            .publish_command(
+                                "exec.stream.input",
+                                format!("exec-stream-input:{stream_id_input}:{input_seq}").as_str(),
+                                payload,
+                            )
+                            .await
+                        {
+                            let _ = event_tx_input.send(Err(err)).await;
+                            break;
+                        }
+                    }
                 }
             }
-            drop(req_tx);
         });
 
-        let event_tx_stream = event_tx.clone();
+        let session_for_events = self.clone();
+        let control_for_events = control.clone();
+        let routing_for_events = routing_state.clone();
+        let command_for_rebind = command.to_string();
+        let opts_for_rebind = opts.clone();
+        let start_wait_for_rebind = start_wait;
+        let mut stream_events = initial_state.events;
+        let mut active_endpoint = initial_state.endpoint;
+        let mut active_stream_id = initial_state.stream_id;
+        let mut active_target_node_id = initial_state.target_node_id;
+        let mut active_producer_epoch = initial_state.producer_epoch;
         tokio::spawn(async move {
+            let mut last_committed_event_seq = 0u64;
+            let mut stall_recovery_attempts: u32 = 0;
+            let mut idle_timeout_strikes: u32 = 0;
+            let rebind_wait_timeout = start_wait_for_rebind + Duration::from_secs(5);
+            const MAX_STALL_RECOVERY_ATTEMPTS: u32 = 5;
+            const REBIND_IDLE_TIMEOUT_STRIKES: u32 = 3;
             loop {
-                match stream.message().await {
-                    Ok(Some(ExecResponse {
-                        response: Some(exec_response::Response::StdoutData(data)),
-                    })) => {
-                        if event_tx_stream
-                            .send(Ok(ExecEvent::Stdout(data)))
+                let next = tokio::time::timeout(Duration::from_secs(2), stream_events.recv()).await;
+                let maybe_event_result = match next {
+                    Ok(value) => {
+                        idle_timeout_strikes = 0;
+                        value
+                    }
+                    Err(_) => {
+                        idle_timeout_strikes = idle_timeout_strikes.saturating_add(1);
+                        if idle_timeout_strikes < REBIND_IDLE_TIMEOUT_STRIKES {
+                            continue;
+                        }
+                        idle_timeout_strikes = 0;
+                        match tokio::time::timeout(
+                            rebind_wait_timeout,
+                            session_for_events.try_rebind_distributed_exec_stream(
+                                DistributedExecRebindParams {
+                                    control: &control_for_events,
+                                    command: command_for_rebind.as_str(),
+                                    opts: &opts_for_rebind,
+                                    start_wait: start_wait_for_rebind,
+                                    current_endpoint: active_endpoint.as_str(),
+                                    logical_stream_id: active_stream_id.as_str(),
+                                    resume_after_event_seq: last_committed_event_seq,
+                                    idle_timeout,
+                                    current_target_node_id: active_target_node_id.as_str(),
+                                    current_producer_epoch: active_producer_epoch,
+                                },
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(rebound))) => {
+                                active_endpoint = rebound.endpoint.clone();
+                                active_stream_id = rebound.stream_id.clone();
+                                active_target_node_id = rebound.target_node_id.clone();
+                                active_producer_epoch = rebound.producer_epoch;
+                                {
+                                    let mut guard = routing_for_events.lock().await;
+                                    *guard = (
+                                        rebound.stream_id.clone(),
+                                        rebound.target_node_id,
+                                        rebound.producer_epoch,
+                                    );
+                                }
+                                stream_events = rebound.events;
+                                stall_recovery_attempts = 0;
+                                idle_timeout_strikes = 0;
+                            }
+                            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                                stall_recovery_attempts = stall_recovery_attempts.saturating_add(1);
+                                if stall_recovery_attempts >= MAX_STALL_RECOVERY_ATTEMPTS {
+                                    let _ = event_tx
+                                        .send(Err(SandboxError::DaemonUnavailable(
+                                            "distributed exec stream stalled after recovery attempts; command was not replayed"
+                                                .to_string(),
+                                        )))
+                                        .await;
+                                    break;
+                                }
+                                let _ = event_tx.send(Ok(ExecEvent::Timeout)).await;
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let Some(event_result) = maybe_event_result else {
+                    match tokio::time::timeout(
+                        rebind_wait_timeout,
+                        session_for_events.try_rebind_distributed_exec_stream(
+                            DistributedExecRebindParams {
+                                control: &control_for_events,
+                                command: command_for_rebind.as_str(),
+                                opts: &opts_for_rebind,
+                                start_wait: start_wait_for_rebind,
+                                current_endpoint: active_endpoint.as_str(),
+                                logical_stream_id: active_stream_id.as_str(),
+                                resume_after_event_seq: last_committed_event_seq,
+                                idle_timeout,
+                                current_target_node_id: active_target_node_id.as_str(),
+                                current_producer_epoch: active_producer_epoch,
+                            },
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(rebound))) => {
+                            active_endpoint = rebound.endpoint.clone();
+                            active_stream_id = rebound.stream_id.clone();
+                            active_target_node_id = rebound.target_node_id.clone();
+                            active_producer_epoch = rebound.producer_epoch;
+                            {
+                                let mut guard = routing_for_events.lock().await;
+                                *guard = (
+                                    rebound.stream_id.clone(),
+                                    rebound.target_node_id,
+                                    rebound.producer_epoch,
+                                );
+                            }
+                            stream_events = rebound.events;
+                            stall_recovery_attempts = 0;
+                            idle_timeout_strikes = 0;
+                            continue;
+                        }
+                        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                            stall_recovery_attempts = stall_recovery_attempts.saturating_add(1);
+                            if stall_recovery_attempts >= MAX_STALL_RECOVERY_ATTEMPTS {
+                                let _ = event_tx
+                                    .send(Err(SandboxError::DaemonUnavailable(
+                                        "distributed exec stream ended and recovery exhausted; command was not replayed"
+                                            .to_string(),
+                                    )))
+                                    .await;
+                                break;
+                            }
+                            let _ = event_tx.send(Ok(ExecEvent::Timeout)).await;
+                            continue;
+                        }
+                    }
+                };
+                let event = match event_result {
+                    Ok(event) => event,
+                    Err(err) => {
+                        match tokio::time::timeout(
+                            rebind_wait_timeout,
+                            session_for_events.try_rebind_distributed_exec_stream(
+                                DistributedExecRebindParams {
+                                    control: &control_for_events,
+                                    command: command_for_rebind.as_str(),
+                                    opts: &opts_for_rebind,
+                                    start_wait: start_wait_for_rebind,
+                                    current_endpoint: active_endpoint.as_str(),
+                                    logical_stream_id: active_stream_id.as_str(),
+                                    resume_after_event_seq: last_committed_event_seq,
+                                    idle_timeout,
+                                    current_target_node_id: active_target_node_id.as_str(),
+                                    current_producer_epoch: active_producer_epoch,
+                                },
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(rebound))) => {
+                                active_endpoint = rebound.endpoint.clone();
+                                active_stream_id = rebound.stream_id.clone();
+                                active_target_node_id = rebound.target_node_id.clone();
+                                active_producer_epoch = rebound.producer_epoch;
+                                {
+                                    let mut guard = routing_for_events.lock().await;
+                                    *guard = (
+                                        rebound.stream_id.clone(),
+                                        rebound.target_node_id,
+                                        rebound.producer_epoch,
+                                    );
+                                }
+                                stream_events = rebound.events;
+                                stall_recovery_attempts = 0;
+                                idle_timeout_strikes = 0;
+                                continue;
+                            }
+                            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                                stall_recovery_attempts = stall_recovery_attempts.saturating_add(1);
+                                if stall_recovery_attempts >= MAX_STALL_RECOVERY_ATTEMPTS {
+                                    let _ = event_tx.send(Err(err)).await;
+                                    break;
+                                }
+                                let _ = event_tx.send(Ok(ExecEvent::Timeout)).await;
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let event_seq = event.normalized_event_seq();
+                if event_seq > 0 {
+                    // @dive: Stream checkpoints enforce no-replay delivery after rebind/resubscribe by suppressing seq <= last committed.
+                    if event_seq <= last_committed_event_seq {
+                        continue;
+                    }
+                    last_committed_event_seq = event_seq;
+                }
+                stall_recovery_attempts = 0;
+                idle_timeout_strikes = 0;
+                match event.kind.as_str() {
+                    "started" => {}
+                    "stdout" => {
+                        if event_tx
+                            .send(Ok(ExecEvent::Stdout(event.data)))
                             .await
                             .is_err()
                         {
                             break;
                         }
                     }
-                    Ok(Some(ExecResponse {
-                        response: Some(exec_response::Response::StderrData(data)),
-                    })) => {
-                        if event_tx_stream
-                            .send(Ok(ExecEvent::Stderr(data)))
+                    "stderr" => {
+                        if event_tx
+                            .send(Ok(ExecEvent::Stderr(event.data)))
                             .await
                             .is_err()
                         {
                             break;
                         }
                     }
-                    Ok(Some(ExecResponse {
-                        response: Some(exec_response::Response::ExitCode(code)),
-                    })) => {
-                        if code == 124 {
-                            let _ = event_tx_stream.send(Ok(ExecEvent::Timeout)).await;
+                    "timeout" => {
+                        if event_tx.send(Ok(ExecEvent::Timeout)).await.is_err() {
+                            break;
                         }
-                        let _ = event_tx_stream.send(Ok(ExecEvent::Exit(code))).await;
+                    }
+                    "exit" => {
+                        let code =
+                            event
+                                .exit_code
+                                .or(if event.timed_out { Some(124) } else { None });
+                        if let Some(code) = code {
+                            let _ = event_tx.send(Ok(ExecEvent::Exit(code))).await;
+                        } else {
+                            let _ = event_tx
+                                .send(Err(SandboxError::InvalidResponse(
+                                    "distributed exec stream exit event missing exit code"
+                                        .to_string(),
+                                )))
+                                .await;
+                        }
                         break;
                     }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(status) => {
-                        let _ = event_tx_stream.send(Err(SandboxError::Grpc(status))).await;
+                    "error" => {
+                        // @dive: Producer terminal errors are surfaced immediately; command replay is intentionally disallowed on this path.
+                        let message = event
+                            .error
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                "distributed exec stream failed with unspecified error".to_string()
+                            });
+                        let _ = event_tx
+                            .send(Err(SandboxError::DaemonUnavailable(message)))
+                            .await;
                         break;
                     }
+                    _ => {}
                 }
             }
         });
 
-        let handle = ExecHandle {
+        Ok(ExecHandle {
             input: input_tx,
             events: Box::pin(ReceiverStream::new(event_rx)),
-        };
-        log_slo_observation("exec.stream.establish.warm_vm", started.elapsed(), "ok");
-        Ok(handle)
+        })
     }
 
     pub async fn shell(&self, opts: ShellOptions) -> Result<ShellHandle> {
@@ -756,10 +1477,17 @@ impl Session {
             .await
             .map_err(|_| SandboxError::InvalidResponse("failed to enqueue shell start".into()))?;
 
-        let mut stream = client
-            .interactive_shell(Request::new(ReceiverStream::new(req_rx)))
-            .await?
-            .into_inner();
+        let shell_response = tokio::time::timeout(
+            self.sandbox.inner.cfg.connect_timeout,
+            client.interactive_shell(Request::new(ReceiverStream::new(req_rx))),
+        )
+        .await
+        .map_err(|_| {
+            SandboxError::DaemonUnavailable(
+                "timed out establishing interactive shell stream against guest RPC".to_string(),
+            )
+        })??;
+        let mut stream = shell_response.into_inner();
 
         let (input_tx, mut input_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
@@ -998,10 +1726,7 @@ impl Session {
             )
             .await?;
 
-        let mut client = self
-            .sandbox
-            .vmd_client_for_endpoint(&node_endpoint)
-            .await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
         let response = client
             .fork_vm(self.sandbox.request_with_auth(ForkVmRequest {
                 parent_vm_id: self.vm_id.clone(),
@@ -1024,10 +1749,8 @@ impl Session {
                 .ensure_vm_and_get_rpc_port(&child_vm.id, &node_endpoint)
                 .await?;
         }
-        let (tenant_id, workspace_id) = self
-            .sandbox
-            .current_session_scope(&self.session_id)
-            .await?;
+        let (tenant_id, workspace_id) =
+            self.sandbox.current_session_scope(&self.session_id).await?;
 
         let child_fence = self
             .sandbox
@@ -1172,17 +1895,11 @@ impl Sandbox {
             )
             .await?;
 
-            // @dive: Reattach path replays execution snapshot restore hints before booting to preserve Tier-B state fidelity.
-            let _ = self
-                .restore_execution_state_if_needed(
-                    &session_id,
-                    &vm.id,
-                    &node_endpoint,
-                    &vm,
-                    false,
-                )
-                .await?;
+            // @dive: Reattach path must boot first, then restore, so memory snapshots are applied with live monitor semantics.
             let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
+            let _ = self
+                .restore_execution_state_if_needed(&session_id, &vm.id, &node_endpoint, &vm, false)
+                .await?;
             let _ = self
                 .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
                 .await?;
@@ -1358,11 +2075,11 @@ impl Sandbox {
         )
         .await?;
 
-        // @dive: Attach uses the same restore primitive as failover rebinding so execution-state recovery is deterministic.
+        // @dive: Attach boot-before-restore ordering preserves memory-snapshot fidelity for Tier-B state recovery.
+        let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
         let _ = self
             .restore_execution_state_if_needed(session_id, &vm.id, &node_endpoint, &vm, false)
             .await?;
-        let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
         let _ = self
             .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
             .await?;
@@ -1520,7 +2237,8 @@ impl Sandbox {
             if self.health_check_endpoint(&endpoint).await.is_err() {
                 continue;
             }
-            self.prewarm_profiles_on_endpoint(&endpoint, &profiles).await?;
+            self.prewarm_profiles_on_endpoint(&endpoint, &profiles)
+                .await?;
         }
         Ok(())
     }
@@ -1849,10 +2567,10 @@ impl Sandbox {
         #[cfg(not(feature = "distributed-control"))]
         let _ = session_id;
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-            if let Some(route) = control.get_session_route(session_id).await? {
-                return Ok((route.tenant_id, route.workspace_id));
-            }
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend
+            && let Some(route) = control.get_session_route(session_id).await?
+        {
+            return Ok((route.tenant_id, route.workspace_id));
         }
         Ok(("default".to_string(), "default".to_string()))
     }
@@ -1978,9 +2696,13 @@ impl Sandbox {
             if candidate == from_endpoint {
                 continue;
             }
-            let Some(candidate_vm) = self.find_vm_by_id_on_endpoint(vm_id, &candidate).await? else {
+            if self
+                .find_vm_by_id_on_endpoint(vm_id, &candidate)
+                .await?
+                .is_none()
+            {
                 continue;
-            };
+            }
 
             #[cfg(feature = "distributed-control")]
             if let ControlBackend::Distributed(control) = &self.inner.control_backend {
@@ -2000,8 +2722,30 @@ impl Sandbox {
                     .await;
             }
 
+            let running_vm = match self.ensure_vm_running(vm_id, &candidate).await {
+                Ok(vm) => vm,
+                Err(_) => {
+                    #[cfg(feature = "distributed-control")]
+                    if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                        let _ = control
+                            .publish_event(
+                                "stream.failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "vm_id": vm_id,
+                                    "from_endpoint": from_endpoint,
+                                    "to_endpoint": candidate.clone(),
+                                    "stage": "ensure_vm_running",
+                                    "reason": reason,
+                                }),
+                            )
+                            .await;
+                    }
+                    continue;
+                }
+            };
             let restore_snapshot_id = match self
-                .restore_execution_state_if_needed(session_id, vm_id, &candidate, &candidate_vm, true)
+                .restore_execution_state_if_needed(session_id, vm_id, &candidate, &running_vm, true)
                 .await
             {
                 Ok(snapshot_id) => snapshot_id,
@@ -2030,7 +2774,12 @@ impl Sandbox {
                 }
             };
 
-            if self.ensure_vm_running(vm_id, &candidate).await.is_err() {
+            // @dive: Route ownership is switched only after guest RPC/portproxy is actually reachable on candidate node.
+            if self
+                .ensure_vm_and_get_rpc_port(vm_id, &candidate)
+                .await
+                .is_err()
+            {
                 #[cfg(feature = "distributed-control")]
                 if let ControlBackend::Distributed(control) = &self.inner.control_backend {
                     let _ = control
@@ -2041,7 +2790,7 @@ impl Sandbox {
                                 "vm_id": vm_id,
                                 "from_endpoint": from_endpoint,
                                 "to_endpoint": candidate.clone(),
-                                "stage": "ensure_vm_running",
+                                "stage": "ensure_guest_rpc_ready",
                                 "reason": reason,
                             }),
                         )
@@ -2126,8 +2875,25 @@ impl Sandbox {
                     "tier_b_eligible session `{_session_id}` requires execution restore snapshot marker"
                 )));
             }
+            tracing::info!(
+                session_id = %_session_id,
+                vm_id = %vm_id,
+                endpoint = %endpoint,
+                tier_b_eligible = tier_b_eligible,
+                enforce_tier_b = enforce_tier_b,
+                "execution restore skipped (no snapshot marker)"
+            );
             return Ok(None);
         };
+        tracing::info!(
+            session_id = %_session_id,
+            vm_id = %vm_id,
+            endpoint = %endpoint,
+            snapshot_id = %snapshot_id,
+            tier_b_eligible = tier_b_eligible,
+            enforce_tier_b = enforce_tier_b,
+            "execution restore snapshot requested"
+        );
 
         let mut client = self.vmd_client_for_endpoint(endpoint).await?;
         client
@@ -2152,6 +2918,13 @@ impl Sandbox {
                 )
                 .await;
         }
+        tracing::info!(
+            session_id = %_session_id,
+            vm_id = %vm_id,
+            endpoint = %endpoint,
+            snapshot_id = %snapshot_id,
+            "execution restore snapshot applied"
+        );
         let _ = (_session_id, enforce_tier_b);
         Ok(Some(snapshot_id))
     }
@@ -2161,15 +2934,16 @@ impl Sandbox {
             Ok(client) => client,
             Err(_) => return Ok(None),
         };
-        match client
-            .get_vm(self.request_with_auth(GetVmRequest {
-                vm_id: vm_id.to_string(),
-            }))
-            .await
-        {
-            Ok(response) => Ok(Some(response.into_inner())),
-            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        let request = self.request_with_auth(GetVmRequest {
+            vm_id: vm_id.to_string(),
+        });
+        let response =
+            tokio::time::timeout(self.inner.cfg.connect_timeout, client.get_vm(request)).await;
+        match response {
             Err(_) => Ok(None),
+            Ok(Ok(response)) => Ok(Some(response.into_inner())),
+            Ok(Err(status)) if status.code() == tonic::Code::NotFound => Ok(None),
+            Ok(Err(_)) => Ok(None),
         }
     }
 
@@ -2216,15 +2990,16 @@ impl Sandbox {
             Ok(client) => client,
             Err(_) => return Ok(None),
         };
-        let response = match client
-            .list_v_ms(self.request_with_auth(ListVMsRequest {
-                include_snapshots: false,
-            }))
-            .await
-        {
-            Ok(response) => response.into_inner(),
-            Err(_) => return Ok(None),
-        };
+        let request = self.request_with_auth(ListVMsRequest {
+            include_snapshots: false,
+        });
+        let response =
+            match tokio::time::timeout(self.inner.cfg.connect_timeout, client.list_v_ms(request))
+                .await
+            {
+                Ok(Ok(response)) => response.into_inner(),
+                Ok(Err(_)) | Err(_) => return Ok(None),
+            };
 
         Ok(response
             .vms
@@ -2257,18 +3032,50 @@ impl Sandbox {
         Ok(vm)
     }
 
+    async fn invalidate_ready_vm_rpc(&self, vm_id: &str, endpoint: &str) {
+        let mut ready = self.inner.ready_vm_rpc.lock().await;
+        ready.remove(&ready_key(endpoint, vm_id));
+    }
+
+    async fn restart_vm_on_endpoint(&self, vm_id: &str, endpoint: &str) -> Result<()> {
+        let mut client = self.vmd_client_for_endpoint(endpoint).await?;
+        let _ = client
+            .restart_vm(self.request_with_auth(VmActionRequest {
+                vm_id: vm_id.to_string(),
+            }))
+            .await?;
+        self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+        Ok(())
+    }
+
     async fn ensure_vm_and_get_rpc_port(&self, vm_id: &str, endpoint: &str) -> Result<i32> {
-        let vm = self.ensure_vm_running(vm_id, endpoint).await?;
-        let rpc_port = vm
+        let mut vm = self.ensure_vm_running(vm_id, endpoint).await?;
+        let mut rpc_port = vm
             .network
             .and_then(|network| network.portproxy_ports)
             .map(|ports| ports.rpc_port)
             .filter(|port| *port > 0)
             .ok_or_else(|| SandboxError::InvalidResponse("VM missing rpc port".into()))?;
 
-        self.ensure_portproxy_ready(vm_id, endpoint, rpc_port)
-            .await?;
-        Ok(rpc_port)
+        match self.ensure_portproxy_ready(vm_id, endpoint, rpc_port).await {
+            Ok(()) => Ok(rpc_port),
+            Err(err) if is_rebind_candidate_error(&err) => {
+                // @dive: VM runtime can survive daemon fail-stop while guest RPC sidecars are stale; force one clean local restart before cross-node escalation.
+                self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
+                self.restart_vm_on_endpoint(vm_id, endpoint).await?;
+                vm = self.ensure_vm_running(vm_id, endpoint).await?;
+                rpc_port = vm
+                    .network
+                    .and_then(|network| network.portproxy_ports)
+                    .map(|ports| ports.rpc_port)
+                    .filter(|port| *port > 0)
+                    .ok_or_else(|| SandboxError::InvalidResponse("VM missing rpc port".into()))?;
+                self.ensure_portproxy_ready(vm_id, endpoint, rpc_port)
+                    .await?;
+                Ok(rpc_port)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn ensure_portproxy_ready(
@@ -2284,10 +3091,12 @@ impl Sandbox {
         };
         if cached_ready {
             let probe_endpoint = format!("http://127.0.0.1:{rpc_port}");
-            if ShellExecClient::connect(probe_endpoint).await.is_ok() {
+            // @dive: Cached readiness must be validated with a full probe RPC so broken streams after failover don't loop on stale cache.
+            if probe_shell_exec_ready(probe_endpoint.as_str(), self.inner.cfg.connect_timeout).await
+            {
                 return Ok(());
             }
-            // @dive: Guest RPC readiness cache is invalidated on failed probe so failover/rebind logic can recover.
+            // @dive: Guest RPC readiness cache is invalidated on failed full probe so failover/rebind logic can recover.
             let mut ready = self.inner.ready_vm_rpc.lock().await;
             ready.remove(&cache_key);
         }
@@ -2297,109 +3106,18 @@ impl Sandbox {
         let mut consecutive_successes = 0u8;
 
         while start.elapsed() < self.inner.cfg.portproxy_ready_timeout {
-            if let Ok(mut client) = ShellExecClient::connect(endpoint.clone()).await {
-                let (req_tx, req_rx) = mpsc::channel(2);
-                if req_tx
-                    .send(ExecRequest {
-                        request: Some(exec_request::Request::Start(ExecStart {
-                            args: vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
-                            env: HashMap::new(),
-                            detach: false,
-                            timeout: Some(5),
-                        })),
-                    })
-                    .await
-                    .is_err()
-                {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+            if probe_shell_exec_ready(endpoint.as_str(), self.inner.cfg.connect_timeout).await {
+                consecutive_successes = consecutive_successes.saturating_add(1);
+                if consecutive_successes < 2 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
-                drop(req_tx);
 
-                let probe = client.exec(Request::new(ReceiverStream::new(req_rx))).await;
-
-                match probe {
-                    Ok(response) => {
-                        let mut stream = response.into_inner();
-                        let mut saw_transport_error = false;
-                        let mut saw_any_frame = false;
-                        let mut saw_exit_code = false;
-                        while let Some(frame) = stream.message().await.transpose() {
-                            match frame {
-                                Ok(ExecResponse {
-                                    response: Some(exec_response::Response::ExitCode(_)),
-                                }) => {
-                                    saw_any_frame = true;
-                                    saw_exit_code = true;
-                                    break;
-                                }
-                                Ok(_) => {
-                                    saw_any_frame = true;
-                                }
-                                Err(status) => {
-                                    let status_message = status.message().to_lowercase();
-                                    let is_transport_not_ready = status.code()
-                                        == tonic::Code::Unavailable
-                                        || status_message.contains("transport error")
-                                        || status_message.contains("connection reset")
-                                        || status_message.contains("broken pipe")
-                                        || status_message.contains("connection refused");
-                                    if is_transport_not_ready {
-                                        saw_transport_error = true;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-
-                        if saw_transport_error {
-                            consecutive_successes = 0;
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                            continue;
-                        }
-
-                        if !saw_any_frame || !saw_exit_code {
-                            consecutive_successes = 0;
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                            continue;
-                        }
-
-                        consecutive_successes = consecutive_successes.saturating_add(1);
-                        if consecutive_successes < 2 {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            continue;
-                        }
-
-                        let mut ready = self.inner.ready_vm_rpc.lock().await;
-                        ready.insert(cache_key.clone(), rpc_port);
-                        return Ok(());
-                    }
-                    Err(status) => {
-                        let status_message = status.message().to_lowercase();
-                        let is_transport_not_ready = status.code() == tonic::Code::Unavailable
-                            || status_message.contains("transport error")
-                            || status_message.contains("connection reset")
-                            || status_message.contains("broken pipe")
-                            || status_message.contains("connection refused");
-
-                        if is_transport_not_ready {
-                            // Guest RPC endpoint is not fully up yet.
-                            consecutive_successes = 0;
-                            continue;
-                        }
-
-                        // Any non-transport gRPC response proves service readiness.
-                        consecutive_successes = consecutive_successes.saturating_add(1);
-                        if consecutive_successes < 2 {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            continue;
-                        }
-                        let mut ready = self.inner.ready_vm_rpc.lock().await;
-                        ready.insert(cache_key.clone(), rpc_port);
-                        return Ok(());
-                    }
-                }
+                let mut ready = self.inner.ready_vm_rpc.lock().await;
+                ready.insert(cache_key.clone(), rpc_port);
+                return Ok(());
             }
+            consecutive_successes = 0;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
@@ -2456,6 +3174,67 @@ impl Sandbox {
         self.clear_session_route(session_id, vm_id, expected_fence)
             .await?;
         Ok(())
+    }
+}
+
+async fn probe_shell_exec_ready(endpoint: &str, establish_timeout: Duration) -> bool {
+    let Ok(mut client) = ShellExecClient::connect(endpoint.to_string()).await else {
+        return false;
+    };
+
+    let (req_tx, req_rx) = mpsc::channel(2);
+    if req_tx
+        .send(ExecRequest {
+            request: Some(exec_request::Request::Start(ExecStart {
+                args: vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
+                env: HashMap::new(),
+                detach: false,
+                timeout: Some(5),
+            })),
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    drop(req_tx);
+
+    let exec_result = tokio::time::timeout(
+        establish_timeout,
+        client.exec(Request::new(ReceiverStream::new(req_rx))),
+    )
+    .await;
+
+    let exec_result = match exec_result {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    match exec_result {
+        Ok(response) => {
+            let mut stream = response.into_inner();
+            let mut saw_any_frame = false;
+            let mut saw_exit_code = false;
+
+            while let Some(frame) = stream.message().await.transpose() {
+                match frame {
+                    Ok(ExecResponse {
+                        response: Some(exec_response::Response::ExitCode(_)),
+                    }) => {
+                        saw_any_frame = true;
+                        saw_exit_code = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        saw_any_frame = true;
+                    }
+                    Err(_) => return false,
+                }
+            }
+
+            saw_any_frame && saw_exit_code
+        }
+        Err(_) => false,
     }
 }
 
@@ -2541,10 +3320,11 @@ fn endpoint_host(endpoint: &str) -> Result<String> {
         )));
     }
 
-    if let Some((host, _port)) = authority.rsplit_once(':') {
-        if !host.is_empty() && !host.contains(':') {
-            return Ok(normalize_dial_host(host).to_string());
-        }
+    if let Some((host, _port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        return Ok(normalize_dial_host(host).to_string());
     }
 
     Ok(normalize_dial_host(authority).to_string())
@@ -2563,7 +3343,10 @@ fn ready_key(endpoint: &str, vm_id: &str) -> String {
 }
 
 fn warm_pool_key(endpoint: &str, image: &str, architecture: &str) -> String {
-    format!("{endpoint}::{image}::{}", normalize_architecture_label(architecture))
+    format!(
+        "{endpoint}::{image}::{}",
+        normalize_architecture_label(architecture)
+    )
 }
 
 fn normalize_architecture_label(raw: &str) -> String {
@@ -2584,7 +3367,10 @@ fn detect_host_architecture_label() -> Option<String> {
 }
 
 fn resolve_tier_b_eligibility(metadata: &HashMap<String, String>) -> bool {
-    if let Some(raw) = metadata.get(META_TIER_B_ELIGIBLE).or_else(|| metadata.get("tier_b_eligible")) {
+    if let Some(raw) = metadata
+        .get(META_TIER_B_ELIGIBLE)
+        .or_else(|| metadata.get("tier_b_eligible"))
+    {
         return parse_bool_like(raw).unwrap_or(true);
     }
     true
@@ -2608,9 +3394,13 @@ fn is_rebind_candidate_error(err: &SandboxError) -> bool {
             let message = status.message().to_ascii_lowercase();
             status.code() == tonic::Code::Unavailable
                 || status.code() == tonic::Code::Unknown
+                || status.code() == tonic::Code::Cancelled
                 || message.contains("transport error")
                 || message.contains("connection reset")
                 || message.contains("broken pipe")
+                || message.contains("connection closed")
+                || message.contains("operation was canceled")
+                || message.contains("canceled")
                 || message.contains("connection refused")
         }
         SandboxError::DaemonUnavailable(message) => {
@@ -2619,6 +3409,9 @@ fn is_rebind_candidate_error(err: &SandboxError) -> bool {
                 || lower.contains("transport")
                 || lower.contains("connection reset")
                 || lower.contains("broken pipe")
+                || lower.contains("connection closed")
+                || lower.contains("operation was canceled")
+                || lower.contains("canceled")
                 || lower.contains("connection refused")
         }
         _ => false,

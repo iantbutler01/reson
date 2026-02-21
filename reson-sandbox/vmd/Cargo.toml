@@ -33,10 +33,11 @@ tower = { version = "0.5.2", features = ["limit", "timeout"] }
 tower-http = { version = "0.6.6", features = ["trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
-uuid = { version = "1.18.1", features = ["v4"] }
+uuid = { version = "1.18.1", features = ["v4", "v7"] }
 reqwest = { version = "0.12.5", features = ["rustls-tls", "stream"] }
 http = "1.1.0"
 indicatif = "0.17.9"
 
 [build-dependencies]
+protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.2"

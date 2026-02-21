@@ -316,9 +316,7 @@ impl VmdService for MockVmd {
             .get(&vm_id)
             .map(|vm| vm.snapshots.clone())
             .unwrap_or_default();
-        Ok(Response::new(ListSnapshotsResponse {
-            snapshots,
-        }))
+        Ok(Response::new(ListSnapshotsResponse { snapshots }))
     }
 
     async fn create_snapshot(
@@ -500,7 +498,10 @@ impl ShellExec for MockShellExec {
         let command = start.args.last().cloned().unwrap_or_default();
         {
             let mut guard = self.state.lock().await;
-            *guard.command_invocations.entry(command.clone()).or_insert(0) += 1;
+            *guard
+                .command_invocations
+                .entry(command.clone())
+                .or_insert(0) += 1;
         }
 
         let mut frames = vec![
@@ -1146,7 +1147,10 @@ async fn tier_b_eligible_failover_requires_restore_snapshot_marker() {
     }
     wait_for_port_closed(primary.portproxy_port as u16).await;
 
-    match session.exec("echo should-fail", ExecOptions::default()).await {
+    match session
+        .exec("echo should-fail", ExecOptions::default())
+        .await
+    {
         Err(SandboxError::InvalidResponse(message)) => {
             assert!(
                 message.contains("tier_b_eligible"),
@@ -1191,21 +1195,15 @@ async fn warm_pool_prewarms_profiles_by_architecture() {
 
     let guard = harness.vmd_state.lock().await;
     assert!(
-        guard
-            .predownload_requests
-            .iter()
-            .any(|(reference, arch)| {
-                reference == "ghcr.io/bracketdevelopers/uv-builder:main" && arch == "amd64"
-            }),
+        guard.predownload_requests.iter().any(|(reference, arch)| {
+            reference == "ghcr.io/bracketdevelopers/uv-builder:main" && arch == "amd64"
+        }),
         "warm pool should request predownload for amd64 profile"
     );
     assert!(
-        guard
-            .predownload_requests
-            .iter()
-            .any(|(reference, arch)| {
-                reference == "ghcr.io/bracketdevelopers/uv-builder:main" && arch == "arm64"
-            }),
+        guard.predownload_requests.iter().any(|(reference, arch)| {
+            reference == "ghcr.io/bracketdevelopers/uv-builder:main" && arch == "arm64"
+        }),
         "warm pool should request predownload for arm64 profile"
     );
     drop(guard);

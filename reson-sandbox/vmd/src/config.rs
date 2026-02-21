@@ -12,6 +12,7 @@ pub const BASE_IMAGES_DIR_NAME: &str = "base_images";
 const DEFAULT_NODE_REGISTRY_PREFIX: &str = "/reson-sandbox";
 const DEFAULT_NODE_REGISTRY_TTL_SECS: i64 = 15;
 const DEFAULT_CONTROL_SUBJECT_PREFIX: &str = "reson.sandbox.control";
+const DEFAULT_CONTROL_CLUSTER_ID: &str = "reson-sandbox-cluster";
 const DEFAULT_CONTROL_DEDUPE_PREFIX: &str = "/reson-sandbox/command-dedupe";
 const DEFAULT_CONTROL_STREAM_NAME: &str = "RESON_SANDBOX_CONTROL";
 const DEFAULT_CONTROL_STREAM_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 7;
@@ -106,6 +107,7 @@ impl NodeRegistryConfig {
 pub struct ControlBusConfig {
     pub nats_url: String,
     pub subject_prefix: String,
+    pub cluster_id: String,
     pub node_id: String,
     pub dedupe_etcd_endpoints: Vec<String>,
     pub dedupe_prefix: String,
@@ -315,6 +317,9 @@ impl Config {
 
         if control.subject_prefix.trim().is_empty() {
             control.subject_prefix = DEFAULT_CONTROL_SUBJECT_PREFIX.to_string();
+        }
+        if control.cluster_id.trim().is_empty() {
+            control.cluster_id = DEFAULT_CONTROL_CLUSTER_ID.to_string();
         }
 
         if control.node_id.trim().is_empty() {
@@ -572,6 +577,9 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
     let subject_prefix = env::var("RESON_SANDBOX_NATS_SUBJECT_PREFIX")
         .or_else(|_| env::var("BRACKET_SANDBOX_NATS_SUBJECT_PREFIX"))
         .unwrap_or_else(|_| DEFAULT_CONTROL_SUBJECT_PREFIX.to_string());
+    let cluster_id = env::var("RESON_SANDBOX_CLUSTER_ID")
+        .or_else(|_| env::var("BRACKET_SANDBOX_CLUSTER_ID"))
+        .unwrap_or_else(|_| DEFAULT_CONTROL_CLUSTER_ID.to_string());
     let node_id = env::var("RESON_SANDBOX_NODE_ID")
         .or_else(|_| env::var("BRACKET_SANDBOX_NODE_ID"))
         .unwrap_or_else(|_| default_node_id());
@@ -636,6 +644,7 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
     Some(ControlBusConfig {
         nats_url,
         subject_prefix: subject_prefix.clone(),
+        cluster_id,
         node_id,
         dedupe_etcd_endpoints,
         dedupe_prefix,

@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use rand::RngCore;
 use serde_json::json;
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedMutexGuard, RwLock};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -38,12 +39,15 @@ const META_FORK_ID: &str = "reson.fork_id";
 const META_FORK_BASE_PATH: &str = "reson.fork_base_path";
 const META_PARENT_VM_ID: &str = "reson.parent_vm_id";
 const META_FORK_SNAPSHOT: &str = "reson.fork_snapshot";
+const META_EXEC_RESTORE_SNAPSHOT_ID: &str = "reson.execution_restore_snapshot_id";
+const META_EXEC_RESTORE_SNAPSHOT_NAME: &str = "reson.execution_restore_snapshot_name";
 const META_FORK_DEPTH: &str = "reson.fork_depth";
 const META_STORAGE_PROFILE: &str = "reson.storage_profile";
 const META_FORK_DURABILITY_CLASS: &str = "reson.fork_durability_class";
 const META_FORK_RESTORE_SCOPE: &str = "reson.fork_restore_scope";
 const MAINTENANCE_DIR_NAME: &str = "_maintenance";
 const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
+const LIVE_FORK_SNAPSHOT_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Clone, Copy, Debug)]
 pub enum CreateVmStage {
@@ -494,20 +498,54 @@ impl Manager {
             self.pause_vm(parent_id).await?;
         }
 
-        let mut fork_snapshot_name = None::<String>;
+        let mut fork_snapshot = None::<SnapshotMetadata>;
         if parent_was_running {
-            let snapshot = self
-                .create_snapshot(
-                    parent_id,
-                    SnapshotParams {
-                        label: format!("fork-{parent_id}"),
-                        description: "reson fork point".to_string(),
-                    },
-                )
-                .await?;
-            fork_snapshot_name = Some(snapshot.name);
-            self.force_stop_vm(parent_id).await?;
+            let snapshot_params = SnapshotParams {
+                label: format!("fork-{parent_id}"),
+                description: "reson fork point".to_string(),
+            };
+            // @dive: Bound live savevm latency; if accelerator/platform blocks on snapshot, force-stop and take an offline snapshot to avoid indefinite fork hangs.
+            let snapshot = match timeout(
+                Duration::from_secs(LIVE_FORK_SNAPSHOT_TIMEOUT_SECS),
+                self.create_snapshot(parent_id, snapshot_params.clone()),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => {
+                    self.force_stop_vm(parent_id).await?;
+                    snapshot
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        vm_id = %parent_id,
+                        error = %err,
+                        "live running-parent fork snapshot failed; retrying with stop + offline snapshot"
+                    );
+                    self.force_stop_vm(parent_id).await?;
+                    self.create_snapshot(parent_id, snapshot_params).await?
+                }
+                Err(_) => {
+                    warn!(
+                        vm_id = %parent_id,
+                        timeout_secs = LIVE_FORK_SNAPSHOT_TIMEOUT_SECS,
+                        "live running-parent fork snapshot timed out; retrying with stop + offline snapshot"
+                    );
+                    self.force_stop_vm(parent_id).await?;
+                    self.create_snapshot(parent_id, snapshot_params).await?
+                }
+            };
+            fork_snapshot = Some(snapshot);
         }
+        let fork_snapshot_name = fork_snapshot.as_ref().map(|snapshot| snapshot.name.clone());
+        // @dive: Child VM keeps its own snapshot identity (new id, same snapshot name) so restore-by-id resolves correctly after failover.
+        let child_restore_snapshot = fork_snapshot.as_ref().map(|snapshot| SnapshotMetadata {
+            id: Uuid::new_v4().to_string(),
+            name: snapshot.name.clone(),
+            label: snapshot.label.clone(),
+            description: snapshot.description.clone(),
+            created_at: snapshot.created_at,
+            disk_only: snapshot.disk_only,
+        });
 
         let (
             parent_name,
@@ -573,8 +611,18 @@ impl Manager {
             fork_restore_scope.to_string(),
         );
         child_metadata.remove(META_FORK_BASE_PATH);
-        if let Some(snapshot_name) = fork_snapshot_name.as_ref() {
-            child_metadata.insert(META_FORK_SNAPSHOT.to_string(), snapshot_name.clone());
+        child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_ID);
+        child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_NAME);
+        if let Some(snapshot) = child_restore_snapshot.as_ref() {
+            child_metadata.insert(META_FORK_SNAPSHOT.to_string(), snapshot.name.clone());
+            child_metadata.insert(
+                META_EXEC_RESTORE_SNAPSHOT_NAME.to_string(),
+                snapshot.name.clone(),
+            );
+            child_metadata.insert(
+                META_EXEC_RESTORE_SNAPSHOT_ID.to_string(),
+                snapshot.id.clone(),
+            );
         }
 
         let child_dir = PathBuf::from(&self.cfg.data_dir).join(&child_id);
@@ -598,7 +646,7 @@ impl Manager {
                 rpc_port: 0,
             },
             metadata: child_metadata,
-            snapshots: Vec::new(),
+            snapshots: child_restore_snapshot.clone().into_iter().collect(),
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: fork_snapshot_name.clone().unwrap_or_default(),
@@ -832,6 +880,15 @@ impl Manager {
             child_dir,
         ));
         self.vms.write().await.insert(child_id.clone(), child_vm);
+        if let Some(snapshot) = child_restore_snapshot {
+            self.snapshots.write().await.insert(
+                snapshot.id.clone(),
+                SnapshotRecord {
+                    vm_id: child_id.clone(),
+                    snapshot,
+                },
+            );
+        }
 
         let child_after = if params.auto_start_child {
             self.start_vm(&child_id).await?
@@ -997,14 +1054,45 @@ impl Manager {
             let pid_path = inner.runtime.pid_path.clone();
             let log_path = vm_dir.join("qemu.log");
 
+            // @dive: Failover can leave an orphaned local qemu process; reclaim ownership before relaunch to avoid disk-lock contention.
+            let reclaimed_stale_runtime = match reclaim_local_runtime_ownership(
+                id,
+                vm_dir.as_path(),
+                qmp_path.as_path(),
+                pid_path.as_path(),
+            )
+            .await
+            {
+                Ok(reclaimed) => reclaimed,
+                Err(err) => {
+                    warn!(
+                        vm_id = %id,
+                        error = %err,
+                        "runtime ownership reclaim failed before restart"
+                    );
+                    false
+                }
+            };
+
             let _ = fs::remove_file(&qmp_path);
             let _ = fs::remove_file(&pid_path);
 
             let mut reserved = HashSet::new();
+            let preferred_proxy_port = if reclaimed_stale_runtime {
+                0
+            } else {
+                inner.metadata.network.proxy_port
+            };
+            let preferred_rpc_port = if reclaimed_stale_runtime {
+                0
+            } else {
+                inner.metadata.network.rpc_port
+            };
+            // @dive: After reclaiming orphan runtime ownership, rotate host ports to avoid stale hostfwd/socket state from prior qemu process.
             inner.metadata.network.proxy_port =
-                allocate_host_port(inner.metadata.network.proxy_port, &mut reserved)?;
+                allocate_host_port(preferred_proxy_port, &mut reserved)?;
             inner.metadata.network.rpc_port =
-                allocate_host_port(inner.metadata.network.rpc_port, &mut reserved)?;
+                allocate_host_port(preferred_rpc_port, &mut reserved)?;
 
             inner.runtime.monitor = None;
             inner.runtime.command_pid = None;
@@ -1194,28 +1282,48 @@ impl Manager {
 
     pub async fn force_stop_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
-        let (monitor, pid) = {
+        let (runtime_state, monitor, pid, vm_dir, qmp_path, pid_path) = {
             let inner = vm.lock().await;
-            if !matches!(inner.runtime.state, VmState::Running | VmState::Paused) {
-                return Ok(inner.metadata.clone());
-            }
-            let monitor = inner
-                .runtime
-                .monitor
-                .clone()
-                .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
+            let state = inner.runtime.state;
+            let monitor = inner.runtime.monitor.clone();
             let pid = inner.runtime.command_pid.unwrap_or_default();
-            (monitor, pid)
+            (
+                state,
+                monitor,
+                pid,
+                vm.dir.clone(),
+                inner.runtime.qmp_path.clone(),
+                inner.runtime.pid_path.clone(),
+            )
         };
 
-        let quit_result = virt::quit(&monitor).await;
-        if quit_result.is_err() {
-            if pid > 0 {
-                kill_process(pid).map_err(ManagerError::Other)?;
+        let mut stopped_with_monitor = false;
+        if matches!(runtime_state, VmState::Running | VmState::Paused) {
+            if let Some(monitor) = monitor {
+                let quit_result = virt::quit(&monitor).await;
+                if quit_result.is_err() && pid > 0 {
+                    kill_process(pid).map_err(ManagerError::Other)?;
+                }
+                wait_for_exit(&vm, Duration::from_secs(30)).await?;
+                stopped_with_monitor = true;
             }
         }
 
-        wait_for_exit(&vm, Duration::from_secs(30)).await?;
+        if !stopped_with_monitor {
+            let reclaimed = reclaim_local_runtime_ownership(
+                id,
+                vm_dir.as_path(),
+                qmp_path.as_path(),
+                pid_path.as_path(),
+            )
+            .await
+            .map_err(ManagerError::Other)?;
+            if reclaimed {
+                // @dive: Attach/failover paths can invoke force-stop without local runtime bookkeeping; persist stopped state after reclaim.
+                mark_vm_state(&vm, VmState::Stopped).await;
+            }
+        }
+
         let meta = vm.lock().await.metadata.clone();
         Ok(meta)
     }
@@ -2014,6 +2122,202 @@ fn kill_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+// @dive: Local runtime ownership reclaim fences orphaned qemu by attempting QMP quit first, then a verified pid kill fallback.
+async fn reclaim_local_runtime_ownership(
+    vm_id: &str,
+    vm_dir: &Path,
+    qmp_path: &Path,
+    pid_path: &Path,
+) -> Result<bool> {
+    let mut reclaimed = false;
+    let mut quit_attempted = false;
+    let mut seen_pids = HashSet::new();
+
+    if qmp_path.exists() {
+        if let Ok(monitor) = virt::wait_for_monitor(qmp_path, Duration::from_millis(750)).await {
+            quit_attempted = true;
+            match virt::quit(&monitor).await {
+                Ok(()) => reclaimed = true,
+                Err(err) => {
+                    warn!(
+                        vm_id = %vm_id,
+                        qmp_path = %qmp_path.display(),
+                        error = %err,
+                        "failed to send qmp quit during ownership reclaim"
+                    );
+                }
+            }
+        }
+    }
+
+    if quit_attempted {
+        let _ = wait_for_runtime_release(qmp_path, pid_path, Duration::from_secs(5)).await;
+    }
+
+    if let Some(pid) = read_pid_file(pid_path) {
+        seen_pids.insert(pid);
+        if !pid_exists(pid) {
+        } else {
+            let Some(command) = read_process_command(pid) else {
+                warn!(
+                    vm_id = %vm_id,
+                    pid,
+                    "skipping pid kill fallback because process command could not be inspected"
+                );
+                return Ok(reclaimed);
+            };
+
+            if !pid_command_matches_vm(command.as_str(), vm_dir, qmp_path) {
+                warn!(
+                    vm_id = %vm_id,
+                    pid,
+                    command = %command,
+                    "skipping pid kill fallback because command does not match expected VM runtime markers"
+                );
+                return Ok(reclaimed);
+            }
+
+            kill_process(pid)?;
+            reclaimed = true;
+            let _ = wait_for_pid_exit(pid, Duration::from_secs(3)).await;
+        }
+    }
+
+    // @dive: Some fail-stop paths leave orphaned qemu without a pidfile; sweep local process table for VM-path-matched qemu processes.
+    for pid in list_local_qemu_pids_for_vm(vm_dir, qmp_path) {
+        if !seen_pids.insert(pid) {
+            continue;
+        }
+        if !pid_exists(pid) {
+            continue;
+        }
+        kill_process(pid)?;
+        reclaimed = true;
+        let _ = wait_for_pid_exit(pid, Duration::from_secs(3)).await;
+    }
+
+    Ok(reclaimed)
+}
+
+async fn wait_for_runtime_release(qmp_path: &Path, pid_path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let pid_alive = read_pid_file(pid_path).map(pid_exists).unwrap_or(false);
+        let qmp_present = qmp_path.exists();
+        if !pid_alive && !qmp_present {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
+async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !pid_exists(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
+fn pid_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    matches!(std::io::Error::last_os_error().raw_os_error(), Some(code) if code == libc::EPERM)
+}
+
+fn read_process_command(pid: u32) -> Option<String> {
+    let pid_arg = pid.to_string();
+    let output = StdCommand::new("ps")
+        .arg("-p")
+        .arg(&pid_arg)
+        .arg("-o")
+        .arg("command=")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8(output.stdout).ok()?;
+    let trimmed = command.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn list_local_qemu_pids_for_vm(vm_dir: &Path, qmp_path: &Path) -> Vec<u32> {
+    let output = StdCommand::new("ps")
+        .arg("-Ao")
+        .arg("pid=,command=")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut iter = trimmed.split_whitespace();
+        let Some(pid_token) = iter.next() else {
+            continue;
+        };
+        let command = trimmed[pid_token.len()..].trim_start();
+        if command.is_empty() {
+            continue;
+        }
+        let Ok(pid) = pid_token.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        if pid_command_matches_vm(command, vm_dir, qmp_path) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+fn pid_command_matches_vm(command: &str, vm_dir: &Path, qmp_path: &Path) -> bool {
+    if !command.contains("qemu-system") {
+        return false;
+    }
+    let vm_dir_str = vm_dir.to_string_lossy();
+    let qmp_str = qmp_path.to_string_lossy();
+    command.contains(vm_dir_str.as_ref()) || command.contains(qmp_str.as_ref())
+}
+
+fn read_pid_file(path: &Path) -> Option<u32> {
+    let content = fs::read_to_string(path).ok()?;
+    let pid = content.trim().parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    Some(pid)
+}
+
 fn normalize_arch(arch: &str) -> ManagerResult<String> {
     match arch.trim().to_lowercase().as_str() {
         "" => Ok(String::new()),
@@ -2645,5 +2949,32 @@ mod tests {
                 "durable-storage-daemon-restart"
             )
         );
+    }
+
+    #[test]
+    fn pid_command_match_requires_qemu_and_vm_markers() {
+        let vm_dir = PathBuf::from("/tmp/reson/vm-123");
+        let qmp_path = vm_dir.join("qmp.sock");
+
+        assert!(pid_command_matches_vm(
+            "qemu-system-aarch64 -qmp unix:/tmp/reson/vm-123/qmp.sock,server=on,wait=off",
+            vm_dir.as_path(),
+            qmp_path.as_path()
+        ));
+        assert!(pid_command_matches_vm(
+            "qemu-system-aarch64 -drive file=/tmp/reson/vm-123/disk.qcow2,format=qcow2",
+            vm_dir.as_path(),
+            qmp_path.as_path()
+        ));
+        assert!(!pid_command_matches_vm(
+            "qemu-system-aarch64 -drive file=/tmp/other/vm-999/disk.qcow2,format=qcow2",
+            vm_dir.as_path(),
+            qmp_path.as_path()
+        ));
+        assert!(!pid_command_matches_vm(
+            "/usr/bin/some-other-process --flag /tmp/reson/vm-123",
+            vm_dir.as_path(),
+            qmp_path.as_path()
+        ));
     }
 }

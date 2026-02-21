@@ -15,6 +15,9 @@ Runtime code and facade crate are present with strict verifiers.
 - `make verify-e2e` - Runs strict verification with e2e enabled
 - `make verify-fork` - Runs strict CoW fork gate directly
 - `make verify-api` - Runs strict facade API gate directly
+- `make verify-strict-real` - Runs fast mock preflight plus mandatory real gates `41-48` using integration profiles
+- `make integration-verify-real-warm-pool` - Runs real warm-pool/cold-start coverage (`7.4`) on live machinery
+- `make integration-verify-planned-drain` - Runs real two-node planned drain handoff probe (admission freeze + in-flight continuity)
 - `make verify-security` - Runs strict authn/authz + TLS security profile gate directly
 - `make verify-slo` - Runs strict SLO threshold/instrumentation gate directly
 - `make evaluate-rollout-policy` - Evaluates rollout pause/rollback policy from observed error-budget burn data
@@ -40,6 +43,8 @@ Runtime code and facade crate are present with strict verifiers.
 
 - Rust-only migration boundary: Python integrations and generated Python stubs are intentionally excluded.
 - Strict mode is the CI enforcement target and includes fork CoW checks.
+- Real-gate CI requirements and profile capabilities are documented in `specs/RESON_SANDBOX_REAL_CI_REQUIREMENTS.md`.
+- Real-gate failure triage is documented in `specs/runbooks/REAL_GATE_FAILURE_TRIAGE_PLAYBOOK.md`.
 - Distributed control is enabled by default (feature `distributed-control`):
   - etcd stores node registry + durable `session_id -> node endpoint` bindings under `/reson-sandbox`.
   - NATS JetStream carries durable control commands/events with explicit-ack consumers and dead-letter replay tooling.

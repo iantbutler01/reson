@@ -54,11 +54,8 @@ pub async fn run_server(config: Config) -> Result<()> {
         .with_context(|| format!("parse listen address {}", config.listen_address))?;
 
     let manager = Arc::new(Manager::new(config.clone()).await.map_err(|e| anyhow!(e))?);
-    let partition_handle = start_partition_monitor(
-        config.node_registry.as_ref(),
-        config.control_bus.as_ref(),
-    )
-    .await?;
+    let partition_handle =
+        start_partition_monitor(config.node_registry.as_ref(), config.control_bus.as_ref()).await?;
     let partition_gate = partition_handle.as_ref().map(|handle| handle.gate());
     let svc = GrpcService {
         manager: Arc::clone(&manager),
@@ -127,13 +124,13 @@ pub async fn run_server(config: Config) -> Result<()> {
         reconcile_trigger_rx,
     )
     .await?;
-    let command_consumer_handle =
-        start_control_bus(
-            config.control_bus.clone(),
-            Some(reconcile_trigger_tx),
-            partition_gate,
-        )
-        .await?;
+    let command_consumer_handle = start_control_bus(
+        config.control_bus.clone(),
+        Arc::clone(&manager),
+        Some(reconcile_trigger_tx),
+        partition_gate,
+    )
+    .await?;
 
     let mut server = Server::builder().layer(grpc_trace);
     if let Some(tls_cfg) = config.security.tls.as_ref() {
@@ -192,12 +189,18 @@ async fn start_node_registry(
 
 async fn start_control_bus(
     control_bus_cfg: Option<ControlBusConfig>,
+    manager: Arc<Manager>,
     reconcile_trigger_tx: Option<mpsc::UnboundedSender<()>>,
     partition_gate: Option<PartitionGate>,
 ) -> Result<Option<control_bus::CommandConsumerHandle>> {
-    control_bus::start_with_trigger(control_bus_cfg, reconcile_trigger_tx, partition_gate)
-        .await
-        .context("start control command consumer")
+    control_bus::start_with_trigger(
+        control_bus_cfg,
+        manager,
+        reconcile_trigger_tx,
+        partition_gate,
+    )
+    .await
+    .context("start control command consumer")
 }
 
 async fn start_partition_monitor(
@@ -331,8 +334,7 @@ impl GrpcService {
                 if !gate.mutation_allowed().await {
                     return Err(Status::unavailable(
                         gate.mutation_rejection_reason().await.unwrap_or_else(|| {
-                            "network partition fail-closed: rejecting mutating commands"
-                                .to_string()
+                            "network partition fail-closed: rejecting mutating commands".to_string()
                         }),
                     ));
                 }

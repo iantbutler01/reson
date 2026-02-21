@@ -76,7 +76,11 @@ impl PartitionMonitorHandle {
 }
 
 impl PartitionGate {
-    fn new(failure_threshold: u32, local_stream_grace: Duration, command_retry_delay: Duration) -> Self {
+    fn new(
+        failure_threshold: u32,
+        local_stream_grace: Duration,
+        command_retry_delay: Duration,
+    ) -> Self {
         Self {
             state: std::sync::Arc::new(RwLock::new(PartitionState::default())),
             failure_threshold,
@@ -147,7 +151,9 @@ impl PartitionGate {
     }
 }
 
-pub async fn start(config: Option<PartitionPolicyConfig>) -> Result<Option<PartitionMonitorHandle>> {
+pub async fn start(
+    config: Option<PartitionPolicyConfig>,
+) -> Result<Option<PartitionMonitorHandle>> {
     let Some(config) = config.map(PartitionPolicyConfig::normalize) else {
         return Ok(None);
     };
@@ -254,16 +260,25 @@ mod tests {
     async fn partition_gate_allows_only_preexisting_streams_within_grace() {
         let gate = PartitionGate::new(1, Duration::from_secs(10), Duration::from_secs(2));
         let now = Instant::now();
-        gate
-            .set_partitioned_since_for_test(Some(now - Duration::from_secs(3)))
+        gate.set_partitioned_since_for_test(Some(now - Duration::from_secs(3)))
             .await;
 
-        assert!(gate.local_stream_allowed(now - Duration::from_secs(4)).await);
-        assert!(!gate.local_stream_allowed(now - Duration::from_secs(1)).await);
+        assert!(
+            gate.local_stream_allowed(now - Duration::from_secs(4))
+                .await
+        );
+        assert!(
+            !gate
+                .local_stream_allowed(now - Duration::from_secs(1))
+                .await
+        );
 
-        gate
-            .set_partitioned_since_for_test(Some(now - Duration::from_secs(20)))
+        gate.set_partitioned_since_for_test(Some(now - Duration::from_secs(20)))
             .await;
-        assert!(!gate.local_stream_allowed(now - Duration::from_secs(30)).await);
+        assert!(
+            !gate
+                .local_stream_allowed(now - Duration::from_secs(30))
+                .await
+        );
     }
 }

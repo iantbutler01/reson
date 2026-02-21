@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_nats::jetstream;
+use async_nats::jetstream::consumer::{AckPolicy, pull};
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -55,6 +57,76 @@ pub(crate) struct NodeRoute {
     pub region: String,
     pub zone: String,
     pub rack: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[allow(dead_code)]
+pub(crate) struct ExecCommandResult {
+    #[serde(default)]
+    pub command_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub vm_id: String,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExecStreamEvent {
+    #[serde(default)]
+    pub cluster_id: String,
+    #[serde(default)]
+    pub logical_stream_id: String,
+    #[serde(default)]
+    pub event_seq: u64,
+    #[serde(default)]
+    pub event_id: String,
+    #[serde(default)]
+    pub producer_epoch: u64,
+    #[serde(default)]
+    pub stream_id: String,
+    #[serde(default)]
+    pub command_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub vm_id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub data: Vec<u8>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub sequence: u64,
+}
+
+impl ExecStreamEvent {
+    pub(crate) fn normalized_event_seq(&self) -> u64 {
+        if self.event_seq == 0 {
+            self.sequence
+        } else {
+            self.event_seq
+        }
+    }
+}
+
+pub(crate) struct ExecStreamSubscription {
+    pub(crate) events: mpsc::Receiver<Result<ExecStreamEvent>>,
+    pub(crate) started: oneshot::Receiver<Result<()>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +252,10 @@ impl DistributedControlPlane {
         Ok(plane)
     }
 
+    pub(crate) fn cluster_id(&self) -> &str {
+        self.cfg.cluster_id.as_str()
+    }
+
     pub(crate) async fn get_session_route(&self, session_id: &str) -> Result<Option<SessionRoute>> {
         let route_key = self.session_key(session_id);
         let legacy_route_key = self.legacy_session_key(session_id);
@@ -210,12 +286,11 @@ impl DistributedControlPlane {
                 ))
             })?;
         }
-        if let Some(fence_kv) = fence_response.kvs().first() {
-            if let Ok(fence) = String::from_utf8(fence_kv.value().to_vec()) {
-                if !fence.trim().is_empty() {
-                    route.ownership_fence = Some(fence);
-                }
-            }
+        if let Some(fence_kv) = fence_response.kvs().first()
+            && let Ok(fence) = String::from_utf8(fence_kv.value().to_vec())
+            && !fence.trim().is_empty()
+        {
+            route.ownership_fence = Some(fence);
         }
         Ok(Some(route))
     }
@@ -310,7 +385,11 @@ impl DistributedControlPlane {
                 )));
             }
             let txn = Txn::new()
-                .when(vec![Compare::value(compare_key, CompareOp::Equal, expected)])
+                .when(vec![Compare::value(
+                    compare_key,
+                    CompareOp::Equal,
+                    expected,
+                )])
                 .and_then(vec![
                     TxnOp::delete(route_key, None),
                     TxnOp::delete(fence_key.clone(), None),
@@ -468,7 +547,11 @@ impl DistributedControlPlane {
             return Err(SandboxError::ResourceExhausted(format!(
                 "no eligible distributed nodes (required_storage_profile={}, required_continuity_tier={}, allow_tier_a_degraded={}, retry_after_ms={}, tenant_id={}, workspace_id={}, {})",
                 required_profile,
-                if tier_b_eligible { required_tier } else { "any" },
+                if tier_b_eligible {
+                    required_tier
+                } else {
+                    "any"
+                },
                 allow_tier_a_degraded,
                 retry_after_ms,
                 tenant_id,
@@ -499,8 +582,14 @@ impl DistributedControlPlane {
 
         let mut ranked = eligible;
         ranked.sort_by(|a, b| {
-            let a_workspace = workspace_endpoint_usage.get(&a.endpoint).copied().unwrap_or(0);
-            let b_workspace = workspace_endpoint_usage.get(&b.endpoint).copied().unwrap_or(0);
+            let a_workspace = workspace_endpoint_usage
+                .get(&a.endpoint)
+                .copied()
+                .unwrap_or(0);
+            let b_workspace = workspace_endpoint_usage
+                .get(&b.endpoint)
+                .copied()
+                .unwrap_or(0);
             let a_zone = zone_usage.get(&a.zone).copied().unwrap_or(0);
             let b_zone = zone_usage.get(&b.zone).copied().unwrap_or(0);
             let a_rack = rack_usage.get(&a.rack).copied().unwrap_or(0);
@@ -514,10 +603,9 @@ impl DistributedControlPlane {
                 .then(a_total.cmp(&b_total))
                 .then(score_node(session_id, &a.node_id).cmp(&score_node(session_id, &b.node_id)))
         });
-        let selected = ranked
-            .first()
-            .cloned()
-            .ok_or_else(|| SandboxError::DaemonUnavailable("no ranked node candidate".to_string()))?;
+        let selected = ranked.first().cloned().ok_or_else(|| {
+            SandboxError::DaemonUnavailable("no ranked node candidate".to_string())
+        })?;
         let _ = self
             .publish_event(
                 "admission.decision",
@@ -549,7 +637,8 @@ impl DistributedControlPlane {
     }
 
     pub(crate) async fn publish_event(&self, event_name: &str, payload: Value) -> Result<()> {
-        let subject = format!("{}.{}", self.cfg.nats_subject_prefix, event_name);
+        // @dive: Control events are published on the `.evt.*` namespace so stream subject filters capture them durably.
+        let subject = format!("{}.evt.{event_name}", self.cfg.nats_subject_prefix);
         let envelope = build_event_envelope(event_name, payload);
         let bytes = serde_json::to_vec(&envelope).map_err(|err| {
             SandboxError::InvalidResponse(format!("serialize control event: {err}"))
@@ -600,6 +689,280 @@ impl DistributedControlPlane {
         self.publish_outbox_record(&outbox).await?;
         self.delete_outbox_record(&outbox.command_id).await?;
         Ok(command_id)
+    }
+
+    pub(crate) async fn node_id_for_endpoint(&self, endpoint: &str) -> Result<Option<String>> {
+        let normalized = endpoint.trim();
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        let routes = self.list_node_routes().await?;
+        Ok(routes
+            .into_iter()
+            .find(|route| route.endpoint.trim() == normalized)
+            .map(|route| route.node_id))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn wait_for_exec_result(
+        &self,
+        command_id: &str,
+        timeout: Duration,
+    ) -> Result<ExecCommandResult> {
+        let command_id = command_id.trim();
+        if command_id.is_empty() {
+            return Err(SandboxError::InvalidResponse(
+                "exec result wait requires non-empty command_id".to_string(),
+            ));
+        }
+        if timeout.is_zero() {
+            return Err(SandboxError::InvalidConfig(
+                "exec result wait timeout must be positive".to_string(),
+            ));
+        }
+
+        let subject = format!(
+            "{}.evt.exec.result.{}",
+            self.cfg.nats_subject_prefix,
+            sanitize_subject_token(command_id)
+        );
+        let stream = self
+            .jetstream
+            .get_stream(self.cfg.nats_stream_name.clone())
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!(
+                    "fetch control stream for exec result failed: {err}"
+                ))
+            })?;
+        let consumer_name = format!("exec-result-{}", Uuid::new_v4().simple());
+        let consumer = stream
+            .create_consumer(pull::Config {
+                durable_name: Some(consumer_name.clone()),
+                ack_policy: AckPolicy::Explicit,
+                ack_wait: timeout,
+                max_deliver: 3,
+                filter_subject: subject.clone(),
+                max_ack_pending: 32,
+                inactive_threshold: Duration::from_secs(30),
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!(
+                    "create exec result consumer failed: {err}"
+                ))
+            })?;
+        // @dive: Ephemeral per-command consumers preserve exactly-once correlation semantics without coupling callers to a shared mutable cursor.
+        let mut messages = consumer.messages().await.map_err(|err| {
+            SandboxError::DaemonUnavailable(format!(
+                "start exec result consumer stream failed: {err}"
+            ))
+        })?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                let _ = stream.delete_consumer(&consumer_name).await;
+                return Err(SandboxError::DaemonUnavailable(format!(
+                    "timed out waiting for exec result command_id={command_id}"
+                )));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let maybe_message = tokio::time::timeout(remaining, messages.next()).await;
+            let maybe_message = match maybe_message {
+                Ok(message) => message,
+                Err(_) => {
+                    let _ = stream.delete_consumer(&consumer_name).await;
+                    return Err(SandboxError::DaemonUnavailable(format!(
+                        "timed out waiting for exec result command_id={command_id}"
+                    )));
+                }
+            };
+            let Some(message) = maybe_message else {
+                continue;
+            };
+            let message = message.map_err(|err| {
+                SandboxError::DaemonUnavailable(format!(
+                    "exec result consumer yielded error: {err}"
+                ))
+            })?;
+
+            let parsed = decode_exec_result_payload(&message.payload)?;
+            let _ = message.ack().await;
+            if parsed.command_id.trim() == command_id {
+                let _ = stream.delete_consumer(&consumer_name).await;
+                return Ok(parsed);
+            }
+        }
+    }
+
+    pub(crate) async fn subscribe_exec_stream_events(
+        &self,
+        stream_id: &str,
+        idle_timeout: Duration,
+        resume_after_event_seq: Option<u64>,
+        expect_started_event: bool,
+    ) -> Result<ExecStreamSubscription> {
+        let stream_id = stream_id.trim();
+        if stream_id.is_empty() {
+            return Err(SandboxError::InvalidResponse(
+                "exec stream subscription requires non-empty stream_id".to_string(),
+            ));
+        }
+        if idle_timeout.is_zero() {
+            return Err(SandboxError::InvalidConfig(
+                "exec stream subscription idle timeout must be positive".to_string(),
+            ));
+        }
+        let resume_after_event_seq = resume_after_event_seq.unwrap_or_default();
+
+        let subject = format!(
+            "{}.evt.exec.stream.{}",
+            self.cfg.nats_subject_prefix,
+            sanitize_subject_token(stream_id)
+        );
+        let stream = self
+            .jetstream
+            .get_stream(self.cfg.nats_stream_name.clone())
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!(
+                    "fetch control stream for exec stream subscription failed: {err}"
+                ))
+            })?;
+        let consumer_name = format!("exec-stream-{}", Uuid::new_v4().simple());
+        let consumer = stream
+            .create_consumer(pull::Config {
+                durable_name: Some(consumer_name.clone()),
+                ack_policy: AckPolicy::Explicit,
+                ack_wait: idle_timeout,
+                max_deliver: 3,
+                filter_subject: subject.clone(),
+                max_ack_pending: 256,
+                inactive_threshold: Duration::from_secs(45),
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!(
+                    "create exec stream consumer failed: {err}"
+                ))
+            })?;
+        // @dive: Every exec stream uses an isolated ephemeral consumer so ordered stream semantics survive control-plane fan-in without shared cursors.
+        let mut messages = consumer.messages().await.map_err(|err| {
+            SandboxError::DaemonUnavailable(format!(
+                "start exec stream consumer stream failed: {err}"
+            ))
+        })?;
+
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut started_tx = Some(started_tx);
+        let stream_name = self.cfg.nats_stream_name.clone();
+        let cleanup_consumer_name = consumer_name.clone();
+        let jetstream = self.jetstream.clone();
+        if !expect_started_event && let Some(tx) = started_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
+
+        tokio::spawn(async move {
+            loop {
+                let next_message = tokio::time::timeout(idle_timeout, messages.next()).await;
+                let maybe_message = match next_message {
+                    Ok(message) => message,
+                    Err(_) => {
+                        let msg = "timed out waiting for distributed exec stream event".to_string();
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Err(SandboxError::DaemonUnavailable(msg.clone())));
+                        }
+                        let _ = event_tx
+                            .send(Err(SandboxError::DaemonUnavailable(msg)))
+                            .await;
+                        break;
+                    }
+                };
+
+                let Some(maybe_message) = maybe_message else {
+                    let msg =
+                        "distributed exec stream event consumer ended unexpectedly".to_string();
+                    if let Some(tx) = started_tx.take() {
+                        let _ = tx.send(Err(SandboxError::DaemonUnavailable(msg.clone())));
+                    }
+                    let _ = event_tx
+                        .send(Err(SandboxError::DaemonUnavailable(msg)))
+                        .await;
+                    break;
+                };
+
+                let message = match maybe_message {
+                    Ok(message) => message,
+                    Err(err) => {
+                        let msg = format!("distributed exec stream consumer yielded error: {err}");
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Err(SandboxError::DaemonUnavailable(msg.clone())));
+                        }
+                        let _ = event_tx
+                            .send(Err(SandboxError::DaemonUnavailable(msg)))
+                            .await;
+                        break;
+                    }
+                };
+
+                let parsed = decode_exec_stream_event_payload(&message.payload);
+                let _ = message.ack().await;
+                let event = match parsed {
+                    Ok(event) => event,
+                    Err(err) => {
+                        if let Some(tx) = started_tx.take() {
+                            let _ = tx.send(Err(SandboxError::DaemonUnavailable(format!("{err}"))));
+                        }
+                        let _ = event_tx.send(Err(err)).await;
+                        break;
+                    }
+                };
+                let event_seq = event.normalized_event_seq();
+                // @dive: Resume semantics are forward-only; once a consumer checkpoint exists, replayed event_seq frames are dropped.
+                if should_drop_replayed_event(event_seq, resume_after_event_seq) {
+                    continue;
+                }
+
+                if let Some(tx) = started_tx.take() {
+                    if expect_started_event && event.kind == "error" {
+                        let err = SandboxError::DaemonUnavailable(
+                            event
+                                .error
+                                .clone()
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or_else(|| {
+                                    "distributed exec stream returned start error".to_string()
+                                }),
+                        );
+                        let _ = tx.send(Err(err));
+                    } else {
+                        let _ = tx.send(Ok(()));
+                    }
+                }
+
+                let terminal = matches!(event.kind.as_str(), "exit" | "timeout" | "error");
+                if event_tx.send(Ok(event)).await.is_err() {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+            }
+
+            if let Ok(stream) = jetstream.get_stream(stream_name).await {
+                let _ = stream.delete_consumer(&cleanup_consumer_name).await;
+            }
+        });
+
+        Ok(ExecStreamSubscription {
+            events: event_rx,
+            started: started_rx,
+        })
     }
 
     pub(crate) async fn acquire_port_lease(
@@ -835,6 +1198,9 @@ fn spawn_outbox_replay_worker(control: DistributedControlPlane) {
 
 fn normalize_cfg(mut cfg: DistributedControlConfig) -> DistributedControlConfig {
     cfg.etcd_prefix = normalize_prefix(&cfg.etcd_prefix);
+    if cfg.cluster_id.trim().is_empty() {
+        cfg.cluster_id = "reson-sandbox-cluster".to_string();
+    }
     if cfg.nats_subject_prefix.trim().is_empty() {
         cfg.nats_subject_prefix = "reson.sandbox.control".to_string();
     }
@@ -994,8 +1360,9 @@ fn decode_session_route_record(key: &str, raw: &[u8]) -> Result<SessionRouteReco
         return Ok(record);
     }
 
-    let endpoint = String::from_utf8(raw.to_vec())
-        .map_err(|err| SandboxError::InvalidResponse(format!("invalid session route value: {err}")))?;
+    let endpoint = String::from_utf8(raw.to_vec()).map_err(|err| {
+        SandboxError::InvalidResponse(format!("invalid session route value: {err}"))
+    })?;
     let session_id = key.rsplit('/').next().unwrap_or_default().to_string();
     Ok(SessionRouteRecord {
         session_id,
@@ -1031,23 +1398,23 @@ fn admission_budget_violation(
         .iter()
         .filter(|route| route.tenant_id == tenant_id)
         .count();
-    if let Some(limit) = tenant_limit {
-        if tenant_sessions >= limit {
-            return Some(format!(
-                "tenant admission budget exhausted (tenant_id={tenant_id}, used={tenant_sessions}, limit={limit})"
-            ));
-        }
+    if let Some(limit) = tenant_limit
+        && tenant_sessions >= limit
+    {
+        return Some(format!(
+            "tenant admission budget exhausted (tenant_id={tenant_id}, used={tenant_sessions}, limit={limit})"
+        ));
     }
     let workspace_sessions = routes
         .iter()
         .filter(|route| route.tenant_id == tenant_id && route.workspace_id == workspace_id)
         .count();
-    if let Some(limit) = workspace_limit {
-        if workspace_sessions >= limit {
-            return Some(format!(
-                "workspace admission budget exhausted (tenant_id={tenant_id}, workspace_id={workspace_id}, used={workspace_sessions}, limit={limit})"
-            ));
-        }
+    if let Some(limit) = workspace_limit
+        && workspace_sessions >= limit
+    {
+        return Some(format!(
+            "workspace admission budget exhausted (tenant_id={tenant_id}, workspace_id={workspace_id}, used={workspace_sessions}, limit={limit})"
+        ));
     }
     None
 }
@@ -1075,10 +1442,10 @@ fn eligible_routes_with_profile(
         }
         let route_tier = normalize_continuity_tier(&route.continuity_tier)
             .unwrap_or_else(|| CONTINUITY_TIER_A.to_string());
-        if let Some(required_tier) = required_continuity_tier.as_ref() {
-            if &route_tier != required_tier {
-                continue;
-            }
+        if let Some(required_tier) = required_continuity_tier.as_ref()
+            && &route_tier != required_tier
+        {
+            continue;
         }
         if route_tier == CONTINUITY_TIER_A {
             if !route.degraded_mode {
@@ -1154,6 +1521,61 @@ fn build_command_envelope(
         "expected_versions": payload.get("expected_versions"),
         "payload": payload,
     })
+}
+
+#[allow(dead_code)]
+fn decode_exec_result_payload(raw: &[u8]) -> Result<ExecCommandResult> {
+    let value: Value = serde_json::from_slice(raw).map_err(|err| {
+        SandboxError::InvalidResponse(format!("decode exec result payload json: {err}"))
+    })?;
+    let payload = value.get("payload").cloned().unwrap_or(value);
+    serde_json::from_value(payload).map_err(|err| {
+        SandboxError::InvalidResponse(format!("decode exec result payload shape: {err}"))
+    })
+}
+
+fn decode_exec_stream_event_payload(raw: &[u8]) -> Result<ExecStreamEvent> {
+    let value: Value = serde_json::from_slice(raw).map_err(|err| {
+        SandboxError::InvalidResponse(format!("decode exec stream payload json: {err}"))
+    })?;
+    let payload = value.get("payload").cloned().unwrap_or(value);
+    let mut parsed: ExecStreamEvent = serde_json::from_value(payload).map_err(|err| {
+        SandboxError::InvalidResponse(format!("decode exec stream payload shape: {err}"))
+    })?;
+    if parsed.logical_stream_id.trim().is_empty() {
+        parsed.logical_stream_id = parsed.stream_id.clone();
+    }
+    if parsed.stream_id.trim().is_empty() {
+        parsed.stream_id = parsed.logical_stream_id.clone();
+    }
+    if parsed.event_seq == 0 {
+        parsed.event_seq = parsed.sequence;
+    }
+    if parsed.sequence == 0 {
+        parsed.sequence = parsed.event_seq;
+    }
+    Ok(parsed)
+}
+
+fn sanitize_subject_token(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "command".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn should_drop_replayed_event(event_seq: u64, resume_after_event_seq: u64) -> bool {
+    resume_after_event_seq > 0 && event_seq > 0 && event_seq <= resume_after_event_seq
 }
 
 fn normalize_storage_profile(raw: &str) -> Option<String> {
@@ -1322,13 +1744,8 @@ mod tests {
             ("http://node-c:8052".to_string(), 4usize),
         ]);
 
-        let eligible = eligible_routes_with_profile(
-            &routes,
-            &usage,
-            None,
-            Some(CONTINUITY_TIER_B),
-            false,
-        );
+        let eligible =
+            eligible_routes_with_profile(&routes, &usage, None, Some(CONTINUITY_TIER_B), false);
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].node_id, "node-a");
     }
@@ -1596,5 +2013,116 @@ mod tests {
         let no_violation =
             admission_budget_violation(&routes, "tenant-a", "workspace-b", Some(3), Some(1));
         assert!(no_violation.is_none());
+    }
+
+    #[test]
+    fn decode_exec_result_payload_accepts_wrapped_or_raw_forms() {
+        let wrapped = json!({
+            "event": "exec.result",
+            "payload": {
+                "command_id": "cmd-1",
+                "session_id": "session-1",
+                "vm_id": "vm-1",
+                "stdout": "ok",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": false,
+                "error": null
+            }
+        });
+        let parsed = decode_exec_result_payload(
+            serde_json::to_string(&wrapped)
+                .expect("serialize wrapped")
+                .as_bytes(),
+        )
+        .expect("decode wrapped result");
+        assert_eq!(parsed.command_id, "cmd-1");
+        assert_eq!(parsed.exit_code, Some(0));
+
+        let raw = json!({
+            "command_id": "cmd-2",
+            "session_id": "session-2",
+            "vm_id": "vm-2",
+            "stdout": "",
+            "stderr": "warn",
+            "exit_code": 1,
+            "timed_out": false,
+            "error": null
+        });
+        let parsed = decode_exec_result_payload(
+            serde_json::to_string(&raw)
+                .expect("serialize raw")
+                .as_bytes(),
+        )
+        .expect("decode raw result");
+        assert_eq!(parsed.command_id, "cmd-2");
+        assert_eq!(parsed.stderr, "warn");
+    }
+
+    #[test]
+    fn decode_exec_stream_event_payload_accepts_wrapped_or_raw_forms() {
+        let wrapped = json!({
+            "event": "exec.stream",
+            "payload": {
+                "cluster_id": "cluster-a",
+                "logical_stream_id": "stream-1",
+                "command_id": "cmd-1",
+                "session_id": "session-1",
+                "vm_id": "vm-1",
+                "kind": "stdout",
+                "data": [111, 107],
+                "exit_code": null,
+                "timed_out": false,
+                "error": null,
+                "event_seq": 2,
+                "event_id": "cluster-a-evt-1",
+                "producer_epoch": 0
+            }
+        });
+        let parsed = decode_exec_stream_event_payload(
+            serde_json::to_string(&wrapped)
+                .expect("serialize wrapped stream event")
+                .as_bytes(),
+        )
+        .expect("decode wrapped stream event");
+        assert_eq!(parsed.logical_stream_id, "stream-1");
+        assert_eq!(parsed.kind, "stdout");
+        assert_eq!(parsed.data, b"ok");
+        assert_eq!(parsed.cluster_id, "cluster-a");
+        assert_eq!(parsed.normalized_event_seq(), 2);
+        assert_eq!(parsed.event_id, "cluster-a-evt-1");
+        assert_eq!(parsed.producer_epoch, 0);
+
+        let raw = json!({
+            "stream_id": "stream-2",
+            "command_id": "cmd-2",
+            "session_id": "session-2",
+            "vm_id": "vm-2",
+            "kind": "exit",
+            "data": [],
+            "exit_code": 0,
+            "timed_out": false,
+            "error": null,
+            "sequence": 3
+        });
+        let parsed = decode_exec_stream_event_payload(
+            serde_json::to_string(&raw)
+                .expect("serialize raw stream event")
+                .as_bytes(),
+        )
+        .expect("decode raw stream event");
+        assert_eq!(parsed.logical_stream_id, "stream-2");
+        assert_eq!(parsed.kind, "exit");
+        assert_eq!(parsed.exit_code, Some(0));
+        assert_eq!(parsed.normalized_event_seq(), 3);
+    }
+
+    #[test]
+    fn replay_filter_drops_events_at_or_below_checkpoint() {
+        assert!(should_drop_replayed_event(1, 1));
+        assert!(should_drop_replayed_event(2, 3));
+        assert!(!should_drop_replayed_event(4, 3));
+        assert!(!should_drop_replayed_event(0, 3));
+        assert!(!should_drop_replayed_event(5, 0));
     }
 }

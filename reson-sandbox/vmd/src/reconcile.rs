@@ -191,8 +191,7 @@ async fn reconcile_once(
     let checkpoint_revision = read_reconcile_checkpoint_revision(&mut client, &checkpoint_key)
         .await
         .unwrap_or(0);
-    let (routes, observed_revision) =
-        load_partitioned_session_routes(&mut client, config).await?;
+    let (routes, observed_revision) = load_partitioned_session_routes(&mut client, config).await?;
 
     let plan = plan_reconcile(
         &config.node_endpoint,
@@ -245,7 +244,8 @@ async fn reconcile_once(
         .put(reconcile_key, summary.to_string(), None)
         .await
         .context("write reconcile summary")?;
-    let _ = write_reconcile_checkpoint_revision(&mut client, &checkpoint_key, observed_revision).await;
+    let _ =
+        write_reconcile_checkpoint_revision(&mut client, &checkpoint_key, observed_revision).await;
 
     if let Some(nats) = nats {
         let subject = format!("{}.evt.reconcile.completed", config.nats_subject_prefix);
@@ -494,12 +494,21 @@ mod tests {
     #[test]
     fn sharded_session_key_detection_is_precise() {
         let prefix = "/reson-sandbox/sessions/";
-        assert!(is_sharded_session_key(prefix, "/reson-sandbox/sessions/03/session-a"));
-        assert!(is_sharded_session_key(prefix, "/reson-sandbox/sessions/15/session-b"));
+        assert!(is_sharded_session_key(
+            prefix,
+            "/reson-sandbox/sessions/03/session-a"
+        ));
+        assert!(is_sharded_session_key(
+            prefix,
+            "/reson-sandbox/sessions/15/session-b"
+        ));
         assert!(!is_sharded_session_key(
             prefix,
             "/reson-sandbox/sessions/session-legacy"
         ));
-        assert!(!is_sharded_session_key(prefix, "/reson-sandbox/sessions/ab/session-c"));
+        assert!(!is_sharded_session_key(
+            prefix,
+            "/reson-sandbox/sessions/ab/session-c"
+        ));
     }
 }

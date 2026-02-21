@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"
 
 GRACE_SECONDS="${LEAK_GRACE_SECONDS:-3}"
+INCLUDE_VMD="${LEAK_CHECK_INCLUDE_VMD:-0}"
 
 usage() {
   cat <<'EOF'
@@ -52,8 +53,16 @@ count_pattern() {
 
 before_qemu="$(count_pattern 'qemu-system')"
 before_portproxy="$(count_pattern '(^|/)portproxy($|[-_ ])|portproxy-')"
+before_vmd="0"
+if [[ "$INCLUDE_VMD" == "1" ]]; then
+  before_vmd="$(count_pattern '(^|/)vmd($| )| vmd --listen ')"
+fi
 
-log "leak harness baseline: qemu=$before_qemu portproxy=$before_portproxy"
+if [[ "$INCLUDE_VMD" == "1" ]]; then
+  log "leak harness baseline: qemu=$before_qemu portproxy=$before_portproxy vmd=$before_vmd"
+else
+  log "leak harness baseline: qemu=$before_qemu portproxy=$before_portproxy"
+fi
 log "running command under leak harness: $*"
 "$@"
 
@@ -61,8 +70,16 @@ sleep "$GRACE_SECONDS"
 
 after_qemu="$(count_pattern 'qemu-system')"
 after_portproxy="$(count_pattern '(^|/)portproxy($|[-_ ])|portproxy-')"
+after_vmd="0"
+if [[ "$INCLUDE_VMD" == "1" ]]; then
+  after_vmd="$(count_pattern '(^|/)vmd($| )| vmd --listen ')"
+fi
 
-log "leak harness after: qemu=$after_qemu portproxy=$after_portproxy"
+if [[ "$INCLUDE_VMD" == "1" ]]; then
+  log "leak harness after: qemu=$after_qemu portproxy=$after_portproxy vmd=$after_vmd"
+else
+  log "leak harness after: qemu=$after_qemu portproxy=$after_portproxy"
+fi
 
 leak=0
 if (( after_qemu > before_qemu )); then
@@ -71,6 +88,10 @@ if (( after_qemu > before_qemu )); then
 fi
 if (( after_portproxy > before_portproxy )); then
   err "portproxy process leak detected: before=$before_portproxy after=$after_portproxy"
+  leak=1
+fi
+if [[ "$INCLUDE_VMD" == "1" ]] && (( after_vmd > before_vmd )); then
+  err "vmd process leak detected: before=$before_vmd after=$after_vmd"
   leak=1
 fi
 

@@ -46,6 +46,7 @@ message AttachDaemonResponse {
   oneof response {
     bytes stdout_data = 1;
     bytes stderr_data = 2;
+    int32 exit_code = 3;
   }
 }
 

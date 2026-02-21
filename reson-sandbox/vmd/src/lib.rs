@@ -1,3 +1,6 @@
+// @dive-file: Root module export surface for vmd runtime subsystems and generated protobuf bindings.
+// @dive-rel: Exposes control bus, app wiring, and VM manager modules consumed by vmd binaries/tests.
+// @dive-rel: Includes both vmd and portproxy protobuf packages so node-local control workers can invoke guest exec RPCs.
 #![allow(clippy::clone_on_copy)]
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::derivable_impls)]
@@ -21,6 +24,14 @@ pub mod state;
 pub mod virt;
 
 pub mod proto {
+    pub mod bracket {
+        pub mod portproxy {
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/bracket.portproxy.v1.rs"));
+            }
+        }
+    }
+
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/vmd.v1.rs"));
     }

@@ -260,6 +260,46 @@ Stream semantics:
 - Reconnect creates a new stream id; replay is not implicit unless explicitly requested by protocol extension.
 - Control commands (`discard`, ownership move) during active stream MUST produce deterministic terminal stream event.
 
+### 5.1 Distributed Exec Event Identity + Resume Contract (Locked)
+
+<!-- @dive: Split event identity into global uniqueness (`event_id`) and per-stream order (`event_seq`) so failover resume can be deterministic without global sequencing. -->
+- Stream events MUST carry both:
+  - `event_id` for global uniqueness (node-independent, cross-cluster safe)
+  - `event_seq` for strict monotonic ordering within one logical stream
+- Required event envelope fields for distributed exec/shell streams:
+  - `cluster_id` (deployment-scoped stable id)
+  - `logical_stream_id` (stable across failover/rebind for one logical exec stream)
+  - `event_seq` (`u64`, strictly increasing per `logical_stream_id`)
+  - `event_id` (recommended `cluster_id` + UUIDv7/ULID form)
+  - `event_kind`
+  - `producer_epoch` (increments on ownership failover/rebind)
+- Ordering rule:
+  - Global monotonic ordering across all streams is explicitly not required.
+  - Strict monotonicity is required per `logical_stream_id`.
+- Resume/dedupe rule:
+  - Consumers MUST dedupe/checkpoint on `(cluster_id, logical_stream_id, event_seq)`.
+  - Rebind/resume MUST continue from `last_committed_event_seq + 1`.
+  - Already delivered events MUST NOT be replayed after rebind.
+  - If a terminal event is already committed for `logical_stream_id`, command execution MUST NOT be re-run.
+
+### 5.2 Distributed Exec Producer Reattach Contract (Locked)
+
+<!-- @dive: Tier-B node-loss continuity requires producer reattachment semantics, not only consumer-side event replay filtering. -->
+- `L3` continuity for active streams is defined as: unplanned node loss, followed by ownership transfer to a surviving node, VM execution-state recovery, and continuation of the same logical stream.
+- Control plane MUST persist stream control state keyed by `(cluster_id, logical_stream_id)` including:
+  - `session_id`, `vm_id`, current owner `node_id`, `producer_epoch`
+  - `last_committed_event_seq`
+  - terminal marker (`terminal_kind`, `terminal_event_seq`, `terminal_event_id`) when committed
+- `exec.stream.start` for an existing non-terminal `logical_stream_id` MUST behave as reattach/resume (idempotent continue), not a fresh command rerun.
+- Failover rebind sequence MUST be:
+  - acquire ownership fence
+  - restore VM execution state for Tier-B eligible session
+  - reattach producer for the same `logical_stream_id`
+  - resume delivery from `last_committed_event_seq + 1`
+  - emit `stream.rebinding` and `stream.rebound` control events
+- If terminal state is already committed for `logical_stream_id`, recovery MUST return the terminal outcome and MUST NOT rerun command execution.
+- If continuation is impossible after bounded recovery attempts, system MUST emit deterministic `stream.failed` terminal outcome and MUST NOT rerun command execution.
+
 ## 6) Port Multiplexing Contract (Distributed)
 
 ### 6.1 Node-level multiplexing
@@ -391,6 +431,8 @@ Readiness policy:
   - Duplicate side effects are prohibited unless command contract is explicitly idempotent and deduped by idempotency key.
 - Stream semantics through failover:
   - Active exec/shell streams MUST recover automatically with preserved per-stream event ordering after reconnect boundary.
+  - Recovery MUST use checkpointed per-stream resume (`last_seq + 1`) and MUST NOT replay already-delivered events.
+  - Terminal-committed streams MUST not restart command execution during recovery.
   - Continuity recovery MUST emit explicit control events (`stream.rebinding`, `stream.rebound`, `stream.failed`) for observability.
 - Planned maintenance continuity:
   - Node drain MUST support proactive handoff for active sessions before process termination.
@@ -493,6 +535,7 @@ Existing gates remain mandatory. Additional required gates:
 - Gate 35: Tier-B execution-state fidelity tests (disk+memory continuity for eligible sessions).
 - Gate 36: Warm-pool/cold-start SLO tests per architecture and platform profile.
 - Gate 39: Full game-day failover drills including continuity + ingress + port multiplexer paths.
+- Gate 40: Distributed stream checkpoint/resume tests (`event_seq` monotonicity, no replay after rebind, terminal-no-rerun enforcement).
 
 All enabled production gates must pass for HA readiness claim.
 
@@ -533,6 +576,10 @@ All enabled production gates must pass for HA readiness claim.
 - [x] Add Tier-B chaos suite for mid-command failover and exactly-once verification.
 - [x] Implement execution-state fidelity classifier and policy (`tier_b_eligible` with disk+memory continuity requirement).
 - [x] Implement architecture-aware warm pools and prewarmed image pipeline.
+- [ ] Implement distributed stream event identity envelope (`cluster_id`, `logical_stream_id`, `event_seq`, `event_id`, `producer_epoch`) end-to-end.
+- [ ] Implement checkpointed stream resume (`last_seq + 1`) with strict no-replay and terminal-no-rerun guarantees across failover.
+- [ ] Implement control-plane-owned producer reattach flow for active logical streams across unplanned node failover.
+- [ ] Enforce per-stream `event_seq` continuity across `producer_epoch` changes (`resume from last checkpoint + 1`).
 
 ### Explicitly Out Of Scope For This Execution Pass
 

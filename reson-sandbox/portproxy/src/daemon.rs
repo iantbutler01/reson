@@ -1,3 +1,6 @@
+// @dive-file: Tracks named long-lived guest-side daemon processes used for attachable command execution streams.
+// @dive-rel: Consumed by portproxy/src/services.rs DaemonManagerService for exec/attach semantics.
+// @dive-rel: Enables distributed stream producer reattachment by name across control-plane rebind attempts.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,7 +9,7 @@ use portable_pty::CommandBuilder;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tracing::{error, info, warn};
 
 use crate::child_tracker::ChildTracker;
@@ -97,6 +100,7 @@ impl DaemonRegistry {
 
         let (stdout_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (stderr_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (exit_tx, _) = watch::channel(None::<i32>);
 
         let entry = Arc::new(DaemonEntry {
             _name: req.name.clone(),
@@ -104,6 +108,7 @@ impl DaemonRegistry {
             stdout_tx: stdout_tx.clone(),
             stderr_tx: stderr_tx.clone(),
             attach_lock: Arc::new(Mutex::new(())),
+            exit_tx: exit_tx.clone(),
         });
 
         {
@@ -127,6 +132,7 @@ impl DaemonRegistry {
                     return;
                 }
             };
+            let _ = exit_tx.send(status.code());
             if pid > 0 {
                 tracker.unregister(pid).await;
             }
@@ -153,6 +159,7 @@ pub struct DaemonEntry {
     pub stdout_tx: broadcast::Sender<Vec<u8>>,
     pub stderr_tx: broadcast::Sender<Vec<u8>>,
     pub attach_lock: Arc<Mutex<()>>,
+    pub exit_tx: watch::Sender<Option<i32>>,
 }
 
 fn spawn_reader<R>(mut reader: R, tx: broadcast::Sender<Vec<u8>>, label: String)

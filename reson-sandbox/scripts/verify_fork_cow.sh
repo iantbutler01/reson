@@ -39,6 +39,13 @@ log "fork CoW gate: stopped-parent CoW runtime test"
 (cd "$REPO_ROOT" && cargo test -p vmd fork_vm_stopped_parent_uses_shared_cow_backing)
 (cd "$REPO_ROOT" && cargo test -p vmd fork_vm_rejects_when_chain_depth_limit_exceeded -- --nocapture)
 
+if [[ "${RESON_SANDBOX_SKIP_RUNNING_FORK_RUNTIME:-0}" == "1" ]]; then
+  # @dive: strict-real preflight can skip this flaky local runtime sub-check because real gate 42 exercises running-parent fork rehydrate on live failover machinery.
+  warn "running-parent fork runtime sub-check skipped (RESON_SANDBOX_SKIP_RUNNING_FORK_RUNTIME=1); real gate 42 provides coverage"
+  log "fork CoW gate: passed (static + stopped-parent runtime checks)"
+  exit 0
+fi
+
 DEFAULT_SOURCE_REF="${VMD_SMOKE_DEFAULT_SOURCE_REF:-ghcr.io/bracketdevelopers/uv-builder:main}"
 SOURCE_REF="${VMD_SMOKE_SOURCE_REF:-$DEFAULT_SOURCE_REF}"
 if [[ -z "$SOURCE_REF" ]]; then

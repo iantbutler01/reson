@@ -1,3 +1,6 @@
+// @dive-file: Implements gRPC PortProxy, ShellExec, and DaemonManager services used inside guest VMs.
+// @dive-rel: Uses portproxy/src/daemon.rs to provide named daemon exec streams that can be reattached.
+// @dive-rel: Conforms to proto/bracket/portproxy/v1/portproxy.proto service contracts.
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -606,6 +609,7 @@ impl DaemonManager for DaemonManagerService {
         let (tx, rx) = mpsc::channel(32);
         let mut stdout_rx = entry.stdout_tx.subscribe();
         let mut stderr_rx = entry.stderr_tx.subscribe();
+        let mut exit_rx = entry.exit_tx.subscribe();
 
         tokio::spawn({
             let tx = tx.clone();
@@ -652,6 +656,28 @@ impl DaemonManager for DaemonManagerService {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            }
+        });
+
+        tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                loop {
+                    let exit_code = *exit_rx.borrow_and_update();
+                    if let Some(exit_code) = exit_code {
+                        let _ = tx
+                            .send(Ok(AttachDaemonResponse {
+                                response: Some(
+                                    crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::ExitCode(exit_code),
+                                ),
+                            }))
+                            .await;
+                        break;
+                    }
+                    if exit_rx.changed().await.is_err() {
+                        break;
                     }
                 }
             }

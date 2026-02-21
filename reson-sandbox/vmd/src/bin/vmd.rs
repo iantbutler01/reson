@@ -188,20 +188,20 @@ async fn main() -> Result<()> {
     if args.ha_mode {
         cfg.ha_mode = true;
     }
-    if let Some(continuity_tier) = args.continuity_tier {
-        if let Some(registry) = cfg.node_registry.as_mut() {
-            registry.continuity_tier = continuity_tier.into();
-        }
+    if let Some(continuity_tier) = args.continuity_tier
+        && let Some(registry) = cfg.node_registry.as_mut()
+    {
+        registry.continuity_tier = continuity_tier.into();
     }
-    if args.degraded_mode {
-        if let Some(registry) = cfg.node_registry.as_mut() {
-            registry.degraded_mode = true;
-        }
+    if args.degraded_mode
+        && let Some(registry) = cfg.node_registry.as_mut()
+    {
+        registry.degraded_mode = true;
     }
-    if args.admission_frozen {
-        if let Some(registry) = cfg.node_registry.as_mut() {
-            registry.admission_frozen = true;
-        }
+    if args.admission_frozen
+        && let Some(registry) = cfg.node_registry.as_mut()
+    {
+        registry.admission_frozen = true;
     }
     if args.disable_node_registry {
         cfg.node_registry = None;
@@ -274,6 +274,7 @@ async fn main() -> Result<()> {
         let mut control = cfg.control_bus.clone().unwrap_or(ControlBusConfig {
             nats_url: "nats://127.0.0.1:4222".to_string(),
             subject_prefix: "reson.sandbox.control".to_string(),
+            cluster_id: "reson-sandbox-cluster".to_string(),
             node_id: "vmd-node".to_string(),
             dedupe_etcd_endpoints: Vec::new(),
             dedupe_prefix: "/reson-sandbox/command-dedupe".to_string(),

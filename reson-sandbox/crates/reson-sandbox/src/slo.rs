@@ -44,21 +44,21 @@ pub fn evaluate_slo(samples: &[SloSample], budgets: &[SloBudget]) -> Vec<String>
     let mut violations = Vec::new();
     for sample in samples {
         if let Some(budget) = budgets.iter().find(|budget| budget.metric == sample.metric) {
-            if let (Some(observed), Some(limit)) = (sample.p95_ms, budget.p95_ms) {
-                if observed > limit {
-                    violations.push(format!(
-                        "{} p95 exceeded: observed={}ms budget={}ms",
-                        sample.metric, observed, limit
-                    ));
-                }
+            if let (Some(observed), Some(limit)) = (sample.p95_ms, budget.p95_ms)
+                && observed > limit
+            {
+                violations.push(format!(
+                    "{} p95 exceeded: observed={}ms budget={}ms",
+                    sample.metric, observed, limit
+                ));
             }
-            if let (Some(observed), Some(limit)) = (sample.p99_ms, budget.p99_ms) {
-                if observed > limit {
-                    violations.push(format!(
-                        "{} p99 exceeded: observed={}ms budget={}ms",
-                        sample.metric, observed, limit
-                    ));
-                }
+            if let (Some(observed), Some(limit)) = (sample.p99_ms, budget.p99_ms)
+                && observed > limit
+            {
+                violations.push(format!(
+                    "{} p99 exceeded: observed={}ms budget={}ms",
+                    sample.metric, observed, limit
+                ));
             }
         }
     }
