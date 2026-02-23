@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Appends certificate revocation entries and emits revocation manifest metadata.
+# @dive-rel: Used by verify_security_ops.sh gate and security operations runbooks.
+# @dive-rel: Maintains revocation ledger for client-cert invalidation workflows.
+
 set -euo pipefail
 
 usage() {

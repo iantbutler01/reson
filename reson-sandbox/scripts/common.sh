@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Shared verifier helper library for logging, repo path resolution, and command checks.
+# @dive-rel: Sourced by scripts/verify_*.sh and operational drill scripts.
+# @dive-rel: Provides consistent strict-gate behavior and runtime source availability checks.
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

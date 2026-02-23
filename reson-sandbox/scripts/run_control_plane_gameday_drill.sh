@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Runs etcd/NATS/zone-failure game-day scenarios against compose control-plane stack.
+# @dive-rel: Invoked by verify_operational_gameday.sh gate for operational readiness evidence.
+# @dive-rel: Produces structured drill report for CI/local failure triage.
+
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"

@@ -1,3 +1,7 @@
+// @dive-file: Core VM metadata/type definitions shared across manager and API conversion layers.
+// @dive-rel: Used by vmd state manager and protobuf translation paths in app/ctl code.
+// @dive-rel: Defines durable and runtime-adjacent structures for VM state and snapshot lineage.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

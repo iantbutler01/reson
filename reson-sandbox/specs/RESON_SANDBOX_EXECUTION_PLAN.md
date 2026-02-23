@@ -1,3 +1,6 @@
+<!-- @dive-file: Execution plan summary for reson-sandbox migration and delivery status. -->
+<!-- @dive-rel: Tracks implementation progress against locked migration checklist expectations. -->
+<!-- @dive-rel: Supports handoff context for verifier scripts and integration workstreams. -->
 # Reson Sandbox Execution Plan
 
 This document tracks implementation of the locked migration plan for `reson-sandbox`.

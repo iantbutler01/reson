@@ -1,3 +1,6 @@
+<!-- @dive-file: Runbook for staged rollout progression and automatic rollback triggers. -->
+<!-- @dive-rel: Consumed by scripts/evaluate_rollout_policy.sh and verify_slo_profile.sh rollout checks. -->
+<!-- @dive-rel: Defines release-control expectations tied to SLO/error-budget observations. -->
 # Staged Rollout And Automatic Rollback Policy
 
 Status: Locked  

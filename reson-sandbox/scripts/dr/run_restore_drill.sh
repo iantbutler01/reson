@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Orchestrates backup+restore disaster-recovery drill and report generation.
+# @dive-rel: Composes scripts/dr/backup_etcd.sh and scripts/dr/restore_etcd.sh.
+# @dive-rel: Used by verify_dr_restore.sh gate and DR runbook execution.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

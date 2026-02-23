@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Builds architecture-specific guest portproxy binaries inside Docker.
+# @dive-rel: Used by integration and local workflows that require guest payload binaries.
+# @dive-rel: Writes outputs to portproxy/bin consumed by VM bootstrap asset resolution.
+
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"

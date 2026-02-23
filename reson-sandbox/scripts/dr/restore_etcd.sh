@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Restores etcd data directories from snapshot backups with manifest output.
+# @dive-rel: Used by scripts/dr/run_restore_drill.sh for DR rehearsal.
+# @dive-rel: Supports dry-run/live restore workflows for operational readiness checks.
+
 set -euo pipefail
 
 usage() {

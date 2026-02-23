@@ -1,3 +1,7 @@
+// @dive-file: QEMU/virt helpers for conversion, monitor operations, and VM process orchestration.
+// @dive-rel: Called by vmd state manager runtime lifecycle transitions and snapshot operations.
+// @dive-rel: Encapsulates platform-specific virtualization behavior behind stable helper APIs.
+
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::ffi::OsStr;

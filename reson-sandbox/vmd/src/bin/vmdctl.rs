@@ -1,3 +1,7 @@
+// @dive-file: Operator CLI client for vmd lifecycle, snapshot, and fork operations.
+// @dive-rel: Calls protobuf APIs exposed by vmd service and mirrors runtime config defaults.
+// @dive-rel: Used by verification/integration harness scripts for black-box runtime assertions.
+
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::too_many_arguments)]
 

@@ -1,3 +1,7 @@
+// @dive-file: State subsystem module root exporting manager, metadata, runtime, and VM types.
+// @dive-rel: Consumed by app/control paths that orchestrate VM lifecycle operations.
+// @dive-rel: Defines the cohesive state API boundary used throughout vmd runtime code.
+
 pub mod manager;
 pub mod metadata;
 pub mod runtime;

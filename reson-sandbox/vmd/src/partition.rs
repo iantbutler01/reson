@@ -1,3 +1,7 @@
+// @dive-file: Network-partition policy monitor and fail-closed gating for mutating control paths.
+// @dive-rel: Integrated by daemon orchestration in vmd/src/app.rs and checked by verifier gates.
+// @dive-rel: Enforces bounded grace for local streams while blocking new mutations during quorum loss.
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -129,6 +133,7 @@ impl PartitionGate {
     async fn record_probe_failure(&self) {
         let mut state = self.state.write().await;
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        // @dive: Fail-closed flips only once at threshold crossing so logs and state transitions stay stable during prolonged outages.
         if state.consecutive_failures >= self.failure_threshold && state.partitioned_since.is_none()
         {
             state.partitioned_since = Some(Instant::now());
@@ -181,6 +186,7 @@ pub async fn start(
                     match probe_once(&loop_config, &mut client).await {
                         Ok(()) => loop_gate.record_probe_success().await,
                         Err(err) => {
+                            // @dive: Probe failures are intentionally treated as control-plane visibility loss, not fatal task exits.
                             debug!(err = %err, "control-plane quorum probe failed");
                             loop_gate.record_probe_failure().await;
                         }
@@ -215,6 +221,7 @@ async fn probe_once(config: &PartitionPolicyConfig, client: &mut Option<EtcdClie
         )
         .await;
     if let Err(err) = probe {
+        // @dive: On RPC failure we drop the client so next tick forces a clean reconnect instead of reusing stale transport.
         *client = None;
         return Err(err).context("etcd partition probe get");
     }
@@ -230,6 +237,7 @@ fn local_stream_allowed_with_now(
     let Some(partitioned_since) = partitioned_since else {
         return true;
     };
+    // @dive: Streams that began after partition onset are blocked; pre-existing streams get bounded grace-only continuation.
     if stream_started_at > partitioned_since {
         return false;
     }

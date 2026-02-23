@@ -1,3 +1,6 @@
+<!-- @dive-file: Security operations runbook for TLS rotation, certificate revocation, and secret handling. -->
+<!-- @dive-rel: Implemented by scripts/security/rotate_tls_bundle.sh and scripts/security/revoke_client_cert.sh. -->
+<!-- @dive-rel: Validated by scripts/verify_security_ops.sh gate checks. -->
 # Reson Sandbox Security Operations Playbook
 
 ## Scope

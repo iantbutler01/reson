@@ -1,3 +1,6 @@
+# @dive-file: Cargo manifest for the public reson-sandbox facade crate and distributed-control feature surface.
+# @dive-rel: Builds crates/reson-sandbox/src/lib.rs and distributed adapter modules consumed by reson-rust.
+# @dive-rel: Defines dependency boundaries for control-plane transports, protobufs, and runtime async tooling.
 [package]
 name = "reson-sandbox"
 version = "0.1.0"

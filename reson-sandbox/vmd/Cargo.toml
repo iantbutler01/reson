@@ -1,3 +1,6 @@
+# @dive-file: Cargo manifest for vmd runtime daemon, library modules, and operator binaries.
+# @dive-rel: Builds vmd/src/lib.rs plus vmd/vmdctl/mqctl binaries used by gate and integration harnesses.
+# @dive-rel: Declares control-plane, virtualization, and protobuf dependencies for VM lifecycle execution.
 [package]
 name = "vmd"
 version = "0.1.0"

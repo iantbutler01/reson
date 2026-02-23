@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Evaluates rollout pause/rollback policy from observed error-budget burn metrics.
+# @dive-rel: Used by verify_slo_profile gate and CI rollout decision workflows.
+# @dive-rel: Reads threshold and observed JSON inputs to produce deterministic rollout verdicts.
+
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"

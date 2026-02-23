@@ -1,3 +1,7 @@
+// @dive-file: TCP forwarding server/client implementation used by guest hostfwd proxy behavior.
+// @dive-rel: Invoked by portproxy/src/main.rs in server and client modes.
+// @dive-rel: Carries port-preface handshake and bidirectional stream piping for forwarded traffic.
+
 use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +26,7 @@ pub async fn run_server(addr: &str) -> anyhow::Result<()> {
 
 async fn handle_server_connection(mut socket: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
     let mut port_buf = [0u8; PORT_BYTES];
+    // @dive: First two bytes are a fixed port preface selecting in-guest destination before payload forwarding begins.
     socket.read_exact(&mut port_buf).await?;
     let dest_port = u16::from_be_bytes(port_buf);
     let target = format!("127.0.0.1:{dest_port}");
@@ -69,6 +74,7 @@ async fn handle_client_connection(
     );
     let mut server = TcpStream::connect(server_addr).await?;
 
+    // @dive: Client writes destination preface once so server can route this stream without any additional control channel.
     let port_bytes = forward_port.to_be_bytes();
     server.write_all(&port_bytes).await?;
 
@@ -80,6 +86,7 @@ async fn copy_bidirectional(mut a: TcpStream, mut b: TcpStream) -> anyhow::Resul
     let (mut ar, mut aw) = a.split();
     let (mut br, mut bw) = b.split();
 
+    // @dive: Bidirectional copy keeps both half-duplex flows active so interactive streams don't deadlock on one-way backpressure.
     let forward = tokio::io::copy(&mut ar, &mut bw);
     let backward = tokio::io::copy(&mut br, &mut aw);
 

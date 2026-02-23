@@ -1,3 +1,7 @@
+// @dive-file: Build-time protobuf generation for guest portproxy gRPC services.
+// @dive-rel: Produces service/client stubs consumed by portproxy/src/main.rs and services.rs.
+// @dive-rel: Must stay in sync with proto/bracket/portproxy/v1/portproxy.proto.
+
 use std::path::PathBuf;
 
 fn set_protoc_env() -> Result<(), Box<dyn std::error::Error>> {

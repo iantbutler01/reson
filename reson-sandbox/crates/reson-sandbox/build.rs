@@ -1,3 +1,7 @@
+// @dive-file: Build-time protobuf generation for facade crate stubs used in distributed/local sandbox clients.
+// @dive-rel: Generates vmd and portproxy protobuf modules consumed by crates/reson-sandbox/src/lib.rs and distributed.rs.
+// @dive-rel: Must stay aligned with proto/bracket/* service definitions to preserve facade compatibility contracts.
+
 use std::path::PathBuf;
 
 fn set_protoc_env() -> Result<(), Box<dyn std::error::Error>> {

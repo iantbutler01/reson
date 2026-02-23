@@ -1,3 +1,6 @@
+<!-- @dive-file: Design spec for etcd+MQ distributed control backing while preserving facade API shape. -->
+<!-- @dive-rel: Complements specs/RESON_SANDBOX_HA_DISTRIBUTED_CONTRACT.md with implementation-oriented control-plane details. -->
+<!-- @dive-rel: Informs distributed adapter behavior in crates/reson-sandbox/src/distributed.rs. -->
 # Reson Sandbox Distributed Control (etcd + MQ)
 
 This document defines the distributed backing layer while keeping the public Rust facade unchanged.

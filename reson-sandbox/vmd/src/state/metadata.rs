@@ -1,3 +1,7 @@
+// @dive-file: Persistent vm.json metadata load/save helpers with normalization guarantees.
+// @dive-rel: Used by vmd/src/state/manager.rs for durable VM state transitions.
+// @dive-rel: Provides atomic metadata writes to preserve lineage and snapshot consistency.
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +41,7 @@ pub fn save_metadata(dir: &Path, meta: &mut VmMetadata) -> Result<()> {
         meta.metadata = Default::default();
     }
 
+    // @dive: Write-through temp file + rename gives crash-safe metadata replacement without torn vm.json state.
     let mut tmp = tempfile::Builder::new()
         .prefix("vm-")
         .suffix(".json")
@@ -48,6 +53,7 @@ pub fn save_metadata(dir: &Path, meta: &mut VmMetadata) -> Result<()> {
     {
         let file = tmp.as_file_mut();
         let mut value = serde_json::to_value(meta)?;
+        // @dive: Timestamp normalization guarantees stable UTC/RFC3339 representation across update paths.
         normalize_timestamps(&mut value);
         let data = serde_json::to_vec_pretty(&value)?;
         file.write_all(&data)?;
@@ -63,6 +69,7 @@ fn normalize_timestamps(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (k, v) in map.iter_mut() {
+                // @dive: Any *_at string field is coerced to UTC so diff/reconcile logic never depends on local timezone formatting.
                 if k.ends_with("_at") {
                     if let Value::String(s) = v {
                         if let Ok(parsed) = DateTime::parse_from_rfc3339(s) {

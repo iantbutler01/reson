@@ -1,3 +1,7 @@
+// @dive-file: Portproxy daemon entrypoint wiring gRPC services, TCP forwarding, and process supervision.
+// @dive-rel: Composes child_tracker, daemon, services, and port_forward modules into one runtime.
+// @dive-rel: Runs in guest VMs and exposes shell/daemon execution channels used by vmd control paths.
+
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::default_constructed_unit_structs)]
 

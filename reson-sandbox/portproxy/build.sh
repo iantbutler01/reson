@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Build helper for portproxy binaries and guest artifacts.
+# @dive-rel: Used by developers/CI to produce executable outputs for runtime packaging.
+# @dive-rel: Complements Cargo build paths used by verification and integration harnesses.
+
 set -euo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then

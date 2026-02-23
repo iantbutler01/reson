@@ -1,3 +1,6 @@
+# @dive-file: Cargo manifest for guest-side portproxy services and binaries.
+# @dive-rel: Builds portproxy/src/main.rs plus gRPC service modules generated from portproxy proto.
+# @dive-rel: Provides guest runtime capabilities used by vmd control-bus exec and forwarding paths.
 [package]
 name = "portproxy"
 version = "0.1.0"

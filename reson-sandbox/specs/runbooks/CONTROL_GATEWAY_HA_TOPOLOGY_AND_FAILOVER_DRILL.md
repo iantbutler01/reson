@@ -1,3 +1,6 @@
+<!-- @dive-file: Operational runbook for control-gateway topology requirements and failover drill expectations. -->
+<!-- @dive-rel: Enforced by scripts/verify_control_gateway_failover.sh and run_control_gateway_failover_drill.sh. -->
+<!-- @dive-rel: Defines gateway-layer resilience constraints for distributed facade routing. -->
 # Control Gateway HA Topology And Failover Drill
 
 Status: Locked  

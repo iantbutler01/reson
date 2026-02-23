@@ -1,3 +1,6 @@
+<!-- @dive-file: Runbook for planned drain handoff, admission freeze, and ownership fencing behavior. -->
+<!-- @dive-rel: Backed by scripts/verify_planned_drain_handoff.sh and real planned-drain integration tests. -->
+<!-- @dive-rel: Documents operator procedure for safe node drain without duplicate side effects. -->
 # Planned Drain Handoff And Fencing Runbook
 
 Status: Locked  

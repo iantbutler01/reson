@@ -1,3 +1,6 @@
+<!-- @dive-file: Compatibility policy for distributed command/event envelope schema evolution. -->
+<!-- @dive-rel: Enforced by scripts/verify_envelope_compat.sh gate checks and schema tests. -->
+<!-- @dive-rel: Applies to envelope builders and decoders in crates/reson-sandbox/src/distributed.rs. -->
 # Reson Sandbox Envelope Compatibility Policy
 
 ## Scope

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Generates CA/server/client TLS bundle artifacts for rotation workflows.
+# @dive-rel: Used by verify_security_ops.sh gate and security runbooks.
+# @dive-rel: Produces deterministic manifest outputs for rotation auditability.
+
 set -euo pipefail
 
 usage() {

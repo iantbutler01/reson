@@ -7,6 +7,8 @@ reson-sandbox provides a Rust-first VM sandbox runtime and facade API with local
 ## Components
 - **HA Distributed Contract** - Defines current execution-scope checklist and explicit out-of-scope topics -> `specs/RESON_SANDBOX_HA_DISTRIBUTED_CONTRACT.md`
 - **Real Integration Plan** - Migration plan from mock-heavy gates to real distributed machinery verification -> `specs/RESON_SANDBOX_REAL_INTEGRATION_TEST_PLAN.md`
+- **Verification Harness Module Map** - Dive metadata for strict gate scripts, drill scripts, and shared verifier helpers -> `.dive/modules/verification_harness.md`
+- **Runtime Support Module Map** - Dive metadata for supporting runtime modules in `vmd`, `portproxy`, and facade SLO evaluation -> `.dive/modules/runtime_support.md`
 - **Verifier Orchestrator** - Runs strict gate sequence and enforces repository contract -> `scripts/verify_reson_sandbox.sh`
 - **Integration Harness** - Boots real control-plane dependencies and runs profile-scoped distributed probes -> `scripts/integration/`
 - **Real Facade Routing Test** - Verifies public facade uses healthy control gateways when primary endpoint is unhealthy -> `crates/reson-sandbox/tests/real_control_gateway_routing.rs`
@@ -41,6 +43,8 @@ reson-sandbox provides a Rust-first VM sandbox runtime and facade API with local
 - Tier-B Continuity + Fidelity Layer -> Verifier Orchestrator: gates 27/33/35 enforce restore, failover exactly-once, and fidelity policy behavior.
 - Warm Pool Pipeline -> Verifier Orchestrator: gate 36 enforces architecture-aware prewarm execution and warm/cold path hooks.
 - Verifier Orchestrator -> Runtime Daemon: gate scripts validate runtime behavior and safety invariants.
+- Verification Harness Module Map -> Verifier Orchestrator: script-level metadata explains which gate scripts implement each contract dimension.
+- Runtime Support Module Map -> Runtime Daemon: module-level metadata maps helper/runtime files to lifecycle and control-plane behavior.
 - Integration Harness -> Runtime Daemon: launches real `vmd` processes and validates externally visible etcd registration/heartbeat behavior.
 - Real Facade Routing Test -> Integration Harness: consumes live node endpoints from integration scripts and validates gateway routing via public facade APIs.
 - Real Failover Harness -> Facade Crate: exercises live `Session::exec` failover semantics under primary-loss conditions.

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Creates etcd snapshot backup artifacts and backup manifest records.
+# @dive-rel: Used by scripts/dr/run_restore_drill.sh and DR runbooks.
+# @dive-rel: Supports dry-run and live modes for disaster-recovery verification.
+
 set -euo pipefail
 
 usage() {

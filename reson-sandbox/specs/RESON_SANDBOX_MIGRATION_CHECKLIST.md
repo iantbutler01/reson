@@ -1,3 +1,6 @@
+<!-- @dive-file: Acceptance checklist for migration parity and runtime/facade behavior guarantees. -->
+<!-- @dive-rel: Serves as requirement source for scripts/verify_reson_sandbox.sh gate ordering. -->
+<!-- @dive-rel: Complements the HA contract by enumerating concrete behavioral acceptance points. -->
 # Reson Sandbox Migration Checklist
 
 This checklist is the locked acceptance surface for extraction from OpenBracket into `reson-sandbox`.

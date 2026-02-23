@@ -1,3 +1,7 @@
+// @dive-file: Tracks spawned child process PIDs for cleanup, signal forwarding, and zombie reaping.
+// @dive-rel: Used by portproxy/src/main.rs server lifecycle and services that spawn subprocesses.
+// @dive-rel: Provides shared async PID registry for daemon/exec safety invariants.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

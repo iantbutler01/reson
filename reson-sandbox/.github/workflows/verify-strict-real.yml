@@ -1,3 +1,6 @@
+# @dive-file: CI workflow enforcing reson-sandbox strict-real verification policy on PRs and main.
+# @dive-rel: Runs bounded PR subset checks and full strict-real checks on main/workflow dispatch.
+# @dive-rel: Executes scripts/verify_reson_sandbox.sh, scripts/verify_real_gate*.sh, and scripts/verify_strict_real.sh.
 name: verify-strict-real
 
 on:

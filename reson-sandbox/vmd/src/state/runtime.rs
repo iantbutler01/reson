@@ -1,3 +1,7 @@
+// @dive-file: In-memory runtime state for active VM processes and monitor handles.
+// @dive-rel: Owned by vmd state manager lifecycle operations for running VM bookkeeping.
+// @dive-rel: Carries process/socket paths and transient runtime flags not persisted to metadata.
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 

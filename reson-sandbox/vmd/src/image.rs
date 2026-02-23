@@ -1,3 +1,7 @@
+// @dive-file: Base image resolution and prebuilt image download pipeline for VM creation.
+// @dive-rel: Used by vmd manager create-vm flows and warm-pool image provisioning paths.
+// @dive-rel: Handles registry URL resolution, resumable downloads, and local qcow2 placement.
+
 use std::{
     env,
     io::ErrorKind,
@@ -133,6 +137,7 @@ where
 
         let mut request = client.get(&url);
         if resume_from > 0 {
+            // @dive: Resume via HTTP range keeps large prebuilt downloads incremental across retries.
             request = request.header(RANGE, format!("bytes={resume_from}-"));
         }
 
@@ -175,6 +180,7 @@ where
                 "VM registry did not honor range request; restarting download"
             );
         }
+        // @dive: If server ignores range, we deliberately truncate local partial state to avoid mixed image fragments.
         let mut open_opts = OpenOptions::new();
         open_opts.write(true).create(true);
         if resuming {
@@ -208,6 +214,7 @@ where
                         error = %err,
                         "failed to read chunk from remote VM image"
                     );
+                    // @dive: Chunk errors restart the full attempt so callers never consume partially-corrupted image tails.
                     last_err = Some(err.into());
                     continue 'attempt;
                 }
@@ -250,6 +257,7 @@ where
             return Err(err.into());
         }
 
+        // @dive: Final rename publishes image atomically; readers only see fully-written qcow2 files.
         info!(path = %target.display(), url = %url, "downloaded prebuilt VM image");
         return Ok(PrebuiltImageStatus::Downloaded { bytes: written });
     }

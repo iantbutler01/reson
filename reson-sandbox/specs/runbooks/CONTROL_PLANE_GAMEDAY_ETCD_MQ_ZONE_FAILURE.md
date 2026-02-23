@@ -1,3 +1,6 @@
+<!-- @dive-file: Operational game-day runbook for etcd quorum, MQ outage, and zone-failure drills. -->
+<!-- @dive-rel: Executed by scripts/run_control_plane_gameday_drill.sh and checked by verify_operational_gameday.sh. -->
+<!-- @dive-rel: Captures failure-injection expectations for distributed control-plane readiness. -->
 # Control Plane Gameday: etcd + MQ + Zone Failure
 
 Status: Locked  

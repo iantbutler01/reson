@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Verifier gate script for verify_security_profile contract coverage.
+# @dive-rel: Invoked by scripts/verify_reson_sandbox.sh gate orchestration and/or Makefile targets.
+# @dive-rel: Uses scripts/common.sh helpers for strict-mode behavior, diagnostics, and command validation.
+
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"

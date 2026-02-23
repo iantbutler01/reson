@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Automated control-gateway failover drill with machine-readable report output.
+# @dive-rel: Invoked by verify_control_gateway_failover.sh gate.
+# @dive-rel: Executes facade contract failover test and emits pass/fail metadata.
+
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"

@@ -1,3 +1,7 @@
+// @dive-file: CLI argument contract for server/client portproxy modes.
+// @dive-rel: Consumed by portproxy/src/main.rs startup path to select proxy behavior.
+// @dive-rel: Validation enforces required client forwarding arguments before runtime boot.
+
 use clap::Parser;
 
 #[derive(Parser, Debug)]

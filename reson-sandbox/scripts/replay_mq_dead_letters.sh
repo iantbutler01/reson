@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# @dive-file: Operator helper to replay dead-letter control messages through mqctl.
+# @dive-rel: Wraps vmd mqctl binary so DLQ recovery is scriptable from repo root.
+# @dive-rel: Supports outbox/control-bus operational runbooks and drills.
+
 set -euo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/common.sh"

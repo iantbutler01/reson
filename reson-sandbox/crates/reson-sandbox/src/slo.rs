@@ -1,3 +1,7 @@
+// @dive-file: SLO budget model and evaluator used by verifier gates and rollout-policy checks.
+// @dive-rel: Consumed by crates/reson-sandbox/src/lib.rs instrumentation and scripts/verify_slo_profile.sh.
+// @dive-rel: Maps observed latency samples to threshold violations used for release readiness decisions.
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SloBudget {
     pub metric: &'static str,
@@ -43,7 +47,9 @@ pub const DEFAULT_SLO_BUDGETS: &[SloBudget] = &[
 pub fn evaluate_slo(samples: &[SloSample], budgets: &[SloBudget]) -> Vec<String> {
     let mut violations = Vec::new();
     for sample in samples {
+        // @dive: Unknown metrics are ignored so new emitters can roll out independently of budget-table updates.
         if let Some(budget) = budgets.iter().find(|budget| budget.metric == sample.metric) {
+            // @dive: p95 and p99 are evaluated independently to preserve signal even when one percentile is absent.
             if let (Some(observed), Some(limit)) = (sample.p95_ms, budget.p95_ms)
                 && observed > limit
             {
