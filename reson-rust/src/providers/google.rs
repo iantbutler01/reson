@@ -785,12 +785,8 @@ impl GoogleGenAIClient {
                             .cloned()
                             .unwrap_or(serde_json::json!({}));
 
-                        // Generate ID since Google doesn't provide one
-                        let id = format!(
-                            "google_{}_{:x}",
-                            name,
-                            std::collections::hash_map::DefaultHasher::new().finish()
-                        );
+                        // Generate unique ID since Google doesn't provide one
+                        let id = format!("google_{}_{}", name, rand_id());
 
                         // Preserve thoughtSignature if present (required for multi-turn)
                         let thought_signature = part.get("thoughtSignature").cloned();
