@@ -1,7 +1,7 @@
 // @dive-file: Tracks named long-lived guest-side daemon processes used for attachable command execution streams.
 // @dive-rel: Consumed by portproxy/src/services.rs DaemonManagerService for exec/attach semantics.
 // @dive-rel: Enables distributed stream producer reattachment by name across control-plane rebind attempts.
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use crate::child_tracker::ChildTracker;
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 
 const CHANNEL_CAPACITY: usize = 100;
+const BACKLOG_MAX_FRAMES: usize = 512;
 
 #[derive(Error, Debug)]
 pub enum DaemonError {
@@ -101,12 +102,14 @@ impl DaemonRegistry {
         let (stdout_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (stderr_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (exit_tx, _) = watch::channel(None::<i32>);
+        let output_backlog = Arc::new(Mutex::new(OutputBacklog::default()));
 
         let entry = Arc::new(DaemonEntry {
             _name: req.name.clone(),
             stdin: Mutex::new(stdin),
             stdout_tx: stdout_tx.clone(),
             stderr_tx: stderr_tx.clone(),
+            output_backlog: output_backlog.clone(),
             attach_lock: Arc::new(Mutex::new(())),
             exit_tx: exit_tx.clone(),
         });
@@ -119,8 +122,20 @@ impl DaemonRegistry {
             daemons.insert(req.name.clone(), entry.clone());
         }
 
-        spawn_reader(stdout, stdout_tx, format!("stdout({})", req.name));
-        spawn_reader(stderr, stderr_tx, format!("stderr({})", req.name));
+        spawn_reader(
+            stdout,
+            stdout_tx,
+            output_backlog.clone(),
+            OutputKind::Stdout,
+            format!("stdout({})", req.name),
+        );
+        spawn_reader(
+            stderr,
+            stderr_tx,
+            output_backlog,
+            OutputKind::Stderr,
+            format!("stderr({})", req.name),
+        );
 
         let daemons = self.daemons.clone();
         let tracker = self.tracker.clone();
@@ -158,11 +173,55 @@ pub struct DaemonEntry {
     pub stdin: Mutex<tokio::process::ChildStdin>,
     pub stdout_tx: broadcast::Sender<Vec<u8>>,
     pub stderr_tx: broadcast::Sender<Vec<u8>>,
+    pub output_backlog: Arc<Mutex<OutputBacklog>>,
     pub attach_lock: Arc<Mutex<()>>,
     pub exit_tx: watch::Sender<Option<i32>>,
 }
 
-fn spawn_reader<R>(mut reader: R, tx: broadcast::Sender<Vec<u8>>, label: String)
+#[derive(Clone, Copy, Debug)]
+pub enum OutputKind {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Debug)]
+pub struct OutputFrame {
+    pub kind: OutputKind,
+    pub data: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct OutputBacklog {
+    frames: VecDeque<OutputFrame>,
+}
+
+impl OutputBacklog {
+    fn push(&mut self, kind: OutputKind, data: Vec<u8>) {
+        if self.frames.len() >= BACKLOG_MAX_FRAMES {
+            let _ = self.frames.pop_front();
+        }
+        self.frames.push_back(OutputFrame { kind, data });
+    }
+
+    fn drain(&mut self) -> Vec<OutputFrame> {
+        self.frames.drain(..).collect()
+    }
+}
+
+impl DaemonEntry {
+    pub async fn drain_output_backlog(&self) -> Vec<OutputFrame> {
+        let mut guard = self.output_backlog.lock().await;
+        guard.drain()
+    }
+}
+
+fn spawn_reader<R>(
+    mut reader: R,
+    tx: broadcast::Sender<Vec<u8>>,
+    backlog: Arc<Mutex<OutputBacklog>>,
+    kind: OutputKind,
+    label: String,
+)
 where
     R: tokio::io::AsyncRead + Send + std::marker::Unpin + 'static,
 {
@@ -173,6 +232,10 @@ where
                 Ok(0) => break,
                 Ok(n) => {
                     let payload = buf[..n].to_vec();
+                    if tx.receiver_count() == 0 {
+                        let mut guard = backlog.lock().await;
+                        guard.push(kind, payload.clone());
+                    }
                     if tx.send(payload).is_err() {
                         // No active listeners; keep reading so buffer does not back up.
                     }
@@ -204,4 +267,52 @@ pub fn build_command_builder(
         builder.cwd(PathBuf::from(dir));
     }
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn output_backlog_replays_stdout_emitted_before_attach() {
+        let tracker = ChildTracker::new();
+        let registry = DaemonRegistry::new(tracker);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time should be monotonic")
+            .as_nanos();
+        let daemon_name = format!("backlog-{nonce}");
+        let req = ExecDaemonRequest {
+            name: daemon_name.clone(),
+            args: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "echo preattach-output; sleep 1".to_string(),
+            ],
+            env: HashMap::new(),
+        };
+
+        registry
+            .exec_daemon(req)
+            .await
+            .expect("exec_daemon should start process");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let entry = registry
+            .get(&daemon_name)
+            .await
+            .expect("daemon entry should exist before process exits");
+        let frames = entry.drain_output_backlog().await;
+
+        assert!(
+            frames.iter().any(|frame| {
+                matches!(frame.kind, OutputKind::Stdout)
+                    && String::from_utf8_lossy(&frame.data).contains("preattach-output")
+            }),
+            "expected stdout emitted before attach to be retained in backlog"
+        );
+    }
 }

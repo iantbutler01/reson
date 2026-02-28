@@ -1245,8 +1245,60 @@ async fn handle_exec_stream_start_command(
     let active_exec_streams = active_exec_streams.clone();
     tokio::spawn(async move {
         let mut terminal_emitted = false;
+        let mut pending_exit_code: Option<i32> = None;
+        const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(150);
         loop {
-            match stream.message().await {
+            let next_message = if let Some(code) = pending_exit_code {
+                match tokio::time::timeout(EXIT_FLUSH_GRACE, stream.message()).await {
+                    Ok(message) => message,
+                    Err(_) => {
+                        sequence = sequence.saturating_add(1);
+                        debug!(
+                            stream_id = %stream_id,
+                            sequence = sequence,
+                            exit_code = code,
+                            "exec.stream deferred exit frame"
+                        );
+                        if let Err(err) = publish_exec_stream_event(
+                            &config,
+                            &jetstream,
+                            ExecStreamEvent {
+                                cluster_id: cluster_id.clone(),
+                                logical_stream_id: logical_stream_id.clone(),
+                                stream_id: stream_id.clone(),
+                                event_seq: sequence,
+                                event_id: next_stream_event_id(cluster_id.as_str()),
+                                producer_epoch,
+                                command_id: command_id.clone(),
+                                session_id: session_id.clone(),
+                                vm_id: vm_id.clone(),
+                                kind: "exit".to_string(),
+                                data: Vec::new(),
+                                exit_code: Some(code),
+                                timed_out: code == 124,
+                                error: None,
+                                sequence,
+                                emitted_by_node_id: node_id.clone(),
+                                emitted_at_unix_ms: unix_millis(),
+                            },
+                        )
+                        .await
+                        {
+                            warn!(
+                                stream_id = %stream_id,
+                                sequence = sequence,
+                                err = %err,
+                                "failed publishing deferred exec.stream exit event"
+                            );
+                        }
+                        terminal_emitted = true;
+                        break;
+                    }
+                }
+            } else {
+                stream.message().await
+            };
+            match next_message {
                 Ok(Some(AttachDaemonResponse {
                     response: Some(attach_daemon_response::Response::StdoutData(bytes)),
                 })) => {
@@ -1376,50 +1428,53 @@ async fn handle_exec_stream_start_command(
                             );
                         }
                     }
-                    sequence = sequence.saturating_add(1);
-                    debug!(
-                        stream_id = %stream_id,
-                        sequence = sequence,
-                        exit_code = code,
-                        "exec.stream exit frame"
-                    );
-                    if let Err(err) = publish_exec_stream_event(
-                        &config,
-                        &jetstream,
-                        ExecStreamEvent {
-                            cluster_id: cluster_id.clone(),
-                            logical_stream_id: logical_stream_id.clone(),
-                            stream_id: stream_id.clone(),
-                            event_seq: sequence,
-                            event_id: next_stream_event_id(cluster_id.as_str()),
-                            producer_epoch,
-                            command_id: command_id.clone(),
-                            session_id: session_id.clone(),
-                            vm_id: vm_id.clone(),
-                            kind: "exit".to_string(),
-                            data: Vec::new(),
-                            exit_code: Some(code),
-                            timed_out: code == 124,
-                            error: None,
-                            sequence,
-                            emitted_by_node_id: node_id.clone(),
-                            emitted_at_unix_ms: unix_millis(),
-                        },
-                    )
-                    .await
-                    {
-                        warn!(
-                            stream_id = %stream_id,
-                            sequence = sequence,
-                            err = %err,
-                            "failed publishing exec.stream exit event"
-                        );
-                    }
-                    terminal_emitted = true;
-                    break;
+                    pending_exit_code = Some(code);
+                    continue;
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
+                    if let Some(code) = pending_exit_code {
+                        sequence = sequence.saturating_add(1);
+                        debug!(
+                            stream_id = %stream_id,
+                            sequence = sequence,
+                            exit_code = code,
+                            "exec.stream exit frame"
+                        );
+                        if let Err(err) = publish_exec_stream_event(
+                            &config,
+                            &jetstream,
+                            ExecStreamEvent {
+                                cluster_id: cluster_id.clone(),
+                                logical_stream_id: logical_stream_id.clone(),
+                                stream_id: stream_id.clone(),
+                                event_seq: sequence,
+                                event_id: next_stream_event_id(cluster_id.as_str()),
+                                producer_epoch,
+                                command_id: command_id.clone(),
+                                session_id: session_id.clone(),
+                                vm_id: vm_id.clone(),
+                                kind: "exit".to_string(),
+                                data: Vec::new(),
+                                exit_code: Some(code),
+                                timed_out: code == 124,
+                                error: None,
+                                sequence,
+                                emitted_by_node_id: node_id.clone(),
+                                emitted_at_unix_ms: unix_millis(),
+                            },
+                        )
+                        .await
+                        {
+                            warn!(
+                                stream_id = %stream_id,
+                                sequence = sequence,
+                                err = %err,
+                                "failed publishing exec.stream exit event"
+                            );
+                        }
+                        terminal_emitted = true;
+                    }
                     debug!(
                         stream_id = %stream_id,
                         sequence = sequence,
@@ -1428,6 +1483,49 @@ async fn handle_exec_stream_start_command(
                     break;
                 }
                 Err(err) => {
+                    if let Some(code) = pending_exit_code {
+                        sequence = sequence.saturating_add(1);
+                        debug!(
+                            stream_id = %stream_id,
+                            sequence = sequence,
+                            exit_code = code,
+                            "exec.stream exit frame after transport close"
+                        );
+                        if let Err(err) = publish_exec_stream_event(
+                            &config,
+                            &jetstream,
+                            ExecStreamEvent {
+                                cluster_id: cluster_id.clone(),
+                                logical_stream_id: logical_stream_id.clone(),
+                                stream_id: stream_id.clone(),
+                                event_seq: sequence,
+                                event_id: next_stream_event_id(cluster_id.as_str()),
+                                producer_epoch,
+                                command_id: command_id.clone(),
+                                session_id: session_id.clone(),
+                                vm_id: vm_id.clone(),
+                                kind: "exit".to_string(),
+                                data: Vec::new(),
+                                exit_code: Some(code),
+                                timed_out: code == 124,
+                                error: None,
+                                sequence,
+                                emitted_by_node_id: node_id.clone(),
+                                emitted_at_unix_ms: unix_millis(),
+                            },
+                        )
+                        .await
+                        {
+                            warn!(
+                                stream_id = %stream_id,
+                                sequence = sequence,
+                                err = %err,
+                                "failed publishing exec.stream exit event"
+                            );
+                        }
+                        terminal_emitted = true;
+                        break;
+                    }
                     sequence = sequence.saturating_add(1);
                     warn!(
                         stream_id = %stream_id,

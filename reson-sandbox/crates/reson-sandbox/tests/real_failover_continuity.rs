@@ -570,13 +570,13 @@ async fn collect_exec_stream_events_for_session(
             continue;
         };
 
-        if let Some(event) = parse_exec_stream_event(&message.payload)
-            && event.session_id == session_id
-        {
-            if matches!(event.kind.as_str(), "exit" | "timeout" | "error") {
-                saw_terminal = true;
+        if let Some(event) = parse_exec_stream_event(&message.payload) {
+            if event.session_id == session_id {
+                if matches!(event.kind.as_str(), "exit" | "timeout" | "error") {
+                    saw_terminal = true;
+                }
+                events.push(event);
             }
-            events.push(event);
         }
         let _ = message.ack().await;
         if saw_terminal && events.len() >= min_events {

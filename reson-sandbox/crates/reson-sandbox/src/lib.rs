@@ -455,19 +455,19 @@ impl Drop for ForwardHandle {
         if let Ok(mut guard) = self.registration.try_lock() {
             let registration = guard.take();
             drop(guard);
-            if let Some(mut registration) = registration
-                && let Ok(handle) = tokio::runtime::Handle::try_current()
-            {
-                handle.spawn(async move {
-                    registration
-                        .multiplexer
-                        .unregister(registration.host_port)
-                        .await;
-                    #[cfg(feature = "distributed-control")]
-                    if let Some(port_lease) = registration.port_lease.take() {
-                        port_lease.shutdown().await;
-                    }
-                });
+            if let Some(mut registration) = registration {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        registration
+                            .multiplexer
+                            .unregister(registration.host_port)
+                            .await;
+                        #[cfg(feature = "distributed-control")]
+                        if let Some(port_lease) = registration.port_lease.take() {
+                            port_lease.shutdown().await;
+                        }
+                    });
+                }
             }
         }
     }
@@ -644,7 +644,7 @@ impl Session {
             .await?;
         self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
             .await;
-        Ok(format!("http://127.0.0.1:{rpc_port}"))
+        rpc_endpoint(&resolved_endpoint, rpc_port)
     }
 
     async fn invalidate_exec_transport_path(&self, endpoint: &str) {
@@ -943,12 +943,12 @@ impl Session {
             Ok(Ok(Err(err))) => return Err(err),
             Ok(Err(_)) => {
                 return Err(SandboxError::DaemonUnavailable(format!(
-                    "distributed exec.stream.start dropped readiness signal command_id={command_id} stream_id={stream_id}"
+                    "distributed exec stream did not become ready (dropped readiness signal) command_id={command_id} stream_id={stream_id}"
                 )));
             }
             Err(_) => {
                 return Err(SandboxError::DaemonUnavailable(format!(
-                    "timed out waiting for distributed exec stream readiness command_id={command_id} stream_id={stream_id}"
+                    "distributed exec stream did not become ready before timeout command_id={command_id} stream_id={stream_id}"
                 )));
             }
         }
@@ -1050,12 +1050,12 @@ impl Session {
             Ok(Ok(Err(err))) => return Err(err),
             Ok(Err(_)) => {
                 return Err(SandboxError::DaemonUnavailable(format!(
-                    "distributed exec stream resume dropped readiness signal logical_stream_id={logical_stream_id} command_id={command_id}"
+                    "distributed exec stream resume did not become ready (dropped readiness signal) logical_stream_id={logical_stream_id} command_id={command_id}"
                 )));
             }
             Err(_) => {
                 return Err(SandboxError::DaemonUnavailable(format!(
-                    "timed out waiting for distributed exec stream resume logical_stream_id={logical_stream_id} command_id={command_id}"
+                    "distributed exec stream resume did not become ready before timeout logical_stream_id={logical_stream_id} command_id={command_id}"
                 )));
             }
         }
@@ -1840,6 +1840,14 @@ impl Sandbox {
         Self::new(config).await
     }
 
+    /// Forces warm-pool/image prewarming without requiring session creation.
+    /// This is intended for startup/bootstrap scripts to avoid first-user cold start.
+    pub async fn prewarm(mut config: SandboxConfig) -> Result<()> {
+        config.prewarm_on_start = false;
+        let sandbox = Self::new(config).await?;
+        sandbox.prewarm_warm_pool_profiles_with_mode(true).await
+    }
+
     pub async fn session(&self, opts: SessionOptions) -> Result<Session> {
         let started = Instant::now();
         let session_id = opts
@@ -2224,7 +2232,11 @@ impl Sandbox {
     }
 
     async fn prewarm_warm_pool_profiles(&self) -> Result<()> {
-        if !self.inner.cfg.prewarm_on_start {
+        self.prewarm_warm_pool_profiles_with_mode(false).await
+    }
+
+    async fn prewarm_warm_pool_profiles_with_mode(&self, force: bool) -> Result<()> {
+        if !force && !self.inner.cfg.prewarm_on_start {
             return Ok(());
         }
 
@@ -2567,10 +2579,10 @@ impl Sandbox {
         #[cfg(not(feature = "distributed-control"))]
         let _ = session_id;
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend
-            && let Some(route) = control.get_session_route(session_id).await?
-        {
-            return Ok((route.tenant_id, route.workspace_id));
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route) = control.get_session_route(session_id).await? {
+                return Ok((route.tenant_id, route.workspace_id));
+            }
         }
         Ok(("default".to_string(), "default".to_string()))
     }
@@ -3090,7 +3102,7 @@ impl Sandbox {
             ready.get(&cache_key).copied() == Some(rpc_port)
         };
         if cached_ready {
-            let probe_endpoint = format!("http://127.0.0.1:{rpc_port}");
+            let probe_endpoint = rpc_endpoint(endpoint, rpc_port)?;
             // @dive: Cached readiness must be validated with a full probe RPC so broken streams after failover don't loop on stale cache.
             if probe_shell_exec_ready(probe_endpoint.as_str(), self.inner.cfg.connect_timeout).await
             {
@@ -3101,7 +3113,7 @@ impl Sandbox {
             ready.remove(&cache_key);
         }
 
-        let endpoint = format!("http://127.0.0.1:{rpc_port}");
+        let endpoint = rpc_endpoint(endpoint, rpc_port)?;
         let start = Instant::now();
         let mut consecutive_successes = 0u8;
 
@@ -3132,7 +3144,7 @@ impl Sandbox {
         endpoint: &str,
     ) -> Result<PortProxyClient<tonic::transport::Channel>> {
         let rpc_port = self.ensure_vm_and_get_rpc_port(vm_id, endpoint).await?;
-        let endpoint = format!("http://127.0.0.1:{rpc_port}");
+        let endpoint = rpc_endpoint(endpoint, rpc_port)?;
         Ok(PortProxyClient::connect(endpoint).await?)
     }
 
@@ -3289,6 +3301,14 @@ fn portproxy_server_addr(endpoint: &str, proxy_port: u16) -> Result<String> {
     Ok(format!("{host}:{proxy_port}"))
 }
 
+fn rpc_endpoint(daemon_endpoint: &str, rpc_port: i32) -> Result<String> {
+    let proxy_port = u16::try_from(rpc_port).map_err(|_| {
+        SandboxError::InvalidResponse(format!("invalid rpc port from vm metadata: {rpc_port}"))
+    })?;
+    let addr = portproxy_server_addr(daemon_endpoint, proxy_port)?;
+    Ok(format!("http://{addr}"))
+}
+
 fn endpoint_host(endpoint: &str) -> Result<String> {
     let normalized = normalize_endpoint(endpoint)?;
     let without_scheme = normalized
@@ -3320,11 +3340,10 @@ fn endpoint_host(endpoint: &str) -> Result<String> {
         )));
     }
 
-    if let Some((host, _port)) = authority.rsplit_once(':')
-        && !host.is_empty()
-        && !host.contains(':')
-    {
-        return Ok(normalize_dial_host(host).to_string());
+    if let Some((host, _port)) = authority.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') {
+            return Ok(normalize_dial_host(host).to_string());
+        }
     }
 
     Ok(normalize_dial_host(authority).to_string())

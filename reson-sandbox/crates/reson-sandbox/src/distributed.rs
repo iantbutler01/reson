@@ -286,11 +286,12 @@ impl DistributedControlPlane {
                 ))
             })?;
         }
-        if let Some(fence_kv) = fence_response.kvs().first()
-            && let Ok(fence) = String::from_utf8(fence_kv.value().to_vec())
-            && !fence.trim().is_empty()
-        {
-            route.ownership_fence = Some(fence);
+        if let Some(fence_kv) = fence_response.kvs().first() {
+            if let Ok(fence) = String::from_utf8(fence_kv.value().to_vec()) {
+                if !fence.trim().is_empty() {
+                    route.ownership_fence = Some(fence);
+                }
+            }
         }
         Ok(Some(route))
     }
@@ -863,8 +864,10 @@ impl DistributedControlPlane {
         let stream_name = self.cfg.nats_stream_name.clone();
         let cleanup_consumer_name = consumer_name.clone();
         let jetstream = self.jetstream.clone();
-        if !expect_started_event && let Some(tx) = started_tx.take() {
-            let _ = tx.send(Ok(()));
+        if !expect_started_event {
+            if let Some(tx) = started_tx.take() {
+                let _ = tx.send(Ok(()));
+            }
         }
 
         tokio::spawn(async move {
@@ -1398,23 +1401,23 @@ fn admission_budget_violation(
         .iter()
         .filter(|route| route.tenant_id == tenant_id)
         .count();
-    if let Some(limit) = tenant_limit
-        && tenant_sessions >= limit
-    {
-        return Some(format!(
-            "tenant admission budget exhausted (tenant_id={tenant_id}, used={tenant_sessions}, limit={limit})"
-        ));
+    if let Some(limit) = tenant_limit {
+        if tenant_sessions >= limit {
+            return Some(format!(
+                "tenant admission budget exhausted (tenant_id={tenant_id}, used={tenant_sessions}, limit={limit})"
+            ));
+        }
     }
     let workspace_sessions = routes
         .iter()
         .filter(|route| route.tenant_id == tenant_id && route.workspace_id == workspace_id)
         .count();
-    if let Some(limit) = workspace_limit
-        && workspace_sessions >= limit
-    {
-        return Some(format!(
-            "workspace admission budget exhausted (tenant_id={tenant_id}, workspace_id={workspace_id}, used={workspace_sessions}, limit={limit})"
-        ));
+    if let Some(limit) = workspace_limit {
+        if workspace_sessions >= limit {
+            return Some(format!(
+                "workspace admission budget exhausted (tenant_id={tenant_id}, workspace_id={workspace_id}, used={workspace_sessions}, limit={limit})"
+            ));
+        }
     }
     None
 }
@@ -1442,10 +1445,10 @@ fn eligible_routes_with_profile(
         }
         let route_tier = normalize_continuity_tier(&route.continuity_tier)
             .unwrap_or_else(|| CONTINUITY_TIER_A.to_string());
-        if let Some(required_tier) = required_continuity_tier.as_ref()
-            && &route_tier != required_tier
-        {
-            continue;
+        if let Some(required_tier) = required_continuity_tier.as_ref() {
+            if &route_tier != required_tier {
+                continue;
+            }
         }
         if route_tier == CONTINUITY_TIER_A {
             if !route.degraded_mode {

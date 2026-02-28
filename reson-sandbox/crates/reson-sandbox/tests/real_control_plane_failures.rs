@@ -358,11 +358,12 @@ async fn wait_for_session_route_endpoint(
 async fn wait_for_key_absent(etcd_endpoints: &[String], key: &str, timeout_dur: Duration) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < timeout_dur {
-        if let Ok(mut client) = EtcdClient::connect(etcd_endpoints.to_vec(), None).await
-            && let Ok(response) = client.get(key.to_string(), None).await
-            && response.kvs().is_empty()
-        {
-            return true;
+        if let Ok(mut client) = EtcdClient::connect(etcd_endpoints.to_vec(), None).await {
+            if let Ok(response) = client.get(key.to_string(), None).await {
+                if response.kvs().is_empty() {
+                    return true;
+                }
+            }
         }
         sleep(Duration::from_millis(250)).await;
     }

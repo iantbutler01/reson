@@ -45,18 +45,37 @@ pub struct StatusInfo {
     pub status: String,
 }
 
-const D2VM_IMAGE: &str = "ghcr.io/bracketdevelopers/d2vm:latest";
+const DEFAULT_D2VM_IMAGE: &str = "linkacloud/d2vm:latest";
 const D2VM_CONTAINER_DIR: &str = "/workspace";
+
+fn configured_d2vm_image() -> String {
+    std::env::var("RESON_SANDBOX_D2VM_IMAGE")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_IMAGE"))
+        .map(|raw| raw.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_D2VM_IMAGE.to_string())
+}
+
+fn host_container_platform() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" | "arm64" => Some("linux/arm64"),
+        "x86_64" | "amd64" => Some("linux/amd64"),
+        _ => None,
+    }
+}
 
 pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> Result<()> {
     if opts.image.trim().is_empty() {
         bail!("d2vm image reference is required");
     }
+    let d2vm_image = configured_d2vm_image();
     let output_name = if opts.output.trim().is_empty() {
         "disk.qcow2".to_string()
     } else {
         opts.output.clone()
     };
+    let converter_platform = host_container_platform();
     let disk_gb = if opts.disk_gb <= 0 { 10 } else { opts.disk_gb };
     let host_dir = host_dir
         .canonicalize()
@@ -68,6 +87,8 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         platform = ?opts.platform,
         pull = opts.pull,
         include_bootstrap = opts.include_bootstrap,
+        converter_image = %d2vm_image,
+        converter_platform = ?converter_platform,
         workdir = %host_dir.display(),
         "running d2vm conversion"
     );
@@ -83,7 +104,14 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
             .arg(format!("{}:{}", host_dir.display(), D2VM_CONTAINER_DIR))
             .arg("-w")
             .arg(D2VM_CONTAINER_DIR)
-            .arg(D2VM_IMAGE)
+            // Force converter image to host architecture so qemu-img itself never runs under
+            // Rosetta/user-mode emulation on Apple Silicon.
+            .args(
+                converter_platform
+                    .map(|platform| vec!["--platform", platform])
+                    .unwrap_or_default(),
+            )
+            .arg(&d2vm_image)
             .arg("--verbose")
             .arg("convert")
             .arg(&opts.image)

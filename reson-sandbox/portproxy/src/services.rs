@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
 use crate::child_tracker::ChildTracker;
-use crate::daemon::{DaemonError, DaemonRegistry, build_command_builder};
+use crate::daemon::{DaemonError, DaemonRegistry, OutputKind, build_command_builder};
 use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManager;
 use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxy;
 use crate::pb::bracket::portproxy::v1::shell_exec_server::ShellExec;
@@ -610,6 +610,28 @@ impl DaemonManager for DaemonManagerService {
         let mut stdout_rx = entry.stdout_tx.subscribe();
         let mut stderr_rx = entry.stderr_tx.subscribe();
         let mut exit_rx = entry.exit_tx.subscribe();
+        let replay_frames = entry.drain_output_backlog().await;
+
+        for frame in replay_frames {
+            let response = match frame.kind {
+                OutputKind::Stdout => {
+                    crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StdoutData(
+                        frame.data,
+                    )
+                }
+                OutputKind::Stderr => {
+                    crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StderrData(
+                        frame.data,
+                    )
+                }
+            };
+            if tx.send(Ok(AttachDaemonResponse { response: Some(response) }))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
 
         tokio::spawn({
             let tx = tx.clone();
