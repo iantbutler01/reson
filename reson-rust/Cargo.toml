@@ -69,7 +69,7 @@ gcp_auth = { version = "0.12", optional = true }
 
 # Optional: MCP support
 reson-mcp = { version = "0.1.0", path = "../reson-mcp", optional = true, default-features = false, features = ["client", "server"] }
-reson-sandbox = { version = "0.1.0", path = "../reson-sandbox/crates/reson-sandbox" }
+reson-sandbox = { version = "0.1.0", path = "../reson-sandbox/crates/reson-sandbox", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -84,6 +84,7 @@ telemetry = ["opentelemetry", "opentelemetry_sdk"]
 google-adc = ["gcp_auth"]
 mcp = ["dep:reson-mcp"]
 mcp-apps = ["mcp", "reson-mcp/apps"]
+sandbox = ["dep:reson-sandbox"]
 
 [lints.rust]
 warnings = "deny"

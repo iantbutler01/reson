@@ -188,20 +188,20 @@ async fn main() -> Result<()> {
     if args.ha_mode {
         cfg.ha_mode = true;
     }
-    if let Some(continuity_tier) = args.continuity_tier
-        && let Some(registry) = cfg.node_registry.as_mut()
-    {
-        registry.continuity_tier = continuity_tier.into();
+    if let Some(continuity_tier) = args.continuity_tier {
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.continuity_tier = continuity_tier.into();
+        }
     }
-    if args.degraded_mode
-        && let Some(registry) = cfg.node_registry.as_mut()
-    {
-        registry.degraded_mode = true;
+    if args.degraded_mode {
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.degraded_mode = true;
+        }
     }
-    if args.admission_frozen
-        && let Some(registry) = cfg.node_registry.as_mut()
-    {
-        registry.admission_frozen = true;
+    if args.admission_frozen {
+        if let Some(registry) = cfg.node_registry.as_mut() {
+            registry.admission_frozen = true;
+        }
     }
     if args.disable_node_registry {
         cfg.node_registry = None;

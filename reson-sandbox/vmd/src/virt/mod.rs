@@ -16,14 +16,14 @@ use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::task;
 use tokio::time::sleep;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 #[derive(Clone, Debug)]
 pub struct MonitorHandle {
     path: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Platform {
     pub os: String,
     pub arch: String,
@@ -300,21 +300,44 @@ pub async fn delete_snapshot(monitor: &MonitorHandle, name: &str) -> Result<()> 
 }
 
 pub async fn inspect_image_platforms(docker_bin: &str, reference: &str) -> Result<Vec<Platform>> {
-    let output = Command::new(docker_bin)
+    let manifest_context = match Command::new(docker_bin)
         .arg("manifest")
         .arg("inspect")
         .arg(reference)
         .output()
         .await
-        .with_context(|| "docker manifest inspect")?;
-    if !output.status.success() {
-        bail!(
+    {
+        Ok(output) if output.status.success() => {
+            let value: Value = serde_json::from_slice(&output.stdout)
+                .context("parse docker manifest inspect output")?;
+            let platforms = parse_platforms_from_manifest_json(&value);
+            if !platforms.is_empty() {
+                return Ok(platforms);
+            }
+            "docker manifest inspect returned no platform information".to_string()
+        }
+        Ok(output) => format!(
             "docker manifest inspect failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(err) => format!("docker manifest inspect command failed: {err}"),
+    };
+
+    warn!(
+        reference = %reference,
+        manifest_context = %manifest_context,
+        "falling back to docker pull platform probes"
+    );
+    let platforms = probe_platforms_via_pull(docker_bin, reference).await?;
+    if platforms.is_empty() {
+        bail!(
+            "unable to determine supported platforms for image {reference}: {manifest_context}; docker pull --platform probes found no supported linux/amd64 or linux/arm64"
         );
     }
-    let value: Value =
-        serde_json::from_slice(&output.stdout).context("parse docker manifest inspect output")?;
+    Ok(platforms)
+}
+
+fn parse_platforms_from_manifest_json(value: &Value) -> Vec<Platform> {
     let mut platforms = Vec::new();
     if let Some(manifests) = value.get("manifests").and_then(|v| v.as_array()) {
         for manifest in manifests {
@@ -341,10 +364,33 @@ pub async fn inspect_image_platforms(docker_bin: &str, reference: &str) -> Resul
             });
         }
     }
-    if platforms.is_empty() {
-        bail!("docker manifest inspect did not return platform information");
+    platforms
+}
+
+async fn probe_platform_via_pull(docker_bin: &str, reference: &str, arch: &str) -> Result<bool> {
+    let output = Command::new(docker_bin)
+        .arg("pull")
+        .arg("--platform")
+        .arg(format!("linux/{arch}"))
+        .arg("--quiet")
+        .arg(reference)
+        .output()
+        .await
+        .with_context(|| format!("docker pull --platform linux/{arch} {reference}"))?;
+    Ok(output.status.success())
+}
+
+async fn probe_platforms_via_pull(docker_bin: &str, reference: &str) -> Result<Vec<Platform>> {
+    let mut out = Vec::new();
+    for arch in ["amd64", "arm64"] {
+        if probe_platform_via_pull(docker_bin, reference, arch).await? {
+            out.push(Platform {
+                os: "linux".to_string(),
+                arch: arch.to_string(),
+            });
+        }
     }
-    Ok(platforms)
+    Ok(out)
 }
 
 pub async fn copy_file(src: &Path, dst: &Path) -> Result<()> {
@@ -526,5 +572,163 @@ async fn read_message(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -
                 return Err(err.into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Clone, Copy)]
+    enum ManifestMode {
+        List,
+        Empty,
+        Fail,
+    }
+
+    fn create_fake_docker(
+        manifest_mode: ManifestMode,
+        pull_amd64: bool,
+        pull_arm64: bool,
+    ) -> (tempfile::TempDir, String, PathBuf) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let log_path = tmp.path().join("fake-docker.log");
+        let script_path = tmp.path().join("fake-docker.sh");
+        let manifest_behavior = match manifest_mode {
+            ManifestMode::List => {
+                r#"cat <<'JSON'
+{"manifests":[{"platform":{"os":"linux","architecture":"amd64"}},{"platform":{"os":"linux","architecture":"arm64"}}]}
+JSON
+exit 0"#
+            }
+            ManifestMode::Empty => {
+                r#"cat <<'JSON'
+{"schemaVersion":2}
+JSON
+exit 0"#
+            }
+            ManifestMode::Fail => {
+                r#"echo "no such manifest" >&2
+exit 1"#
+            }
+        };
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log_path}"
+if [ "${{1:-}}" = "manifest" ] && [ "${{2:-}}" = "inspect" ]; then
+  {manifest_behavior}
+fi
+if [ "${{1:-}}" = "pull" ]; then
+  platform=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--platform" ]; then
+      shift
+      platform="$1"
+      continue
+    fi
+    shift
+  done
+  case "$platform" in
+    linux/amd64)
+      if [ "{pull_amd64}" = "true" ]; then exit 0; fi
+      exit 1
+      ;;
+    linux/arm64)
+      if [ "{pull_arm64}" = "true" ]; then exit 0; fi
+      exit 1
+      ;;
+    *)
+      exit 1
+      ;;
+  esac
+fi
+echo "unsupported args: $*" >&2
+exit 2
+"#,
+            log_path = log_path.display(),
+            manifest_behavior = manifest_behavior,
+            pull_amd64 = pull_amd64,
+            pull_arm64 = pull_arm64
+        );
+        fs::write(&script_path, script).expect("write fake docker script");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&script_path)
+                .expect("read script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("set script executable");
+        }
+        (tmp, script_path.to_string_lossy().to_string(), log_path)
+    }
+
+    #[tokio::test]
+    async fn inspect_image_platforms_uses_manifest_when_available() {
+        let (_tmp, docker_bin, log_path) = create_fake_docker(ManifestMode::List, false, false);
+        let platforms = inspect_image_platforms(&docker_bin, "example/image:latest")
+            .await
+            .expect("platform lookup should succeed");
+        assert_eq!(platforms.len(), 2);
+        assert!(
+            platforms
+                .iter()
+                .any(|p| p.os == "linux" && p.arch == "amd64")
+        );
+        assert!(
+            platforms
+                .iter()
+                .any(|p| p.os == "linux" && p.arch == "arm64")
+        );
+
+        let log = fs::read_to_string(log_path).expect("read fake docker log");
+        assert!(!log.contains("pull "), "fallback pull probe should not run");
+    }
+
+    #[tokio::test]
+    async fn inspect_image_platforms_falls_back_to_pull_probe_on_manifest_failure() {
+        let (_tmp, docker_bin, _log_path) = create_fake_docker(ManifestMode::Fail, true, false);
+        let platforms = inspect_image_platforms(&docker_bin, "example/image:latest")
+            .await
+            .expect("fallback probe should succeed");
+        assert_eq!(
+            platforms,
+            vec![Platform {
+                os: "linux".to_string(),
+                arch: "amd64".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_image_platforms_falls_back_on_manifest_without_platform_fields() {
+        let (_tmp, docker_bin, _log_path) = create_fake_docker(ManifestMode::Empty, true, false);
+        let platforms = inspect_image_platforms(&docker_bin, "example/image:latest")
+            .await
+            .expect("fallback probe should succeed");
+        assert_eq!(
+            platforms,
+            vec![Platform {
+                os: "linux".to_string(),
+                arch: "amd64".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_image_platforms_errors_when_no_platform_detected() {
+        let (_tmp, docker_bin, _log_path) = create_fake_docker(ManifestMode::Fail, false, false);
+        let err = inspect_image_platforms(&docker_bin, "example/missing:latest")
+            .await
+            .expect_err("lookup should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("example/missing:latest"));
+        assert!(msg.contains("docker manifest inspect failed"));
+        assert!(msg.contains("docker pull --platform probes found no supported"));
     }
 }

@@ -431,7 +431,7 @@ fn build_directory_record(
     ts: DateTime<Utc>,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(33 + ident.len());
-    let ident_is_even = ident.len().is_multiple_of(2);
+    let ident_is_even = ident.len() % 2 == 0;
     buf.push(33 + ident.len() as u8 + ident_is_even as u8);
     buf.push(0);
     buf.extend_from_slice(&extent.to_le_bytes());
