@@ -14,6 +14,7 @@ use reson_agentic::error::Result;
 use reson_agentic::parsers::{Deserializable, FieldDescription};
 use serde::{Deserialize, Serialize};
 
+#[allow(clippy::too_many_arguments)]
 fn run_params(
     prompt: Option<&str>,
     system: Option<&str>,
@@ -170,7 +171,7 @@ fn multiply_numbers(op: MathOperation) -> BoxFuture<'static, Result<String>> {
 /// Agent function that uses typed tools
 #[agentic(model = "openrouter:anthropic/claude-sonnet-4")]
 async fn assistant(request: String, runtime: Runtime) -> Result<String> {
-    r#"
+    let _instructions = r#"
     A helpful assistant with weather and math tools.
 
     Tools:

@@ -352,7 +352,7 @@ async fn test_anthropic_direct_parallel_tools() {
 
     // Claude should call the weather tool twice (once for each city)
     assert!(
-        tool_calls.len() >= 1,
+        !tool_calls.is_empty(),
         "Should receive at least one tool call"
     );
 }
@@ -492,12 +492,11 @@ async fn test_parallel_execution_pattern() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => match chunk {
-                StreamChunk::ToolCallComplete(tool_call) => {
+            Ok(chunk) => {
+                if let StreamChunk::ToolCallComplete(tool_call) = chunk {
                     tool_calls.push(tool_call);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;
@@ -571,8 +570,8 @@ async fn test_mixed_parallel_tool_types() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => match chunk {
-                StreamChunk::ToolCallComplete(tool_call) => {
+            Ok(chunk) => {
+                if let StreamChunk::ToolCallComplete(tool_call) = chunk {
                     let name = tool_call
                         .get("name")
                         .or_else(|| tool_call.get("_tool_name"))
@@ -583,8 +582,7 @@ async fn test_mixed_parallel_tool_types() {
                     tool_names.push(name);
                     tool_calls.push(tool_call);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;

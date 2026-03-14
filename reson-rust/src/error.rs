@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn test_is_retryable() {
         assert!(Error::Inference("test".to_string()).is_retryable());
-        assert!(Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "test")).is_retryable());
+        assert!(Error::Io(std::io::Error::other("test")).is_retryable());
         assert!(!Error::NonRetryable("test".to_string()).is_retryable());
         assert!(!Error::Validation("test".to_string()).is_retryable());
     }
@@ -124,7 +124,7 @@ mod tests {
         let json_err: Error = serde_json::from_str::<i32>("invalid").unwrap_err().into();
         assert!(matches!(json_err, Error::Json(_)));
 
-        let io_err: Error = std::io::Error::new(std::io::ErrorKind::Other, "test").into();
+        let io_err: Error = std::io::Error::other("test").into();
         assert!(matches!(io_err, Error::Io(_)));
     }
 }

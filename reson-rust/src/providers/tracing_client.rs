@@ -579,7 +579,7 @@ mod tests {
         // Verify the cost is in a reasonable range for Sonnet pricing
         // 100 input tokens * 3 microdollars + 50 output tokens * 15 microdollars = 1050 microdollars
         assert!(
-            credits >= 1000 && credits <= 1100,
+            (1000..=1100).contains(&credits),
             "Unexpected credit amount: {} (expected ~1050)",
             credits
         );

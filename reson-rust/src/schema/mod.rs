@@ -5,6 +5,10 @@
 use crate::error::{Error, Result};
 use serde_json::Value;
 
+mod normalized;
+
+pub use normalized::{AdditionalProperties, SchemaType, ToolParametersSchema};
+
 /// Fix output schema for provider-specific requirements
 ///
 /// Different providers have different JSON Schema requirements:
@@ -89,6 +93,18 @@ fn fix_schema_for_google(schema: &mut Value) {
 
         // Recurse into nested schemas
         recurse_schema_fix(schema, fix_schema_for_google);
+    }
+}
+
+/// Fix tool parameter schemas for provider-specific requirements.
+///
+/// This is intentionally less aggressive than structured-output normalization.
+/// Tool schemas should preserve optionality and nested structure.
+pub fn fix_tool_schema_for_provider(schema: &mut Value, provider: &str) {
+    match provider {
+        "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
+        | "google-gemini" => fix_schema_for_google(schema),
+        _ => {}
     }
 }
 

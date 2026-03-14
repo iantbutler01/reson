@@ -226,6 +226,10 @@ mod agentic_macro_tests {
     use reson_agentic::agentic;
     use reson_agentic::error::Result;
 
+    type AgentFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>;
+
+    #[allow(clippy::too_many_arguments)]
     fn run_params(
         prompt: Option<&str>,
         system: Option<&str>,
@@ -282,11 +286,7 @@ mod agentic_macro_tests {
 
         // We can check that the function exists and has the right signature
         // by creating a function pointer (this will fail to compile if signature is wrong)
-        let _fn_ptr: fn(
-            String,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>,
-        > = |input| Box::pin(simple_agentic_fn(input));
+        let _fn_ptr: fn(String) -> AgentFuture = |input| Box::pin(simple_agentic_fn(input));
     }
 
     // Test with no model attribute (should use None)
@@ -312,11 +312,7 @@ mod agentic_macro_tests {
     #[test]
     fn test_agentic_macro_no_model_compiles() {
         // Just verify it compiles
-        let _fn_ptr: fn(
-            i32,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>,
-        > = |data| Box::pin(no_model_agentic_fn(data));
+        let _fn_ptr: fn(i32) -> AgentFuture = |data| Box::pin(no_model_agentic_fn(data));
     }
 
     // Test with multiple parameters
@@ -346,11 +342,7 @@ mod agentic_macro_tests {
     #[test]
     fn test_agentic_macro_multi_params_compiles() {
         // Verify multi-param function compiles correctly
-        let _fn_ptr: fn(
-            String,
-            u32,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>,
-        > = |name, count| Box::pin(multi_param_fn(name, count));
+        let _fn_ptr: fn(String, u32) -> AgentFuture =
+            |name, count| Box::pin(multi_param_fn(name, count));
     }
 }

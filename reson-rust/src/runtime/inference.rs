@@ -13,7 +13,7 @@ use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
 };
-use crate::schema::fix_output_schema_for_provider;
+use crate::schema::{fix_output_schema_for_provider, fix_tool_schema_for_provider};
 use crate::types::ChatMessage;
 use crate::utils::ConversationMessage;
 
@@ -26,161 +26,6 @@ pub struct CallResult {
     pub reasoning: Option<String>,
     /// Tool calls from the response (if any)
     pub tool_calls: Vec<serde_json::Value>,
-}
-
-/// Convert a field type to JSON schema type
-fn field_type_to_json_type(field_type: &str) -> serde_json::Value {
-    serde_json::json!(infer_json_type(field_type))
-}
-
-/// Infer JSON schema type name from a Rust type string
-fn infer_json_type(field_type: &str) -> &'static str {
-    let ty = strip_type_modifiers(field_type);
-    if ty.is_empty() {
-        return "string";
-    }
-
-    // Handle slices/arrays like &[T] or [T; N]
-    if ty.starts_with('[') {
-        return "array";
-    }
-
-    // Handle manual descriptors (string, integer, etc)
-    let ty_lower = ty.to_ascii_lowercase();
-    match ty_lower.as_str() {
-        "string" | "&str" | "str" => return "string",
-        "number" | "f32" | "f64" | "float" => return "number",
-        "integer" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize"
-        | "isize" => return "integer",
-        "boolean" | "bool" => return "boolean",
-        "array" => return "array",
-        "object" => return "object",
-        _ => {}
-    }
-
-    let (base, generics) = split_type_and_generics(ty);
-    let ident = base.rsplit("::").next().unwrap_or(base);
-
-    if ident == "Option" {
-        if let Some(inner) = generics {
-            return infer_json_type(inner);
-        }
-        return "string";
-    }
-
-    if ident == "Vec" || ident == "VecDeque" || ident == "LinkedList" {
-        return "array";
-    }
-
-    if ident == "HashMap" || ident == "BTreeMap" || ident == "IndexMap" {
-        return "object";
-    }
-
-    if ident == "Value" && base.contains("serde_json") {
-        return "object";
-    }
-
-    match ident {
-        "String" => "string",
-        "str" => "string",
-        "f32" | "f64" => "number",
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
-            "integer"
-        }
-        "bool" => "boolean",
-        _ => "string",
-    }
-}
-
-/// Determine the `items` schema for array-like fields
-fn field_type_array_items(field_type: &str) -> Option<serde_json::Value> {
-    let ty = strip_type_modifiers(field_type);
-    if ty.is_empty() {
-        return None;
-    }
-
-    // Handle manual "array" descriptor with unknown item type
-    if ty.eq_ignore_ascii_case("array") {
-        return Some(serde_json::json!({ "type": "string" }));
-    }
-
-    // Handle slices like &[T] or [T; N]
-    if ty.starts_with('[') {
-        if let Some(end) = ty.find(';') {
-            let inner = ty[1..end].trim();
-            if !inner.is_empty() {
-                return Some(serde_json::json!({ "type": infer_json_type(inner) }));
-            }
-        } else if let Some(end) = ty.rfind(']') {
-            let inner = ty[1..end].trim();
-            if !inner.is_empty() {
-                return Some(serde_json::json!({ "type": infer_json_type(inner) }));
-            }
-        }
-        return Some(serde_json::json!({ "type": "string" }));
-    }
-
-    let (base, generics) = split_type_and_generics(ty);
-    let ident = base.rsplit("::").next().unwrap_or(base);
-
-    if ident == "Option" {
-        if let Some(inner) = generics {
-            return field_type_array_items(inner);
-        }
-        return None;
-    }
-
-    if ident == "Vec" || ident == "VecDeque" || ident == "LinkedList" {
-        if let Some(inner) = generics {
-            return Some(serde_json::json!({ "type": infer_json_type(inner) }));
-        }
-        return Some(serde_json::json!({ "type": "string" }));
-    }
-
-    None
-}
-
-/// Remove reference/mut modifiers from type strings
-fn strip_type_modifiers(field_type: &str) -> &str {
-    let mut ty = field_type.trim();
-    loop {
-        if let Some(stripped) = ty.strip_prefix('&') {
-            ty = stripped.trim_start();
-            if let Some(stripped_mut) = ty.strip_prefix("mut") {
-                ty = stripped_mut.trim_start();
-            }
-            continue;
-        }
-        break;
-    }
-    ty
-}
-
-/// Split a type string into the base identifier and its first generic argument
-fn split_type_and_generics(ty: &str) -> (&str, Option<&str>) {
-    if let Some(start) = ty.find('<') {
-        let base = &ty[..start];
-        let mut depth = 0usize;
-        for (offset, ch) in ty[start..].char_indices() {
-            match ch {
-                '<' => depth += 1,
-                '>' => {
-                    if depth == 0 {
-                        break;
-                    }
-                    depth -= 1;
-                    if depth == 0 {
-                        let inner = &ty[start + 1..start + offset];
-                        return (base, Some(inner));
-                    }
-                }
-                _ => {}
-            }
-        }
-        (base, None)
-    } else {
-        (ty, None)
-    }
 }
 
 /// Generate native tool schemas for the given model/provider
@@ -208,42 +53,10 @@ fn generate_tool_schemas(
     for (tool_name, _tool_fn) in tools.iter() {
         // Check if we have schema info for this tool
         let tool_schema = if let Some(schema_info) = tool_schemas.get(tool_name) {
-            // Build properties and required from field descriptions
-            let mut properties = serde_json::Map::new();
-            let mut required = Vec::new();
+            let mut parameters = schema_info.parameters.to_json_schema();
+            fix_tool_schema_for_provider(&mut parameters, &provider);
 
-            for field in &schema_info.fields {
-                let mut field_schema = serde_json::Map::new();
-                let field_type_json = field_type_to_json_type(&field.field_type);
-                let is_array = field_type_json == serde_json::json!("array");
-                field_schema.insert("type".to_string(), field_type_json);
-                if is_array {
-                    let items_schema = field_type_array_items(&field.field_type)
-                        .unwrap_or_else(|| serde_json::json!({ "type": "string" }));
-                    field_schema.insert("items".to_string(), items_schema);
-                }
-                if !field.description.is_empty() {
-                    field_schema.insert(
-                        "description".to_string(),
-                        serde_json::json!(field.description),
-                    );
-                }
-                properties.insert(field.name.clone(), serde_json::Value::Object(field_schema));
-
-                if field.required {
-                    required.push(serde_json::json!(field.name));
-                }
-            }
-
-            generator.generate_schema(
-                tool_name,
-                &schema_info.description,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                }),
-            )
+            generator.generate_schema(tool_name, &schema_info.description, parameters)
         } else {
             // No schema info - generate minimal schema
             generator.generate_schema(
@@ -719,6 +532,7 @@ pub async fn call_llm_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ToolParametersSchema;
 
     #[test]
     fn test_create_inference_client_anthropic() {
@@ -780,8 +594,6 @@ mod tests {
 
     #[test]
     fn test_generate_tool_schemas_anthropic() {
-        use crate::parsers::FieldDescription;
-
         let mut tools = HashMap::new();
         tools.insert(
             "get_weather".to_string(),
@@ -794,12 +606,23 @@ mod tests {
             ToolSchemaInfo {
                 name: "get_weather".to_string(),
                 description: "Get the weather for a location".to_string(),
-                fields: vec![FieldDescription {
+                fields: vec![crate::parsers::FieldDescription {
                     name: "location".to_string(),
                     field_type: "string".to_string(),
                     description: "The city name".to_string(),
                     required: true,
                 }],
+                parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "The city name"
+                        }
+                    },
+                    "required": ["location"]
+                }))
+                .unwrap(),
             },
         );
 
@@ -818,8 +641,6 @@ mod tests {
 
     #[test]
     fn test_generate_tool_schemas_openai() {
-        use crate::parsers::FieldDescription;
-
         let mut tools = HashMap::new();
         tools.insert(
             "calculate".to_string(),
@@ -832,12 +653,23 @@ mod tests {
             ToolSchemaInfo {
                 name: "calculate".to_string(),
                 description: "Calculate a math expression".to_string(),
-                fields: vec![FieldDescription {
+                fields: vec![crate::parsers::FieldDescription {
                     name: "expression".to_string(),
                     field_type: "string".to_string(),
                     description: "Math expression to evaluate".to_string(),
                     required: true,
                 }],
+                parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "Math expression to evaluate"
+                        }
+                    },
+                    "required": ["expression"]
+                }))
+                .unwrap(),
             },
         );
 
@@ -856,8 +688,6 @@ mod tests {
 
     #[test]
     fn test_generate_tool_schemas_with_schema_info() {
-        use crate::parsers::FieldDescription;
-
         let mut tools = HashMap::new();
         tools.insert(
             "search".to_string(),
@@ -871,25 +701,47 @@ mod tests {
                 name: "search".to_string(),
                 description: "Search for documents".to_string(),
                 fields: vec![
-                    FieldDescription {
+                    crate::parsers::FieldDescription {
                         name: "query".to_string(),
                         field_type: "string".to_string(),
                         description: "Search query".to_string(),
                         required: true,
                     },
-                    FieldDescription {
+                    crate::parsers::FieldDescription {
                         name: "limit".to_string(),
                         field_type: "integer".to_string(),
                         description: "Max results".to_string(),
                         required: false,
                     },
-                    FieldDescription {
+                    crate::parsers::FieldDescription {
                         name: "ids".to_string(),
                         field_type: "Vec<i64>".to_string(),
                         description: "Optional document ids".to_string(),
                         required: false,
                     },
                 ],
+                parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results"
+                        },
+                        "ids": {
+                            "type": "array",
+                            "description": "Optional document ids",
+                            "items": {
+                                "type": "integer"
+                            }
+                        }
+                    },
+                    "required": ["query"]
+                }))
+                .unwrap(),
             },
         );
 
@@ -919,44 +771,57 @@ mod tests {
     }
 
     #[test]
-    fn test_field_type_to_json_type() {
-        assert_eq!(
-            field_type_to_json_type("String"),
-            serde_json::json!("string")
+    fn test_generate_tool_schemas_preserves_nested_objects_and_google_constraints() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "write_thread".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("ok".to_string()))),
         );
-        assert_eq!(field_type_to_json_type("i32"), serde_json::json!("integer"));
-        assert_eq!(field_type_to_json_type("f64"), serde_json::json!("number"));
-        assert_eq!(
-            field_type_to_json_type("bool"),
-            serde_json::json!("boolean")
-        );
-        assert_eq!(
-            field_type_to_json_type("Vec<String>"),
-            serde_json::json!("array")
-        );
-        assert_eq!(
-            field_type_to_json_type("Option<i32>"),
-            serde_json::json!("integer")
-        );
-        assert_eq!(
-            field_type_to_json_type("alloc::vec::Vec<i64>"),
-            serde_json::json!("array")
-        );
-        assert_eq!(
-            field_type_to_json_type("CustomType"),
-            serde_json::json!("string")
-        );
-    }
 
-    #[test]
-    fn test_field_type_array_items_detection() {
-        let array_items = field_type_array_items("Vec<i64>").unwrap();
-        assert_eq!(array_items["type"], "integer");
+        let mut tool_schemas = HashMap::new();
+        tool_schemas.insert(
+            "write_thread".to_string(),
+            ToolSchemaInfo {
+                name: "write_thread".to_string(),
+                description: "Write a thread".to_string(),
+                fields: vec![],
+                parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/$defs/ThreadItem"
+                            }
+                        }
+                    },
+                    "required": ["items"],
+                    "$defs": {
+                        "ThreadItem": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "image_ids": {
+                                    "type": "array",
+                                    "items": { "type": "integer" }
+                                }
+                            },
+                            "required": ["text"],
+                            "additionalProperties": false
+                        }
+                    }
+                }))
+                .unwrap(),
+            },
+        );
 
-        let option_items = field_type_array_items("Option<Vec<String>>").unwrap();
-        assert_eq!(option_items["type"], "string");
-
-        let slice_items = field_type_array_items("&[bool]").unwrap();
-        assert_eq!(slice_items["type"], "boolean");
+        let google =
+            generate_tool_schemas(&tools, &tool_schemas, "gemini:gemini-3-flash-preview").unwrap();
+        let nested = &google[0]["parameters"]["properties"]["items"]["items"]["properties"];
+        assert_eq!(nested["text"]["type"], "string");
+        assert_eq!(nested["image_ids"]["items"]["type"], "integer");
+        assert!(google[0]["parameters"]["properties"]["items"]["items"]
+            .get("additionalProperties")
+            .is_none());
     }
 }

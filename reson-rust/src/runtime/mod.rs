@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
+use crate::schema::ToolParametersSchema;
 use crate::types::ReasoningSegment;
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;
@@ -36,6 +37,7 @@ pub struct ToolSchemaInfo {
     pub name: String,
     pub description: String,
     pub fields: Vec<crate::parsers::FieldDescription>,
+    pub parameters: ToolParametersSchema,
 }
 
 /// Runtime - Main execution environment for agentic functions
@@ -212,55 +214,20 @@ impl Runtime {
         tools.insert(name.clone(), tool_fn);
         drop(tools);
 
-        // Extract field info from schema and store schema info
-        let fields = Self::extract_fields_from_schema(&schema);
+        // Parse and store full schema information while preserving
+        // flat field metadata for introspection and existing callers.
+        let parameters = ToolParametersSchema::from_json_schema(&schema)?;
+        let fields = parameters.top_level_field_descriptions();
         let schema_info = ToolSchemaInfo {
             name: name.clone(),
             description,
             fields,
+            parameters,
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(name, schema_info);
 
         Ok(())
-    }
-
-    /// Helper to extract field descriptions from a JSON schema
-    fn extract_fields_from_schema(
-        schema: &serde_json::Value,
-    ) -> Vec<crate::parsers::FieldDescription> {
-        let mut fields = Vec::new();
-
-        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-            let required = schema
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-
-            for (name, prop) in properties {
-                let field_type = prop
-                    .get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("object")
-                    .to_string();
-                let description = prop
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let is_required = required.contains(&name.as_str());
-
-                fields.push(crate::parsers::FieldDescription {
-                    name: name.clone(),
-                    field_type,
-                    description,
-                    required: is_required,
-                });
-            }
-        }
-
-        fields
     }
 
     /// Register a tool with type and handler (Python: runtime.tool(fn, name=..., tool_type=...))
@@ -329,10 +296,12 @@ impl Runtime {
 
         // Extract and store schema information from Deserializable type
         let field_descriptions = T::field_descriptions();
+        let parameters = ToolParametersSchema::from_field_descriptions(&field_descriptions);
         let schema_info = ToolSchemaInfo {
             name: tool_name.clone(),
             description: format!("Tool: {}", tool_name), // Default description
             fields: field_descriptions,
+            parameters,
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(tool_name.clone(), schema_info);
@@ -828,9 +797,9 @@ mod tests {
         assert_eq!(schema_info.name, "get_weather");
         assert_eq!(schema_info.fields.len(), 2);
         assert_eq!(schema_info.fields[0].name, "location");
-        assert_eq!(schema_info.fields[0].required, true);
+        assert!(schema_info.fields[0].required);
         assert_eq!(schema_info.fields[1].name, "unit");
-        assert_eq!(schema_info.fields[1].required, false);
+        assert!(!schema_info.fields[1].required);
     }
 
     #[tokio::test]
@@ -863,6 +832,61 @@ mod tests {
             .fields
             .iter()
             .any(|f| f.name == "unit" && !f.required));
+        assert_eq!(
+            weather_schema.parameters.to_json_schema()["properties"]["location"]["type"],
+            "string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_tool_with_schema_preserves_nested_structure() {
+        let runtime = Runtime::new();
+
+        runtime
+            .register_tool_with_schema(
+                "write_thread",
+                "Write a thread",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/$defs/ThreadItem"
+                            }
+                        }
+                    },
+                    "required": ["items"],
+                    "$defs": {
+                        "ThreadItem": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string" },
+                                "image_ids": {
+                                    "type": "array",
+                                    "items": { "type": "integer" }
+                                }
+                            },
+                            "required": ["text"]
+                        }
+                    }
+                }),
+                ToolFunction::Sync(Box::new(|args| Ok(args.to_string()))),
+            )
+            .await
+            .unwrap();
+
+        let schemas = runtime.get_tool_schemas().await;
+        let write_thread = schemas.get("write_thread").unwrap();
+        let json = write_thread.parameters.to_json_schema();
+        assert_eq!(
+            json["properties"]["items"]["items"]["properties"]["text"]["type"],
+            "string"
+        );
+        assert_eq!(
+            json["properties"]["items"]["items"]["properties"]["image_ids"]["items"]["type"],
+            "integer"
+        );
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ fn get_openrouter_key() -> Option<String> {
     env::var("OPENROUTER_API_KEY").ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_params(
     prompt: Option<&str>,
     system: Option<&str>,
@@ -1665,13 +1666,12 @@ async fn test_google_streaming() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => match chunk {
-                reson_agentic::providers::StreamChunk::Content(text) => {
+            Ok(chunk) => {
+                if let reson_agentic::providers::StreamChunk::Content(text) = chunk {
                     print!("{}", text);
                     full_content.push_str(&text);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;

@@ -517,7 +517,7 @@ fn test_reasoning_segment_in_conversation_message() {
 #[test]
 fn test_reasoning_segments_collection() {
     // Test creating a collection of reasoning segments
-    let segments = vec![
+    let segments = [
         ReasoningSegment::new("First thought".to_string()).with_segment_index(0),
         ReasoningSegment::new("Second thought".to_string()).with_segment_index(1),
         ReasoningSegment::new("Third thought".to_string()).with_segment_index(2),

@@ -937,8 +937,6 @@ impl GoogleGenAIClient {
     }
 }
 
-use std::hash::Hasher;
-
 #[async_trait]
 impl InferenceClient for GoogleGenAIClient {
     async fn get_generation(
