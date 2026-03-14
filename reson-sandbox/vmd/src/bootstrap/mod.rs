@@ -60,6 +60,29 @@ set -euxo pipefail
 
 HOSTNAME={host_value}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TRACE_LOG=/var/log/bootstrap-init.trace.log
+
+mkdir -p /var/log
+touch "$TRACE_LOG"
+chmod 0644 "$TRACE_LOG"
+SERIAL_DEV=""
+for dev in /dev/ttyAMA0 /dev/ttyS0 /dev/console; do
+  if [ -c "$dev" ]; then
+    SERIAL_DEV="$dev"
+    break
+  fi
+done
+if [ -n "$SERIAL_DEV" ]; then
+  exec > >(tee -a "$TRACE_LOG" "$SERIAL_DEV") 2>&1
+else
+  exec >>"$TRACE_LOG" 2>&1
+fi
+
+log() {{
+  printf 'bootstrap-init: %s %s\n' "$(date -Iseconds)" "$*"
+}}
+
+log "begin hostname=${{HOSTNAME}} script_dir=${{SCRIPT_DIR}}"
 
 if [ -n "$HOSTNAME" ]; then
   if command -v hostnamectl >/dev/null 2>&1; then
@@ -77,13 +100,23 @@ if [ -n "$HOSTNAME" ]; then
   fi
 fi
 
-SRC="$SCRIPT_DIR/portproxy"
+log "searching bootstrap payload files"
+SRC=""
+for candidate in "$SCRIPT_DIR/portproxy" "$SCRIPT_DIR/PORTPROXY"; do
+  if [ -f "$candidate" ]; then
+    SRC="$candidate"
+    break
+  fi
+done
 DEST="/usr/sbin/portproxy"
-if [ ! -f "$SRC" ]; then
-  echo "portproxy binary missing on bootstrap volume" >&2
-  exit 1
+if [ -z "$SRC" ]; then
+  echo "bootstrap-init: portproxy binary missing on bootstrap volume (expected $SCRIPT_DIR/portproxy or $SCRIPT_DIR/PORTPROXY)" >&2
+  ls -la "$SCRIPT_DIR" >&2 || true
+  exit 52
 fi
+log "installing portproxy src=$SRC dest=$DEST"
 install -m 0755 "$SRC" "$DEST"
+ls -la "$DEST" || true
 
 cat <<'EOF' >/etc/systemd/system/portproxy.service
 [Unit]
@@ -92,12 +125,61 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
+Environment=RUST_LOG=trace
+ExecStartPre=/bin/sh -c 'echo "portproxy.service preflight: $(date -Iseconds) starting /usr/sbin/portproxy --server"'
 ExecStart=/usr/sbin/portproxy --server
 Restart=on-failure
-RestartSec=5
+RestartSec=2
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+cat <<'EOF' >/usr/local/sbin/portproxy-diagnostics.sh
+#!/bin/bash
+set -euo pipefail
+echo "portproxy-diag: $(date -Iseconds) begin"
+echo "portproxy-diag: uname=$(uname -a)"
+echo "portproxy-diag: portproxy ls => $(ls -l /usr/sbin/portproxy 2>&1 || true)"
+if command -v file >/dev/null 2>&1; then
+  file /usr/sbin/portproxy || true
+fi
+systemctl is-enabled portproxy.service || true
+systemctl is-active portproxy.service || true
+systemctl --no-pager -l status portproxy.service || true
+journalctl --no-pager -u portproxy.service -n 200 || true
+ss -ltnp || true
+echo "portproxy-diag: $(date -Iseconds) end"
+EOF
+chmod 0755 /usr/local/sbin/portproxy-diagnostics.sh
+
+cat <<'EOF' >/etc/systemd/system/portproxy-diagnostics.service
+[Unit]
+Description=Dump portproxy diagnostics
+After=portproxy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/portproxy-diagnostics.sh
+StandardOutput=journal+console
+StandardError=journal+console
+EOF
+
+cat <<'EOF' >/etc/systemd/system/portproxy-diagnostics.timer
+[Unit]
+Description=Run portproxy diagnostics after boot
+
+[Timer]
+OnBootSec=12s
+AccuracySec=1s
+Unit=portproxy-diagnostics.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 EOF
 
 cat <<'EOF' >/usr/local/sbin/firstboot-resize-rootfs.sh
@@ -181,11 +263,32 @@ Persistent=true
 WantedBy=multi-user.target
 EOF
 
+log "reloading systemd units"
 systemctl daemon-reload
-systemctl enable portproxy.service
-systemctl start portproxy.service
+log "enabling and starting portproxy.service"
+if ! systemctl enable portproxy.service; then
+  log "failed enabling portproxy.service"
+  exit 53
+fi
+if ! systemctl start portproxy.service; then
+  log "failed starting portproxy.service"
+  systemctl --no-pager -l status portproxy.service || true
+  journalctl --no-pager -u portproxy.service -n 200 || true
+  exit 54
+fi
+
+log "enabling resize timer"
 systemctl enable firstboot-resize-rootfs.timer
 systemctl start firstboot-resize-rootfs.timer
+
+log "enabling diagnostics timer"
+systemctl enable portproxy-diagnostics.timer
+systemctl start portproxy-diagnostics.timer
+
+log "portproxy startup status snapshot"
+systemctl --no-pager -l status portproxy.service || true
+journalctl --no-pager -u portproxy.service -n 100 || true
+log "bootstrap init complete"
 "#
     )
 }

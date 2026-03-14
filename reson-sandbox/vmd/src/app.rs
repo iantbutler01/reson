@@ -22,6 +22,7 @@ use tonic::{GrpcMethod, Request, Response, Status};
 use tower_http::classify::GrpcFailureClass;
 use tower_http::trace::TraceLayer;
 use tracing::{Level, Span, debug, error, info};
+use uuid::Uuid;
 
 use crate::config::{Config, TlsServerConfig};
 use crate::image::{self, PrebuiltImageStatus};
@@ -44,7 +45,7 @@ use crate::state::{
 };
 use crate::{
     config::{ControlBusConfig, NodeRegistryConfig},
-    control_bus, reconcile, registry,
+    control_bus, reconcile, registry, virt,
 };
 
 pub async fn run_server(config: Config) -> Result<()> {
@@ -679,6 +680,7 @@ impl VmdService for GrpcService {
         let reference = req.reference;
         let target = image::default_base_image_path(&self.cfg, &reference, &arch);
         let force = req.force;
+        let docker_bin = self.cfg.docker_bin.clone();
         let (tx, rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
@@ -786,10 +788,38 @@ impl VmdService for GrpcService {
                     )));
                 }
                 Ok(PrebuiltImageStatus::NotFound) => {
-                    let status = Status::not_found(format!(
-                        "no prebuilt VM image found for {reference} ({arch})"
-                    ));
-                    let _ = tx.send(Err(status));
+                    // @dive: Prewarm must fully seed qcow cache; if registry miss occurs, fallback to d2vm conversion now.
+                    let _ = tx.send(Ok(build_pre_download_response(
+                        PreDownloadVmImagePhase::Downloading,
+                        format!(
+                            "no prebuilt VM image for {reference} ({arch}); converting from container image"
+                        ),
+                        0,
+                        None,
+                    )));
+
+                    match convert_container_image_to_qcow(
+                        docker_bin.as_str(),
+                        reference.as_str(),
+                        arch.as_str(),
+                        target.as_path(),
+                    )
+                    .await
+                    {
+                        Ok(bytes) => {
+                            let message =
+                                format!("stored converted VM image at {}", target.display());
+                            let _ = tx.send(Ok(build_pre_download_response(
+                                PreDownloadVmImagePhase::Complete,
+                                message,
+                                bytes,
+                                Some(bytes),
+                            )));
+                        }
+                        Err(status) => {
+                            let _ = tx.send(Err(status));
+                        }
+                    }
                 }
                 Err(err) => {
                     let status = Status::internal(format!(
@@ -898,6 +928,75 @@ impl VmdService for GrpcService {
             .map_err(status_from_error)?;
         Ok(Response::new(()))
     }
+}
+
+async fn convert_container_image_to_qcow(
+    docker_bin: &str,
+    reference: &str,
+    arch: &str,
+    target: &std::path::Path,
+) -> Result<u64, Status> {
+    let base_dir = target.parent().ok_or_else(|| {
+        Status::internal(format!(
+            "failed to resolve base image directory for {}",
+            target.display()
+        ))
+    })?;
+
+    if let Err(err) = fs::create_dir_all(base_dir).await {
+        return Err(Status::internal(format!(
+            "failed to create base image directory {}: {err}",
+            base_dir.display()
+        )));
+    }
+
+    let base_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Status::internal(format!("invalid target file name {}", target.display()))
+        })?;
+    let tmp_name = format!(
+        "{}-{}.{}",
+        base_name.trim_end_matches(image::BASE_IMAGE_EXT),
+        Uuid::new_v4(),
+        image::BASE_IMAGE_EXT.trim_start_matches('.')
+    );
+    let tmp_path = base_dir.join(&tmp_name);
+
+    let options = virt::D2VmOptions {
+        image: reference.to_string(),
+        output: tmp_name.clone(),
+        disk_gb: image::BASE_IMAGE_SIZE_GB,
+        pull: true,
+        platform: Some(format!("linux/{arch}")),
+        include_bootstrap: true,
+    };
+
+    if let Err(err) = virt::run_d2vm(docker_bin, base_dir, options).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(Status::internal(format!(
+            "failed to convert VM image {reference} ({arch}): {err}"
+        )));
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, target).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(Status::internal(format!(
+            "failed to store converted VM image at {}: {err}",
+            target.display()
+        )));
+    }
+
+    fs::metadata(target)
+        .await
+        .map(|metadata| metadata.len())
+        .map_err(|err| {
+            Status::internal(format!(
+                "failed to inspect converted VM image {}: {err}",
+                target.display()
+            ))
+        })
 }
 
 enum Action {

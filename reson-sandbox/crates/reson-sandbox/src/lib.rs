@@ -385,9 +385,69 @@ struct NodePortMultiplexer {
     forwards: Mutex<HashMap<u16, ForwardTask>>,
 }
 
+fn configured_forward_bind_addr() -> String {
+    std::env::var("RESON_SANDBOX_FORWARD_BIND_ADDR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn configured_forward_port_range() -> Option<(u16, u16)> {
+    let raw = std::env::var("RESON_SANDBOX_FORWARD_PORT_RANGE").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let normalized = raw.replace(':', "-");
+    let (start, end) = normalized.split_once('-')?;
+    let start = start.trim().parse::<u16>().ok()?;
+    let end = end.trim().parse::<u16>().ok()?;
+    if start == 0 || end == 0 {
+        return None;
+    }
+    Some(if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    })
+}
+
 impl NodePortMultiplexer {
     async fn register(&self, guest_port: u16, server_addr: String) -> Result<u16> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let bind_addr = configured_forward_bind_addr();
+        let listener = if let Some((range_start, range_end)) = configured_forward_port_range() {
+            let mut bound: Option<TcpListener> = None;
+            let mut last_error: Option<std::io::Error> = None;
+            for port in range_start..=range_end {
+                match TcpListener::bind((bind_addr.as_str(), port)).await {
+                    Ok(listener) => {
+                        bound = Some(listener);
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                    }
+                }
+            }
+            match bound {
+                Some(listener) => listener,
+                None => {
+                    return Err(SandboxError::Io(last_error.unwrap_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            format!(
+                                "no available forward port in range {}-{} on {}",
+                                range_start, range_end, bind_addr
+                            ),
+                        )
+                    })));
+                }
+            }
+        } else {
+            TcpListener::bind((bind_addr.as_str(), 0)).await?
+        };
         let host_port = listener.local_addr()?.port();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let join = tokio::spawn(async move {
@@ -2050,7 +2110,7 @@ impl Sandbox {
             tokio::spawn(async move {
                 let profiles = vec![refill_profile];
                 let _ = sandbox
-                    .prewarm_profiles_on_endpoint(endpoint.as_str(), &profiles)
+                    .prewarm_profiles_on_endpoint(endpoint.as_str(), &profiles, false)
                     .await;
             });
         }
@@ -2194,16 +2254,29 @@ impl Sandbox {
     async fn ensure_daemon_ready(&self) -> Result<()> {
         match &self.inner.control_backend {
             ControlBackend::Direct => {
+                let mut last_health_err: Option<String> = None;
                 for endpoint in self.candidate_endpoints().await? {
-                    if self.health_check_endpoint(&endpoint).await.is_ok() {
-                        return Ok(());
+                    match self.health_check_endpoint(&endpoint).await {
+                        Ok(()) => return Ok(()),
+                        Err(err) => {
+                            let err_msg = err.to_string();
+                            tracing::warn!(
+                                endpoint = %endpoint,
+                                error = %err_msg,
+                                "sandbox daemon health check failed"
+                            );
+                            last_health_err = Some(err_msg);
+                        }
                     }
                 }
 
                 if !self.inner.cfg.auto_spawn {
+                    let detail = last_health_err
+                        .map(|msg| format!("; last health error: {msg}"))
+                        .unwrap_or_default();
                     return Err(SandboxError::DaemonUnavailable(format!(
-                        "unable to connect to sandbox daemon at any configured control endpoint (primary: {})",
-                        self.inner.cfg.endpoint
+                        "unable to connect to sandbox daemon at any configured control endpoint (primary: {}){}",
+                        self.inner.cfg.endpoint, detail
                     )));
                 }
 
@@ -2249,7 +2322,7 @@ impl Sandbox {
             if self.health_check_endpoint(&endpoint).await.is_err() {
                 continue;
             }
-            self.prewarm_profiles_on_endpoint(&endpoint, &profiles)
+            self.prewarm_profiles_on_endpoint(&endpoint, &profiles, force)
                 .await?;
         }
         Ok(())
@@ -2280,6 +2353,7 @@ impl Sandbox {
         &self,
         endpoint: &str,
         profiles: &[WarmPoolProfile],
+        strict: bool,
     ) -> Result<()> {
         for profile in profiles {
             if profile.image.trim().is_empty() {
@@ -2293,12 +2367,25 @@ impl Sandbox {
             if self.warm_pool_contains_key(key.as_str()).await {
                 continue;
             }
-            if self
+            match self
                 .prewarm_profile_on_endpoint(endpoint, profile, architecture.as_str())
                 .await
-                .is_ok()
             {
-                self.warm_pool_mark_ready(key).await;
+                Ok(()) => {
+                    self.warm_pool_mark_ready(key).await;
+                }
+                Err(err) => {
+                    if strict {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        image = %profile.image,
+                        architecture = %architecture,
+                        error = %err,
+                        "warm-pool prewarm failed; continuing in best-effort mode"
+                    );
+                }
             }
         }
         Ok(())
@@ -2429,9 +2516,35 @@ impl Sandbox {
         if let Some(data_dir) = &self.inner.cfg.daemon_data_dir {
             cmd.arg("--data-dir").arg(data_dir);
         }
+
+        let daemon_log_dir = self
+            .inner
+            .cfg
+            .daemon_data_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("reson-sandbox-daemon"));
+        fs::create_dir_all(&daemon_log_dir)?;
+        let stdout_log_path = daemon_log_dir.join("vmd.stdout.log");
+        let stderr_log_path = daemon_log_dir.join("vmd.stderr.log");
+        let stdout_log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdout_log_path)?;
+        let stderr_log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_log_path)?;
+
+        tracing::info!(
+            listen = %self.inner.cfg.daemon_listen,
+            stdout = %stdout_log_path.display(),
+            stderr = %stderr_log_path.display(),
+            "spawning sandbox daemon"
+        );
+
         cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
+        cmd.stdout(Stdio::from(stdout_log));
+        cmd.stderr(Stdio::from(stderr_log));
 
         let child = cmd.spawn()?;
         *guard = Some(ManagedDaemon { child });

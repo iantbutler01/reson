@@ -418,8 +418,12 @@ impl DistributedControlPlane {
         client.delete(fence_key, None).await.map_err(|err| {
             SandboxError::DaemonUnavailable(format!("etcd delete session fence failed: {err}"))
         })?;
-        let _ = client.delete(legacy_route_key, None).await;
-        let _ = client.delete(legacy_fence_key, None).await;
+        if let Err(err) = client.delete(legacy_route_key, None).await {
+            tracing::warn!(error = %err, "failed to delete legacy session route key");
+        }
+        if let Err(err) = client.delete(legacy_fence_key, None).await {
+            tracing::warn!(error = %err, "failed to delete legacy session fence key");
+        }
         Ok(())
     }
 
@@ -765,7 +769,14 @@ impl DistributedControlPlane {
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                let _ = stream.delete_consumer(&consumer_name).await;
+                if let Err(err) = stream.delete_consumer(&consumer_name).await {
+                    tracing::warn!(
+                        error = %err,
+                        consumer = %consumer_name,
+                        command_id = %command_id,
+                        "failed to delete timed-out exec result consumer"
+                    );
+                }
                 return Err(SandboxError::DaemonUnavailable(format!(
                     "timed out waiting for exec result command_id={command_id}"
                 )));
@@ -775,7 +786,14 @@ impl DistributedControlPlane {
             let maybe_message = match maybe_message {
                 Ok(message) => message,
                 Err(_) => {
-                    let _ = stream.delete_consumer(&consumer_name).await;
+                    if let Err(err) = stream.delete_consumer(&consumer_name).await {
+                        tracing::warn!(
+                            error = %err,
+                            consumer = %consumer_name,
+                            command_id = %command_id,
+                            "failed to delete exec result consumer after timeout"
+                        );
+                    }
                     return Err(SandboxError::DaemonUnavailable(format!(
                         "timed out waiting for exec result command_id={command_id}"
                     )));
@@ -791,9 +809,22 @@ impl DistributedControlPlane {
             })?;
 
             let parsed = decode_exec_result_payload(&message.payload)?;
-            let _ = message.ack().await;
+            if let Err(err) = message.ack().await {
+                tracing::warn!(
+                    error = %err,
+                    command_id = %command_id,
+                    "failed to ack exec result message"
+                );
+            }
             if parsed.command_id.trim() == command_id {
-                let _ = stream.delete_consumer(&consumer_name).await;
+                if let Err(err) = stream.delete_consumer(&consumer_name).await {
+                    tracing::warn!(
+                        error = %err,
+                        consumer = %consumer_name,
+                        command_id = %command_id,
+                        "failed to delete exec result consumer after successful match"
+                    );
+                }
                 return Ok(parsed);
             }
         }
@@ -863,6 +894,7 @@ impl DistributedControlPlane {
         let mut started_tx = Some(started_tx);
         let stream_name = self.cfg.nats_stream_name.clone();
         let cleanup_consumer_name = consumer_name.clone();
+        let stream_id = stream_id.to_string();
         let jetstream = self.jetstream.clone();
         if !expect_started_event {
             if let Some(tx) = started_tx.take() {
@@ -914,7 +946,14 @@ impl DistributedControlPlane {
                 };
 
                 let parsed = decode_exec_stream_event_payload(&message.payload);
-                let _ = message.ack().await;
+                if let Err(err) = message.ack().await {
+                    tracing::warn!(
+                        error = %err,
+                        stream_id = %stream_id,
+                        consumer = %cleanup_consumer_name,
+                        "failed to ack distributed exec stream event"
+                    );
+                }
                 let event = match parsed {
                     Ok(event) => event,
                     Err(err) => {
@@ -958,7 +997,14 @@ impl DistributedControlPlane {
             }
 
             if let Ok(stream) = jetstream.get_stream(stream_name).await {
-                let _ = stream.delete_consumer(&cleanup_consumer_name).await;
+                if let Err(err) = stream.delete_consumer(&cleanup_consumer_name).await {
+                    tracing::warn!(
+                        error = %err,
+                        consumer = %cleanup_consumer_name,
+                        stream_id = %stream_id,
+                        "failed to delete distributed exec stream consumer"
+                    );
+                }
             }
         });
 
@@ -1176,11 +1222,24 @@ impl DistributedControlPlane {
 
         for mut record in records {
             if self.publish_outbox_record(&record).await.is_ok() {
-                let _ = self.delete_outbox_record(&record.command_id).await;
+                if let Err(err) = self.delete_outbox_record(&record.command_id).await {
+                    tracing::warn!(
+                        error = %err,
+                        command_id = %record.command_id,
+                        "failed to delete outbox record after successful replay"
+                    );
+                }
             } else {
                 record.attempts += 1;
                 record.updated_at_unix_ms = unix_millis();
-                let _ = self.put_outbox_record(&record).await;
+                if let Err(err) = self.put_outbox_record(&record).await {
+                    tracing::warn!(
+                        error = %err,
+                        command_id = %record.command_id,
+                        attempts = record.attempts,
+                        "failed to persist outbox retry record"
+                    );
+                }
             }
         }
 
@@ -1194,7 +1253,9 @@ fn spawn_outbox_replay_worker(control: DistributedControlPlane) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let _ = control.replay_outbox_once().await;
+            if let Err(err) = control.replay_outbox_once().await {
+                tracing::warn!(error = %err, "outbox replay tick failed");
+            }
         }
     });
 }

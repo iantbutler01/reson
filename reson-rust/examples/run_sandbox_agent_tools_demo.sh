@@ -46,4 +46,4 @@ ERR
 fi
 
 cd "$ROOT"
-cargo run --example sandbox_agent_tools_demo
+cargo run --features sandbox --example sandbox_agent_tools_demo

@@ -625,7 +625,10 @@ impl DaemonManager for DaemonManagerService {
                     )
                 }
             };
-            if tx.send(Ok(AttachDaemonResponse { response: Some(response) }))
+            if tx
+                .send(Ok(AttachDaemonResponse {
+                    response: Some(response),
+                }))
                 .await
                 .is_err()
             {

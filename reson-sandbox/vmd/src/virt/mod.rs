@@ -45,7 +45,7 @@ pub struct StatusInfo {
     pub status: String,
 }
 
-const DEFAULT_D2VM_IMAGE: &str = "linkacloud/d2vm:latest";
+const DEFAULT_D2VM_IMAGE: &str = "ghcr.io/iantbutler01/reson/d2vm:latest";
 const D2VM_CONTAINER_DIR: &str = "/workspace";
 
 fn configured_d2vm_image() -> String {

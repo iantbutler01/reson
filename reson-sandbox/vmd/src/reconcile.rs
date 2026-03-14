@@ -201,7 +201,15 @@ async fn reconcile_once(
     );
 
     for key in &plan.delete_keys {
-        let _ = client.delete(key.clone(), None).await;
+        if let Err(err) = client.delete(key.clone(), None).await {
+            warn!(
+                node_id = %config.node_id,
+                endpoint = %config.node_endpoint,
+                key = %key,
+                err = %err,
+                "failed to delete stale session route during reconciliation"
+            );
+        }
     }
     for route in &plan.upserts {
         let key = format!(
@@ -249,7 +257,18 @@ async fn reconcile_once(
 
     if let Some(nats) = nats {
         let subject = format!("{}.evt.reconcile.completed", config.nats_subject_prefix);
-        let _ = nats.publish(subject, summary.to_string().into()).await;
+        if let Err(err) = nats
+            .publish(subject.clone(), summary.to_string().into())
+            .await
+        {
+            warn!(
+                node_id = %config.node_id,
+                endpoint = %config.node_endpoint,
+                subject = %subject,
+                err = %err,
+                "failed to publish reconcile completion event"
+            );
+        }
     }
 
     debug!(

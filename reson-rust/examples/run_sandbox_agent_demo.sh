@@ -29,4 +29,4 @@ export RESON_VMD_BIN="${RESON_VMD_BIN:-$VMD_BIN_DEFAULT}"
 export RESON_PROXY_BIN_DIR="${RESON_PROXY_BIN_DIR:-$SANDBOX_ROOT/portproxy/bin}"
 
 cd "$ROOT"
-cargo run --example sandbox_agent_demo
+cargo run --features sandbox --example sandbox_agent_demo

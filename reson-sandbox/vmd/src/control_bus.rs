@@ -610,7 +610,14 @@ async fn process_command_message(
                 command_type = %envelope.command_type,
                 "skipping control command targeted at a different node"
             );
-            let _ = message.ack().await;
+            if let Err(err) = message.ack().await {
+                warn!(
+                    node_id = %node_id,
+                    command_id = %envelope.command_id,
+                    err = %err,
+                    "failed to ack command targeted at different node"
+                );
+            }
             return;
         }
     }
@@ -663,7 +670,15 @@ async fn process_command_message(
                         idempotency_key = %dedupe_key,
                         "dropping duplicate control command (etcd dedupe)"
                     );
-                    let _ = message.ack().await;
+                    if let Err(err) = message.ack().await {
+                        warn!(
+                            node_id = %node_id,
+                            command_id = %envelope.command_id,
+                            idempotency_key = %dedupe_key,
+                            err = %err,
+                            "failed to ack duplicate command after etcd dedupe"
+                        );
+                    }
                     return;
                 }
                 Ok(false) => {}
@@ -690,7 +705,15 @@ async fn process_command_message(
                     idempotency_key = %dedupe_key,
                     "dropping duplicate control command"
                 );
-                let _ = message.ack().await;
+                if let Err(err) = message.ack().await {
+                    warn!(
+                        node_id = %node_id,
+                        command_id = %envelope.command_id,
+                        idempotency_key = %dedupe_key,
+                        err = %err,
+                        "failed to ack duplicate command after local dedupe"
+                    );
+                }
                 return;
             }
             seen.insert(dedupe_key.clone(), now);

@@ -221,8 +221,7 @@ fn spawn_reader<R>(
     backlog: Arc<Mutex<OutputBacklog>>,
     kind: OutputKind,
     label: String,
-)
-where
+) where
     R: tokio::io::AsyncRead + Send + std::marker::Unpin + 'static,
 {
     tokio::spawn(async move {
