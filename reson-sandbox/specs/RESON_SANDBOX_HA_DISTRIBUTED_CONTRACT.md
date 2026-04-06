@@ -58,6 +58,9 @@ Implemented now:
 - vmd node self-registration with etcd lease heartbeat.
 - NATS lifecycle event publication (`session.bound`, `session.discarded`).
 - Direct node gRPC data path for exec/shell/file operations.
+- Shared-mount contract now carries availability, continuity, and backend-profile requirements.
+- Distributed placement can now reject nodes that do not advertise the required shared mount
+  backend profile before a session is created or rebound.
 
 Not yet implemented:
 
@@ -65,6 +68,9 @@ Not yet implemented:
 - MQ-backed reconciliation/repair workers.
 - Production-grade multi-node port multiplexing plane (single per-node multiplexer contract with global routing model).
 - Full HA failure/recovery verifier set for distributed operation.
+- Cross-node continuity for mounted filesystems is only as strong as the selected shared backend;
+  the contract exists, but a real shared backend plus failover validation is still required for
+  true Tier-B mounted-filesystem readiness.
 
 ## 4) Target Distributed Control-Plane Contract
 
@@ -234,6 +240,35 @@ Convergence rule:
 - Watch consumers MUST support partitioned watches with resumable revision checkpoints.
 - etcd compaction/defrag policy MUST be defined and automated for production profile.
 - Loss/restart of watch consumers MUST not create correctness gaps; reconcile sweep MUST close missed-event windows.
+
+### 4.10 Shared Mount Continuity Contract (Locked)
+
+Every shared mount attached to a VM/session MUST declare:
+
+- `availability`
+  - `NodeLocal`
+  - `SharedStorage`
+- `continuity`
+  - `RestartSameNode`
+  - `RestoreCrossNode`
+- `backend_profile`
+
+Placement and rebind rules:
+
+- `NodeLocal` mounts MUST NOT claim `RestoreCrossNode`.
+- `SharedStorage` mounts MUST declare a non-empty `backend_profile`.
+- Nodes MUST advertise the shared mount backend profiles they can satisfy.
+- Session create and session rebind MUST filter candidate nodes against required shared mount
+  backend profiles before attempting transport recovery.
+- `tier_b_eligible=true` sessions MUST require `RestoreCrossNode` shared mounts for any mounted
+  filesystem that is expected to survive node failure as part of the session contract.
+
+Readiness rules:
+
+- A mounted filesystem is Tier-A compatible when it can be restarted on the same node and the
+  node still satisfies the declared backend contract.
+- A mounted filesystem is Tier-B compatible only when the backend is truly cross-node restorable
+  and the failover tests prove that continuity on surviving nodes.
 
 ## 5) Target Data-Plane Contract
 

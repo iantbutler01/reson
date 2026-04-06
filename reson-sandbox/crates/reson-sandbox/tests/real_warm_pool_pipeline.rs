@@ -291,6 +291,7 @@ async fn warm_pool_hit_path_avoids_image_download_and_conversion_on_request_path
             }),
             auto_start: false,
             architecture: arch.clone(),
+            shared_mounts: Vec::new(),
         }))
         .await
         .expect("start direct create_vm stream")

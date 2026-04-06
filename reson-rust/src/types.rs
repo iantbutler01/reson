@@ -188,6 +188,137 @@ impl ChatMessage {
     }
 }
 
+/// Canonical assistant response payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantResponse {
+    /// Ordered output emitted by the assistant.
+    pub output: Vec<ResponsePart>,
+}
+
+impl AssistantResponse {
+    /// Create a new response from ordered output items.
+    pub fn new(output: Vec<ResponsePart>) -> Self {
+        Self { output }
+    }
+
+    /// Create a text-only assistant response.
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            output: vec![ResponsePart::Text { text: text.into() }],
+        }
+    }
+
+    /// Return all text output concatenated in-order.
+    pub fn text(&self) -> String {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return the first text segment when available.
+    pub fn as_str(&self) -> Option<&str> {
+        self.output.iter().find_map(|part| match part {
+            ResponsePart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Return all reasoning output concatenated in-order.
+    pub fn reasoning(&self) -> String {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Reasoning { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return all tool calls in-order.
+    pub fn tool_calls(&self) -> Vec<&ToolCall> {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Tool { call } => Some(call),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return all signatures in-order.
+    pub fn signatures(&self) -> Vec<&str> {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Signature { value } => Some(value.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Check whether the response contains tool calls.
+    pub fn has_tool_calls(&self) -> bool {
+        self.output
+            .iter()
+            .any(|part| matches!(part, ResponsePart::Tool { .. }))
+    }
+
+    /// Append ordered output, coalescing adjacent text-like chunks.
+    pub fn push_output(&mut self, part: ResponsePart) {
+        match (self.output.last_mut(), &part) {
+            (
+                Some(ResponsePart::Text { text: existing }),
+                ResponsePart::Text { text },
+            ) => existing.push_str(text),
+            (
+                Some(ResponsePart::Reasoning { text: existing }),
+                ResponsePart::Reasoning { text },
+            ) => existing.push_str(text),
+            (
+                Some(ResponsePart::Signature { value: existing }),
+                ResponsePart::Signature { value },
+            ) => existing.push_str(value),
+            _ => self.output.push(part),
+        }
+    }
+}
+
+impl std::fmt::Display for AssistantResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.text())
+    }
+}
+
+/// Ordered assistant output item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResponsePart {
+    /// User-visible text.
+    Text { text: String },
+    /// Reasoning/thinking text.
+    Reasoning { text: String },
+    /// Tool call emitted by the assistant.
+    Tool { call: ToolCall },
+    /// Provider signature needed for replay fidelity.
+    Signature { value: String },
+}
+
+/// Typed streaming event for progressively building an assistant response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResponseStreamEvent {
+    /// Ordered output emitted during streaming.
+    Output(ResponsePart),
+    /// Partial tool-call payload before a complete tool call is available.
+    ToolPartial(serde_json::Value),
+    /// Final usage statistics for the streamed response.
+    Usage(TokenUsage),
+    /// Final canonical assistant response.
+    Complete(AssistantResponse),
+}
+
 /// Token usage statistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -821,20 +952,39 @@ impl ToolCall {
         provider: Provider,
     ) -> Result<Self> {
         match provider {
-            Provider::Anthropic | Provider::Bedrock => Ok(Self {
-                tool_use_id: provider_format["id"]
-                    .as_str()
-                    .ok_or_else(|| Error::Parse("Missing 'id' in tool call".to_string()))?
-                    .to_string(),
-                tool_name: provider_format["name"]
-                    .as_str()
-                    .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
-                    .to_string(),
-                args: provider_format["input"].clone(),
-                raw_arguments: None,
-                signature: None,
-                tool_obj: Some(provider_format),
-            }),
+            Provider::Anthropic | Provider::Bedrock => {
+                let signature = provider_format
+                    .get("signature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        provider_format
+                            .get("thought_signature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| {
+                        provider_format
+                            .get("thoughtSignature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+
+                Ok(Self {
+                    tool_use_id: provider_format["id"]
+                        .as_str()
+                        .ok_or_else(|| Error::Parse("Missing 'id' in tool call".to_string()))?
+                        .to_string(),
+                    tool_name: provider_format["name"]
+                        .as_str()
+                        .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
+                        .to_string(),
+                    args: provider_format["input"].clone(),
+                    raw_arguments: None,
+                    signature,
+                    tool_obj: Some(provider_format),
+                })
+            }
             Provider::OpenAI | Provider::OpenRouter => {
                 let function = &provider_format["function"];
                 let arguments = &function["arguments"];
@@ -903,12 +1053,29 @@ impl ToolCall {
                 let hash = hasher.finish();
                 let tool_use_id = format!("google_{}_{}", name, hash);
 
+                let signature = provider_format
+                    .get("thoughtSignature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        provider_format
+                            .get("thought_signature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| {
+                        provider_format
+                            .get("signature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+
                 Ok(Self {
                     tool_use_id,
                     tool_name: name.to_string(),
                     args,
                     raw_arguments: None,
-                    signature: None,
+                    signature,
                     tool_obj: Some(provider_format),
                 })
             }
@@ -1201,7 +1368,7 @@ impl ReasoningSegment {
                     "text": self.content
                 });
                 if let Some(ref sig) = self.signature {
-                    obj["thought_signature"] = serde_json::Value::String(sig.clone());
+                    obj["thoughtSignature"] = serde_json::Value::String(sig.clone());
                 }
                 obj
             }

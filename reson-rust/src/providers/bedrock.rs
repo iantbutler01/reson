@@ -21,7 +21,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 #[cfg(feature = "bedrock")]
-use crate::types::Provider;
+use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
 #[cfg(feature = "bedrock")]
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
 
@@ -198,23 +198,36 @@ impl InferenceClient for BedrockClient {
             let response_json: serde_json::Value = parse_json_value_strict_bytes(body_bytes)?;
 
             // Parse response (same format as Anthropic)
-            // Extract text content and tool calls from content blocks
             let content_blocks = response_json["content"].as_array();
-
-            let mut text_content = String::new();
-            let mut tool_calls = Vec::new();
+            let mut response = AssistantResponse::default();
 
             if let Some(blocks) = content_blocks {
                 for block in blocks {
-                    // Extract text content
                     if block["type"] == "text" {
                         if let Some(text) = block["text"].as_str() {
-                            text_content.push_str(text);
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Text {
+                                    text: text.to_string(),
+                                });
+                            }
                         }
-                    }
-                    // Extract tool calls
-                    else if block["type"] == "tool_use" {
-                        tool_calls.push(block.clone());
+                    } else if block["type"] == "thinking" {
+                        if let Some(text) = block["thinking"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    } else if block["type"] == "tool_use" {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(block.clone(), Provider::Bedrock)?,
+                        });
                     }
                 }
             }
@@ -231,21 +244,18 @@ impl InferenceClient for BedrockClient {
 
             // If tools were provided, return full response for tool extraction
             let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-            let has_tool_calls = !tool_calls.is_empty();
+            let has_tool_calls = response.has_tool_calls();
 
-            Ok(GenerationResponse {
-                content: text_content,
-                reasoning: None,
-                tool_calls,
-                reasoning_segments: Vec::new(),
+            Ok(GenerationResponse::from_assistant_response(
+                response,
                 usage,
-                provider_cost_dollars: None,
-                raw: if has_tools || has_tool_calls {
+                None,
+                if has_tools || has_tool_calls {
                     Some(response_json)
                 } else {
                     None
                 },
-            })
+            ))
         }
 
         #[cfg(not(feature = "bedrock"))]

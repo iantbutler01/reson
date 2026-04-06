@@ -5,8 +5,8 @@
 
 use crate::error::Result;
 use crate::types::{
-    ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage, Provider, ReasoningSegment,
-    ToolCall, ToolResult, VideoMetadata,
+    AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage,
+    Provider, ReasoningSegment, ResponsePart, ToolCall, ToolResult, VideoMetadata,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -16,6 +16,8 @@ use uuid::Uuid;
 pub enum ConversationMessage {
     /// Regular chat message (user, assistant, system)
     Chat(ChatMessage),
+    /// Durable assistant response with ordered output.
+    AssistantResponse(AssistantResponse),
     /// Tool call from the assistant
     ToolCall(ToolCall),
     /// Tool result from execution
@@ -29,6 +31,12 @@ pub enum ConversationMessage {
 impl From<ChatMessage> for ConversationMessage {
     fn from(msg: ChatMessage) -> Self {
         ConversationMessage::Chat(msg)
+    }
+}
+
+impl From<AssistantResponse> for ConversationMessage {
+    fn from(response: AssistantResponse) -> Self {
+        ConversationMessage::AssistantResponse(response)
     }
 }
 
@@ -383,6 +391,201 @@ fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) ->
     }
 }
 
+fn tool_call_to_provider_part(tool_call: &ToolCall, provider: Provider) -> Value {
+    match provider {
+        Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => json!({
+            "type": "tool_use",
+            "id": tool_call.tool_use_id,
+            "name": tool_call.tool_name,
+            "input": tool_call.args
+        }),
+        Provider::GoogleGenAI => {
+            let mut part = json!({
+                "functionCall": {
+                    "name": tool_call.tool_name,
+                    "args": tool_call.args
+                }
+            });
+            if let Some(ref signature) = tool_call.signature {
+                part["thoughtSignature"] = json!(signature);
+            } else if let Some(ref obj) = tool_call.tool_obj {
+                if let Some(signature) = obj.get("thoughtSignature") {
+                    part["thoughtSignature"] = signature.clone();
+                }
+            }
+            part
+        }
+        _ => json!({}),
+    }
+}
+
+fn attach_signature_to_value(value: &mut Value, signature: &str, provider: Provider) {
+    match provider {
+        Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+            value["signature"] = json!(signature);
+        }
+        Provider::GoogleGenAI => {
+            value["thoughtSignature"] = json!(signature);
+        }
+        Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+            value["signature"] = json!(signature);
+        }
+        Provider::OpenAI | Provider::OpenRouter => {}
+    }
+}
+
+fn assistant_response_to_openai_chat_message(response: &AssistantResponse) -> Value {
+    let content = response.text();
+    let tool_calls: Vec<Value> = response
+        .tool_calls()
+        .into_iter()
+        .map(|tool_call| {
+            let args_str = tool_call.raw_arguments.clone().unwrap_or_else(|| {
+                serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())
+            });
+            json!({
+                "id": tool_call.tool_use_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.tool_name,
+                    "arguments": args_str
+                }
+            })
+        })
+        .collect();
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+    message
+}
+
+fn assistant_response_to_anthropic_message(
+    response: &AssistantResponse,
+    provider: Provider,
+) -> Value {
+    let mut content = Vec::new();
+    let mut idx = 0;
+    while idx < response.output.len() {
+        match &response.output[idx] {
+            ResponsePart::Text { text } => content.push(json!({
+                "type": "text",
+                "text": text
+            })),
+            ResponsePart::Reasoning { text } => {
+                let mut block = ReasoningSegment::new(text.clone()).to_provider_format(provider);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut block, value, provider);
+                    idx += 1;
+                }
+                content.push(block);
+            }
+            ResponsePart::Tool { call } => {
+                let mut block = tool_call_to_provider_part(call, provider);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut block, value, provider);
+                    idx += 1;
+                }
+                content.push(block);
+            }
+            ResponsePart::Signature { .. } => {}
+        }
+        idx += 1;
+    }
+
+    json!({
+        "role": "assistant",
+        "content": content
+    })
+}
+
+fn assistant_response_to_google_message(response: &AssistantResponse) -> Value {
+    let mut parts = Vec::new();
+    let mut idx = 0;
+    while idx < response.output.len() {
+        match &response.output[idx] {
+            ResponsePart::Text { text } => parts.push(json!({ "text": text })),
+            ResponsePart::Reasoning { text } => {
+                let mut part = json!({
+                    "thought": true,
+                    "text": text
+                });
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut part, value, Provider::GoogleGenAI);
+                    idx += 1;
+                }
+                parts.push(part);
+            }
+            ResponsePart::Tool { call } => {
+                let mut part = tool_call_to_provider_part(call, Provider::GoogleGenAI);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut part, value, Provider::GoogleGenAI);
+                    idx += 1;
+                }
+                parts.push(part);
+            }
+            ResponsePart::Signature { .. } => {}
+        }
+        idx += 1;
+    }
+
+    json!({
+        "role": "model",
+        "parts": parts
+    })
+}
+
+fn assistant_response_to_responses_items(response: &AssistantResponse) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut idx = 0;
+    while idx < response.output.len() {
+        match &response.output[idx] {
+            ResponsePart::Text { text } => {
+                items.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "id": format!("msg_{}", Uuid::new_v4()),
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": []
+                    }]
+                }));
+            }
+            ResponsePart::Reasoning { text } => {
+                let mut item = json!({
+                    "type": "reasoning",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text
+                    }]
+                });
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut item, value, Provider::OpenAIResponses);
+                    idx += 1;
+                }
+                items.push(item);
+            }
+            ResponsePart::Tool { call } => {
+                let mut item = call.to_provider_assistant_message(Provider::OpenAIResponses);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut item, value, Provider::OpenAIResponses);
+                    idx += 1;
+                }
+                items.push(item);
+            }
+            ResponsePart::Signature { .. } => {}
+        }
+        idx += 1;
+    }
+    items
+}
+
 /// Convert messages to OpenAI/OpenRouter Responses API input format.
 ///
 /// Returns (instructions, input_items).
@@ -433,6 +636,9 @@ pub fn convert_messages_to_responses_input(
                     }));
                 }
             },
+            ConversationMessage::AssistantResponse(response) => {
+                input_items.extend(assistant_response_to_responses_items(response));
+            }
             ConversationMessage::ToolCall(tool_call) => {
                 let args_str = tool_call.raw_arguments.clone().unwrap_or_else(|| {
                     serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())
@@ -633,6 +839,32 @@ pub fn convert_messages_to_provider_format(
                     "role": role,
                     "content": chat_msg.content
                 }));
+            }
+
+            ConversationMessage::AssistantResponse(response) => {
+                flush_pending(
+                    &mut converted_messages,
+                    &mut pending_anthropic_blocks,
+                    &mut pending_google_parts,
+                );
+
+                match provider {
+                    Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                        converted_messages
+                            .push(assistant_response_to_anthropic_message(response, provider));
+                    }
+                    Provider::GoogleGenAI => {
+                        converted_messages.push(assistant_response_to_google_message(response));
+                    }
+                    Provider::OpenAI | Provider::OpenRouter => {
+                        converted_messages.push(assistant_response_to_openai_chat_message(
+                            response,
+                        ));
+                    }
+                    Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                        converted_messages.extend(assistant_response_to_responses_items(response));
+                    }
+                }
             }
 
             ConversationMessage::ToolCall(tool_call) => {

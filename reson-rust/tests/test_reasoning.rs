@@ -472,7 +472,7 @@ fn test_reasoning_segment_google_format() {
         "This is test reasoning content"
     );
     assert_eq!(
-        google_format.get("thought_signature").unwrap(),
+        google_format.get("thoughtSignature").unwrap(),
         "test_signature_123"
     );
 }

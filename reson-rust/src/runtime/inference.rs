@@ -11,21 +11,108 @@ use tokio::sync::RwLock;
 use crate::error::{Error, Result};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
+    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient, StreamChunk,
 };
 use crate::schema::fix_output_schema_for_provider;
-use crate::types::ChatMessage;
+use crate::types::{
+    AssistantResponse, ChatMessage, CreateResult, ReasoningSegment, ResponsePart,
+    ResponseStreamEvent, TokenUsage, ToolCall,
+};
 use crate::utils::ConversationMessage;
 
 use super::{Accumulators, ToolFunction, ToolSchemaInfo};
 
 /// Result from non-streaming LLM call
 pub struct CallResult {
-    pub parsed_value: serde_json::Value,
-    pub raw_response: Option<String>,
-    pub reasoning: Option<String>,
-    /// Tool calls from the response (if any)
-    pub tool_calls: Vec<serde_json::Value>,
+    pub response: AssistantResponse,
+}
+
+async fn stream_chunk_to_runtime_events(
+    chunk: StreamChunk,
+    accumulators: Arc<RwLock<Accumulators>>,
+    response: Arc<RwLock<AssistantResponse>>,
+) -> Result<Vec<ResponseStreamEvent>> {
+    match chunk {
+        StreamChunk::Content(text) => {
+            {
+                let mut acc = accumulators.write().await;
+                acc.raw_response.push(text.clone());
+            }
+            {
+                let mut response = response.write().await;
+                response.push_output(ResponsePart::Text { text: text.clone() });
+            }
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Text { text })])
+        }
+        StreamChunk::Reasoning(text) => {
+            let mut acc = accumulators.write().await;
+            acc.reasoning.push(text.clone());
+
+            if let Some(current) = acc.current_reasoning_segment.as_mut() {
+                current.content.push_str(&text);
+                let updated_content = current.content.clone();
+                if let Some(last) = acc.reasoning_segments.last_mut() {
+                    last.content = updated_content;
+                }
+            } else {
+                let segment = ReasoningSegment::with_index(text.clone(), acc.reasoning_segments.len());
+                acc.reasoning_segments.push(segment.clone());
+                acc.current_reasoning_segment = Some(segment);
+            }
+            drop(acc);
+
+            {
+                let mut response = response.write().await;
+                response.push_output(ResponsePart::Reasoning { text: text.clone() });
+            }
+
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Reasoning { text })])
+        }
+        StreamChunk::Signature(sig) => {
+            let mut acc = accumulators.write().await;
+            if let Some(current) = acc.current_reasoning_segment.as_mut() {
+                current.signature = Some(sig.clone());
+                if let Some(last) = acc.reasoning_segments.last_mut() {
+                    last.signature = Some(sig.clone());
+                }
+            }
+            drop(acc);
+
+            {
+                let mut response = response.write().await;
+                response.push_output(ResponsePart::Signature { value: sig.clone() });
+            }
+
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Signature {
+                value: sig,
+            })])
+        }
+        StreamChunk::ToolCallComplete(tool) => {
+            let tool_calls = match ToolCall::create(tool)? {
+                CreateResult::Single(call) => vec![call],
+                CreateResult::Multiple(calls) => calls,
+                CreateResult::Empty => Vec::new(),
+            };
+
+            let mut events = Vec::new();
+            let mut response_guard = response.write().await;
+            for call in tool_calls {
+                response_guard.push_output(ResponsePart::Tool { call: call.clone() });
+                events.push(ResponseStreamEvent::Output(ResponsePart::Tool { call }));
+            }
+            Ok(events)
+        }
+        StreamChunk::ToolCallPartial(tool) => Ok(vec![ResponseStreamEvent::ToolPartial(tool)]),
+        StreamChunk::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => Ok(vec![ResponseStreamEvent::Usage(TokenUsage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        })]),
+    }
 }
 
 /// Convert a field type to JSON schema type
@@ -523,83 +610,14 @@ pub async fn call_llm(
     // Make API call
     let response = client.get_generation(&messages, &config).await?;
 
-    // Check if response contains tool calls
-    if response.has_tool_calls() {
-        // Return tool calls - we need to format them for the runtime
-        // Add _tool_name field so runtime.is_tool_call() works
-        let formatted_tool_calls: Vec<serde_json::Value> = response
-            .tool_calls
-            .iter()
-            .map(|tc| {
-                let mut tool_call = tc.clone();
-                // For Anthropic format: {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
-                if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
-                    if let Some(obj) = tool_call.as_object_mut() {
-                        obj.insert("_tool_name".to_string(), serde_json::json!(name));
-                        // Also copy input fields to top level for easier access
-                        if let Some(input) = tc.get("input").cloned() {
-                            if let Some(input_obj) = input.as_object() {
-                                for (k, v) in input_obj {
-                                    obj.insert(k.clone(), v.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                // For OpenAI format: {"id": "...", "function": {"name": "...", "arguments": "..."}}
-                else if let Some(func) = tc.get("function") {
-                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                        if let Some(obj) = tool_call.as_object_mut() {
-                            obj.insert("_tool_name".to_string(), serde_json::json!(name));
-                            // Parse arguments JSON and copy to top level
-                            if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
-                                if let Ok(args) =
-                                    serde_json::from_str::<serde_json::Value>(args_str)
-                                {
-                                    if let Some(args_obj) = args.as_object() {
-                                        for (k, v) in args_obj {
-                                            obj.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                tool_call
-            })
-            .collect();
-
-        // Return first tool call as parsed_value (for single tool call case)
-        // and all tool calls in the tool_calls vec
-        let parsed_value = if formatted_tool_calls.len() == 1 {
-            formatted_tool_calls[0].clone()
-        } else {
-            serde_json::json!(formatted_tool_calls)
-        };
-
-        return Ok(CallResult {
-            parsed_value,
-            raw_response: Some(response.content),
-            reasoning: response.reasoning,
-            tool_calls: formatted_tool_calls,
-        });
+    if response.response.output.is_empty() {
+        return Err(Error::Inference(
+            "Provider returned an empty assistant response".to_string(),
+        ));
     }
 
-    // Parse response as text/JSON
-    let parsed_value = if !response.content.is_empty() {
-        // Try to parse as JSON, fallback to string
-        serde_json::from_str(&response.content)
-            .unwrap_or_else(|_| serde_json::json!(response.content))
-    } else {
-        serde_json::Value::Null
-    };
-
     Ok(CallResult {
-        parsed_value,
-        raw_response: Some(response.content),
-        reasoning: response.reasoning,
-        tool_calls: Vec::new(),
+        response: response.response,
     })
 }
 
@@ -620,8 +638,8 @@ pub async fn call_llm_stream(
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
-    _accumulators: Arc<RwLock<Accumulators>>,
-) -> Result<Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value)>> + Send>>> {
+    accumulators: Arc<RwLock<Accumulators>>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
     let client = create_inference_client(model, api_key)?;
 
@@ -682,38 +700,38 @@ pub async fn call_llm_stream(
     // Get streaming response
     let stream = client.connect_and_listen(&messages, &config).await?;
 
-    // Transform stream to (chunk_type, value) tuples
-    let transformed = stream.map(move |chunk_result| match chunk_result {
-        Ok(chunk) => {
-            use crate::providers::StreamChunk;
-            match chunk {
-                StreamChunk::Content(text) => Ok(("content".to_string(), serde_json::json!(text))),
-                StreamChunk::Reasoning(text) => {
-                    Ok(("reasoning".to_string(), serde_json::json!(text)))
-                }
-                StreamChunk::Signature(sig) => {
-                    Ok(("signature".to_string(), serde_json::json!(sig)))
-                }
-                StreamChunk::ToolCallComplete(tool) => Ok(("tool_call_complete".to_string(), tool)),
-                StreamChunk::ToolCallPartial(tool) => Ok(("tool_call_partial".to_string(), tool)),
-                StreamChunk::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                } => Ok((
-                    "usage".to_string(),
-                    serde_json::json!({
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cached_tokens": cached_tokens
-                    }),
-                )),
+    let response = Arc::new(RwLock::new(AssistantResponse::default()));
+    let stream_response = response.clone();
+
+    let transformed = stream.then(move |chunk_result| {
+        let accumulators = accumulators.clone();
+        let response = stream_response.clone();
+        async move {
+            match chunk_result {
+                Ok(chunk) => match stream_chunk_to_runtime_events(chunk, accumulators, response).await
+                {
+                    Ok(events) => events.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
+                },
+                Err(e) => vec![Err(e)],
             }
         }
-        Err(e) => Err(e),
+    })
+    .flat_map(futures::stream::iter);
+
+    let final_response = response.clone();
+    let completed = futures::stream::once(async move {
+        let response = final_response.read().await.clone();
+        if response.output.is_empty() {
+            Err(Error::Inference(
+                "Provider returned an empty assistant response".to_string(),
+            ))
+        } else {
+            Ok(ResponseStreamEvent::Complete(response))
+        }
     });
 
-    Ok(Box::pin(transformed))
+    Ok(Box::pin(transformed.chain(completed)))
 }
 
 #[cfg(test)]
@@ -753,6 +771,30 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let result = create_inference_client("openai:resp:gpt-4o", None);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_updates_raw_response_accumulator() {
+        let accumulators = Arc::new(RwLock::new(Accumulators::default()));
+        let response = Arc::new(RwLock::new(AssistantResponse::default()));
+        let events = stream_chunk_to_runtime_events(
+            StreamChunk::Content("hello".to_string()),
+            accumulators.clone(),
+            response.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ResponseStreamEvent::Output(ResponsePart::Text { text }) if text == "hello"
+        ));
+        assert_eq!(
+            accumulators.read().await.raw_response,
+            vec!["hello".to_string()]
+        );
+        assert_eq!(response.read().await.text(), "hello");
     }
 
     #[test]

@@ -231,9 +231,9 @@ impl TracingInferenceClient {
             "timestamp": timestamp,
             "messages": msgs_json,
             "response": {
-                "content": response.content,
-                "tool_calls_count": response.tool_calls.len(),
-                "has_reasoning": response.reasoning.is_some(),
+                "content": response.response.text(),
+                "tool_calls_count": response.response.tool_calls().len(),
+                "has_reasoning": !response.response.reasoning().is_empty(),
             },
             "usage": {
                 "input_tokens": response.usage.input_tokens,
@@ -491,19 +491,16 @@ mod tests {
             if self.should_fail {
                 Err(Error::RetriesExceeded("mock failure".to_string()))
             } else {
-                Ok(GenerationResponse {
-                    content: "test".to_string(),
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    reasoning_segments: Vec::new(),
-                    usage: TokenUsage {
+                Ok(GenerationResponse::from_assistant_response(
+                    crate::types::AssistantResponse::from_text("test"),
+                    TokenUsage {
                         input_tokens: 100,
                         output_tokens: 50,
                         cached_tokens: 0,
                     },
-                    provider_cost_dollars: None,
-                    raw: None,
-                })
+                    None,
+                    None,
+                ))
             }
         }
 

@@ -185,6 +185,9 @@ fn print_history(label: &str, history: &[ConversationMessage]) {
 fn describe_message(message: &ConversationMessage) -> String {
     match message {
         ConversationMessage::Chat(chat) => format!("{:?}: {}", chat.role, chat.content),
+        ConversationMessage::AssistantResponse(response) => {
+            format!("AssistantResponse -> {}", response.text())
+        }
         ConversationMessage::ToolCall(tc) => {
             format!("ToolCall -> {} {}", tc.tool_name, pretty_json(&tc.args))
         }

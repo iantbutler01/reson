@@ -13,6 +13,7 @@ use crate::assets::portproxy;
 
 const INIT_SCRIPT_NAME: &str = "init.sh";
 const PORTPROXY_NAME: &str = "portproxy";
+const SHARED_MOUNTS_NAME: &str = "shared-mounts.tsv";
 const VOLUME_ID: &str = "brkboot";
 const SECTOR_SIZE: u32 = 2048;
 
@@ -21,6 +22,14 @@ pub struct Config {
     pub instance_id: String,
     pub hostname: String,
     pub arch: String,
+    pub shared_mounts: Vec<SharedMount>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SharedMount {
+    pub guest_path: String,
+    pub mount_tag: String,
+    pub read_only: bool,
 }
 
 pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
@@ -36,10 +45,12 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
     let bin = portproxy::binary(cfg.arch.as_str())
         .with_context(|| "bootstrap iso: locate portproxy binary")?;
     let init = build_init_script(&hostname);
+    let shared_mounts = build_shared_mounts_file(&cfg.shared_mounts);
 
     let entries = vec![
         IsoEntry::new(INIT_SCRIPT_NAME, init.into_bytes()),
         IsoEntry::new(PORTPROXY_NAME, bin),
+        IsoEntry::new(SHARED_MOUNTS_NAME, shared_mounts.into_bytes()),
     ];
 
     if let Some(parent) = path.as_ref().parent() {
@@ -118,6 +129,12 @@ log "installing portproxy src=$SRC dest=$DEST"
 install -m 0755 "$SRC" "$DEST"
 ls -la "$DEST" || true
 
+mkdir -p /etc/reson
+if [ -f "$SCRIPT_DIR/shared-mounts.tsv" ]; then
+  # @dive: Shared mount intent is persisted outside the ISO so a guest reboot can remount the same tags through systemd without reissuing the create request.
+  install -m 0644 "$SCRIPT_DIR/shared-mounts.tsv" /etc/reson/shared-mounts.tsv
+fi
+
 cat <<'EOF' >/etc/systemd/system/portproxy.service
 [Unit]
 Description=Bracket PortProxy
@@ -155,6 +172,72 @@ ss -ltnp || true
 echo "portproxy-diag: $(date -Iseconds) end"
 EOF
 chmod 0755 /usr/local/sbin/portproxy-diagnostics.sh
+
+cat <<'EOF' >/usr/local/sbin/reson-mount-shares.sh
+#!/bin/bash
+set -euo pipefail
+
+CONFIG=/etc/reson/shared-mounts.tsv
+if [ ! -s "$CONFIG" ]; then
+  exit 0
+fi
+
+log() {{
+  printf 'reson-shared-mounts: %s %s\n' "$(date -Iseconds)" "$*" | systemd-cat -t reson-shared-mounts || true
+}}
+
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe 9pnet_virtio || true
+  modprobe 9p || true
+fi
+
+while IFS=$'\t' read -r TAG GUEST MODE; do
+  if [ -z "${{TAG:-}}" ] || [ -z "${{GUEST:-}}" ]; then
+    continue
+  fi
+
+  # @dive: Precreate every mountpoint before mounting anything so nested writable mounts remain
+  # mountable even when their parent path will become a read-only shared root.
+  mkdir -p "$GUEST"
+done < "$CONFIG"
+
+while IFS=$'\t' read -r TAG GUEST MODE; do
+  if [ -z "${{TAG:-}}" ] || [ -z "${{GUEST:-}}" ]; then
+    continue
+  fi
+
+  if mountpoint -q "$GUEST"; then
+    log "mount exists tag=$TAG guest=$GUEST"
+    continue
+  fi
+
+  OPTS="trans=virtio,version=9p2000.L,msize=104857600"
+  if [ "${{MODE:-rw}}" = "ro" ]; then
+    OPTS="$OPTS,ro"
+  fi
+
+  if mount -t 9p -o "$OPTS" "$TAG" "$GUEST"; then
+    log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}}"
+  else
+    log "failed tag=$TAG guest=$GUEST mode=${{MODE:-rw}}"
+  fi
+done < "$CONFIG"
+EOF
+chmod 0755 /usr/local/sbin/reson-mount-shares.sh
+
+cat <<'EOF' >/etc/systemd/system/reson-shared-mounts.service
+[Unit]
+Description=Mount Reson shared directories
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/reson-mount-shares.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 cat <<'EOF' >/etc/systemd/system/portproxy-diagnostics.service
 [Unit]
@@ -281,6 +364,10 @@ log "enabling resize timer"
 systemctl enable firstboot-resize-rootfs.timer
 systemctl start firstboot-resize-rootfs.timer
 
+log "enabling shared mounts service"
+systemctl enable reson-shared-mounts.service
+systemctl start reson-shared-mounts.service || true
+
 log "enabling diagnostics timer"
 systemctl enable portproxy-diagnostics.timer
 systemctl start portproxy-diagnostics.timer
@@ -311,6 +398,32 @@ fn shell_escape(value: &str) -> String {
         out.push('\'');
         out
     }
+}
+
+fn build_shared_mounts_file(shared_mounts: &[SharedMount]) -> String {
+    // @dive: Nested guest mountpoints must appear after their parents so the guest mounts `/nym`
+    // before `/nym/task-overlays`, while the bootstrap script precreates both paths ahead of time.
+    let mut ordered_mounts = shared_mounts.to_vec();
+    ordered_mounts.sort_by(|left, right| {
+        let left_depth = Path::new(&left.guest_path).components().count();
+        let right_depth = Path::new(&right.guest_path).components().count();
+        left_depth
+            .cmp(&right_depth)
+            .then_with(|| left.guest_path.cmp(&right.guest_path))
+            .then_with(|| left.mount_tag.cmp(&right.mount_tag))
+    });
+
+    let mut out = String::new();
+    for mount in &ordered_mounts {
+        let mode = if mount.read_only { "ro" } else { "rw" };
+        out.push_str(&mount.mount_tag);
+        out.push('\t');
+        out.push_str(&mount.guest_path);
+        out.push('\t');
+        out.push_str(mode);
+        out.push('\n');
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -652,6 +765,11 @@ mod tests {
             instance_id: "vm-test".to_string(),
             hostname: "vm-test".to_string(),
             arch: "amd64".to_string(),
+            shared_mounts: vec![SharedMount {
+                guest_path: "/nym".to_string(),
+                mount_tag: "nymfs".to_string(),
+                read_only: false,
+            }],
         };
         create_iso(&iso_path, cfg)?;
 
@@ -664,7 +782,48 @@ mod tests {
             entries.contains(&"PORTPROXY;1".to_string()),
             "portproxy missing"
         );
+        assert!(
+            entries.contains(&"SHARED-MOUNTS.TSV;1".to_string()),
+            "shared mounts manifest missing"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn build_shared_mounts_file_orders_parent_before_nested_child() {
+        let mounts = vec![
+            SharedMount {
+                guest_path: "/nym/task-overlays".to_string(),
+                mount_tag: "nymfs-task-overlays".to_string(),
+                read_only: false,
+            },
+            SharedMount {
+                guest_path: "/nym".to_string(),
+                mount_tag: "nymfs".to_string(),
+                read_only: true,
+            },
+        ];
+
+        let file = build_shared_mounts_file(&mounts);
+        let lines: Vec<&str> = file.lines().collect();
+        assert_eq!(lines[0], "nymfs\t/nym\tro");
+        assert_eq!(lines[1], "nymfs-task-overlays\t/nym/task-overlays\trw");
+    }
+
+    #[test]
+    fn init_script_precreates_guest_paths_before_mount_phase() {
+        let script = build_init_script("vm-test");
+        let precreate = script
+            .find("mkdir -p \"$GUEST\"")
+            .expect("precreate loop present");
+        let mount_phase = script
+            .rfind("if mountpoint -q \"$GUEST\"; then")
+            .expect("mount loop present");
+
+        assert!(
+            precreate < mount_phase,
+            "expected guest-path precreate pass before mount phase"
+        );
     }
 
     fn read_root_entries(path: &Path) -> Result<Vec<String>> {

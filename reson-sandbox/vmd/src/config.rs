@@ -28,6 +28,7 @@ const STORAGE_PROFILE_LOCAL_EPHEMERAL: &str = "local-ephemeral";
 const STORAGE_PROFILE_DURABLE_SHARED: &str = "durable-shared";
 const CONTINUITY_TIER_A: &str = "tier-a";
 const CONTINUITY_TIER_B: &str = "tier-b";
+const DEFAULT_SHARED_MOUNT_PROFILE_LOCAL: &str = "local-path";
 const DEFAULT_NODE_REGION: &str = "local-region";
 const DEFAULT_NODE_ZONE: &str = "local-zone";
 const DEFAULT_NODE_RACK: &str = "local-rack";
@@ -78,6 +79,7 @@ pub struct NodeRegistryConfig {
     pub continuity_tier: ContinuityTier,
     pub degraded_mode: bool,
     pub admission_frozen: bool,
+    pub shared_mount_profiles: Vec<String>,
     pub region: String,
     pub zone: String,
     pub rack: String,
@@ -96,6 +98,7 @@ impl NodeRegistryConfig {
             continuity_tier: default_continuity_tier_from_env(),
             degraded_mode: default_degraded_mode_from_env(),
             admission_frozen: default_admission_frozen_from_env(),
+            shared_mount_profiles: default_shared_mount_profiles_from_env(),
             region: default_node_region_from_env(),
             zone: default_node_zone_from_env(),
             rack: default_node_rack_from_env(),
@@ -157,6 +160,7 @@ pub struct Config {
     pub max_fork_chain_depth: usize,
     pub fork_compaction_depth_threshold: usize,
     pub storage_profile: StorageProfile,
+    pub shared_mount_profiles: Vec<String>,
     pub ha_mode: bool,
     pub node_registry: Option<NodeRegistryConfig>,
     pub control_bus: Option<ControlBusConfig>,
@@ -183,6 +187,7 @@ impl Default for Config {
             max_fork_chain_depth: default_max_fork_chain_depth_from_env(),
             fork_compaction_depth_threshold: default_fork_compaction_depth_threshold_from_env(),
             storage_profile: default_storage_profile_from_env(),
+            shared_mount_profiles: default_shared_mount_profiles_from_env(),
             ha_mode: default_ha_mode_from_env(),
             node_registry: default_node_registry_from_env("127.0.0.1:8052"),
             control_bus: default_control_bus_from_env(),
@@ -235,8 +240,11 @@ impl Config {
                 self.storage_profile.as_str()
             );
         }
+        self.shared_mount_profiles =
+            normalize_shared_mount_profiles(self.shared_mount_profiles.clone());
         if let Some(registry) = self.node_registry.as_mut() {
             registry.storage_profile = self.storage_profile;
+            registry.shared_mount_profiles = self.shared_mount_profiles.clone();
         }
         self.normalize_node_registry();
         self.normalize_control_bus();
@@ -293,6 +301,8 @@ impl Config {
         if registry.max_active_vms == Some(0) {
             registry.max_active_vms = None;
         }
+        registry.shared_mount_profiles =
+            normalize_shared_mount_profiles(registry.shared_mount_profiles.clone());
         if registry.region.trim().is_empty() {
             registry.region = DEFAULT_NODE_REGION.to_string();
         }
@@ -561,6 +571,11 @@ fn default_node_registry_from_env(listen_address: &str) -> Option<NodeRegistryCo
         .ok()
         .and_then(|value| parse_bool_flag(&value))
         .unwrap_or_else(default_admission_frozen_from_env);
+    config.shared_mount_profiles = env::var("RESON_SANDBOX_NODE_SHARED_MOUNT_PROFILES")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NODE_SHARED_MOUNT_PROFILES"))
+        .ok()
+        .map(|value| parse_csv_list(&value))
+        .unwrap_or_else(default_shared_mount_profiles_from_env);
 
     Some(config)
 }
@@ -745,6 +760,14 @@ fn default_ha_mode_from_env() -> bool {
         .unwrap_or(false)
 }
 
+fn default_shared_mount_profiles_from_env() -> Vec<String> {
+    env::var("RESON_SANDBOX_SHARED_MOUNT_PROFILES")
+        .or_else(|_| env::var("BRACKET_SANDBOX_SHARED_MOUNT_PROFILES"))
+        .ok()
+        .map(|value| parse_csv_list(&value))
+        .unwrap_or_else(|| vec![DEFAULT_SHARED_MOUNT_PROFILE_LOCAL.to_string()])
+}
+
 fn default_security_from_env() -> SecurityConfig {
     let admin_token = env::var("RESON_SANDBOX_AUTH_TOKEN")
         .or_else(|_| env::var("BRACKET_SANDBOX_AUTH_TOKEN"))
@@ -808,6 +831,31 @@ fn parse_csv_env(name: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(endpoints)
+}
+
+fn parse_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_shared_mount_profiles(values: Vec<String>) -> Vec<String> {
+    let mut normalized = values
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if !normalized
+        .iter()
+        .any(|value| value == DEFAULT_SHARED_MOUNT_PROFILE_LOCAL)
+    {
+        normalized.push(DEFAULT_SHARED_MOUNT_PROFILE_LOCAL.to_string());
+    }
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn normalize_endpoint_like(raw: &str) -> String {
@@ -940,6 +988,10 @@ mod tests {
                 continuity_tier: tier,
                 degraded_mode,
                 admission_frozen: false,
+                shared_mount_profiles: vec![
+                    DEFAULT_SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 region: "test-region".to_string(),
                 zone: "test-zone".to_string(),
                 rack: "test-rack".to_string(),

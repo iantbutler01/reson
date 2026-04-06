@@ -246,6 +246,7 @@ pub struct SessionOptions {
     pub metadata: HashMap<String, String>,
     pub auto_start: bool,
     pub resources: Option<ResourceLimits>,
+    pub shared_mounts: Vec<SharedMount>,
 }
 
 impl Default for SessionOptions {
@@ -258,8 +259,44 @@ impl Default for SessionOptions {
             metadata: HashMap::new(),
             auto_start: true,
             resources: None,
+            shared_mounts: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedMountAvailability {
+    NodeLocal,
+    SharedStorage,
+}
+
+impl Default for SharedMountAvailability {
+    fn default() -> Self {
+        Self::NodeLocal
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedMountContinuity {
+    RestartSameNode,
+    RestoreCrossNode,
+}
+
+impl Default for SharedMountContinuity {
+    fn default() -> Self {
+        Self::RestartSameNode
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedMount {
+    pub host_path: String,
+    pub guest_path: String,
+    pub mount_tag: String,
+    pub read_only: bool,
+    pub availability: SharedMountAvailability,
+    pub continuity: SharedMountContinuity,
+    pub backend_profile: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1821,6 +1858,8 @@ impl Session {
                 Some(response.fork_id.as_str()),
                 Some(tenant_id.as_str()),
                 Some(workspace_id.as_str()),
+                vm_tier_b_eligible(&child_vm),
+                vm_required_shared_mount_profiles(&child_vm),
                 None,
             )
             .await?;
@@ -1931,6 +1970,8 @@ impl Sandbox {
             .entry("workspace_id".to_string())
             .or_insert_with(|| workspace_id.clone());
         let tier_b_eligible = resolve_tier_b_eligibility(&metadata);
+        validate_shared_mount_contract(&opts.shared_mounts, tier_b_eligible)?;
+        let required_mount_profiles = required_shared_mount_profiles(&opts.shared_mounts);
         metadata.insert(
             META_TIER_B_ELIGIBLE.to_string(),
             if tier_b_eligible { "true" } else { "false" }.to_string(),
@@ -1979,6 +2020,8 @@ impl Sandbox {
                     None,
                     Some(attached_tenant_id.as_str()),
                     Some(attached_workspace_id.as_str()),
+                    vm_tier_b_eligible(&vm),
+                    vm_required_shared_mount_profiles(&vm),
                     expected_fence.as_deref(),
                 )
                 .await?;
@@ -2028,10 +2071,29 @@ impl Sandbox {
             metadata: Some(Metadata { entries: metadata }),
             auto_start: opts.auto_start,
             architecture: architecture.clone(),
+            shared_mounts: opts
+                .shared_mounts
+                .into_iter()
+                .map(|mount| proto::vmd::v1::SharedMount {
+                    host_path: mount.host_path,
+                    guest_path: mount.guest_path,
+                    mount_tag: mount.mount_tag,
+                    read_only: mount.read_only,
+                    availability: shared_mount_availability_proto(&mount.availability),
+                    continuity: shared_mount_continuity_proto(&mount.continuity),
+                    backend_profile: normalize_mount_backend_profile(&mount.backend_profile),
+                })
+                .collect(),
         };
 
         let node_endpoint = self
-            .endpoint_for_new_session(&session_id, &tenant_id, &workspace_id, tier_b_eligible)
+            .endpoint_for_new_session(
+                &session_id,
+                &tenant_id,
+                &workspace_id,
+                tier_b_eligible,
+                &required_mount_profiles,
+            )
             .await?;
         let warm_pool_key = warm_pool_key(&node_endpoint, image.as_str(), architecture.as_str());
         let warm_pool_hit = self.warm_pool_contains_key(warm_pool_key.as_str()).await;
@@ -2077,6 +2139,8 @@ impl Sandbox {
                 None,
                 Some(tenant_id.as_str()),
                 Some(workspace_id.as_str()),
+                tier_b_eligible,
+                required_mount_profiles.clone(),
                 None,
             )
             .await?;
@@ -2125,6 +2189,7 @@ impl Sandbox {
             .find_vm_by_session_id(session_id)
             .await?
             .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?;
+        validate_vm_mount_contract(session_id, &vm)?;
         let expected_fence = self.current_session_fence(session_id).await?;
         let (tenant_id, workspace_id) = self.current_session_scope(session_id).await?;
 
@@ -2159,6 +2224,8 @@ impl Sandbox {
                 None,
                 Some(tenant_id.as_str()),
                 Some(workspace_id.as_str()),
+                vm_tier_b_eligible(&vm),
+                vm_required_shared_mount_profiles(&vm),
                 expected_fence.as_deref(),
             )
             .await?;
@@ -2590,6 +2657,7 @@ impl Sandbox {
         _tenant_id: &str,
         _workspace_id: &str,
         _tier_b_eligible: bool,
+        _required_mount_profiles: &[String],
     ) -> Result<String> {
         #[cfg(feature = "distributed-control")]
         if let ControlBackend::Distributed(control) = &self.inner.control_backend {
@@ -2607,12 +2675,13 @@ impl Sandbox {
                     _tenant_id,
                     _workspace_id,
                     _tier_b_eligible,
+                    _required_mount_profiles,
                 )
                 .await?;
             return normalize_endpoint(&node.endpoint);
         }
 
-        let _ = _tier_b_eligible;
+        let _ = (_tier_b_eligible, _required_mount_profiles);
         for endpoint in self.candidate_endpoints().await? {
             if self.health_check_endpoint(&endpoint).await.is_ok() {
                 return Ok(endpoint);
@@ -2646,6 +2715,8 @@ impl Sandbox {
         _fork_id: Option<&str>,
         _tenant_id: Option<&str>,
         _workspace_id: Option<&str>,
+        _tier_b_eligible: bool,
+        _required_mount_profiles: Vec<String>,
         _expected_fence: Option<&str>,
     ) -> Result<Option<String>> {
         #[cfg(feature = "distributed-control")]
@@ -2661,6 +2732,8 @@ impl Sandbox {
                         ownership_fence: None,
                         tenant_id: _tenant_id.unwrap_or("default").to_string(),
                         workspace_id: _workspace_id.unwrap_or("default").to_string(),
+                        tier_b_eligible: _tier_b_eligible,
+                        required_mount_profiles: _required_mount_profiles,
                     },
                     _expected_fence,
                 )
@@ -2684,7 +2757,7 @@ impl Sandbox {
                 .await;
             return Ok(route.ownership_fence);
         }
-        let _ = _expected_fence;
+        let _ = (_tier_b_eligible, _required_mount_profiles, _expected_fence);
         Ok(None)
     }
 
@@ -2817,7 +2890,26 @@ impl Sandbox {
         expected_fence: Option<&str>,
         reason: &str,
     ) -> Result<Option<(String, Option<String>)>> {
-        for candidate in self.candidate_endpoints().await? {
+        let candidates = {
+            #[cfg(feature = "distributed-control")]
+            if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                control
+                    .rebind_candidates_for_session(session_id, from_endpoint)
+                    .await?
+                    .into_iter()
+                    .map(|route| route.endpoint)
+                    .collect::<Vec<_>>()
+            } else {
+                self.candidate_endpoints().await?
+            }
+
+            #[cfg(not(feature = "distributed-control"))]
+            {
+                self.candidate_endpoints().await?
+            }
+        };
+
+        for candidate in candidates {
             if candidate == from_endpoint {
                 continue;
             }
@@ -2936,6 +3028,8 @@ impl Sandbox {
                         None,
                         Some(tenant_id.as_str()),
                         Some(workspace_id.as_str()),
+                        vm_tier_b_eligible(&running_vm),
+                        vm_required_shared_mount_profiles(&running_vm),
                         expected_fence,
                     )
                     .await?;
@@ -3510,6 +3604,162 @@ fn resolve_tier_b_eligibility(metadata: &HashMap<String, String>) -> bool {
 
 fn vm_tier_b_eligible(vm: &Vm) -> bool {
     resolve_tier_b_eligibility(&vm.metadata)
+}
+
+fn shared_mount_availability_proto(availability: &SharedMountAvailability) -> i32 {
+    match availability {
+        SharedMountAvailability::NodeLocal => {
+            proto::vmd::v1::SharedMountAvailability::NodeLocal as i32
+        }
+        SharedMountAvailability::SharedStorage => {
+            proto::vmd::v1::SharedMountAvailability::SharedStorage as i32
+        }
+    }
+}
+
+fn shared_mount_continuity_proto(continuity: &SharedMountContinuity) -> i32 {
+    match continuity {
+        SharedMountContinuity::RestartSameNode => {
+            proto::vmd::v1::SharedMountContinuity::RestartSameNode as i32
+        }
+        SharedMountContinuity::RestoreCrossNode => {
+            proto::vmd::v1::SharedMountContinuity::RestoreCrossNode as i32
+        }
+    }
+}
+
+fn shared_mount_availability_from_proto(value: i32) -> SharedMountAvailability {
+    match proto::vmd::v1::SharedMountAvailability::try_from(value)
+        .unwrap_or(proto::vmd::v1::SharedMountAvailability::Unspecified)
+    {
+        proto::vmd::v1::SharedMountAvailability::SharedStorage => {
+            SharedMountAvailability::SharedStorage
+        }
+        _ => SharedMountAvailability::NodeLocal,
+    }
+}
+
+fn shared_mount_continuity_from_proto(
+    value: i32,
+    availability: &SharedMountAvailability,
+) -> SharedMountContinuity {
+    match proto::vmd::v1::SharedMountContinuity::try_from(value)
+        .unwrap_or(proto::vmd::v1::SharedMountContinuity::Unspecified)
+    {
+        proto::vmd::v1::SharedMountContinuity::RestoreCrossNode => {
+            SharedMountContinuity::RestoreCrossNode
+        }
+        proto::vmd::v1::SharedMountContinuity::RestartSameNode => {
+            SharedMountContinuity::RestartSameNode
+        }
+        proto::vmd::v1::SharedMountContinuity::Unspecified => {
+            default_mount_continuity(availability)
+        }
+    }
+}
+
+fn default_mount_continuity(availability: &SharedMountAvailability) -> SharedMountContinuity {
+    match availability {
+        SharedMountAvailability::NodeLocal => SharedMountContinuity::RestartSameNode,
+        SharedMountAvailability::SharedStorage => SharedMountContinuity::RestoreCrossNode,
+    }
+}
+
+fn normalize_mount_backend_profile(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn validate_shared_mount_contract(
+    shared_mounts: &[SharedMount],
+    tier_b_eligible: bool,
+) -> Result<()> {
+    for mount in shared_mounts {
+        let backend_profile = normalize_mount_backend_profile(&mount.backend_profile);
+        if matches!(mount.availability, SharedMountAvailability::NodeLocal)
+            && matches!(mount.continuity, SharedMountContinuity::RestoreCrossNode)
+        {
+            return Err(SandboxError::InvalidResponse(format!(
+                "shared mount `{}` cannot claim cross-node restore continuity with node-local availability",
+                mount.mount_tag
+            )));
+        }
+        if matches!(mount.availability, SharedMountAvailability::SharedStorage)
+            && backend_profile.is_empty()
+        {
+            return Err(SandboxError::InvalidResponse(format!(
+                "shared-storage mount `{}` requires a non-empty backend_profile so distributed placement can verify backend availability",
+                mount.mount_tag
+            )));
+        }
+        if tier_b_eligible && !matches!(mount.continuity, SharedMountContinuity::RestoreCrossNode) {
+            return Err(SandboxError::InvalidResponse(format!(
+                "tier_b_eligible session requires cross-node-restorable shared mounts; mount `{}` is only `{}`",
+                mount.mount_tag,
+                match mount.continuity {
+                    SharedMountContinuity::RestartSameNode => "restart-same-node",
+                    SharedMountContinuity::RestoreCrossNode => "restore-cross-node",
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn required_shared_mount_profiles(shared_mounts: &[SharedMount]) -> Vec<String> {
+    let mut profiles = shared_mounts
+        .iter()
+        .filter(|mount| matches!(mount.availability, SharedMountAvailability::SharedStorage))
+        .map(|mount| normalize_mount_backend_profile(&mount.backend_profile))
+        .filter(|profile| !profile.is_empty())
+        .collect::<Vec<_>>();
+    profiles.sort();
+    profiles.dedup();
+    profiles
+}
+
+fn vm_required_shared_mount_profiles(vm: &Vm) -> Vec<String> {
+    let mut profiles = vm
+        .shared_mounts
+        .iter()
+        .filter(|mount| {
+            matches!(
+                shared_mount_availability_from_proto(mount.availability),
+                SharedMountAvailability::SharedStorage
+            )
+        })
+        .map(|mount| normalize_mount_backend_profile(&mount.backend_profile))
+        .filter(|profile| !profile.is_empty())
+        .collect::<Vec<_>>();
+    profiles.sort();
+    profiles.dedup();
+    profiles
+}
+
+fn validate_vm_mount_contract(session_id: &str, vm: &Vm) -> Result<()> {
+    let tier_b_eligible = vm_tier_b_eligible(vm);
+    let mounts = vm
+        .shared_mounts
+        .iter()
+        .map(|mount| {
+            let availability = shared_mount_availability_from_proto(mount.availability);
+            let continuity = shared_mount_continuity_from_proto(mount.continuity, &availability);
+            SharedMount {
+                host_path: mount.host_path.clone(),
+                guest_path: mount.guest_path.clone(),
+                mount_tag: mount.mount_tag.clone(),
+                read_only: mount.read_only,
+                availability,
+                continuity,
+                backend_profile: mount.backend_profile.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    validate_shared_mount_contract(&mounts, tier_b_eligible).map_err(|err| match err {
+        SandboxError::InvalidResponse(message) => SandboxError::InvalidResponse(format!(
+            "session `{session_id}` has non-continuous shared mount contract: {message}"
+        )),
+        other => other,
+    })
 }
 
 fn parse_bool_like(raw: &str) -> Option<bool> {

@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::utils::ConversationMessage;
 
 // Re-export types for convenience
-pub use crate::types::{CostInfo, Provider, TokenUsage};
+pub use crate::types::{AssistantResponse, CostInfo, Provider, TokenUsage};
 
 // Provider implementations
 pub mod anthropic;
@@ -161,17 +161,17 @@ impl GenerationConfig {
 /// Response from a generation request
 #[derive(Debug, Clone)]
 pub struct GenerationResponse {
-    /// Generated content (text)
+    /// Canonical assistant response.
+    pub response: AssistantResponse,
+
+    /// Concatenated text output for compatibility.
     pub content: String,
 
-    /// Extended reasoning content (if any)
+    /// Concatenated reasoning output for compatibility.
     pub reasoning: Option<String>,
 
-    /// Tool calls made by the model
+    /// Tool calls in provider-preserving JSON form for compatibility.
     pub tool_calls: Vec<serde_json::Value>,
-
-    /// Reasoning segments
-    pub reasoning_segments: Vec<serde_json::Value>,
 
     /// Token usage statistics
     pub usage: TokenUsage,
@@ -187,20 +187,54 @@ pub struct GenerationResponse {
 impl GenerationResponse {
     /// Create a simple text response
     pub fn text(content: impl Into<String>) -> Self {
+        let response = AssistantResponse::from_text(content.into());
         Self {
-            content: content.into(),
+            content: response.text(),
             reasoning: None,
             tool_calls: Vec::new(),
-            reasoning_segments: Vec::new(),
+            response,
             usage: TokenUsage::default(),
             provider_cost_dollars: None,
             raw: None,
         }
     }
 
+    /// Build a generation response from the canonical assistant response.
+    pub fn from_assistant_response(
+        response: AssistantResponse,
+        usage: TokenUsage,
+        provider_cost_dollars: Option<f64>,
+        raw: Option<serde_json::Value>,
+    ) -> Self {
+        let content = response.text();
+        let reasoning = {
+            let reasoning = response.reasoning();
+            if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            }
+        };
+        let tool_calls = response
+            .tool_calls()
+            .into_iter()
+            .map(normalized_tool_call_json)
+            .collect();
+
+        Self {
+            response,
+            content,
+            reasoning,
+            tool_calls,
+            usage,
+            provider_cost_dollars,
+            raw,
+        }
+    }
+
     /// Check if response contains tool calls
     pub fn has_tool_calls(&self) -> bool {
-        !self.tool_calls.is_empty()
+        self.response.has_tool_calls() || !self.tool_calls.is_empty()
     }
 
     /// Set provider-reported cost
@@ -208,6 +242,37 @@ impl GenerationResponse {
         self.provider_cost_dollars = Some(cost_dollars);
         self
     }
+}
+
+fn normalized_tool_call_json(call: &crate::types::ToolCall) -> serde_json::Value {
+    let args_for_function = call.raw_arguments.as_ref().map_or_else(
+        || call.args.clone(),
+        |raw| serde_json::Value::String(raw.clone()),
+    );
+
+    let mut value = serde_json::json!({
+        "id": call.tool_use_id,
+        "_tool_use_id": call.tool_use_id,
+        "_tool_name": call.tool_name,
+        "name": call.tool_name,
+        "input": call.args,
+        "function": {
+            "name": call.tool_name,
+            "arguments": args_for_function
+        }
+    });
+
+    if let Some(signature) = &call.signature {
+        value["signature"] = serde_json::json!(signature);
+    }
+
+    if let (Some(obj), Some(map)) = (call.args.as_object(), value.as_object_mut()) {
+        for (key, entry) in obj {
+            map.insert(key.clone(), entry.clone());
+        }
+    }
+
+    value
 }
 
 /// Stream chunk types
@@ -359,16 +424,19 @@ mod tests {
     #[test]
     fn test_generation_response_text() {
         let response = GenerationResponse::text("Hello, world!");
-        assert_eq!(response.content, "Hello, world!");
+        assert_eq!(response.response.text(), "Hello, world!");
         assert!(!response.has_tool_calls());
     }
 
     #[test]
     fn test_generation_response_with_tool_calls() {
         let mut response = GenerationResponse::text("Using tools...");
-        response
-            .tool_calls
-            .push(serde_json::json!({"name": "get_weather"}));
+        response.response.push_output(crate::types::ResponsePart::Tool {
+            call: crate::types::ToolCall::new(
+                "get_weather",
+                serde_json::json!({"city": "SF"}),
+            ),
+        });
         assert!(response.has_tool_calls());
     }
 }

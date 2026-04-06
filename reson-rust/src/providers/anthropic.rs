@@ -17,7 +17,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{CacheMarker, ChatRole, Provider, TokenUsage};
+use crate::types::{AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
 
 /// Anthropic API client
@@ -176,47 +176,50 @@ impl AnthropicClient {
         messages
     }
 
-    /// Extract text content from response
-    fn extract_text_content(&self, content: &serde_json::Value) -> String {
+    /// Extract canonical assistant response from content blocks.
+    fn extract_response(&self, content: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
         if let Some(blocks) = content.as_array() {
             for block in blocks {
-                if block["type"] == "text" {
-                    if let Some(text) = block["text"].as_str() {
-                        return text.to_string();
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
                     }
+                    Some("thinking") => {
+                        if let Some(text) = block["thinking"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    }
+                    Some("tool_use") => {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(block.clone(), Provider::Anthropic)?,
+                        });
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        String::new()
-    }
-
-    /// Extract reasoning/thinking content from response
-    fn extract_reasoning(&self, content: &serde_json::Value) -> Option<String> {
-        if let Some(blocks) = content.as_array() {
-            let thinking: Vec<String> = blocks
-                .iter()
-                .filter(|block| block["type"] == "thinking")
-                .filter_map(|block| block["thinking"].as_str().map(|s| s.to_string()))
-                .collect();
-
-            if !thinking.is_empty() {
-                return Some(thinking.join("\n"));
-            }
-        }
-        None
-    }
-
-    /// Extract tool calls from response content
-    fn extract_tool_calls(&self, content: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut tool_calls = Vec::new();
-        if let Some(blocks) = content.as_array() {
-            for block in blocks {
-                if block["type"] == "tool_use" {
-                    tool_calls.push(block.clone());
-                }
-            }
-        }
-        tool_calls
+        Ok(response)
     }
 
     /// Parse token usage from response
@@ -320,27 +323,22 @@ impl InferenceClient for AnthropicClient {
 
         // Extract content
         let content_value = &body["content"];
-        let text_content = self.extract_text_content(content_value);
-        let reasoning = self.extract_reasoning(content_value);
-        let tool_calls = self.extract_tool_calls(content_value);
+        let response = self.extract_response(content_value)?;
 
         // If tools were provided, return full response for tool extraction
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content: text_content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
-            provider_cost_dollars: None,
-            raw: if has_tools || has_tool_calls {
+            None,
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -476,8 +474,8 @@ mod tests {
             {"type": "text", "text": "Hello, world!"}
         ]);
 
-        let text = client.extract_text_content(&content);
-        assert_eq!(text, "Hello, world!");
+        let response = client.extract_response(&content).unwrap();
+        assert_eq!(response.text(), "Hello, world!");
     }
 
     #[test]
@@ -488,10 +486,10 @@ mod tests {
             {"type": "text", "text": "Using tool..."}
         ]);
 
-        let tool_calls = client.extract_tool_calls(&content);
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0]["id"], "toolu_123");
-        assert_eq!(tool_calls[0]["name"], "get_weather");
+        let response = client.extract_response(&content).unwrap();
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_use_id, "toolu_123");
+        assert_eq!(response.tool_calls()[0].tool_name, "get_weather");
     }
 
     #[test]

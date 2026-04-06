@@ -23,6 +23,7 @@ const STORAGE_PROFILE_LOCAL_EPHEMERAL: &str = "local-ephemeral";
 const STORAGE_PROFILE_DURABLE_SHARED: &str = "durable-shared";
 const CONTINUITY_TIER_A: &str = "tier-a";
 const CONTINUITY_TIER_B: &str = "tier-b";
+const SHARED_MOUNT_PROFILE_LOCAL: &str = "local-path";
 const CONTROL_ENVELOPE_SCHEMA_VERSION: &str = "v1";
 const DEFAULT_SHARD_COUNT: u8 = 16;
 
@@ -43,6 +44,8 @@ pub(crate) struct SessionRoute {
     pub ownership_fence: Option<String>,
     pub tenant_id: String,
     pub workspace_id: String,
+    pub tier_b_eligible: bool,
+    pub required_mount_profiles: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +55,7 @@ pub(crate) struct NodeRoute {
     pub max_active_vms: Option<usize>,
     pub storage_profile: String,
     pub continuity_tier: String,
+    pub shared_mount_profiles: Vec<String>,
     pub degraded_mode: bool,
     pub admission_frozen: bool,
     pub region: String,
@@ -145,6 +149,10 @@ struct SessionRouteRecord {
     #[serde(default)]
     workspace_id: String,
     #[serde(default)]
+    tier_b_eligible: bool,
+    #[serde(default)]
+    required_mount_profiles: Vec<String>,
+    #[serde(default)]
     updated_at_unix_ms: u64,
 }
 
@@ -159,6 +167,8 @@ struct NodeRecord {
     storage_profile: String,
     #[serde(default)]
     continuity_tier: String,
+    #[serde(default)]
+    shared_mount_profiles: Vec<String>,
     #[serde(default)]
     degraded_mode: bool,
     #[serde(default)]
@@ -301,6 +311,8 @@ impl DistributedControlPlane {
         route: SessionRoute,
         expected_fence: Option<&str>,
     ) -> Result<SessionRoute> {
+        let required_mount_profiles =
+            normalize_shared_mount_profiles(&route.required_mount_profiles);
         let route_key = self.session_key(&route.session_id);
         let fence_key = self.session_fence_key(&route.session_id);
         let next_fence = Uuid::new_v4().to_string();
@@ -313,6 +325,8 @@ impl DistributedControlPlane {
             ownership_fence: Some(next_fence.clone()),
             tenant_id: route.tenant_id.clone(),
             workspace_id: route.workspace_id.clone(),
+            tier_b_eligible: route.tier_b_eligible,
+            required_mount_profiles: required_mount_profiles.clone(),
             updated_at_unix_ms: unix_millis(),
         })
         .map_err(|err| SandboxError::InvalidResponse(format!("serialize session route: {err}")))?;
@@ -356,8 +370,31 @@ impl DistributedControlPlane {
         }
 
         let mut updated = route;
+        updated.required_mount_profiles = required_mount_profiles;
         updated.ownership_fence = Some(next_fence);
         Ok(updated)
+    }
+
+    pub(crate) async fn rebind_candidates_for_session(
+        &self,
+        session_id: &str,
+        from_endpoint: &str,
+    ) -> Result<Vec<NodeRoute>> {
+        let routes = self.list_node_routes().await?;
+        if routes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session_route = self.get_session_route(session_id).await?;
+        let session_routes = self.session_route_records().await?;
+        Ok(eligible_rebind_routes(
+            &routes,
+            &session_routes,
+            session_route.as_ref(),
+            from_endpoint,
+            self.cfg.required_storage_profile.as_deref(),
+            self.cfg.required_continuity_tier.as_deref(),
+            self.cfg.allow_tier_a_degraded,
+        ))
     }
 
     pub(crate) async fn delete_session_route(
@@ -455,6 +492,7 @@ impl DistributedControlPlane {
         tenant_id: &str,
         workspace_id: &str,
         tier_b_eligible: bool,
+        required_mount_profiles: &[String],
     ) -> Result<NodeRoute> {
         let routes = self.list_node_routes().await?;
         if routes.is_empty() {
@@ -502,6 +540,7 @@ impl DistributedControlPlane {
             self.cfg.required_storage_profile.as_deref(),
             required_continuity_tier,
             allow_tier_a_degraded,
+            required_mount_profiles,
         );
         if eligible.is_empty() {
             let mut details = Vec::new();
@@ -512,13 +551,14 @@ impl DistributedControlPlane {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unbounded".to_string());
                 details.push(format!(
-                    "{}@{} used={} limit={} storage_profile={} continuity_tier={} degraded_mode={} admission_frozen={}",
+                    "{}@{} used={} limit={} storage_profile={} continuity_tier={} shared_mount_profiles={:?} degraded_mode={} admission_frozen={}",
                     route.node_id,
                     route.endpoint,
                     used,
                     limit,
                     route.storage_profile,
                     route.continuity_tier,
+                    route.shared_mount_profiles,
                     route.degraded_mode,
                     route.admission_frozen
                 ));
@@ -546,6 +586,7 @@ impl DistributedControlPlane {
                         "retry_after_ms": retry_after_ms,
                         "candidate_count": routes.len(),
                         "tier_b_eligible": tier_b_eligible,
+                        "required_mount_profiles": required_mount_profiles,
                     }),
                 )
                 .await;
@@ -634,6 +675,7 @@ impl DistributedControlPlane {
                     } else {
                         "any"
                     },
+                    "required_mount_profiles": required_mount_profiles,
                     "allow_tier_a_degraded": allow_tier_a_degraded,
                 }),
             )
@@ -1351,6 +1393,10 @@ fn decode_session_route(raw: &[u8]) -> Result<SessionRoute> {
             ownership_fence: record.ownership_fence,
             tenant_id: normalize_scope_value(&record.tenant_id),
             workspace_id: normalize_scope_value(&record.workspace_id),
+            tier_b_eligible: record.tier_b_eligible,
+            required_mount_profiles: normalize_shared_mount_profiles(
+                &record.required_mount_profiles,
+            ),
         });
     }
 
@@ -1366,6 +1412,8 @@ fn decode_session_route(raw: &[u8]) -> Result<SessionRoute> {
         ownership_fence: None,
         tenant_id: "default".to_string(),
         workspace_id: "default".to_string(),
+        tier_b_eligible: false,
+        required_mount_profiles: Vec::new(),
     })
 }
 
@@ -1389,6 +1437,7 @@ fn decode_node_route(key: &str, raw: &[u8]) -> Result<NodeRoute> {
                 .unwrap_or_else(|| STORAGE_PROFILE_LOCAL_EPHEMERAL.to_string()),
             continuity_tier: normalize_continuity_tier(&record.continuity_tier)
                 .unwrap_or_else(|| CONTINUITY_TIER_A.to_string()),
+            shared_mount_profiles: normalize_shared_mount_profiles(&record.shared_mount_profiles),
             degraded_mode: record.degraded_mode,
             admission_frozen: record.admission_frozen,
             region: normalize_scope_value(&record.region),
@@ -1406,6 +1455,7 @@ fn decode_node_route(key: &str, raw: &[u8]) -> Result<NodeRoute> {
         max_active_vms: None,
         storage_profile: STORAGE_PROFILE_LOCAL_EPHEMERAL.to_string(),
         continuity_tier: CONTINUITY_TIER_A.to_string(),
+        shared_mount_profiles: vec![SHARED_MOUNT_PROFILE_LOCAL.to_string()],
         degraded_mode: true,
         admission_frozen: false,
         region: "default".to_string(),
@@ -1421,6 +1471,8 @@ fn decode_session_route_record(key: &str, raw: &[u8]) -> Result<SessionRouteReco
         }
         record.tenant_id = normalize_scope_value(&record.tenant_id);
         record.workspace_id = normalize_scope_value(&record.workspace_id);
+        record.required_mount_profiles =
+            normalize_shared_mount_profiles(&record.required_mount_profiles);
         return Ok(record);
     }
 
@@ -1437,8 +1489,44 @@ fn decode_session_route_record(key: &str, raw: &[u8]) -> Result<SessionRouteReco
         ownership_fence: None,
         tenant_id: "default".to_string(),
         workspace_id: "default".to_string(),
+        tier_b_eligible: false,
+        required_mount_profiles: Vec::new(),
         updated_at_unix_ms: 0,
     })
+}
+
+fn eligible_rebind_routes(
+    routes: &[NodeRoute],
+    session_routes: &[SessionRouteRecord],
+    session_route: Option<&SessionRoute>,
+    from_endpoint: &str,
+    required_storage_profile: Option<&str>,
+    required_continuity_tier: Option<&str>,
+    allow_tier_a_degraded: bool,
+) -> Vec<NodeRoute> {
+    let usage = session_counts_by_endpoint(session_routes);
+    let (route_tier, route_allow_tier_a_degraded, route_profiles) = match session_route {
+        Some(route) if route.tier_b_eligible => (
+            required_continuity_tier,
+            allow_tier_a_degraded,
+            route.required_mount_profiles.as_slice(),
+        ),
+        Some(route) => (None, true, route.required_mount_profiles.as_slice()),
+        None => (None, true, &[][..]),
+    };
+
+    eligible_routes_with_profile(
+        routes,
+        &usage,
+        required_storage_profile,
+        route_tier,
+        route_allow_tier_a_degraded,
+        route_profiles,
+    )
+    .into_iter()
+    // @dive: Rebind candidate filtering excludes the current endpoint before transport probing so session continuity obeys mount/backend policy first.
+    .filter(|route| route.endpoint != from_endpoint)
+    .collect()
 }
 
 fn session_counts_by_endpoint(records: &[SessionRouteRecord]) -> HashMap<String, usize> {
@@ -1489,10 +1577,12 @@ fn eligible_routes_with_profile(
     required_storage_profile: Option<&str>,
     required_continuity_tier: Option<&str>,
     allow_tier_a_degraded: bool,
+    required_mount_profiles: &[String],
 ) -> Vec<NodeRoute> {
     let mut out = Vec::new();
     let required_storage_profile = required_storage_profile.and_then(normalize_storage_profile);
     let required_continuity_tier = required_continuity_tier.and_then(normalize_continuity_tier);
+    let required_mount_profiles = normalize_shared_mount_profiles(required_mount_profiles);
     for route in routes {
         if route.admission_frozen {
             continue;
@@ -1508,6 +1598,15 @@ fn eligible_routes_with_profile(
             .unwrap_or_else(|| CONTINUITY_TIER_A.to_string());
         if let Some(required_tier) = required_continuity_tier.as_ref() {
             if &route_tier != required_tier {
+                continue;
+            }
+        }
+        if !required_mount_profiles.is_empty() {
+            let route_profiles = normalize_shared_mount_profiles(&route.shared_mount_profiles);
+            if required_mount_profiles
+                .iter()
+                .any(|profile| !route_profiles.iter().any(|candidate| candidate == profile))
+            {
                 continue;
             }
         }
@@ -1664,6 +1763,23 @@ fn normalize_continuity_tier(raw: &str) -> Option<String> {
     }
 }
 
+fn normalize_shared_mount_profiles(values: &[String]) -> Vec<String> {
+    let mut normalized = values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if !normalized
+        .iter()
+        .any(|value| value == SHARED_MOUNT_PROFILE_LOCAL)
+    {
+        normalized.push(SHARED_MOUNT_PROFILE_LOCAL.to_string());
+    }
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
 fn normalize_scope_value(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1761,6 +1877,55 @@ fn ownership_fence_allows_transition(current: Option<&str>, expected: Option<&st
 mod tests {
     use super::*;
 
+    fn node_route(
+        node_id: &str,
+        endpoint: &str,
+        storage_profile: &str,
+        continuity_tier: &str,
+        degraded_mode: bool,
+        shared_mount_profiles: &[&str],
+    ) -> NodeRoute {
+        NodeRoute {
+            node_id: node_id.to_string(),
+            endpoint: endpoint.to_string(),
+            max_active_vms: None,
+            storage_profile: storage_profile.to_string(),
+            continuity_tier: continuity_tier.to_string(),
+            shared_mount_profiles: shared_mount_profiles
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            degraded_mode,
+            admission_frozen: false,
+            region: "r1".to_string(),
+            zone: "z1".to_string(),
+            rack: "rack-a".to_string(),
+        }
+    }
+
+    fn session_route(
+        session_id: &str,
+        endpoint: &str,
+        tier_b_eligible: bool,
+        required_mount_profiles: &[&str],
+    ) -> SessionRoute {
+        SessionRoute {
+            session_id: session_id.to_string(),
+            vm_id: "vm-1".to_string(),
+            endpoint: endpoint.to_string(),
+            node_id: Some("node-a".to_string()),
+            fork_id: None,
+            ownership_fence: None,
+            tenant_id: "tenant-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            tier_b_eligible,
+            required_mount_profiles: required_mount_profiles
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
+    }
+
     #[test]
     fn eligible_routes_filters_nodes_at_capacity() {
         let routes = vec![
@@ -1770,6 +1935,10 @@ mod tests {
                 max_active_vms: Some(2),
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1782,6 +1951,10 @@ mod tests {
                 max_active_vms: Some(1),
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1794,6 +1967,7 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_LOCAL_EPHEMERAL.to_string(),
                 continuity_tier: CONTINUITY_TIER_A.to_string(),
+                shared_mount_profiles: vec![SHARED_MOUNT_PROFILE_LOCAL.to_string()],
                 degraded_mode: true,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1808,8 +1982,14 @@ mod tests {
             ("http://node-c:8052".to_string(), 4usize),
         ]);
 
-        let eligible =
-            eligible_routes_with_profile(&routes, &usage, None, Some(CONTINUITY_TIER_B), false);
+        let eligible = eligible_routes_with_profile(
+            &routes,
+            &usage,
+            None,
+            Some(CONTINUITY_TIER_B),
+            false,
+            &[],
+        );
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].node_id, "node-a");
     }
@@ -1823,6 +2003,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: true,
                 region: "r1".to_string(),
@@ -1835,6 +2019,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1849,6 +2037,7 @@ mod tests {
             Some(STORAGE_PROFILE_DURABLE_SHARED),
             Some(CONTINUITY_TIER_B),
             false,
+            &[],
         );
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].node_id, "node-ready");
@@ -1863,6 +2052,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_LOCAL_EPHEMERAL.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1875,6 +2068,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1890,6 +2087,7 @@ mod tests {
             Some(STORAGE_PROFILE_DURABLE_SHARED),
             Some(CONTINUITY_TIER_B),
             false,
+            &[],
         );
         assert_eq!(durable_only.len(), 1);
         assert_eq!(durable_only[0].node_id, "node-b");
@@ -1900,6 +2098,7 @@ mod tests {
             Some(STORAGE_PROFILE_LOCAL_EPHEMERAL),
             Some(CONTINUITY_TIER_B),
             false,
+            &[],
         );
         assert_eq!(local_only.len(), 1);
         assert_eq!(local_only[0].node_id, "node-a");
@@ -1914,6 +2113,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_B.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1926,6 +2129,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_A.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: true,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1938,6 +2145,10 @@ mod tests {
                 max_active_vms: None,
                 storage_profile: STORAGE_PROFILE_DURABLE_SHARED.to_string(),
                 continuity_tier: CONTINUITY_TIER_A.to_string(),
+                shared_mount_profiles: vec![
+                    SHARED_MOUNT_PROFILE_LOCAL.to_string(),
+                    "shared-posix".to_string(),
+                ],
                 degraded_mode: false,
                 admission_frozen: false,
                 region: "r1".to_string(),
@@ -1953,6 +2164,7 @@ mod tests {
             Some(STORAGE_PROFILE_DURABLE_SHARED),
             Some(CONTINUITY_TIER_B),
             false,
+            &[],
         );
         assert_eq!(tier_b_only.len(), 1);
         assert_eq!(tier_b_only[0].node_id, "node-tier-b");
@@ -1963,9 +2175,121 @@ mod tests {
             Some(STORAGE_PROFILE_DURABLE_SHARED),
             Some(CONTINUITY_TIER_A),
             true,
+            &[],
         );
         assert_eq!(allow_tier_a_degraded.len(), 1);
         assert_eq!(allow_tier_a_degraded[0].node_id, "node-tier-a-degraded");
+    }
+
+    #[test]
+    fn eligible_routes_filters_by_required_shared_mount_profiles() {
+        let routes = vec![
+            node_route(
+                "node-local-only",
+                "http://node-local-only:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_B,
+                false,
+                &[],
+            ),
+            node_route(
+                "node-shared-posix",
+                "http://node-shared-posix:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_B,
+                false,
+                &["shared-posix"],
+            ),
+            node_route(
+                "node-shared-alt",
+                "http://node-shared-alt:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_B,
+                false,
+                &["shared-alt"],
+            ),
+        ];
+        let usage = HashMap::new();
+
+        let eligible = eligible_routes_with_profile(
+            &routes,
+            &usage,
+            Some(STORAGE_PROFILE_DURABLE_SHARED),
+            Some(CONTINUITY_TIER_B),
+            false,
+            &["shared-posix".to_string()],
+        );
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].node_id, "node-shared-posix");
+    }
+
+    #[test]
+    fn eligible_rebind_routes_enforce_session_mount_contract_and_exclude_current_endpoint() {
+        let routes = vec![
+            node_route(
+                "node-primary",
+                "http://node-primary:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_B,
+                false,
+                &["shared-posix"],
+            ),
+            node_route(
+                "node-secondary-valid",
+                "http://node-secondary-valid:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_B,
+                false,
+                &["shared-posix"],
+            ),
+            node_route(
+                "node-secondary-wrong-profile",
+                "http://node-secondary-wrong-profile:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_B,
+                false,
+                &["shared-alt"],
+            ),
+            node_route(
+                "node-secondary-tier-a",
+                "http://node-secondary-tier-a:8052",
+                STORAGE_PROFILE_DURABLE_SHARED,
+                CONTINUITY_TIER_A,
+                false,
+                &["shared-posix"],
+            ),
+        ];
+        let session_routes = vec![SessionRouteRecord {
+            session_id: "session-1".to_string(),
+            vm_id: "vm-1".to_string(),
+            endpoint: "http://node-primary:8052".to_string(),
+            node_id: Some("node-primary".to_string()),
+            fork_id: None,
+            ownership_fence: Some("fence-1".to_string()),
+            tenant_id: "tenant-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            tier_b_eligible: true,
+            required_mount_profiles: vec!["shared-posix".to_string()],
+            updated_at_unix_ms: 1,
+        }];
+
+        let eligible = eligible_rebind_routes(
+            &routes,
+            &session_routes,
+            Some(&session_route(
+                "session-1",
+                "http://node-primary:8052",
+                true,
+                &["shared-posix"],
+            )),
+            "http://node-primary:8052",
+            Some(STORAGE_PROFILE_DURABLE_SHARED),
+            Some(CONTINUITY_TIER_B),
+            false,
+        );
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].node_id, "node-secondary-valid");
     }
 
     #[test]
@@ -2052,6 +2376,8 @@ mod tests {
                 ownership_fence: None,
                 tenant_id: "tenant-a".to_string(),
                 workspace_id: "workspace-a".to_string(),
+                tier_b_eligible: false,
+                required_mount_profiles: Vec::new(),
                 updated_at_unix_ms: 1,
             },
             SessionRouteRecord {
@@ -2063,6 +2389,8 @@ mod tests {
                 ownership_fence: None,
                 tenant_id: "tenant-a".to_string(),
                 workspace_id: "workspace-a".to_string(),
+                tier_b_eligible: false,
+                required_mount_profiles: Vec::new(),
                 updated_at_unix_ms: 2,
             },
         ];

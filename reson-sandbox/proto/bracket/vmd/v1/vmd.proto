@@ -64,6 +64,28 @@ message NetworkSpec {
   PortProxyPorts portproxy_ports = 4;
 }
 
+enum SharedMountAvailability {
+  SHARED_MOUNT_AVAILABILITY_UNSPECIFIED = 0;
+  SHARED_MOUNT_AVAILABILITY_NODE_LOCAL = 1;
+  SHARED_MOUNT_AVAILABILITY_SHARED_STORAGE = 2;
+}
+
+enum SharedMountContinuity {
+  SHARED_MOUNT_CONTINUITY_UNSPECIFIED = 0;
+  SHARED_MOUNT_CONTINUITY_RESTART_SAME_NODE = 1;
+  SHARED_MOUNT_CONTINUITY_RESTORE_CROSS_NODE = 2;
+}
+
+message SharedMount {
+  string host_path = 1;
+  string guest_path = 2;
+  string mount_tag = 3;
+  bool read_only = 4;
+  SharedMountAvailability availability = 5;
+  SharedMountContinuity continuity = 6;
+  string backend_profile = 7;
+}
+
 message Snapshot {
   string id = 1;
   string name = 2;
@@ -85,6 +107,7 @@ message VM {
   map<string, string> metadata = 10;
   repeated Snapshot snapshots = 11;
   google.protobuf.Timestamp started_at = 12;
+  repeated SharedMount shared_mounts = 13;
 }
 
 message ListVMsRequest {
@@ -106,6 +129,7 @@ message CreateVMRequest {
   Metadata metadata = 4;
   bool auto_start = 5;
   string architecture = 6;
+  repeated SharedMount shared_mounts = 7;
 }
 
 enum CreateVmPhase {

@@ -17,7 +17,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{Provider, TokenUsage};
+use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
     convert_messages_to_responses_input, parse_json_value_strict_str, parse_sse_stream,
     ConversationMessage,
@@ -184,91 +184,69 @@ impl OpenAIResponsesClient {
         }
     }
 
-    fn extract_output_text(&self, body: &serde_json::Value) -> String {
-        let mut content = String::new();
+    fn extract_response(&self, body: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
         if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
             for item in output {
-                if item.get("type").and_then(|v| v.as_str()) == Some("message")
-                    && item.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                {
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("message") if item.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+                        if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                            for part in parts {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                        if !text.is_empty() {
+                                            response.push_output(ResponsePart::Text {
+                                                text: text.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(summary) = item.get("summary") {
+                            if let Some(arr) = summary.as_array() {
+                                for part in arr {
+                                    if let Some(text) = part.as_str() {
+                                        response.push_output(ResponsePart::Reasoning {
+                                            text: text.to_string(),
+                                        });
+                                    }
+                                }
+                            } else if let Some(text) = summary.as_str() {
+                                if !text.is_empty() {
+                                    response.push_output(ResponsePart::Reasoning {
+                                        text: text.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                            for part in parts {
                                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                    content.push_str(text);
+                                    if !text.is_empty() {
+                                        response.push_output(ResponsePart::Reasoning {
+                                            text: text.to_string(),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
-        content
-    }
-
-    fn extract_reasoning(&self, body: &serde_json::Value) -> Option<String> {
-        let mut reasoning = String::new();
-        if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
-            for item in output {
-                if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-                    if let Some(summary) = item.get("summary") {
-                        if let Some(arr) = summary.as_array() {
-                            for part in arr {
-                                if let Some(text) = part.as_str() {
-                                    reasoning.push_str(text);
-                                }
-                            }
-                        } else if let Some(text) = summary.as_str() {
-                            reasoning.push_str(text);
-                        }
+                    Some("function_call") => {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(
+                                item.clone(),
+                                self.provider,
+                            )?,
+                        });
                     }
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                reasoning.push_str(text);
-                            }
-                        }
-                    }
+                    _ => {}
                 }
             }
         }
-        if reasoning.is_empty() {
-            None
-        } else {
-            Some(reasoning)
-        }
-    }
-
-    fn extract_tool_calls(&self, body: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut tool_calls = Vec::new();
-        if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
-            for item in output {
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    let args = item
-                        .get("arguments")
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_else(|| "{}".to_string());
-                    tool_calls.push(serde_json::json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": args
-                        }
-                    }));
-                }
-            }
-        }
-        tool_calls
+        Ok(response)
     }
 
     async fn make_request(
@@ -381,26 +359,21 @@ impl InferenceClient for OpenAIResponsesClient {
             None
         };
 
-        let content = self.extract_output_text(&body);
-        let reasoning = self.extract_reasoning(&body);
-        let tool_calls = self.extract_tool_calls(&body);
+        let response = self.extract_response(&body)?;
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
             provider_cost_dollars,
-            raw: if has_tools || has_tool_calls {
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -535,9 +508,9 @@ mod tests {
             }]
         });
 
-        let calls = client.extract_tool_calls(&body);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["id"], "call_123");
-        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        let response = client.extract_response(&body).unwrap();
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_use_id, "call_123");
+        assert_eq!(response.tool_calls()[0].tool_name, "get_weather");
     }
 }

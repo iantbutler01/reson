@@ -18,7 +18,10 @@ use reson_agentic::runtime::{RunParams, Runtime, ToolFunction};
 use reson_agentic::schema::{
     AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator,
 };
-use reson_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
+use reson_agentic::types::{
+    AssistantResponse, ChatMessage, Provider, ResponsePart, ResponseStreamEvent, ToolCall,
+    ToolResult,
+};
 use reson_agentic::utils::ConversationMessage;
 use reson_agentic::Tool;
 use serde::{Deserialize, Serialize};
@@ -197,9 +200,34 @@ fn parse_tool_call_args(value: &serde_json::Value) -> Option<serde_json::Value> 
     }
 }
 
-fn extract_tool_call_args(
-    tool_call: &serde_json::Value,
+trait ToolCallCarrier {
+    fn first_tool_call_value(&self) -> reson_agentic::error::Result<serde_json::Value>;
+}
+
+impl ToolCallCarrier for serde_json::Value {
+    fn first_tool_call_value(&self) -> reson_agentic::error::Result<serde_json::Value> {
+        Ok(self.clone())
+    }
+}
+
+impl ToolCallCarrier for AssistantResponse {
+    fn first_tool_call_value(&self) -> reson_agentic::error::Result<serde_json::Value> {
+        let tool_call = self.tool_calls().first().copied().ok_or_else(|| {
+            reson_agentic::error::Error::NonRetryable(
+                "Assistant response did not contain a tool call".to_string(),
+            )
+        })?;
+        Ok(tool_call
+            .tool_obj
+            .clone()
+            .unwrap_or_else(|| serde_json::to_value(tool_call).unwrap()))
+    }
+}
+
+fn extract_tool_call_args<T: ToolCallCarrier>(
+    tool_call: &T,
 ) -> reson_agentic::error::Result<serde_json::Value> {
+    let tool_call = tool_call.first_tool_call_value()?;
     let direct_args = tool_call
         .get("arguments")
         .or_else(|| tool_call.get("input"))
@@ -233,14 +261,18 @@ fn tool_call_name(tool_call: &serde_json::Value) -> Option<&str> {
         })
 }
 
-fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::error::Result<i64> {
+fn require_i64_field<T: ToolCallCarrier>(
+    value: &T,
+    field: &str,
+) -> reson_agentic::error::Result<i64> {
+    let value = value.first_tool_call_value()?;
     if let Some(raw) = value.get(field) {
         return parse_i64_value(raw).ok_or_else(|| {
             reson_agentic::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
         });
     }
 
-    let args = extract_tool_call_args(value)?;
+    let args = extract_tool_call_args(&value)?;
     let raw = args.get(field).ok_or_else(|| {
         reson_agentic::error::Error::NonRetryable(format!("Missing '{}' field", field))
     })?;
@@ -249,7 +281,10 @@ fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::e
     })
 }
 
-fn require_tool_call_id(tool_call: &serde_json::Value) -> reson_agentic::error::Result<String> {
+fn require_tool_call_id<T: ToolCallCarrier>(
+    tool_call: &T,
+) -> reson_agentic::error::Result<String> {
+    let tool_call = tool_call.first_tool_call_value()?;
     let id = tool_call
         .get("id")
         .and_then(|v| v.as_str())
@@ -422,35 +457,38 @@ async fn openai_responses_tool_stream_agent(
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok((chunk_type, value)) => {
-                if chunk_type == "tool_call_complete" {
-                    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if id.is_empty() {
-                        return Err(reson_agentic::error::Error::NonRetryable(
-                            "Missing tool call id in stream".to_string(),
-                        ));
-                    }
-
-                    let name = tool_call_name(&value);
-                    if name != Some("add_numbers") {
-                        return Err(reson_agentic::error::Error::NonRetryable(format!(
-                            "Unexpected tool name in stream: {:?}",
-                            name
-                        )));
-                    }
-
-                    let a = require_i64_field(&value, "a")?;
-                    let b = require_i64_field(&value, "b")?;
-                    if a != 25 || b != 35 {
-                        return Err(reson_agentic::error::Error::NonRetryable(format!(
-                            "Unexpected stream args: a={}, b={}",
-                            a, b
-                        )));
-                    }
-
-                    saw_tool = true;
+            Ok(ResponseStreamEvent::Output(ResponsePart::Tool { call })) => {
+                let value = call
+                    .tool_obj
+                    .clone()
+                    .unwrap_or_else(|| serde_json::to_value(&call).unwrap());
+                let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    return Err(reson_agentic::error::Error::NonRetryable(
+                        "Missing tool call id in stream".to_string(),
+                    ));
                 }
+
+                let name = tool_call_name(&value);
+                if name != Some("add_numbers") {
+                    return Err(reson_agentic::error::Error::NonRetryable(format!(
+                        "Unexpected tool name in stream: {:?}",
+                        name
+                    )));
+                }
+
+                let a = require_i64_field(&value, "a")?;
+                let b = require_i64_field(&value, "b")?;
+                if a != 25 || b != 35 {
+                    return Err(reson_agentic::error::Error::NonRetryable(format!(
+                        "Unexpected stream args: a={}, b={}",
+                        a, b
+                    )));
+                }
+
+                saw_tool = true;
             }
+            Ok(_) => {}
             Err(e) => {
                 return Err(reson_agentic::error::Error::NonRetryable(format!(
                     "Stream error: {}",

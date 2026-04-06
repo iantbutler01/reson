@@ -82,6 +82,48 @@ pub struct NetworkSpec {
     pub rpc_port: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SharedMountAvailability {
+    NodeLocal,
+    SharedStorage,
+}
+
+impl Default for SharedMountAvailability {
+    fn default() -> Self {
+        Self::NodeLocal
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SharedMountContinuity {
+    RestartSameNode,
+    RestoreCrossNode,
+}
+
+impl Default for SharedMountContinuity {
+    fn default() -> Self {
+        Self::RestartSameNode
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedMountSpec {
+    pub host_path: String,
+    pub guest_path: String,
+    #[serde(default)]
+    pub mount_tag: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub availability: SharedMountAvailability,
+    #[serde(default)]
+    pub continuity: SharedMountContinuity,
+    #[serde(default)]
+    pub backend_profile: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
     pub id: String,
@@ -114,6 +156,8 @@ pub struct VmMetadata {
     pub metadata: HashMap<String, String>,
     #[serde(default)]
     pub snapshots: Vec<SnapshotMetadata>,
+    #[serde(default)]
+    pub shared_mounts: Vec<SharedMountSpec>,
     #[serde(default)]
     pub suspended_snapshot: String,
     #[serde(default)]
@@ -177,6 +221,7 @@ pub struct CreateVmParams {
     pub metadata: HashMap<String, String>,
     pub auto_start: bool,
     pub architecture: String,
+    pub shared_mounts: Vec<SharedMountSpec>,
 }
 
 #[derive(Debug, Clone, Default)]

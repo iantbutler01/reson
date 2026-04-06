@@ -49,7 +49,7 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::runtime::{RunParams, Runtime};
     pub use crate::types::{
-        CacheMarker, ChatMessage, ChatRole, CreateResult, Provider, ReasoningSegment, TokenUsage,
-        ToolCall, ToolResult,
+        AssistantResponse, CacheMarker, ChatMessage, ChatRole, CreateResult, Provider,
+        ReasoningSegment, ResponsePart, ResponseStreamEvent, TokenUsage, ToolCall, ToolResult,
     };
 }

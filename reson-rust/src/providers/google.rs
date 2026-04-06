@@ -26,7 +26,7 @@ use crate::providers::{
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::ChatRole;
-use crate::types::{Provider, TokenUsage};
+use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{media_part_to_google_format, ConversationMessage, JsonStreamAccumulator};
 
 #[cfg(feature = "google-adc")]
@@ -615,6 +615,52 @@ impl GoogleGenAIClient {
                         "parts": [{"text": chat_msg.content}]
                     }));
                 }
+                ConversationMessage::AssistantResponse(response) => {
+                    let mut parts = Vec::new();
+                    let mut idx = 0;
+                    while idx < response.output.len() {
+                        match &response.output[idx] {
+                            ResponsePart::Text { text } => parts.push(serde_json::json!({
+                                "text": text
+                            })),
+                            ResponsePart::Reasoning { text } => {
+                                let mut part = serde_json::json!({
+                                    "thought": true,
+                                    "text": text
+                                });
+                                if let Some(ResponsePart::Signature { value }) =
+                                    response.output.get(idx + 1)
+                                {
+                                    part["thoughtSignature"] = serde_json::json!(value);
+                                    idx += 1;
+                                }
+                                parts.push(part);
+                            }
+                            ResponsePart::Tool { call } => {
+                                let mut part = serde_json::json!({
+                                    "functionCall": {
+                                        "name": call.tool_name,
+                                        "args": call.args
+                                    }
+                                });
+                                if let Some(ResponsePart::Signature { value }) =
+                                    response.output.get(idx + 1)
+                                {
+                                    part["thoughtSignature"] = serde_json::json!(value);
+                                    idx += 1;
+                                }
+                                parts.push(part);
+                            }
+                            ResponsePart::Signature { .. } => {}
+                        }
+                        idx += 1;
+                    }
+
+                    contents.push(serde_json::json!({
+                        "role": "model",
+                        "parts": parts
+                    }));
+                }
                 ConversationMessage::ToolCall(tool_call) => {
                     // Google uses functionCall for assistant tool calls
                     let mut part = serde_json::json!({
@@ -624,7 +670,9 @@ impl GoogleGenAIClient {
                         }
                     });
                     // Include thoughtSignature if available (required by Google for multi-turn)
-                    if let Some(ref obj) = tool_call.tool_obj {
+                    if let Some(ref signature) = tool_call.signature {
+                        part["thoughtSignature"] = serde_json::json!(signature);
+                    } else if let Some(ref obj) = tool_call.tool_obj {
                         if let Some(sig) = obj.get("thoughtSignature") {
                             part["thoughtSignature"] = sig.clone();
                         }
@@ -727,96 +775,62 @@ impl GoogleGenAIClient {
         }]))
     }
 
-    /// Extract text content from response
-    fn extract_text_content(&self, candidates: &serde_json::Value) -> String {
-        if let Some(first) = candidates.as_array().and_then(|a| a.first()) {
-            if let Some(parts) = first["content"]["parts"].as_array() {
-                for part in parts {
-                    // Skip thought parts
-                    if part
-                        .get("thought")
-                        .and_then(|t| t.as_bool())
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if let Some(text) = part["text"].as_str() {
-                        return text.to_string();
-                    }
-                }
-            }
-        }
-        String::new()
-    }
-
-    /// Extract reasoning content from response
-    fn extract_reasoning(&self, candidates: &serde_json::Value) -> Option<String> {
-        if let Some(first) = candidates.as_array().and_then(|a| a.first()) {
-            if let Some(parts) = first["content"]["parts"].as_array() {
-                let reasoning: Vec<String> = parts
-                    .iter()
-                    .filter(|part| {
-                        part.get("thought")
-                            .and_then(|t| t.as_bool())
-                            .unwrap_or(false)
-                    })
-                    .filter_map(|part| part["text"].as_str().map(|s| s.to_string()))
-                    .collect();
-
-                if !reasoning.is_empty() {
-                    return Some(reasoning.join("\n"));
-                }
-            }
-        }
-        None
-    }
-
-    /// Extract tool calls from response
-    fn extract_tool_calls(&self, candidates: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut tool_calls = Vec::new();
-
+    /// Extract canonical assistant response from Gemini candidates.
+    fn extract_response(&self, candidates: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
         if let Some(first) = candidates.as_array().and_then(|a| a.first()) {
             if let Some(parts) = first["content"]["parts"].as_array() {
                 for part in parts {
                     if let Some(func_call) = part.get("functionCall") {
-                        let name = func_call["name"].as_str().unwrap_or("");
-                        let args = func_call
-                            .get("args")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({}));
-
-                        // Generate ID since Google doesn't provide one
-                        let id = format!(
-                            "google_{}_{:x}",
-                            name,
-                            std::collections::hash_map::DefaultHasher::new().finish()
-                        );
-
-                        // Preserve thoughtSignature if present (required for multi-turn)
-                        let thought_signature = part.get("thoughtSignature").cloned();
-
-                        // Convert to normalized format with _tool_name for compatibility
-                        let mut tc = serde_json::json!({
-                            "id": id,
-                            "_tool_name": name,
-                            "_tool_use_id": id,
-                            "name": name,
-                            "input": args,
-                            "function": {
-                                "name": name,
-                                "arguments": args
-                            }
-                        });
-                        if let Some(sig) = thought_signature {
-                            tc["thoughtSignature"] = sig;
+                        let mut call = ToolCall::from_provider_format(
+                            serde_json::json!({ "functionCall": func_call }),
+                            Provider::GoogleGenAI,
+                        )?;
+                        if let Some(signature) =
+                            part.get("thoughtSignature").and_then(|v| v.as_str())
+                        {
+                            call.signature = Some(signature.to_string());
                         }
-                        tool_calls.push(tc);
+                        response.push_output(ResponsePart::Tool {
+                            call,
+                        });
+                        if let Some(signature) =
+                            part.get("thoughtSignature").and_then(|v| v.as_str())
+                        {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    } else if part
+                        .get("thought")
+                        .and_then(|t| t.as_bool())
+                        .unwrap_or(false)
+                    {
+                        if let Some(text) = part["text"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(signature) =
+                            part.get("thoughtSignature").and_then(|v| v.as_str())
+                        {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    } else if let Some(text) = part["text"].as_str() {
+                        if !text.is_empty() {
+                            response.push_output(ResponsePart::Text {
+                                text: text.to_string(),
+                            });
+                        }
                     }
                 }
             }
         }
-
-        tool_calls
+        Ok(response)
     }
 
     /// Parse token usage from response
@@ -941,8 +955,6 @@ impl GoogleGenAIClient {
     }
 }
 
-use std::hash::Hasher;
-
 #[async_trait]
 impl InferenceClient for GoogleGenAIClient {
     async fn get_generation(
@@ -957,30 +969,25 @@ impl InferenceClient for GoogleGenAIClient {
 
         // Parse response
         let candidates = &body["candidates"];
-        let text_content = self.extract_text_content(candidates);
-        let reasoning = self.extract_reasoning(candidates);
-        let tool_calls = self.extract_tool_calls(candidates);
+        let response = self.extract_response(candidates)?;
 
         // Parse usage
         let usage = self.parse_usage(&body["usageMetadata"]);
 
         // If tools were provided, return full response
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content: text_content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
-            provider_cost_dollars: None,
-            raw: if has_tools || has_tool_calls {
+            None,
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -1315,8 +1322,8 @@ mod tests {
             }
         }]);
 
-        let text = client.extract_text_content(&candidates);
-        assert_eq!(text, "Hello, world!");
+        let response = client.extract_response(&candidates).unwrap();
+        assert_eq!(response.text(), "Hello, world!");
     }
 
     #[test]
@@ -1331,8 +1338,8 @@ mod tests {
             }
         }]);
 
-        let text = client.extract_text_content(&candidates);
-        assert_eq!(text, "The answer is 42");
+        let response = client.extract_response(&candidates).unwrap();
+        assert_eq!(response.text(), "The answer is 42");
     }
 
     #[test]
@@ -1347,8 +1354,8 @@ mod tests {
             }
         }]);
 
-        let reasoning = client.extract_reasoning(&candidates);
-        assert_eq!(reasoning, Some("Let me think...".to_string()));
+        let response = client.extract_response(&candidates).unwrap();
+        assert_eq!(response.reasoning(), "Let me think...");
     }
 
     #[test]
@@ -1365,10 +1372,9 @@ mod tests {
             }
         }]);
 
-        let tool_calls = client.extract_tool_calls(&candidates);
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0]["name"], "get_weather");
-        assert_eq!(tool_calls[0]["_tool_name"], "get_weather");
+        let response = client.extract_response(&candidates).unwrap();
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_name, "get_weather");
     }
 
     #[test]

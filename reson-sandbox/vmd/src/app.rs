@@ -39,9 +39,9 @@ use crate::proto::v1::{
 };
 use crate::state::manager::{CreateVmProgressCallback, CreateVmProgressEvent, CreateVmStage};
 use crate::state::{
-    CreateVmParams, ForkVmParams, Manager, ManagerError, SnapshotMetadata, SnapshotParams,
-    UpdateVmParams, VmMetadata, VmSource as StateVmSource, VmSourceType as StateVmSourceType,
-    VmState,
+    CreateVmParams, ForkVmParams, Manager, ManagerError, SharedMountAvailability,
+    SharedMountContinuity, SharedMountSpec, SnapshotMetadata, SnapshotParams, UpdateVmParams,
+    VmMetadata, VmSource as StateVmSource, VmSourceType as StateVmSourceType, VmState,
 };
 use crate::{
     config::{ControlBusConfig, NodeRegistryConfig},
@@ -495,6 +495,61 @@ impl VmdService for GrpcService {
             metadata: req.metadata.map_or_else(Default::default, |m| m.entries),
             auto_start: req.auto_start,
             architecture: req.architecture,
+            // @dive: Shared mounts stay typed over gRPC so the daemon can validate and persist mount intent independently of opaque metadata keys.
+            shared_mounts: req
+                .shared_mounts
+                .into_iter()
+                .map(|mount| SharedMountSpec {
+                    availability: match crate::proto::v1::SharedMountAvailability::try_from(
+                        mount.availability,
+                    )
+                    .unwrap_or(crate::proto::v1::SharedMountAvailability::Unspecified)
+                    {
+                        crate::proto::v1::SharedMountAvailability::SharedStorage => {
+                            SharedMountAvailability::SharedStorage
+                        }
+                        _ => SharedMountAvailability::NodeLocal,
+                    },
+                    continuity: {
+                        let availability =
+                            match crate::proto::v1::SharedMountAvailability::try_from(
+                                mount.availability,
+                            )
+                            .unwrap_or(crate::proto::v1::SharedMountAvailability::Unspecified)
+                            {
+                                crate::proto::v1::SharedMountAvailability::SharedStorage => {
+                                    SharedMountAvailability::SharedStorage
+                                }
+                                _ => SharedMountAvailability::NodeLocal,
+                            };
+                        match crate::proto::v1::SharedMountContinuity::try_from(mount.continuity)
+                            .unwrap_or(crate::proto::v1::SharedMountContinuity::Unspecified)
+                        {
+                            crate::proto::v1::SharedMountContinuity::RestoreCrossNode => {
+                                SharedMountContinuity::RestoreCrossNode
+                            }
+                            crate::proto::v1::SharedMountContinuity::RestartSameNode => {
+                                SharedMountContinuity::RestartSameNode
+                            }
+                            crate::proto::v1::SharedMountContinuity::Unspecified => {
+                                match availability {
+                                    SharedMountAvailability::SharedStorage => {
+                                        SharedMountContinuity::RestoreCrossNode
+                                    }
+                                    SharedMountAvailability::NodeLocal => {
+                                        SharedMountContinuity::RestartSameNode
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    backend_profile: mount.backend_profile.trim().to_ascii_lowercase(),
+                    host_path: mount.host_path,
+                    guest_path: mount.guest_path,
+                    mount_tag: mount.mount_tag,
+                    read_only: mount.read_only,
+                })
+                .collect(),
         };
 
         let manager = Arc::clone(&self.manager);
@@ -1176,6 +1231,33 @@ fn build_vm(
         metadata: meta.metadata.clone(),
         snapshots: Vec::new(),
         started_at: meta.started_at.map(to_timestamp),
+        shared_mounts: meta
+            .shared_mounts
+            .iter()
+            .map(|mount| crate::proto::v1::SharedMount {
+                host_path: mount.host_path.clone(),
+                guest_path: mount.guest_path.clone(),
+                mount_tag: mount.mount_tag.clone(),
+                read_only: mount.read_only,
+                availability: match mount.availability {
+                    SharedMountAvailability::NodeLocal => {
+                        crate::proto::v1::SharedMountAvailability::NodeLocal as i32
+                    }
+                    SharedMountAvailability::SharedStorage => {
+                        crate::proto::v1::SharedMountAvailability::SharedStorage as i32
+                    }
+                },
+                continuity: match mount.continuity {
+                    SharedMountContinuity::RestartSameNode => {
+                        crate::proto::v1::SharedMountContinuity::RestartSameNode as i32
+                    }
+                    SharedMountContinuity::RestoreCrossNode => {
+                        crate::proto::v1::SharedMountContinuity::RestoreCrossNode as i32
+                    }
+                },
+                backend_profile: mount.backend_profile.clone(),
+            })
+            .collect(),
     };
 
     if let Some(runtime) = runtime {

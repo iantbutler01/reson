@@ -28,7 +28,8 @@ use reson_sandbox::proto::vmd::v1::{
 };
 use reson_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError,
-    SessionOptions, ShellEvent, ShellInput, WarmPoolProfile,
+    SessionOptions, SharedMount, SharedMountAvailability, SharedMountContinuity, ShellEvent,
+    ShellInput, WarmPoolProfile,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
@@ -47,6 +48,7 @@ struct MockVmdState {
     restore_calls: usize,
     restored_snapshot_ids: Vec<String>,
     predownload_requests: Vec<(String, String)>,
+    create_requests: Vec<CreateVmRequest>,
 }
 
 #[derive(Clone)]
@@ -98,6 +100,7 @@ impl MockVmd {
             metadata,
             snapshots: Vec::new(),
             started_at: None,
+            shared_mounts: Vec::new(),
         }
     }
 
@@ -163,6 +166,7 @@ impl VmdService for MockVmd {
     ) -> Result<Response<Self::CreateVMStream>, Status> {
         let req = request.into_inner();
         let mut guard = self.state.lock().await;
+        guard.create_requests.push(req.clone());
         guard.next_vm_id += 1;
         let vm_id = format!("vm-{}", guard.next_vm_id);
         let state = if req.auto_start {
@@ -171,7 +175,7 @@ impl VmdService for MockVmd {
             VmState::Stopped as i32
         };
         let metadata = req.metadata.map(|m| m.entries).unwrap_or_default();
-        let vm = self.build_vm(
+        let mut vm = self.build_vm(
             vm_id.clone(),
             if req.name.is_empty() {
                 format!("session-{vm_id}")
@@ -181,6 +185,7 @@ impl VmdService for MockVmd {
             state,
             metadata,
         );
+        vm.shared_mounts = req.shared_mounts;
         guard.vms.insert(vm_id, vm.clone());
 
         let stream = tokio_stream::iter(vec![Ok(CreateVmStreamResponse {
@@ -230,7 +235,7 @@ impl VmdService for MockVmd {
         child_metadata.insert("reson.fork_id".to_string(), fork_id.clone());
         child_metadata.insert("reson.parent_vm_id".to_string(), parent.id.clone());
 
-        let child_vm = self.build_vm(
+        let mut child_vm = self.build_vm(
             child_id.clone(),
             if req.child_name.is_empty() {
                 format!("{}-fork", parent.name)
@@ -244,6 +249,7 @@ impl VmdService for MockVmd {
             },
             child_metadata,
         );
+        child_vm.shared_mounts = parent.shared_mounts.clone();
 
         guard.vms.insert(child_id, child_vm.clone());
 
@@ -785,6 +791,162 @@ async fn session_reuse_and_fork_lineage_contract() {
     timeout(Duration::from_secs(3), harness.shutdown())
         .await
         .expect("mock harness shutdown timed out");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_create_forwards_shared_mounts_contract() {
+    let harness = TestHarness::start().await;
+
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    sandbox
+        .session(SessionOptions {
+            session_id: Some("session-mounts".to_string()),
+            auto_start: false,
+            shared_mounts: vec![SharedMount {
+                host_path: "/tmp/nymfs".to_string(),
+                guest_path: "/nym".to_string(),
+                mount_tag: "nymfs".to_string(),
+                read_only: false,
+                availability: SharedMountAvailability::SharedStorage,
+                continuity: SharedMountContinuity::RestoreCrossNode,
+                backend_profile: "shared-posix".to_string(),
+            }],
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("create session with shared mounts");
+
+    let guard = harness.vmd_state.lock().await;
+    let req = guard
+        .create_requests
+        .last()
+        .expect("expected create request to be recorded");
+    assert_eq!(req.shared_mounts.len(), 1);
+    assert_eq!(req.shared_mounts[0].host_path, "/tmp/nymfs");
+    assert_eq!(req.shared_mounts[0].guest_path, "/nym");
+    assert_eq!(req.shared_mounts[0].mount_tag, "nymfs");
+    assert!(!req.shared_mounts[0].read_only);
+    assert_eq!(
+        req.shared_mounts[0].availability,
+        reson_sandbox::proto::vmd::v1::SharedMountAvailability::SharedStorage as i32
+    );
+    assert_eq!(
+        req.shared_mounts[0].continuity,
+        reson_sandbox::proto::vmd::v1::SharedMountContinuity::RestoreCrossNode as i32
+    );
+    assert_eq!(req.shared_mounts[0].backend_profile, "shared-posix");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tier_b_session_rejects_node_local_shared_mounts() {
+    let harness = TestHarness::start().await;
+
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let mut metadata = HashMap::new();
+    metadata.insert("tier_b_eligible".to_string(), "true".to_string());
+
+    let err = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-tier-b-node-local".to_string()),
+            auto_start: false,
+            metadata,
+            shared_mounts: vec![SharedMount {
+                host_path: "/tmp/local-mount".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "workspace".to_string(),
+                read_only: false,
+                availability: SharedMountAvailability::NodeLocal,
+                continuity: SharedMountContinuity::RestartSameNode,
+                backend_profile: String::new(),
+            }],
+            ..SessionOptions::default()
+        })
+        .await;
+
+    let err = match err {
+        Ok(_) => panic!("tier-b session should reject node-local mounts"),
+        Err(err) => err,
+    };
+
+    match err {
+        SandboxError::InvalidResponse(message) => {
+            assert!(message.contains("tier_b_eligible"));
+            assert!(message.contains("workspace"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tier_b_session_accepts_cross_node_shared_mounts() {
+    let harness = TestHarness::start().await;
+
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let mut metadata = HashMap::new();
+    metadata.insert("tier_b_eligible".to_string(), "true".to_string());
+
+    sandbox
+        .session(SessionOptions {
+            session_id: Some("session-tier-b-shared".to_string()),
+            auto_start: false,
+            metadata,
+            shared_mounts: vec![SharedMount {
+                host_path: "/mnt/shared/workspace".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "workspace".to_string(),
+                read_only: false,
+                availability: SharedMountAvailability::SharedStorage,
+                continuity: SharedMountContinuity::RestoreCrossNode,
+                backend_profile: "shared-posix".to_string(),
+            }],
+            ..SessionOptions::default()
+        })
+        .await
+        .expect("tier-b session should accept shared-storage mounts");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_storage_mount_requires_backend_profile() {
+    let harness = TestHarness::start().await;
+
+    let sandbox = Sandbox::connect(harness.vmd_endpoint.clone(), sandbox_config())
+        .await
+        .expect("connect sandbox facade to mock vmd");
+
+    let result = sandbox
+        .session(SessionOptions {
+            session_id: Some("session-shared-missing-profile".to_string()),
+            auto_start: false,
+            shared_mounts: vec![SharedMount {
+                host_path: "/mnt/shared/workspace".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "workspace".to_string(),
+                read_only: false,
+                availability: SharedMountAvailability::SharedStorage,
+                continuity: SharedMountContinuity::RestoreCrossNode,
+                backend_profile: String::new(),
+            }],
+            ..SessionOptions::default()
+        })
+        .await;
+
+    match result {
+        Ok(_) => panic!("shared-storage mount should require backend_profile"),
+        Err(SandboxError::InvalidResponse(message)) => {
+            assert!(message.contains("backend_profile"));
+            assert!(message.contains("workspace"));
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

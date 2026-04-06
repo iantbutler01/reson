@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
-use crate::types::ReasoningSegment;
+use crate::types::{AssistantResponse, ReasoningSegment, ResponseStreamEvent, ToolCall};
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;
 
@@ -225,6 +225,29 @@ impl Runtime {
         Ok(())
     }
 
+    /// Unregister a tool and remove all associated metadata.
+    ///
+    /// Returns `true` if the tool existed and was removed.
+    pub async fn unregister_tool(&self, name: &str) -> bool {
+        let removed = {
+            let mut tools = self.tools.write().await;
+            tools.remove(name).is_some()
+        };
+
+        let mut tool_types = self.tool_types.write().await;
+        tool_types.remove(name);
+        drop(tool_types);
+
+        let mut tool_schemas = self.tool_schemas.write().await;
+        tool_schemas.remove(name);
+        drop(tool_schemas);
+
+        let mut tool_constructors = self.tool_constructors.write().await;
+        tool_constructors.remove(name);
+
+        removed
+    }
+
     /// Helper to extract field descriptions from a JSON schema
     fn extract_fields_from_schema(
         schema: &serde_json::Value,
@@ -372,7 +395,7 @@ impl Runtime {
     }
 
     /// Execute a non-streaming LLM call
-    pub async fn run(&mut self, params: RunParams) -> Result<serde_json::Value> {
+    pub async fn run(&mut self, params: RunParams) -> Result<AssistantResponse> {
         // Mark as used
         self.used = true;
 
@@ -413,26 +436,28 @@ impl Runtime {
         .await?;
 
         // Update accumulators
-        if let Some(raw) = &result.raw_response {
+        let text = result.response.text();
+        if !text.is_empty() {
             let mut acc = self.accumulators.write().await;
-            acc.raw_response.push(raw.clone());
+            acc.raw_response.push(text);
         }
 
-        if let Some(reasoning) = &result.reasoning {
+        let reasoning = result.response.reasoning();
+        if !reasoning.is_empty() {
             let mut acc = self.accumulators.write().await;
-            acc.reasoning.push(reasoning.clone());
+            acc.reasoning.push(reasoning);
         }
 
-        Ok(result.parsed_value)
+        Ok(result.response)
     }
 
     /// Execute a streaming LLM call
     ///
-    /// Returns an async stream of (chunk_type, chunk_value) tuples
+    /// Returns an async stream of typed response-building events.
     pub async fn run_stream(
         &mut self,
         params: RunParams,
-    ) -> Result<impl futures::stream::Stream<Item = Result<(String, serde_json::Value)>>> {
+    ) -> Result<impl futures::stream::Stream<Item = Result<ResponseStreamEvent>>> {
         // Mark as used
         self.used = true;
 
@@ -475,39 +500,41 @@ impl Runtime {
         .await
     }
 
-    /// Check if a result is a tool call
-    pub fn is_tool_call(&self, result: &serde_json::Value) -> bool {
-        // Check for _tool_name field in JSON
-        result.get("_tool_name").and_then(|v| v.as_str()).is_some()
-    }
-
-    /// Get tool name from result
-    pub fn get_tool_name(&self, result: &serde_json::Value) -> Option<String> {
-        result
-            .get("_tool_name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-
     /// Execute a tool call
-    pub async fn execute_tool(&self, tool_result: &serde_json::Value) -> Result<String> {
-        let tool_name = self
-            .get_tool_name(tool_result)
-            .ok_or_else(|| Error::NonRetryable("No tool name in result".to_string()))?;
-
+    pub async fn execute_tool_call(&self, tool_call: &ToolCall) -> Result<String> {
         let tools = self.tools.read().await;
         let tool_fn = tools
-            .get(&tool_name)
-            .ok_or_else(|| Error::NonRetryable(format!("Tool '{}' not found", tool_name)))?;
+            .get(&tool_call.tool_name)
+            .ok_or_else(|| Error::NonRetryable(format!("Tool '{}' not found", tool_call.tool_name)))?;
 
-        // Extract arguments
-        let args = tool_result.clone();
+        let args = tool_call.args.clone();
 
         // Execute based on function type
         match tool_fn {
             ToolFunction::Sync(f) => f(args),
             ToolFunction::Async(f) => f(args).await,
         }
+    }
+
+    /// Check whether an assistant response contains tool calls.
+    pub fn is_tool_call(&self, response: &AssistantResponse) -> bool {
+        response.has_tool_calls()
+    }
+
+    /// Get the first tool name from an assistant response.
+    pub fn get_tool_name(&self, response: &AssistantResponse) -> Option<String> {
+        response
+            .tool_calls()
+            .first()
+            .map(|tool_call| tool_call.tool_name.clone())
+    }
+
+    /// Execute the first tool call in an assistant response.
+    pub async fn execute_tool(&self, response: &AssistantResponse) -> Result<String> {
+        let tool_call = response.tool_calls().first().copied().ok_or_else(|| {
+            Error::NonRetryable("Assistant response does not contain a tool call".to_string())
+        })?;
+        self.execute_tool_call(tool_call).await
     }
 
     /// Get accumulated raw response
@@ -672,36 +699,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_tool_call() {
+    async fn test_unregister_tool_removes_registration() {
         let runtime = Runtime::new();
 
-        let tool_call = serde_json::json!({
-            "_tool_name": "test_tool",
-            "arg1": "value1"
-        });
+        let tool_fn = ToolFunction::Sync(Box::new(|_args| Ok("result".to_string())));
+        runtime
+            .register_tool("test_tool", tool_fn, Some("TestType".to_string()))
+            .await
+            .unwrap();
 
-        assert!(runtime.is_tool_call(&tool_call));
+        let removed = runtime.unregister_tool("test_tool").await;
+        assert!(removed);
 
-        let not_tool_call = serde_json::json!({
-            "result": "value"
-        });
+        let tools = runtime.tools.read().await;
+        assert!(!tools.contains_key("test_tool"));
+        drop(tools);
 
-        assert!(!runtime.is_tool_call(&not_tool_call));
+        let tool_types = runtime.tool_types.read().await;
+        assert!(!tool_types.contains_key("test_tool"));
+        drop(tool_types);
+
+        let tool_schemas = runtime.tool_schemas.read().await;
+        assert!(!tool_schemas.contains_key("test_tool"));
     }
 
     #[tokio::test]
-    async fn test_get_tool_name() {
+    async fn test_unregister_typed_tool_allows_reregister() {
+        use futures::future::BoxFuture;
+
         let runtime = Runtime::new();
 
-        let tool_call = serde_json::json!({
-            "_tool_name": "my_tool",
-            "arg1": "value1"
-        });
+        runtime
+            .tool::<WeatherQuery, _>(
+                |_query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move { Ok("Sunny".to_string()) })
+                },
+                Some("get_weather"),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(
-            runtime.get_tool_name(&tool_call),
-            Some("my_tool".to_string())
-        );
+        let removed = runtime.unregister_tool("get_weather").await;
+        assert!(removed);
+
+        let constructors = runtime.tool_constructors.read().await;
+        assert!(!constructors.contains_key("get_weather"));
+        drop(constructors);
+
+        runtime
+            .tool::<WeatherQuery, _>(
+                |_query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move { Ok("Rainy".to_string()) })
+                },
+                Some("get_weather"),
+            )
+            .await
+            .unwrap();
+
+        let tool_call = crate::types::ToolCall::new("get_weather", serde_json::json!({
+            "location": "Paris"
+        }));
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
+        assert_eq!(result, "Rainy");
+    }
+
+    #[tokio::test]
+    async fn test_assistant_response_tool_helpers() {
+        let response = crate::types::AssistantResponse::new(vec![
+            crate::types::ResponsePart::Text {
+                text: "hello".to_string(),
+            },
+            crate::types::ResponsePart::Tool {
+                call: crate::types::ToolCall::new(
+                    "my_tool",
+                    serde_json::json!({ "arg1": "value1" }),
+                ),
+            },
+        ]);
+
+        assert!(response.has_tool_calls());
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_name, "my_tool");
     }
 
     #[tokio::test]
@@ -715,12 +793,11 @@ mod tests {
 
         runtime.register_tool("greet", tool_fn, None).await.unwrap();
 
-        let tool_call = serde_json::json!({
-            "_tool_name": "greet",
+        let tool_call = crate::types::ToolCall::new("greet", serde_json::json!({
             "name": "Alice"
-        });
+        }));
 
-        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "Hello, Alice!");
     }
 
@@ -890,14 +967,13 @@ mod tests {
             .unwrap();
 
         // Simulate a tool call from LLM with JSON args
-        let tool_call = serde_json::json!({
-            "_tool_name": "get_weather",
+        let tool_call = crate::types::ToolCall::new("get_weather", serde_json::json!({
             "location": "Paris",
             "unit": "fahrenheit"
-        });
+        }));
 
         // Execute the tool - it should deserialize JSON -> WeatherQuery -> call handler
-        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "Weather in Paris (fahrenheit): Sunny, 22°");
     }
 
@@ -922,13 +998,12 @@ mod tests {
             .unwrap();
 
         // Tool call with optional field missing
-        let tool_call = serde_json::json!({
-            "_tool_name": "get_weather",
+        let tool_call = crate::types::ToolCall::new("get_weather", serde_json::json!({
             "location": "Tokyo"
             // unit is not provided, should use default
-        });
+        }));
 
-        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "celsius in Tokyo");
     }
 }

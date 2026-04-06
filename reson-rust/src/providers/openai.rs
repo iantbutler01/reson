@@ -17,7 +17,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{Provider, TokenUsage};
+use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
     convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
 };
@@ -75,6 +75,36 @@ impl OAIClient {
             trace_callback: None,
             provider: Provider::OpenAI,
         }
+    }
+
+    fn extract_response(&self, message: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
+
+        if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+            if !content.is_empty() {
+                response.push_output(ResponsePart::Text {
+                    text: content.to_string(),
+                });
+            }
+        }
+
+        if let Some(reasoning) = message.get("reasoning").and_then(|r| r.as_str()) {
+            if !reasoning.is_empty() {
+                response.push_output(ResponsePart::Reasoning {
+                    text: reasoning.to_string(),
+                });
+            }
+        }
+
+        if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array()) {
+            for tool_call in tool_calls {
+                response.push_output(ResponsePart::Tool {
+                    call: ToolCall::from_provider_format(tool_call.clone(), self.provider)?,
+                });
+            }
+        }
+
+        Ok(response)
     }
 
     /// Set reasoning mode (for o-series models)
@@ -311,38 +341,22 @@ impl InferenceClient for OAIClient {
         // Extract message and content
         let choice = &body["choices"][0];
         let message = &choice["message"];
-        let content = message["content"].as_str().unwrap_or("").to_string();
-
-        // Extract reasoning if present
-        let reasoning = message
-            .get("reasoning")
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string());
-
-        // Extract tool calls if present
-        let tool_calls = message
-            .get("tool_calls")
-            .and_then(|tc| tc.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let response = self.extract_response(message)?;
 
         // If tools were provided, return full response for tool extraction
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
             provider_cost_dollars,
-            raw: if has_tools || has_tool_calls {
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(

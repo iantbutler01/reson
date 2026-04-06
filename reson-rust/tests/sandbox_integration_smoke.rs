@@ -1,3 +1,5 @@
+#![cfg(feature = "sandbox")]
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reson_sandbox::{ForkOptions, Sandbox, SandboxConfig, SessionOptions};

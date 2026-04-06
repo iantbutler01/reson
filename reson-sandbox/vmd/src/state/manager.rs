@@ -27,8 +27,9 @@ use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus
 use crate::state::metadata::{load_metadata, save_metadata};
 use crate::state::runtime::VmRuntime;
 use crate::state::types::{
-    CreateVmParams, ForkVmParams, NetworkSpec, SnapshotMetadata, SnapshotRecord, UpdateVmParams,
-    Vm, VmInner, VmMetadata, VmSource, VmSourceType, VmState, new_snapshot_metadata, sanitize_name,
+    CreateVmParams, ForkVmParams, NetworkSpec, SharedMountAvailability, SharedMountContinuity,
+    SharedMountSpec, SnapshotMetadata, SnapshotRecord, UpdateVmParams, Vm, VmInner, VmMetadata,
+    VmSource, VmSourceType, VmState, new_snapshot_metadata, sanitize_name,
 };
 use crate::virt;
 
@@ -284,6 +285,16 @@ impl Manager {
         }
         self.enforce_create_vm_capacity().await?;
         let name = sanitize_name(&params.name);
+        // @dive: Shared mounts are normalized before persistence so mount tags and host paths stay stable across restarts and forks.
+        params.shared_mounts = normalize_shared_mounts(params.shared_mounts)?;
+        ensure_mount_profiles_supported(&params.shared_mounts, &self.cfg.shared_mount_profiles)?;
+        info!(
+            name = %name,
+            source = %params.source.reference,
+            shared_mount_count = params.shared_mounts.len(),
+            shared_mounts = ?params.shared_mounts,
+            "creating vm with normalized shared mounts"
+        );
 
         let mac = random_mac().map_err(ManagerError::Other)?;
         let requested_arch_str = normalize_arch(&params.architecture)?;
@@ -359,6 +370,7 @@ impl Manager {
             },
             metadata: params.metadata.clone(),
             snapshots: Vec::new(),
+            shared_mounts: params.shared_mounts.clone(),
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: String::new(),
@@ -553,6 +565,7 @@ impl Manager {
             parent_resources,
             parent_source,
             parent_metadata,
+            parent_shared_mounts,
             parent_depth,
         ) = {
             let inner = parent_vm.lock().await;
@@ -571,6 +584,7 @@ impl Manager {
                 inner.metadata.resources.clone(),
                 inner.metadata.source.clone(),
                 inner.metadata.metadata.clone(),
+                inner.metadata.shared_mounts.clone(),
                 parent_depth,
             )
         };
@@ -647,11 +661,16 @@ impl Manager {
             },
             metadata: child_metadata,
             snapshots: child_restore_snapshot.clone().into_iter().collect(),
+            shared_mounts: parent_shared_mounts,
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: fork_snapshot_name.clone().unwrap_or_default(),
             started_at: None,
         };
+        ensure_mount_profiles_supported(
+            &child_meta.shared_mounts,
+            &self.cfg.shared_mount_profiles,
+        )?;
 
         let parent_before_metadata = {
             let inner = parent_vm.lock().await;
@@ -681,6 +700,12 @@ impl Manager {
                     instance_id: child_id.clone(),
                     hostname: child_meta.name.clone(),
                     arch: parent_arch,
+                    shared_mounts: child_meta
+                        .shared_mounts
+                        .iter()
+                        .cloned()
+                        .map(map_bootstrap_shared_mount)
+                        .collect(),
                 },
             ) {
                 let _ = fs::remove_dir_all(&child_dir);
@@ -814,6 +839,12 @@ impl Manager {
                     instance_id: child_id.clone(),
                     hostname: child_meta.name.clone(),
                     arch: parent_arch,
+                    shared_mounts: child_meta
+                        .shared_mounts
+                        .iter()
+                        .cloned()
+                        .map(map_bootstrap_shared_mount)
+                        .collect(),
                 },
             ) {
                 Self::rollback_stopped_fork_artifacts(
@@ -1607,10 +1638,21 @@ impl Manager {
 
         let bootstrap_path = vm.dir.join("bootstrap.iso");
         debug!(vm_id = %vm_id, path = %bootstrap_path.display(), "writing bootstrap seed image");
+        ensure_mount_profiles_supported(
+            &guard.metadata.shared_mounts,
+            &self.cfg.shared_mount_profiles,
+        )?;
         let cfg = bootstrap::Config {
             instance_id: guard.metadata.id.clone(),
             hostname: guard.metadata.name.clone(),
             arch: arch.to_string(),
+            shared_mounts: guard
+                .metadata
+                .shared_mounts
+                .iter()
+                .cloned()
+                .map(map_bootstrap_shared_mount)
+                .collect(),
         };
         bootstrap::create_iso(&bootstrap_path, cfg).map_err(ManagerError::Other)?;
 
@@ -1685,24 +1727,20 @@ impl Manager {
         reference: &str,
         requested: Option<String>,
     ) -> ManagerResult<(String, String)> {
+        // @dive: Session clients already send a normalized architecture in the common path.
+        // Trusting that explicit contract keeps VM creation off the network-bound manifest probe path.
+        if let Some(req_arch) = requested {
+            let req_arch = normalize_arch(&req_arch)?;
+            return Ok((req_arch.clone(), format!("linux/{req_arch}")));
+        }
+
         let platforms = virt::inspect_image_platforms(&self.cfg.docker_bin, reference)
             .await
             .map_err(ManagerError::Other)?;
-
-        if let Some(req_arch) = requested {
-            if !platform_supports_architecture(&platforms, &req_arch) {
-                return Err(ManagerError::Other(anyhow!(
-                    "image {reference} does not provide linux/{req_arch}"
-                )));
-            }
-            Ok((req_arch.clone(), format!("linux/{req_arch}")))
-        } else {
-            let arch =
-                choose_preferred_architecture(&platforms, &self.host_arch).ok_or_else(|| {
-                    anyhow!("image {reference} does not provide a supported architecture")
-                })?;
-            Ok((arch.clone(), format!("linux/{arch}")))
-        }
+        let arch = choose_preferred_architecture(&platforms, &self.host_arch).ok_or_else(|| {
+            anyhow!("image {reference} does not provide a supported architecture")
+        })?;
+        Ok((arch.clone(), format!("linux/{arch}")))
     }
 
     async fn vm_by_id(&self, id: &str) -> ManagerResult<Arc<Vm>> {
@@ -1932,6 +1970,16 @@ fn build_qemu_args(
     args.push("-pidfile".to_string());
     args.push(pid_path.display().to_string());
 
+    for (index, mount) in meta.shared_mounts.iter().enumerate() {
+        // @dive: Typed shared mounts become explicit QEMU shares so guest bootstrap can mount the same durable tags every boot.
+        args.push("-virtfs".to_string());
+        let readonly = if mount.read_only { ",readonly=on" } else { "" };
+        args.push(format!(
+            "local,id=share{index},path={},security_model=none,multidevs=remap,mount_tag={}{}",
+            mount.host_path, mount.mount_tag, readonly
+        ));
+    }
+
     if let Some(bios) = bios {
         args.push("-bios".to_string());
         args.push(bios);
@@ -1952,6 +2000,169 @@ fn build_qemu_args(
     }
 
     Ok(args)
+}
+
+fn map_bootstrap_shared_mount(mount: SharedMountSpec) -> bootstrap::SharedMount {
+    bootstrap::SharedMount {
+        guest_path: mount.guest_path,
+        mount_tag: mount.mount_tag,
+        read_only: mount.read_only,
+    }
+}
+
+fn normalize_shared_mounts(
+    shared_mounts: Vec<SharedMountSpec>,
+) -> ManagerResult<Vec<SharedMountSpec>> {
+    let mut normalized = Vec::with_capacity(shared_mounts.len());
+    let mut guest_paths = HashSet::new();
+    let mut mount_tags = HashSet::new();
+
+    for (index, mount) in shared_mounts.into_iter().enumerate() {
+        let host_path = mount.host_path.trim();
+        let guest_path = mount.guest_path.trim();
+        if host_path.is_empty() {
+            return Err(ManagerError::Other(anyhow!(
+                "shared mount host_path is required"
+            )));
+        }
+        if guest_path.is_empty() {
+            return Err(ManagerError::Other(anyhow!(
+                "shared mount guest_path is required"
+            )));
+        }
+        if !guest_path.starts_with('/') {
+            return Err(ManagerError::Other(anyhow!(
+                "shared mount guest_path must be absolute: {}",
+                guest_path
+            )));
+        }
+
+        let canonical_host = fs::canonicalize(host_path)
+            .with_context(|| format!("canonicalize shared mount host path {}", host_path))
+            .map_err(ManagerError::Other)?;
+        let guest_path = guest_path.to_string();
+        if !guest_paths.insert(guest_path.clone()) {
+            return Err(ManagerError::Other(anyhow!(
+                "duplicate shared mount guest_path {}",
+                guest_path
+            )));
+        }
+
+        let mount_tag = normalize_mount_tag(mount.mount_tag.as_str(), index);
+        if !mount_tags.insert(mount_tag.clone()) {
+            return Err(ManagerError::Other(anyhow!(
+                "duplicate shared mount mount_tag {}",
+                mount_tag
+            )));
+        }
+
+        let availability = normalize_mount_availability(mount.availability);
+        let continuity = normalize_mount_continuity(mount.continuity, &availability)?;
+        let backend_profile = normalize_mount_backend_profile(mount.backend_profile.as_str());
+        if matches!(availability, SharedMountAvailability::SharedStorage)
+            && backend_profile.is_empty()
+        {
+            return Err(ManagerError::Other(anyhow!(
+                "shared-storage mount {} requires a non-empty backend_profile",
+                mount_tag
+            )));
+        }
+
+        normalized.push(SharedMountSpec {
+            host_path: canonical_host.to_string_lossy().to_string(),
+            guest_path,
+            mount_tag,
+            read_only: mount.read_only,
+            availability,
+            continuity,
+            backend_profile,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_mount_availability(raw: SharedMountAvailability) -> SharedMountAvailability {
+    match raw {
+        SharedMountAvailability::SharedStorage => SharedMountAvailability::SharedStorage,
+        SharedMountAvailability::NodeLocal => SharedMountAvailability::NodeLocal,
+    }
+}
+
+fn normalize_mount_continuity(
+    raw: SharedMountContinuity,
+    availability: &SharedMountAvailability,
+) -> ManagerResult<SharedMountContinuity> {
+    // @dive: Shared-storage mounts may opt into same-node restarts or cross-node restore, but
+    // node-local mounts must never claim cross-node continuity because VMD cannot satisfy that
+    // contract after failover.
+    match (raw, availability) {
+        (SharedMountContinuity::RestoreCrossNode, SharedMountAvailability::NodeLocal) => {
+            Err(ManagerError::Other(anyhow!(
+                "node-local shared mounts cannot declare cross-node restore continuity"
+            )))
+        }
+        (SharedMountContinuity::RestoreCrossNode, SharedMountAvailability::SharedStorage) => {
+            Ok(SharedMountContinuity::RestoreCrossNode)
+        }
+        (SharedMountContinuity::RestartSameNode, SharedMountAvailability::SharedStorage) => {
+            Ok(SharedMountContinuity::RestartSameNode)
+        }
+        (SharedMountContinuity::RestartSameNode, SharedMountAvailability::NodeLocal) => {
+            Ok(SharedMountContinuity::RestartSameNode)
+        }
+    }
+}
+
+fn normalize_mount_tag(raw: &str, index: usize) -> String {
+    let trimmed = raw.trim();
+    let candidate = if trimmed.is_empty() {
+        format!("share{index}")
+    } else {
+        trimmed.to_string()
+    };
+    candidate
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn normalize_mount_backend_profile(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn ensure_mount_profiles_supported(
+    shared_mounts: &[SharedMountSpec],
+    supported_profiles: &[String],
+) -> ManagerResult<()> {
+    let supported = supported_profiles
+        .iter()
+        .map(|value| normalize_mount_backend_profile(value))
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>();
+
+    for mount in shared_mounts {
+        if !matches!(mount.availability, SharedMountAvailability::SharedStorage) {
+            continue;
+        }
+        if supported.contains(&mount.backend_profile) {
+            continue;
+        }
+        return Err(ManagerError::Other(anyhow!(
+            "shared mount `{}` requires backend_profile `{}` but this node only supports {:?}",
+            mount.mount_tag,
+            mount.backend_profile,
+            supported_profiles
+        )));
+    }
+
+    Ok(())
 }
 
 async fn mark_vm_state(vm: &Arc<Vm>, state: VmState) {
@@ -2487,6 +2698,7 @@ mod tests {
             max_fork_chain_depth: 32,
             fork_compaction_depth_threshold: 8,
             storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string(), "shared-posix".to_string()],
             ha_mode: false,
             node_registry: None,
             control_bus: None,
@@ -2555,6 +2767,15 @@ mod tests {
             },
             metadata: HashMap::new(),
             snapshots: Vec::new(),
+            shared_mounts: vec![SharedMountSpec {
+                host_path: parent_dir.to_string_lossy().to_string(),
+                guest_path: "/nym".to_string(),
+                mount_tag: "nymfs".to_string(),
+                read_only: false,
+                availability: SharedMountAvailability::SharedStorage,
+                continuity: SharedMountContinuity::RestoreCrossNode,
+                backend_profile: "shared-posix".to_string(),
+            }],
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: String::new(),
@@ -2623,6 +2844,9 @@ mod tests {
                 .map(String::as_str),
             Some("daemon-restart-same-node")
         );
+        assert_eq!(child_after.shared_mounts, parent_after.shared_mounts);
+        assert_eq!(child_after.shared_mounts[0].guest_path, "/nym");
+        assert_eq!(child_after.shared_mounts[0].mount_tag, "nymfs");
 
         let fork_base_path = parent_after
             .metadata
@@ -2691,6 +2915,7 @@ mod tests {
             },
             metadata: HashMap::new(),
             snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: String::new(),
@@ -2711,6 +2936,7 @@ mod tests {
             max_fork_chain_depth: 32,
             fork_compaction_depth_threshold: 8,
             storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string()],
             ha_mode: false,
             node_registry: None,
             control_bus: None,
@@ -2754,6 +2980,7 @@ mod tests {
             max_fork_chain_depth: 32,
             fork_compaction_depth_threshold: 8,
             storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string()],
             ha_mode: false,
             node_registry: None,
             control_bus: None,
@@ -2794,6 +3021,7 @@ mod tests {
             },
             metadata: HashMap::new(),
             snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: String::new(),
@@ -2842,6 +3070,7 @@ mod tests {
             max_fork_chain_depth: 1,
             fork_compaction_depth_threshold: 1,
             storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string()],
             ha_mode: false,
             node_registry: None,
             control_bus: None,
@@ -2882,6 +3111,7 @@ mod tests {
             },
             metadata: HashMap::from([(META_FORK_DEPTH.to_string(), "1".to_string())]),
             snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
             suspended_snapshot: String::new(),
             suspended_boot_snapshot: String::new(),
             boot_snapshot: String::new(),
@@ -2976,5 +3206,194 @@ mod tests {
             vm_dir.as_path(),
             qmp_path.as_path()
         ));
+    }
+
+    #[test]
+    fn build_qemu_args_emits_shared_mounts_as_virtfs() {
+        let meta = VmMetadata {
+            id: "vm-shared-mounts".to_string(),
+            name: "shared".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:09".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: vec![SharedMountSpec {
+                host_path: "/tmp/nymfs".to_string(),
+                guest_path: "/nym".to_string(),
+                mount_tag: "nymfs".to_string(),
+                read_only: true,
+                availability: SharedMountAvailability::SharedStorage,
+                continuity: SharedMountContinuity::RestoreCrossNode,
+                backend_profile: "shared-posix".to_string(),
+            }],
+            suspended_snapshot: String::new(),
+            suspended_boot_snapshot: String::new(),
+            boot_snapshot: String::new(),
+            started_at: None,
+        };
+        let mut port_map = HashMap::new();
+        port_map.insert(3000, 13337);
+
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-shared"),
+            Path::new("/tmp/vm-shared/qmp.sock"),
+            Path::new("/tmp/vm-shared/qemu.pid"),
+            ARCH_AMD64,
+            &port_map,
+        )
+        .expect("build qemu args");
+
+        assert!(args.iter().any(|arg| arg == "-virtfs"));
+        assert!(args.iter().any(|arg| {
+            arg.contains("path=/tmp/nymfs")
+                && arg.contains("mount_tag=nymfs")
+                && arg.contains("readonly=on")
+        }));
+    }
+
+    #[test]
+    fn normalize_shared_mounts_defaults_node_local_restart_same_node() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let host_path = tmp.path().join("shared");
+        fs::create_dir_all(&host_path).expect("create shared dir");
+
+        let normalized = normalize_shared_mounts(vec![SharedMountSpec {
+            host_path: host_path.to_string_lossy().to_string(),
+            guest_path: "/workspace".to_string(),
+            mount_tag: "workspace".to_string(),
+            read_only: false,
+            availability: SharedMountAvailability::NodeLocal,
+            continuity: SharedMountContinuity::RestartSameNode,
+            backend_profile: String::new(),
+        }])
+        .expect("normalize shared mount");
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized[0].availability,
+            SharedMountAvailability::NodeLocal
+        );
+        assert_eq!(
+            normalized[0].continuity,
+            SharedMountContinuity::RestartSameNode
+        );
+    }
+
+    #[test]
+    fn normalize_shared_mounts_rejects_cross_node_node_local_mounts() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let host_path = tmp.path().join("shared");
+        fs::create_dir_all(&host_path).expect("create shared dir");
+
+        let err = normalize_shared_mounts(vec![SharedMountSpec {
+            host_path: host_path.to_string_lossy().to_string(),
+            guest_path: "/workspace".to_string(),
+            mount_tag: "workspace".to_string(),
+            read_only: false,
+            availability: SharedMountAvailability::NodeLocal,
+            continuity: SharedMountContinuity::RestoreCrossNode,
+            backend_profile: String::new(),
+        }])
+        .expect_err("node-local mount should reject cross-node continuity");
+
+        assert!(format!("{err}").contains("node-local shared mounts"));
+    }
+
+    #[test]
+    fn normalize_shared_mounts_rejects_shared_storage_without_backend_profile() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let host_path = tmp.path().join("shared");
+        fs::create_dir_all(&host_path).expect("create shared dir");
+
+        let err = normalize_shared_mounts(vec![SharedMountSpec {
+            host_path: host_path.to_string_lossy().to_string(),
+            guest_path: "/workspace".to_string(),
+            mount_tag: "workspace".to_string(),
+            read_only: false,
+            availability: SharedMountAvailability::SharedStorage,
+            continuity: SharedMountContinuity::RestoreCrossNode,
+            backend_profile: String::new(),
+        }])
+        .expect_err("shared-storage mount should require backend_profile");
+
+        assert!(format!("{err}").contains("backend_profile"));
+    }
+
+    #[tokio::test]
+    async fn resolve_docker_platform_uses_requested_arch_without_docker_probe() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
+
+        let fake_docker = tmp.path().join("docker");
+        fs::write(
+            &fake_docker,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.log\"\nexit 97\n",
+        )
+        .expect("write fake docker");
+        let mut perms = fs::metadata(&fake_docker)
+            .expect("stat fake docker")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&fake_docker, perms).expect("chmod fake docker");
+
+        let manager = Manager {
+            cfg: Config {
+                listen_address: "127.0.0.1:0".to_string(),
+                data_dir: data_dir.to_string_lossy().to_string(),
+                qemu_bin: "qemu-system-x86_64".to_string(),
+                qemu_arm64_bin: "qemu-system-aarch64".to_string(),
+                qemu_img_bin: "qemu-img".to_string(),
+                docker_bin: fake_docker.to_string_lossy().to_string(),
+                log_level: "info".to_string(),
+                force_local_build: false,
+                max_active_vms: None,
+                max_fork_chain_depth: 8,
+                fork_compaction_depth_threshold: 8,
+                storage_profile: config::StorageProfile::LocalEphemeral,
+                shared_mount_profiles: vec!["local-path".to_string()],
+                ha_mode: false,
+                node_registry: None,
+                control_bus: None,
+                security: Default::default(),
+            },
+            host_arch: ARCH_ARM64.to_string(),
+            vms: RwLock::new(HashMap::new()),
+            snapshots: RwLock::new(HashMap::new()),
+        };
+
+        let (arch, platform) = manager
+            .resolve_docker_platform("example/image:latest", Some("arm64".to_string()))
+            .await
+            .expect("requested arch should bypass docker probing");
+
+        assert_eq!(arch, "arm64");
+        assert_eq!(platform, "linux/arm64");
+        assert!(
+            !fake_docker.with_extension("log").exists(),
+            "explicit architecture should not invoke docker manifest/pull probes"
+        );
     }
 }
