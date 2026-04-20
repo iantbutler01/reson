@@ -240,9 +240,7 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
             ));
         }
 
-        history.push(reson_agentic::utils::ConversationMessage::AssistantResponse(
-            result.clone(),
-        ));
+        history.push(reson_agentic::utils::ConversationMessage::AssistantResponse(result.clone()));
 
         for tool_call in tool_calls {
             println!("🔧 Native turn {}: {}", turn_count, tool_call.tool_name);

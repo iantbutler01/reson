@@ -791,9 +791,7 @@ impl GoogleGenAIClient {
                         {
                             call.signature = Some(signature.to_string());
                         }
-                        response.push_output(ResponsePart::Tool {
-                            call,
-                        });
+                        response.push_output(ResponsePart::Tool { call });
                         if let Some(signature) =
                             part.get("thoughtSignature").and_then(|v| v.as_str())
                         {

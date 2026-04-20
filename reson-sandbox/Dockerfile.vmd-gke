@@ -1,0 +1,60 @@
+ARG D2VM_SOURCE_IMAGE=us-west1-docker.pkg.dev/grounded-being-490907-r4/reson/d2vm:ghcr-private-amd64
+
+FROM rust:1.90-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    build-essential \
+    clang \
+    cmake \
+    git \
+    libssl-dev \
+    make \
+    protobuf-compiler \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY vmd ./vmd
+COPY proto ./proto
+COPY portproxy/bin ./portproxy/bin
+
+WORKDIR /src/vmd
+RUN cargo build --release --bin vmd
+
+FROM --platform=linux/amd64 ${D2VM_SOURCE_IMAGE} AS d2vm
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    cryptsetup-bin \
+    docker.io \
+    dosfstools \
+    e2fsprogs \
+    extlinux \
+    fdisk \
+    iproute2 \
+    iptables \
+    kpartx \
+    parted \
+    qemu-efi-aarch64 \
+    qemu-system-arm \
+    qemu-system-x86 \
+    qemu-utils \
+    util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=d2vm /usr/local/bin/d2vm /usr/local/bin/d2vm
+COPY --from=builder /src/vmd/target/release/vmd /usr/local/bin/vmd
+COPY portproxy/bin/portproxy-linux-amd64 /opt/reson/portproxy/bin/portproxy-linux-amd64
+COPY portproxy/bin/portproxy-linux-arm64 /opt/reson/portproxy/bin/portproxy-linux-arm64
+
+RUN chmod +x /usr/local/bin/vmd \
+    /opt/reson/portproxy/bin/portproxy-linux-amd64 \
+    /opt/reson/portproxy/bin/portproxy-linux-arm64
+
+ENTRYPOINT ["vmd"]

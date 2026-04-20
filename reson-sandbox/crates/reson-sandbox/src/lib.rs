@@ -191,6 +191,7 @@ impl WarmPoolProfile {
 pub struct SandboxConfig {
     pub endpoint: String,
     pub control_gateway_endpoints: Vec<String>,
+    pub endpoint_overrides: HashMap<String, String>,
     pub auto_spawn: bool,
     pub daemon_listen: String,
     pub daemon_bin: Option<PathBuf>,
@@ -215,6 +216,7 @@ impl Default for SandboxConfig {
         Self {
             endpoint: "http://127.0.0.1:8052".to_string(),
             control_gateway_endpoints: Vec::new(),
+            endpoint_overrides: HashMap::new(),
             auto_spawn: true,
             daemon_listen: "127.0.0.1:8052".to_string(),
             daemon_bin: None,
@@ -226,7 +228,7 @@ impl Default for SandboxConfig {
                 .unwrap_or_else(|_| "ghcr.io/bracketdevelopers/uv-builder:main".to_string()),
             default_architecture: None,
             default_resources: ResourceLimits::default(),
-            default_shell: "bash".to_string(),
+            default_shell: "/bin/sh".to_string(),
             portproxy_client_bin: None,
             warm_pool_profiles: Vec::new(),
             prewarm_on_start: true,
@@ -297,6 +299,8 @@ pub struct SharedMount {
     pub availability: SharedMountAvailability,
     pub continuity: SharedMountContinuity,
     pub backend_profile: String,
+    pub vfs_endpoint: String,
+    pub vfs_scope_path: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -686,6 +690,12 @@ impl Session {
         &self.vm_id
     }
 
+    // @dive: Exposes the currently resolved owner endpoint so higher-level integrations can
+    // persist the real routed node instead of pinning follow-up control-plane calls to a gateway.
+    pub async fn resolved_endpoint(&self) -> Result<String> {
+        self.resolve_session_endpoint().await
+    }
+
     async fn ownership_fence(&self) -> Option<String> {
         self.ownership_fence.lock().await.clone()
     }
@@ -741,7 +751,11 @@ impl Session {
             .await?;
         self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
             .await;
-        rpc_endpoint(&resolved_endpoint, rpc_port)
+        rpc_endpoint(
+            &self.sandbox.inner.cfg.endpoint_overrides,
+            &resolved_endpoint,
+            rpc_port,
+        )
     }
 
     async fn invalidate_exec_transport_path(&self, endpoint: &str) {
@@ -1185,17 +1199,34 @@ impl Session {
         let target_node_id = self
             .resolve_distributed_exec_target(control, endpoint.as_str())
             .await?;
-        let initial_state = self
+        let initial_state = match self
             .begin_distributed_exec_stream(DistributedExecStartParams {
                 command,
                 opts: &opts,
                 control,
-                endpoint,
-                target_node_id,
+                endpoint: endpoint.clone(),
+                target_node_id: target_node_id.clone(),
                 start_wait,
                 idle_timeout,
             })
-            .await?;
+            .await
+        {
+            Ok(state) => state,
+            Err(SandboxError::DaemonUnavailable(message))
+                if message.contains("distributed exec stream did not become ready") =>
+            {
+                return self
+                    .exec_via_control_plane_run_fallback(
+                        command,
+                        opts,
+                        control,
+                        endpoint,
+                        target_node_id,
+                    )
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
 
         let (input_tx, mut input_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(128);
@@ -1549,6 +1580,97 @@ impl Session {
         })
     }
 
+    #[cfg(feature = "distributed-control")]
+    async fn exec_via_control_plane_run_fallback(
+        &self,
+        command: &str,
+        opts: ExecOptions,
+        control: &distributed::DistributedControlPlane,
+        endpoint: String,
+        target_node_id: String,
+    ) -> Result<ExecHandle> {
+        let timeout_secs = opts.timeout_secs.unwrap_or(30).max(1);
+        let shell = opts
+            .shell
+            .clone()
+            .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
+        let command_id = control
+            .publish_command(
+                "exec.run",
+                format!("exec-run:{}", Uuid::new_v4()).as_str(),
+                json!({
+                    "session_id": self.session_id.as_str(),
+                    "vm_id": self.vm_id.as_str(),
+                    "endpoint": endpoint.as_str(),
+                    "target_node_id": target_node_id.as_str(),
+                    "command": command,
+                    "env": opts.env.clone(),
+                    "detach": opts.detach,
+                    "shell": shell,
+                    "timeout_secs": timeout_secs,
+                }),
+            )
+            .await?;
+
+        let wait_timeout = self.sandbox.inner.cfg.connect_timeout + Duration::from_secs(15);
+        let control_for_task = control.clone();
+        let (input_tx, mut input_rx) = mpsc::channel(64);
+        let (event_tx, event_rx) = mpsc::channel(128);
+        tokio::spawn(async move {
+            while let Some(input) = input_rx.recv().await {
+                match input {
+                    ExecInput::Eof => break,
+                    ExecInput::Data(_) | ExecInput::Signal(_) | ExecInput::Resize { .. } => {}
+                }
+            }
+
+            match control_for_task
+                .wait_for_exec_result(command_id.as_str(), wait_timeout)
+                .await
+            {
+                Ok(result) => {
+                    if !result.stdout.is_empty() {
+                        let _ = event_tx
+                            .send(Ok(ExecEvent::Stdout(result.stdout.into_bytes())))
+                            .await;
+                    }
+                    if !result.stderr.is_empty() {
+                        let _ = event_tx
+                            .send(Ok(ExecEvent::Stderr(result.stderr.into_bytes())))
+                            .await;
+                    }
+                    if let Some(error) = result.error {
+                        let _ = event_tx
+                            .send(Err(SandboxError::DaemonUnavailable(error)))
+                            .await;
+                        return;
+                    }
+                    if result.timed_out {
+                        let _ = event_tx.send(Ok(ExecEvent::Timeout)).await;
+                        return;
+                    }
+                    if let Some(code) = result.exit_code {
+                        let _ = event_tx.send(Ok(ExecEvent::Exit(code))).await;
+                    } else {
+                        let _ = event_tx
+                            .send(Err(SandboxError::InvalidResponse(
+                                "distributed exec.run result missing exit code".to_string(),
+                            )))
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    let _ = event_tx.send(Err(err)).await;
+                }
+            }
+        });
+
+        Ok(ExecHandle {
+            input: input_tx,
+            events: Box::pin(ReceiverStream::new(event_rx)),
+        })
+    }
+
     pub async fn shell(&self, opts: ShellOptions) -> Result<ShellHandle> {
         let started = Instant::now();
         let endpoint = self.ensure_session_rpc_endpoint().await?;
@@ -1735,7 +1857,11 @@ impl Session {
                 "VM reported zero proxy port for forwarding".into(),
             ));
         }
-        let proxy_addr = portproxy_server_addr(&node_endpoint, proxy_port)?;
+        let proxy_addr = portproxy_server_addr(
+            &self.sandbox.inner.cfg.endpoint_overrides,
+            &node_endpoint,
+            proxy_port,
+        )?;
         let multiplexer = self
             .sandbox
             .node_multiplexer_for_endpoint(&node_endpoint)
@@ -2082,6 +2208,8 @@ impl Sandbox {
                     availability: shared_mount_availability_proto(&mount.availability),
                     continuity: shared_mount_continuity_proto(&mount.continuity),
                     backend_profile: normalize_mount_backend_profile(&mount.backend_profile),
+                    vfs_endpoint: mount.vfs_endpoint,
+                    vfs_scope_path: mount.vfs_scope_path,
                 })
                 .collect(),
         };
@@ -2124,7 +2252,11 @@ impl Sandbox {
         let mut final_vm: Option<Vm> = None;
         while let Some(update) = stream.message().await? {
             if let Some(proto::vmd::v1::create_vm_stream_response::Event::Vm(vm)) = update.event {
+                // Some daemon builds keep the create stream open after emitting the terminal VM
+                // payload. Once we have that payload, waiting for EOF adds no value and can hang
+                // session creation indefinitely.
                 final_vm = Some(vm);
+                break;
             }
         }
 
@@ -2213,6 +2345,13 @@ impl Sandbox {
         let _ = self
             .restore_execution_state_if_needed(session_id, &vm.id, &node_endpoint, &vm, false)
             .await?;
+        #[cfg(feature = "distributed-control")]
+        if !matches!(&self.inner.control_backend, ControlBackend::Distributed(_)) {
+            let _ = self
+                .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
+                .await?;
+        }
+        #[cfg(not(feature = "distributed-control"))]
         let _ = self
             .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
             .await?;
@@ -2239,6 +2378,31 @@ impl Sandbox {
         };
         log_slo_observation("session.attach", started.elapsed(), "ok");
         Ok(session)
+    }
+
+    pub async fn discard_session_by_id(&self, session_id: &str) -> Result<()> {
+        let expected_fence = self.current_session_fence(session_id).await?;
+        if let Some((vm, node_endpoint)) = self.find_vm_by_session_id(session_id).await? {
+            return self
+                .discard_vm(
+                    &vm.id,
+                    &node_endpoint,
+                    Some(session_id),
+                    expected_fence.as_deref(),
+                )
+                .await;
+        }
+
+        #[cfg(feature = "distributed-control")]
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend
+            && let Some(route) = control.get_session_route(session_id).await?
+        {
+            return self
+                .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
+                .await;
+        }
+
+        Ok(())
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
@@ -2306,6 +2470,7 @@ impl Sandbox {
         endpoint_raw: &str,
     ) -> Result<VmdServiceClient<tonic::transport::Channel>> {
         let endpoint_raw = normalize_endpoint(endpoint_raw)?;
+        let endpoint_raw = self.rewrite_endpoint(&endpoint_raw)?;
         let mut endpoint = Endpoint::from_shared(endpoint_raw.clone())
             .map_err(|err| SandboxError::InvalidEndpoint(err.to_string()))?
             .connect_timeout(self.inner.cfg.connect_timeout)
@@ -2316,6 +2481,14 @@ impl Sandbox {
                 .map_err(|err| SandboxError::InvalidConfig(err.to_string()))?;
         }
         Ok(VmdServiceClient::connect(endpoint).await?)
+    }
+
+    fn rewrite_endpoint(&self, endpoint: &str) -> Result<String> {
+        let normalized = normalize_endpoint(endpoint)?;
+        if let Some(override_endpoint) = self.inner.cfg.endpoint_overrides.get(&normalized) {
+            return normalize_endpoint(override_endpoint);
+        }
+        Ok(normalized)
     }
 
     async fn ensure_daemon_ready(&self) -> Result<()> {
@@ -3309,7 +3482,8 @@ impl Sandbox {
             ready.get(&cache_key).copied() == Some(rpc_port)
         };
         if cached_ready {
-            let probe_endpoint = rpc_endpoint(endpoint, rpc_port)?;
+            let probe_endpoint =
+                rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?;
             // @dive: Cached readiness must be validated with a full probe RPC so broken streams after failover don't loop on stale cache.
             if probe_shell_exec_ready(probe_endpoint.as_str(), self.inner.cfg.connect_timeout).await
             {
@@ -3320,7 +3494,7 @@ impl Sandbox {
             ready.remove(&cache_key);
         }
 
-        let endpoint = rpc_endpoint(endpoint, rpc_port)?;
+        let endpoint = rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?;
         let start = Instant::now();
         let mut consecutive_successes = 0u8;
 
@@ -3351,7 +3525,7 @@ impl Sandbox {
         endpoint: &str,
     ) -> Result<PortProxyClient<tonic::transport::Channel>> {
         let rpc_port = self.ensure_vm_and_get_rpc_port(vm_id, endpoint).await?;
-        let endpoint = rpc_endpoint(endpoint, rpc_port)?;
+        let endpoint = rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?;
         Ok(PortProxyClient::connect(endpoint).await?)
     }
 
@@ -3405,7 +3579,7 @@ async fn probe_shell_exec_ready(endpoint: &str, establish_timeout: Duration) -> 
     if req_tx
         .send(ExecRequest {
             request: Some(exec_request::Request::Start(ExecStart {
-                args: vec!["sh".to_string(), "-lc".to_string(), "true".to_string()],
+                args: vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()],
                 env: HashMap::new(),
                 detach: false,
                 timeout: Some(5),
@@ -3431,27 +3605,33 @@ async fn probe_shell_exec_ready(endpoint: &str, establish_timeout: Duration) -> 
 
     match exec_result {
         Ok(response) => {
-            let mut stream = response.into_inner();
-            let mut saw_any_frame = false;
-            let mut saw_exit_code = false;
+            let probe_read = async {
+                let mut stream = response.into_inner();
+                let mut saw_any_frame = false;
+                let mut saw_exit_code = false;
 
-            while let Some(frame) = stream.message().await.transpose() {
-                match frame {
-                    Ok(ExecResponse {
-                        response: Some(exec_response::Response::ExitCode(_)),
-                    }) => {
-                        saw_any_frame = true;
-                        saw_exit_code = true;
-                        break;
+                while let Some(frame) = stream.message().await.transpose() {
+                    match frame {
+                        Ok(ExecResponse {
+                            response: Some(exec_response::Response::ExitCode(_)),
+                        }) => {
+                            saw_any_frame = true;
+                            saw_exit_code = true;
+                            break;
+                        }
+                        Ok(_) => {
+                            saw_any_frame = true;
+                        }
+                        Err(_) => return false,
                     }
-                    Ok(_) => {
-                        saw_any_frame = true;
-                    }
-                    Err(_) => return false,
                 }
-            }
 
-            saw_any_frame && saw_exit_code
+                saw_any_frame && saw_exit_code
+            };
+
+            tokio::time::timeout(establish_timeout, probe_read)
+                .await
+                .unwrap_or(false)
         }
         Err(_) => false,
     }
@@ -3500,19 +3680,32 @@ fn normalize_endpoint(raw: &str) -> Result<String> {
     Ok(format!("http://{value}"))
 }
 
-fn portproxy_server_addr(endpoint: &str, proxy_port: u16) -> Result<String> {
-    let host = endpoint_host(endpoint)?;
+fn portproxy_server_addr(
+    endpoint_overrides: &HashMap<String, String>,
+    endpoint: &str,
+    proxy_port: u16,
+) -> Result<String> {
+    let normalized = normalize_endpoint(endpoint)?;
+    let effective = endpoint_overrides
+        .get(&normalized)
+        .map(String::as_str)
+        .unwrap_or(normalized.as_str());
+    let host = endpoint_host(effective)?;
     if host.contains(':') {
         return Ok(format!("[{host}]:{proxy_port}"));
     }
     Ok(format!("{host}:{proxy_port}"))
 }
 
-fn rpc_endpoint(daemon_endpoint: &str, rpc_port: i32) -> Result<String> {
+fn rpc_endpoint(
+    endpoint_overrides: &HashMap<String, String>,
+    daemon_endpoint: &str,
+    rpc_port: i32,
+) -> Result<String> {
     let proxy_port = u16::try_from(rpc_port).map_err(|_| {
         SandboxError::InvalidResponse(format!("invalid rpc port from vm metadata: {rpc_port}"))
     })?;
-    let addr = portproxy_server_addr(daemon_endpoint, proxy_port)?;
+    let addr = portproxy_server_addr(endpoint_overrides, daemon_endpoint, proxy_port)?;
     Ok(format!("http://{addr}"))
 }
 
@@ -3751,6 +3944,8 @@ fn validate_vm_mount_contract(session_id: &str, vm: &Vm) -> Result<()> {
                 availability,
                 continuity,
                 backend_profile: mount.backend_profile.clone(),
+                vfs_endpoint: mount.vfs_endpoint.clone(),
+                vfs_scope_path: mount.vfs_scope_path.clone(),
             }
         })
         .collect::<Vec<_>>();
@@ -3877,25 +4072,28 @@ mod tests {
 
     #[test]
     fn portproxy_server_addr_uses_endpoint_host() {
-        let value = portproxy_server_addr("http://sandbox-node.internal:18072", 3001)
+        let overrides = HashMap::new();
+        let value = portproxy_server_addr(&overrides, "http://sandbox-node.internal:18072", 3001)
             .expect("address should derive host");
         assert_eq!(value, "sandbox-node.internal:3001");
     }
 
     #[test]
     fn portproxy_server_addr_rewrites_unspecified_hosts_for_local_dial() {
-        let v4 = portproxy_server_addr("http://0.0.0.0:18072", 3001)
+        let overrides = HashMap::new();
+        let v4 = portproxy_server_addr(&overrides, "http://0.0.0.0:18072", 3001)
             .expect("v4 unspecified host should normalize");
         assert_eq!(v4, "127.0.0.1:3001");
 
-        let v6 = portproxy_server_addr("http://[::]:18072", 3001)
+        let v6 = portproxy_server_addr(&overrides, "http://[::]:18072", 3001)
             .expect("v6 unspecified host should normalize");
         assert_eq!(v6, "[::1]:3001");
     }
 
     #[test]
     fn portproxy_server_addr_supports_ipv6_endpoints() {
-        let value = portproxy_server_addr("http://[2001:db8::42]:18072", 3001)
+        let overrides = HashMap::new();
+        let value = portproxy_server_addr(&overrides, "http://[2001:db8::42]:18072", 3001)
             .expect("ipv6 host should preserve brackets");
         assert_eq!(value, "[2001:db8::42]:3001");
     }

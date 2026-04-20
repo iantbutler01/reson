@@ -27,6 +27,26 @@ struct Args {
     #[arg(long)]
     docker_bin: Option<String>,
     #[arg(long)]
+    qemu_run_as_uid: Option<u32>,
+    #[arg(long)]
+    qemu_run_as_gid: Option<u32>,
+    #[arg(long)]
+    guest_dns_server: Option<String>,
+    #[arg(long)]
+    guest_http_proxy_guest_addr: Option<String>,
+    #[arg(long)]
+    guest_http_proxy_upstream_addr: Option<String>,
+    #[arg(long)]
+    envoy_bin: Option<String>,
+    #[arg(long)]
+    envoy_log_level: Option<String>,
+    #[arg(long)]
+    envoy_admin_addr: Option<String>,
+    #[arg(long)]
+    coredns_bin: Option<String>,
+    #[arg(long)]
+    coredns_bind_addr: Option<String>,
+    #[arg(long)]
     log_level: Option<String>,
     /// Skip checking S3 for prebuilt VM images and always build locally
     #[arg(long)]
@@ -166,6 +186,36 @@ async fn main() -> Result<()> {
     }
     if let Some(docker) = args.docker_bin {
         cfg.docker_bin = docker;
+    }
+    if let Some(uid) = args.qemu_run_as_uid {
+        cfg.qemu_process.run_as_uid = uid;
+    }
+    if let Some(gid) = args.qemu_run_as_gid {
+        cfg.qemu_process.run_as_gid = gid;
+    }
+    if let Some(guest_dns_server) = args.guest_dns_server {
+        cfg.guest_network.dns_server = Some(guest_dns_server);
+    }
+    if let Some(guest_addr) = args.guest_http_proxy_guest_addr {
+        cfg.guest_network.http_proxy_guest_addr = Some(guest_addr);
+    }
+    if let Some(upstream_addr) = args.guest_http_proxy_upstream_addr {
+        cfg.guest_network.http_proxy_upstream_addr = Some(upstream_addr);
+    }
+    if let Some(envoy_bin) = args.envoy_bin {
+        cfg.network_services.envoy_bin = envoy_bin;
+    }
+    if let Some(envoy_log_level) = args.envoy_log_level {
+        cfg.network_services.envoy_log_level = envoy_log_level;
+    }
+    if let Some(envoy_admin_addr) = args.envoy_admin_addr {
+        cfg.network_services.envoy_admin_addr = envoy_admin_addr;
+    }
+    if let Some(coredns_bin) = args.coredns_bin {
+        cfg.network_services.coredns_bin = coredns_bin;
+    }
+    if let Some(coredns_bind_addr) = args.coredns_bind_addr {
+        cfg.network_services.coredns_bind_addr = coredns_bind_addr;
     }
     if let Some(level) = args.log_level {
         cfg.log_level = level;

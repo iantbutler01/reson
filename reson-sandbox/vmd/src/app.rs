@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::config::{Config, TlsServerConfig};
 use crate::image::{self, PrebuiltImageStatus};
+use crate::network;
 use crate::partition::{self, PartitionGate, PartitionPolicyConfig};
 use crate::proto::v1::{
     CreateSnapshotRequest, CreateVmPhase, CreateVmProgress, CreateVmRequest,
@@ -45,7 +46,7 @@ use crate::state::{
 };
 use crate::{
     config::{ControlBusConfig, NodeRegistryConfig},
-    control_bus, reconcile, registry, virt,
+    control_bus, public_ingress, reconcile, registry, virt,
 };
 
 pub async fn run_server(config: Config) -> Result<()> {
@@ -55,6 +56,12 @@ pub async fn run_server(config: Config) -> Result<()> {
         .with_context(|| format!("parse listen address {}", config.listen_address))?;
 
     let manager = Arc::new(Manager::new(config.clone()).await.map_err(|e| anyhow!(e))?);
+    let network_handle = network::start(&config)
+        .await
+        .context("start network services")?;
+    let public_ingress_handle = public_ingress::start(&config, Arc::clone(&manager))
+        .await
+        .context("start public ingress server")?;
     let partition_handle =
         start_partition_monitor(config.node_registry.as_ref(), config.control_bus.as_ref()).await?;
     let partition_gate = partition_handle.as_ref().map(|handle| handle.gate());
@@ -156,6 +163,12 @@ pub async fn run_server(config: Config) -> Result<()> {
         handle.shutdown().await;
     }
     if let Some(handle) = partition_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = network_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = public_ingress_handle {
         handle.shutdown().await;
     }
 
@@ -548,6 +561,8 @@ impl VmdService for GrpcService {
                     guest_path: mount.guest_path,
                     mount_tag: mount.mount_tag,
                     read_only: mount.read_only,
+                    vfs_endpoint: mount.vfs_endpoint,
+                    vfs_scope_path: mount.vfs_scope_path,
                 })
                 .collect(),
         };
@@ -1256,6 +1271,8 @@ fn build_vm(
                     }
                 },
                 backend_profile: mount.backend_profile.clone(),
+                vfs_endpoint: mount.vfs_endpoint.clone(),
+                vfs_scope_path: mount.vfs_scope_path.clone(),
             })
             .collect(),
     };

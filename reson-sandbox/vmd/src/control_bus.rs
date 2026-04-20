@@ -395,7 +395,7 @@ pub async fn start_with_trigger(
                                     message,
                                     &config,
                                     &node_id,
-                                    manager.as_ref(),
+                                    &manager,
                                     dedupe_store.as_ref(),
                                     fence_store.as_ref(),
                                     partition_gate.as_ref(),
@@ -568,7 +568,7 @@ async fn process_command_message(
     message: jetstream::Message,
     config: &ControlBusConfig,
     node_id: &str,
-    manager: &Manager,
+    manager: &std::sync::Arc<Manager>,
     dedupe_store: Option<&EtcdDedupeStore>,
     fence_store: Option<&EtcdOwnershipFenceStore>,
     partition_gate: Option<&PartitionGate>,
@@ -578,6 +578,7 @@ async fn process_command_message(
     jetstream: &jetstream::Context,
     dedupe_ttl: Duration,
 ) {
+    let dispatch_start = tokio::time::Instant::now();
     let parsed = serde_json::from_slice::<CommandEnvelope>(&message.payload);
     let envelope = match parsed {
         Ok(envelope) => envelope,
@@ -758,6 +759,12 @@ async fn process_command_message(
         ordering_key = %envelope.ordering_key,
         "received control command"
     );
+    info!(
+        command_id = %envelope.command_id,
+        command_type = %envelope.command_type,
+        dispatch_prep_ms = dispatch_start.elapsed().as_millis() as u64,
+        "DISPATCH_PREP dispatcher ready to call handler"
+    );
 
     if envelope.command_type == "reconcile.run" {
         if let Some(tx) = reconcile_trigger {
@@ -771,17 +778,41 @@ async fn process_command_message(
         }
     } else if envelope.command_type == "exec.run" {
         if let Err(err) =
-            handle_exec_run_command(&envelope, config, node_id, manager, jetstream).await
+            handle_exec_run_command(&envelope, config, node_id, manager.as_ref(), jetstream).await
         {
-            handle_failed_command_message(
-                &message,
-                config,
-                node_id,
-                jetstream,
-                "exec_run_failed",
-                &err.to_string(),
-            )
-            .await;
+            let error_text = err.to_string();
+            match publish_exec_run_error_result(&envelope, config, node_id, jetstream, &error_text)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(ack_err) = message.ack().await {
+                        warn!(
+                            node_id = %node_id,
+                            command_id = %envelope.command_id,
+                            err = %ack_err,
+                            "failed to ack exec.run command after publishing error result"
+                        );
+                    }
+                }
+                Err(publish_err) => {
+                    warn!(
+                        node_id = %node_id,
+                        command_id = %envelope.command_id,
+                        exec_error = %error_text,
+                        publish_err = %publish_err,
+                        "failed to publish exec.run error result; falling back to retry handling"
+                    );
+                    handle_failed_command_message(
+                        &message,
+                        config,
+                        node_id,
+                        jetstream,
+                        "exec_run_failed",
+                        &error_text,
+                    )
+                    .await;
+                }
+            }
             return;
         }
     } else if envelope.command_type == "exec.stream.start" {
@@ -863,7 +894,7 @@ async fn handle_exec_run_command(
         .await
         .context("connect shell exec client for exec.run")?;
 
-    let shell = payload.shell.unwrap_or_else(|| "bash".to_string());
+    let shell = payload.shell.unwrap_or_else(|| "/bin/sh".to_string());
     let (req_tx, req_rx) = mpsc::channel(8);
     req_tx
         .send(ExecRequest {
@@ -952,11 +983,53 @@ async fn handle_exec_run_command(
     Ok(())
 }
 
+async fn publish_exec_run_error_result(
+    envelope: &CommandEnvelope,
+    config: &ControlBusConfig,
+    node_id: &str,
+    jetstream: &jetstream::Context,
+    error: &str,
+) -> Result<()> {
+    let payload: ExecRunPayload = serde_json::from_value(envelope.payload.clone())
+        .context("decode exec.run error payload")?;
+    let command_id = if envelope.command_id.trim().is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        envelope.command_id.clone()
+    };
+    let event_subject = format!(
+        "{}.evt.exec.result.{}",
+        config.subject_prefix,
+        sanitize_subject_token(command_id.as_str())
+    );
+    let result = ExecRunResult {
+        command_id,
+        session_id: payload.session_id,
+        vm_id: payload.vm_id,
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: None,
+        timed_out: false,
+        error: Some(error.to_string()),
+        executed_by_node_id: node_id.to_string(),
+        completed_at_unix_ms: unix_millis(),
+    };
+    let bytes = serde_json::to_vec(&result).context("serialize exec.run error result event")?;
+    let publish_ack = jetstream
+        .publish(event_subject, bytes.into())
+        .await
+        .context("publish exec.run error result event")?;
+    publish_ack
+        .await
+        .context("await exec.run error result publish ack")?;
+    Ok(())
+}
+
 async fn handle_exec_stream_start_command(
     envelope: &CommandEnvelope,
     config: &ControlBusConfig,
     node_id: &str,
-    manager: &Manager,
+    manager: &std::sync::Arc<Manager>,
     active_exec_streams: &std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>>,
     jetstream: &jetstream::Context,
 ) -> Result<()> {
@@ -999,6 +1072,9 @@ async fn handle_exec_stream_start_command(
     let vm_id = payload.vm_id.clone();
     let mut sequence = payload.resume_after_event_seq;
 
+    let handler_start = tokio::time::Instant::now();
+    info!(stream_id = %stream_id, command_id = %command_id, vm_id = %payload.vm_id, "STREAMSTART_T1 handler_entry");
+
     {
         let guard = active_exec_streams.lock().await;
         if guard.contains_key(&stream_id) {
@@ -1012,17 +1088,22 @@ async fn handle_exec_stream_start_command(
             return Ok(());
         }
     }
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T2 after_active_streams_check");
 
     let mut vm = manager
         .start_vm(payload.vm_id.as_str())
         .await
         .map_err(|err| anyhow!("ensure vm running for exec.stream.start: {err}"))?;
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T3 after_manager_start_vm");
     let mut vm_metadata = vm.metadata.clone();
     let tier_b_eligible = metadata_tier_b_eligible(&vm_metadata);
     if resume_only && tier_b_eligible {
-        let Some(snapshot_id) =
-            resolve_execution_restore_snapshot_id(manager, payload.vm_id.as_str(), &vm_metadata)
-                .await?
+        let Some(snapshot_id) = resolve_execution_restore_snapshot_id(
+            manager.as_ref(),
+            payload.vm_id.as_str(),
+            &vm_metadata,
+        )
+        .await?
         else {
             // @dive: Tier-B resume cannot rerun commands; missing restore marker is emitted as a terminal stream error.
             sequence = sequence.saturating_add(1);
@@ -1110,12 +1191,17 @@ async fn handle_exec_stream_start_command(
         ));
     }
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
+    info!(stream_id = %stream_id, endpoint = %endpoint, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T4 before_daemon_connect");
     let mut daemon_client = DaemonManagerClient::connect(endpoint.clone())
         .await
         .context("connect daemon manager client for exec.stream.start")?;
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T5 after_daemon_connect");
     let daemon_name = format!("reson-exec-stream-{}", sanitize_subject_token(&stream_id));
     if !resume_only {
-        let shell = payload.shell.clone().unwrap_or_else(|| "bash".to_string());
+        let shell = payload
+            .shell
+            .clone()
+            .unwrap_or_else(|| "/bin/sh".to_string());
         daemon_client
             .exec_daemon(Request::new(ExecDaemonRequest {
                 name: daemon_name.clone(),
@@ -1124,6 +1210,7 @@ async fn handle_exec_stream_start_command(
             }))
             .await
             .context("invoke daemon manager for exec.stream.start")?;
+        info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T6 after_exec_daemon_rpc");
     }
 
     let attach_retry_deadline = if resume_only {
@@ -1132,9 +1219,11 @@ async fn handle_exec_stream_start_command(
         None
     };
     let (response, req_tx) = loop {
+        info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T7 before_attach_connect");
         let mut attach_client = DaemonManagerClient::connect(endpoint.clone())
             .await
             .context("connect daemon manager client for exec.stream attach")?;
+        info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T8 after_attach_connect");
         let (req_tx, req_rx) = mpsc::channel(64);
         req_tx
             .send(AttachDaemonRequest {
@@ -1144,11 +1233,15 @@ async fn handle_exec_stream_start_command(
             })
             .await
             .map_err(|_| anyhow!("enqueue exec.stream attach start request"))?;
+        info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T9 before_attach_daemon_rpc");
         match attach_client
             .attach_daemon(Request::new(ReceiverStream::new(req_rx)))
             .await
         {
-            Ok(response) => break (response, req_tx),
+            Ok(response) => {
+                info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T10 after_attach_daemon_rpc_ok");
+                break (response, req_tx);
+            }
             Err(status) => {
                 if resume_only && status.code() == tonic::Code::NotFound {
                     if let Some(deadline) = attach_retry_deadline {
@@ -1205,28 +1298,54 @@ async fn handle_exec_stream_start_command(
             },
         );
     }
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T11 after_active_streams_insert");
+    // @dive: The tier-B execution-restore snapshot is taken via qemu's `background-snapshot`
+    //        migration capability (see state::manager::create_snapshot → virt::save_vm_background).
+    //        That path installs userfaultfd-WP on guest RAM and streams pages to an external file
+    //        in a worker thread — the guest keeps running throughout, only briefly barriers on
+    //        WP faults. We still spawn the refresh on a tokio task so the "started" event publishes
+    //        immediately, but the task no longer freezes the VM while it runs.
     if tier_b_eligible {
-        match refresh_execution_restore_snapshot_marker(manager, vm_id.as_str(), &vm_metadata).await
-        {
-            Ok((snapshot_id, snapshot_name)) => {
-                info!(
-                    vm_id = %vm_id,
-                    stream_id = %stream_id,
-                    snapshot_id = %snapshot_id,
-                    snapshot_name = %snapshot_name,
-                    "refreshed execution restore snapshot marker for tier-b exec stream"
-                );
+        let manager_for_snapshot = std::sync::Arc::clone(manager);
+        let vm_id_for_snapshot = vm_id.clone();
+        let stream_id_for_snapshot = stream_id.clone();
+        let vm_metadata_for_snapshot = vm_metadata.clone();
+        tokio::spawn(async move {
+            match refresh_execution_restore_snapshot_marker(
+                manager_for_snapshot.as_ref(),
+                vm_id_for_snapshot.as_str(),
+                &vm_metadata_for_snapshot,
+            )
+            .await
+            {
+                Ok(Some((snapshot_id, snapshot_name))) => {
+                    info!(
+                        vm_id = %vm_id_for_snapshot,
+                        stream_id = %stream_id_for_snapshot,
+                        snapshot_id = %snapshot_id,
+                        snapshot_name = %snapshot_name,
+                        "refreshed execution restore snapshot marker for tier-b exec stream (background)"
+                    );
+                }
+                Ok(None) => {
+                    warn!(
+                        vm_id = %vm_id_for_snapshot,
+                        stream_id = %stream_id_for_snapshot,
+                        "background snapshot unsupported on host; disabled tier-b restore-marker enforcement for this vm"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        vm_id = %vm_id_for_snapshot,
+                        stream_id = %stream_id_for_snapshot,
+                        error = %err,
+                        "failed refreshing execution restore snapshot marker for tier-b exec stream (background)"
+                    );
+                }
             }
-            Err(err) => {
-                warn!(
-                    vm_id = %vm_id,
-                    stream_id = %stream_id,
-                    error = %err,
-                    "failed refreshing execution restore snapshot marker for tier-b exec stream"
-                );
-            }
-        }
+        });
     }
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T12 after_refresh_exec_restore");
     info!(
         stream_id = %stream_id,
         command_id = %command_id,
@@ -1237,6 +1356,7 @@ async fn handle_exec_stream_start_command(
     );
 
     sequence = sequence.saturating_add(1);
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T13 before_publish_started_event");
     publish_exec_stream_event(
         config,
         jetstream,
@@ -1261,6 +1381,7 @@ async fn handle_exec_stream_start_command(
         },
     )
     .await?;
+    info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T14 after_publish_started_event_handler_done");
 
     let config = config.clone();
     let node_id = node_id.to_string();
@@ -1936,7 +2057,7 @@ async fn refresh_execution_restore_snapshot_marker(
     manager: &Manager,
     vm_id: &str,
     vm_metadata: &HashMap<String, String>,
-) -> Result<(String, String)> {
+) -> Result<Option<(String, String)>> {
     if let Some(previous_snapshot_id) = vm_metadata
         .get(META_EXEC_RESTORE_SNAPSHOT_ID)
         .map(String::as_str)
@@ -1949,7 +2070,7 @@ async fn refresh_execution_restore_snapshot_marker(
             .await;
     }
 
-    let snapshot = manager
+    let snapshot = match manager
         .create_snapshot(
             vm_id,
             SnapshotParams {
@@ -1958,7 +2079,35 @@ async fn refresh_execution_restore_snapshot_marker(
             },
         )
         .await
-        .map_err(|err| anyhow!("create execution restore snapshot marker failed: {err}"))?;
+    {
+        Ok(snapshot) => snapshot,
+        Err(err) if background_snapshot_unsupported(&err) => {
+            let mut degraded_metadata = vm_metadata.clone();
+            degraded_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_ID);
+            degraded_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_NAME);
+            degraded_metadata.insert(META_TIER_B_ELIGIBLE.to_string(), "false".to_string());
+            manager
+                .update_vm(
+                    vm_id,
+                    UpdateVmParams {
+                        name: None,
+                        metadata: Some(degraded_metadata),
+                    },
+                )
+                .await
+                .map_err(|persist_err| {
+                    anyhow!(
+                        "disable tier-b eligibility after unsupported background snapshot failed: {persist_err}"
+                    )
+                })?;
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(anyhow!(
+                "create execution restore snapshot marker failed: {err}"
+            ));
+        }
+    };
 
     let mut updated_metadata = vm_metadata.clone();
     updated_metadata.insert(
@@ -1980,7 +2129,14 @@ async fn refresh_execution_restore_snapshot_marker(
         .await
         .map_err(|err| anyhow!("persist execution restore snapshot marker failed: {err}"))?;
 
-    Ok((snapshot.id, snapshot.name))
+    Ok(Some((snapshot.id, snapshot.name)))
+}
+
+fn background_snapshot_unsupported(err: &crate::state::ManagerError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("background-snapshot is not supported by host kernel")
+        || message.contains("enable background-snapshot capabilities")
+        || message.contains("userfaultfd")
 }
 
 fn dedupe_key(envelope: &CommandEnvelope) -> String {

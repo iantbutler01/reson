@@ -503,9 +503,9 @@ impl Runtime {
     /// Execute a tool call
     pub async fn execute_tool_call(&self, tool_call: &ToolCall) -> Result<String> {
         let tools = self.tools.read().await;
-        let tool_fn = tools
-            .get(&tool_call.tool_name)
-            .ok_or_else(|| Error::NonRetryable(format!("Tool '{}' not found", tool_call.tool_name)))?;
+        let tool_fn = tools.get(&tool_call.tool_name).ok_or_else(|| {
+            Error::NonRetryable(format!("Tool '{}' not found", tool_call.tool_name))
+        })?;
 
         let args = tool_call.args.clone();
 
@@ -756,9 +756,12 @@ mod tests {
             .await
             .unwrap();
 
-        let tool_call = crate::types::ToolCall::new("get_weather", serde_json::json!({
-            "location": "Paris"
-        }));
+        let tool_call = crate::types::ToolCall::new(
+            "get_weather",
+            serde_json::json!({
+                "location": "Paris"
+            }),
+        );
         let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "Rainy");
     }
@@ -793,9 +796,12 @@ mod tests {
 
         runtime.register_tool("greet", tool_fn, None).await.unwrap();
 
-        let tool_call = crate::types::ToolCall::new("greet", serde_json::json!({
-            "name": "Alice"
-        }));
+        let tool_call = crate::types::ToolCall::new(
+            "greet",
+            serde_json::json!({
+                "name": "Alice"
+            }),
+        );
 
         let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "Hello, Alice!");
@@ -967,10 +973,13 @@ mod tests {
             .unwrap();
 
         // Simulate a tool call from LLM with JSON args
-        let tool_call = crate::types::ToolCall::new("get_weather", serde_json::json!({
-            "location": "Paris",
-            "unit": "fahrenheit"
-        }));
+        let tool_call = crate::types::ToolCall::new(
+            "get_weather",
+            serde_json::json!({
+                "location": "Paris",
+                "unit": "fahrenheit"
+            }),
+        );
 
         // Execute the tool - it should deserialize JSON -> WeatherQuery -> call handler
         let result = runtime.execute_tool_call(&tool_call).await.unwrap();
@@ -998,10 +1007,13 @@ mod tests {
             .unwrap();
 
         // Tool call with optional field missing
-        let tool_call = crate::types::ToolCall::new("get_weather", serde_json::json!({
-            "location": "Tokyo"
-            // unit is not provided, should use default
-        }));
+        let tool_call = crate::types::ToolCall::new(
+            "get_weather",
+            serde_json::json!({
+                "location": "Tokyo"
+                // unit is not provided, should use default
+            }),
+        );
 
         let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "celsius in Tokyo");

@@ -732,9 +732,26 @@ impl DistributedControlPlane {
             updated_at_unix_ms: unix_millis(),
             attempts: 0,
         };
+        let publish_started = tokio::time::Instant::now();
+        tracing::info!(
+            command_type = %command_type,
+            command_id = %outbox.command_id,
+            subject = %outbox.subject,
+            "distributed.publish_command start"
+        );
         self.put_outbox_record(&outbox).await?;
+        let outbox_put_ms = publish_started.elapsed().as_millis() as u64;
         self.publish_outbox_record(&outbox).await?;
+        let publish_done_ms = publish_started.elapsed().as_millis() as u64;
         self.delete_outbox_record(&outbox.command_id).await?;
+        tracing::info!(
+            command_type = %command_type,
+            command_id = %outbox.command_id,
+            outbox_put_ms,
+            nats_publish_ms = publish_done_ms - outbox_put_ms,
+            total_ms = publish_started.elapsed().as_millis() as u64,
+            "distributed.publish_command ok"
+        );
         Ok(command_id)
     }
 
@@ -879,6 +896,7 @@ impl DistributedControlPlane {
         resume_after_event_seq: Option<u64>,
         expect_started_event: bool,
     ) -> Result<ExecStreamSubscription> {
+        let subscribe_started = tokio::time::Instant::now();
         let stream_id = stream_id.trim();
         if stream_id.is_empty() {
             return Err(SandboxError::InvalidResponse(
@@ -906,6 +924,11 @@ impl DistributedControlPlane {
                     "fetch control stream for exec stream subscription failed: {err}"
                 ))
             })?;
+        tracing::info!(
+            stream_id = %stream_id,
+            get_stream_ms = subscribe_started.elapsed().as_millis() as u64,
+            "SUBSCRIBE_T1 get_stream_done"
+        );
         let consumer_name = format!("exec-stream-{}", Uuid::new_v4().simple());
         let consumer = stream
             .create_consumer(pull::Config {
@@ -924,6 +947,12 @@ impl DistributedControlPlane {
                     "create exec stream consumer failed: {err}"
                 ))
             })?;
+        tracing::info!(
+            stream_id = %stream_id,
+            create_consumer_ms = subscribe_started.elapsed().as_millis() as u64,
+            consumer = %consumer_name,
+            "SUBSCRIBE_T2 create_consumer_done"
+        );
         // @dive: Every exec stream uses an isolated ephemeral consumer so ordered stream semantics survive control-plane fan-in without shared cursors.
         let mut messages = consumer.messages().await.map_err(|err| {
             SandboxError::DaemonUnavailable(format!(
@@ -938,6 +967,7 @@ impl DistributedControlPlane {
         let cleanup_consumer_name = consumer_name.clone();
         let stream_id = stream_id.to_string();
         let jetstream = self.jetstream.clone();
+        let subscribe_loop_started = subscribe_started;
         if !expect_started_event {
             if let Some(tx) = started_tx.take() {
                 let _ = tx.send(Ok(()));
@@ -1013,6 +1043,12 @@ impl DistributedControlPlane {
                 }
 
                 if let Some(tx) = started_tx.take() {
+                    tracing::info!(
+                        stream_id = %stream_id,
+                        first_event_kind = %event.kind,
+                        first_event_ms = subscribe_loop_started.elapsed().as_millis() as u64,
+                        "SUBSCRIBE_T3 first_event_received"
+                    );
                     if expect_started_event && event.kind == "error" {
                         let err = SandboxError::DaemonUnavailable(
                             event

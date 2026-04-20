@@ -23,6 +23,7 @@ pub struct Config {
     pub hostname: String,
     pub arch: String,
     pub shared_mounts: Vec<SharedMount>,
+    pub http_proxy_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,9 +45,8 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
 
     let bin = portproxy::binary(cfg.arch.as_str())
         .with_context(|| "bootstrap iso: locate portproxy binary")?;
-    let init = build_init_script(&hostname);
+    let init = build_init_script(&hostname, cfg.http_proxy_url.as_deref());
     let shared_mounts = build_shared_mounts_file(&cfg.shared_mounts);
-
     let entries = vec![
         IsoEntry::new(INIT_SCRIPT_NAME, init.into_bytes()),
         IsoEntry::new(PORTPROXY_NAME, bin),
@@ -63,8 +63,9 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
     write_iso(path.as_ref(), VOLUME_ID, &entries)
 }
 
-fn build_init_script(hostname: &str) -> String {
+fn build_init_script(hostname: &str, http_proxy_url: Option<&str>) -> String {
     let host_value = shell_escape(hostname);
+    let proxy_setup = build_proxy_setup_script(http_proxy_url);
     format!(
         r#"#!/bin/bash
 set -euxo pipefail
@@ -135,6 +136,8 @@ if [ -f "$SCRIPT_DIR/shared-mounts.tsv" ]; then
   install -m 0644 "$SCRIPT_DIR/shared-mounts.tsv" /etc/reson/shared-mounts.tsv
 fi
 
+{proxy_setup}
+
 cat <<'EOF' >/etc/systemd/system/portproxy.service
 [Unit]
 Description=Bracket PortProxy
@@ -186,7 +189,12 @@ log() {{
   printf 'reson-shared-mounts: %s %s\n' "$(date -Iseconds)" "$*" | systemd-cat -t reson-shared-mounts || true
 }}
 
+# @dive: virtio-fs is the preferred host↔guest shared FS transport because virtio-9p
+# blocks qemu migration (see vmd plan notes). The init script tries virtio-fs first
+# and falls back to virtio-9p for dev hosts (e.g., macOS) where the vmd daemon can't
+# spawn virtiofsd and has to emit -virtfs devices instead.
 if command -v modprobe >/dev/null 2>&1; then
+  modprobe virtiofs || true
   modprobe 9pnet_virtio || true
   modprobe 9p || true
 fi
@@ -211,13 +219,17 @@ while IFS=$'\t' read -r TAG GUEST MODE; do
     continue
   fi
 
-  OPTS="trans=virtio,version=9p2000.L,msize=104857600"
+  VFS_OPTS="default_permissions,allow_other"
+  NINEP_OPTS="trans=virtio,version=9p2000.L,msize=104857600"
   if [ "${{MODE:-rw}}" = "ro" ]; then
-    OPTS="$OPTS,ro"
+    VFS_OPTS="$VFS_OPTS,ro"
+    NINEP_OPTS="$NINEP_OPTS,ro"
   fi
 
-  if mount -t 9p -o "$OPTS" "$TAG" "$GUEST"; then
-    log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}}"
+  if mount -t virtiofs -o "$VFS_OPTS" "$TAG" "$GUEST" 2>/dev/null; then
+    log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=virtiofs"
+  elif mount -t 9p -o "$NINEP_OPTS" "$TAG" "$GUEST"; then
+    log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=9p"
   else
     log "failed tag=$TAG guest=$GUEST mode=${{MODE:-rw}}"
   fi
@@ -376,8 +388,93 @@ log "portproxy startup status snapshot"
 systemctl --no-pager -l status portproxy.service || true
 journalctl --no-pager -u portproxy.service -n 100 || true
 log "bootstrap init complete"
-"#
+"#,
+        host_value = host_value,
+        proxy_setup = proxy_setup,
     )
+}
+
+fn build_proxy_setup_script(http_proxy_url: Option<&str>) -> String {
+    let managed_files = [
+        "/etc/reson/proxy.env",
+        "/etc/profile.d/reson-proxy.sh",
+        "/etc/apt/apt.conf.d/90reson-proxy",
+        "/etc/npmrc",
+        "/root/.gitconfig",
+        "/root/.config/pip/pip.conf",
+    ];
+
+    match http_proxy_url {
+        Some(url) => {
+            let proxy_url = shell_escape(url);
+            let no_proxy = shell_escape("localhost,127.0.0.1");
+            format!(
+                r#"log "configuring managed guest proxy environment"
+HTTP_PROXY_URL={proxy_url}
+NO_PROXY_VALUE={no_proxy}
+
+mkdir -p /etc/reson /etc/profile.d /etc/apt/apt.conf.d /root/.config/pip
+
+cat <<EOF >/etc/reson/proxy.env
+http_proxy=$HTTP_PROXY_URL
+https_proxy=$HTTP_PROXY_URL
+HTTP_PROXY=$HTTP_PROXY_URL
+HTTPS_PROXY=$HTTP_PROXY_URL
+all_proxy=$HTTP_PROXY_URL
+ALL_PROXY=$HTTP_PROXY_URL
+no_proxy=$NO_PROXY_VALUE
+NO_PROXY=$NO_PROXY_VALUE
+EOF
+chmod 0644 /etc/reson/proxy.env
+
+cat <<'EOF' >/etc/profile.d/reson-proxy.sh
+if [ -f /etc/reson/proxy.env ]; then
+  set -a
+  . /etc/reson/proxy.env
+  set +a
+fi
+EOF
+chmod 0644 /etc/profile.d/reson-proxy.sh
+
+cat <<EOF >/etc/apt/apt.conf.d/90reson-proxy
+Acquire::http::Proxy "$HTTP_PROXY_URL";
+Acquire::https::Proxy "$HTTP_PROXY_URL";
+EOF
+chmod 0644 /etc/apt/apt.conf.d/90reson-proxy
+
+cat <<EOF >/etc/npmrc
+proxy=$HTTP_PROXY_URL
+https-proxy=$HTTP_PROXY_URL
+EOF
+chmod 0644 /etc/npmrc
+
+cat <<EOF >/root/.gitconfig
+[http]
+	proxy = $HTTP_PROXY_URL
+[https]
+	proxy = $HTTP_PROXY_URL
+EOF
+chmod 0644 /root/.gitconfig
+
+cat <<EOF >/root/.config/pip/pip.conf
+[global]
+proxy = $HTTP_PROXY_URL
+EOF
+chmod 0644 /root/.config/pip/pip.conf"#
+            )
+        }
+        None => {
+            let remove_lines = managed_files
+                .iter()
+                .map(|path| format!("rm -f {path}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                r#"log "managed guest proxy disabled; removing managed proxy files"
+{remove_lines}"#
+            )
+        }
+    }
 }
 
 fn shell_escape(value: &str) -> String {
@@ -770,6 +867,7 @@ mod tests {
                 mount_tag: "nymfs".to_string(),
                 read_only: false,
             }],
+            http_proxy_url: None,
         };
         create_iso(&iso_path, cfg)?;
 
@@ -812,7 +910,7 @@ mod tests {
 
     #[test]
     fn init_script_precreates_guest_paths_before_mount_phase() {
-        let script = build_init_script("vm-test");
+        let script = build_init_script("vm-test", None);
         let precreate = script
             .find("mkdir -p \"$GUEST\"")
             .expect("precreate loop present");
@@ -824,6 +922,26 @@ mod tests {
             precreate < mount_phase,
             "expected guest-path precreate pass before mount phase"
         );
+    }
+
+    #[test]
+    fn init_script_configures_managed_proxy_files_when_proxy_url_present() {
+        let script = build_init_script("vm-test", Some("http://10.0.2.100:3128"));
+        assert!(script.contains("log \"configuring managed guest proxy environment\""));
+        assert!(script.contains("HTTP_PROXY_URL='http://10.0.2.100:3128'"));
+        assert!(script.contains("cat <<EOF >/etc/reson/proxy.env"));
+        assert!(script.contains("Acquire::http::Proxy \"$HTTP_PROXY_URL\";"));
+        assert!(script.contains("cat <<EOF >/root/.config/pip/pip.conf"));
+    }
+
+    #[test]
+    fn init_script_removes_managed_proxy_files_when_proxy_url_absent() {
+        let script = build_init_script("vm-test", None);
+        assert!(script.contains("managed guest proxy disabled; removing managed proxy files"));
+        assert!(script.contains("rm -f /etc/reson/proxy.env"));
+        assert!(script.contains("rm -f /etc/profile.d/reson-proxy.sh"));
+        assert!(script.contains("rm -f /etc/apt/apt.conf.d/90reson-proxy"));
+        assert!(script.contains("rm -f /root/.config/pip/pip.conf"));
     }
 
     fn read_root_entries(path: &Path) -> Result<Vec<String>> {

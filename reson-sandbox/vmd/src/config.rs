@@ -146,6 +146,139 @@ pub struct SecurityConfig {
     pub tls: Option<TlsServerConfig>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QemuProcessConfig {
+    pub run_as_uid: u32,
+    pub run_as_gid: u32,
+}
+
+impl Default for QemuProcessConfig {
+    fn default() -> Self {
+        Self {
+            run_as_uid: default_qemu_run_as_uid_from_env(),
+            run_as_gid: default_qemu_run_as_gid_from_env(),
+        }
+    }
+}
+
+impl QemuProcessConfig {
+    fn normalize(&mut self) -> Result<()> {
+        if self.run_as_uid == 0 {
+            bail!("qemu run_as_uid must be non-zero");
+        }
+        if self.run_as_gid == 0 {
+            bail!("qemu run_as_gid must be non-zero");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkServicesConfig {
+    pub envoy_bin: String,
+    pub envoy_log_level: String,
+    pub envoy_admin_addr: String,
+    pub coredns_bin: String,
+    pub coredns_bind_addr: String,
+    pub coredns_threat_hosts_path: String,
+    pub public_ingress_bind_addr: Option<String>,
+    pub api_internal_base_url: Option<String>,
+}
+
+impl Default for NetworkServicesConfig {
+    fn default() -> Self {
+        Self {
+            envoy_bin: default_envoy_bin_from_env(),
+            envoy_log_level: default_envoy_log_level_from_env(),
+            envoy_admin_addr: default_envoy_admin_addr_from_env(),
+            coredns_bin: default_coredns_bin_from_env(),
+            coredns_bind_addr: default_coredns_bind_addr_from_env(),
+            coredns_threat_hosts_path: default_coredns_threat_hosts_path_from_env(),
+            public_ingress_bind_addr: default_public_ingress_bind_addr_from_env(),
+            api_internal_base_url: default_api_internal_base_url_from_env(),
+        }
+    }
+}
+
+impl NetworkServicesConfig {
+    fn normalize(&mut self, guest_network: &GuestNetworkConfig) -> Result<()> {
+        self.envoy_log_level = self.envoy_log_level.trim().to_string();
+        if self.envoy_log_level.is_empty() {
+            self.envoy_log_level = "info".to_string();
+        }
+        self.envoy_admin_addr = normalize_socket_addr(&self.envoy_admin_addr, "envoy admin addr")?;
+        if guest_network.http_proxy_upstream_addr.is_some() {
+            self.envoy_bin = resolve_binary(&self.envoy_bin, "envoy")?;
+        }
+        if guest_network.http_proxy_upstream_addr.is_some() || guest_network.dns_server.is_some() {
+            self.coredns_bin = resolve_binary(&self.coredns_bin, "coredns")?;
+            self.coredns_bind_addr =
+                normalize_socket_addr(&self.coredns_bind_addr, "coredns bind addr")?;
+        }
+        self.coredns_threat_hosts_path = self.coredns_threat_hosts_path.trim().to_string();
+        if self.coredns_threat_hosts_path.is_empty() {
+            self.coredns_threat_hosts_path = "/opt/reson/network/threat-domains.hosts".to_string();
+        }
+        self.public_ingress_bind_addr = normalize_optional_socket_addr(
+            self.public_ingress_bind_addr.take(),
+            "public ingress bind addr",
+        )?;
+        self.api_internal_base_url = self
+            .api_internal_base_url
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestNetworkConfig {
+    pub dns_server: Option<String>,
+    pub http_proxy_guest_addr: Option<String>,
+    pub http_proxy_upstream_addr: Option<String>,
+}
+
+impl GuestNetworkConfig {
+    fn normalize(&mut self) -> Result<()> {
+        self.dns_server = normalize_optional_ip_addr(self.dns_server.take(), "guest dns server")?;
+        self.http_proxy_guest_addr = normalize_optional_socket_addr(
+            self.http_proxy_guest_addr.take(),
+            "guest http proxy guest addr",
+        )?;
+        self.http_proxy_upstream_addr = normalize_optional_socket_addr(
+            self.http_proxy_upstream_addr.take(),
+            "guest http proxy upstream addr",
+        )?;
+
+        match (
+            self.http_proxy_guest_addr.is_some(),
+            self.http_proxy_upstream_addr.is_some(),
+        ) {
+            (true, true) => {
+                if self.dns_server.is_none() {
+                    // @dive: Proxy-enabled guests still need slirp's built-in virtual
+                    //        nameserver advertised so the guest has a stable DNS target.
+                    //        The qemu-owned upstream DNS sockets are pinned to CoreDNS by
+                    //        the pod-local firewall/NAT path.
+                    self.dns_server = Some("10.0.2.3".to_string());
+                }
+                Ok(())
+            }
+            (false, false) => Ok(()),
+            _ => bail!(
+                "guest http proxy config requires both guest and upstream addresses to be set"
+            ),
+        }
+    }
+
+    pub fn http_proxy_url(&self) -> Option<String> {
+        self.http_proxy_guest_addr
+            .as_ref()
+            .map(|addr| format!("http://{addr}"))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_address: String,
@@ -153,6 +286,10 @@ pub struct Config {
     pub qemu_bin: String,
     pub qemu_arm64_bin: String,
     pub qemu_img_bin: String,
+    /// Absolute path to the `virtiofsd` binary used to serve host↔guest shared
+    /// filesystems to live-migration-capable virtio-fs guest devices. Defaults to the
+    /// location shipped in the qemu-system-common package on Ubuntu 22.04.
+    pub virtiofsd_bin: String,
     pub docker_bin: String,
     pub log_level: String,
     pub force_local_build: bool,
@@ -161,6 +298,10 @@ pub struct Config {
     pub fork_compaction_depth_threshold: usize,
     pub storage_profile: StorageProfile,
     pub shared_mount_profiles: Vec<String>,
+    pub nymfs_internal_service_token: Option<String>,
+    pub qemu_process: QemuProcessConfig,
+    pub guest_network: GuestNetworkConfig,
+    pub network_services: NetworkServicesConfig,
     pub ha_mode: bool,
     pub node_registry: Option<NodeRegistryConfig>,
     pub control_bus: Option<ControlBusConfig>,
@@ -180,6 +321,7 @@ impl Default for Config {
             qemu_bin: "qemu-system-x86_64".to_string(),
             qemu_arm64_bin: "qemu-system-aarch64".to_string(),
             qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: default_virtiofsd_bin(),
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
@@ -188,6 +330,10 @@ impl Default for Config {
             fork_compaction_depth_threshold: default_fork_compaction_depth_threshold_from_env(),
             storage_profile: default_storage_profile_from_env(),
             shared_mount_profiles: default_shared_mount_profiles_from_env(),
+            nymfs_internal_service_token: default_nymfs_internal_service_token_from_env(),
+            qemu_process: QemuProcessConfig::default(),
+            guest_network: default_guest_network_from_env(),
+            network_services: NetworkServicesConfig::default(),
             ha_mode: default_ha_mode_from_env(),
             node_registry: default_node_registry_from_env("127.0.0.1:8052"),
             control_bus: default_control_bus_from_env(),
@@ -242,6 +388,9 @@ impl Config {
         }
         self.shared_mount_profiles =
             normalize_shared_mount_profiles(self.shared_mount_profiles.clone());
+        self.qemu_process.normalize()?;
+        self.guest_network.normalize()?;
+        self.network_services.normalize(&self.guest_network)?;
         if let Some(registry) = self.node_registry.as_mut() {
             registry.storage_profile = self.storage_profile;
             registry.shared_mount_profiles = self.shared_mount_profiles.clone();
@@ -702,6 +851,18 @@ fn default_fork_compaction_depth_threshold_from_env() -> usize {
         .unwrap_or(DEFAULT_FORK_COMPACTION_DEPTH_THRESHOLD)
 }
 
+/// Default location of the `virtiofsd` binary. Ubuntu 24.04's `virtiofsd` package
+/// (the Rust reimplementation from gitlab.com/virtio-fs/virtiofsd) installs the binary
+/// at `/usr/libexec/virtiofsd`. Override via `RESON_SANDBOX_VIRTIOFSD_BIN` when running
+/// against a different base image or a custom build.
+fn default_virtiofsd_bin() -> String {
+    env::var("RESON_SANDBOX_VIRTIOFSD_BIN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_VIRTIOFSD_BIN"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/usr/libexec/virtiofsd".to_string())
+}
+
 fn default_storage_profile_from_env() -> StorageProfile {
     env::var("RESON_SANDBOX_STORAGE_PROFILE")
         .or_else(|_| env::var("BRACKET_SANDBOX_STORAGE_PROFILE"))
@@ -766,6 +927,134 @@ fn default_shared_mount_profiles_from_env() -> Vec<String> {
         .ok()
         .map(|value| parse_csv_list(&value))
         .unwrap_or_else(|| vec![DEFAULT_SHARED_MOUNT_PROFILE_LOCAL.to_string()])
+}
+
+fn default_nymfs_internal_service_token_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_guest_network_from_env() -> GuestNetworkConfig {
+    GuestNetworkConfig {
+        dns_server: default_guest_dns_server_from_env(),
+        http_proxy_guest_addr: default_guest_http_proxy_guest_addr_from_env(),
+        http_proxy_upstream_addr: default_guest_http_proxy_upstream_addr_from_env(),
+    }
+}
+
+fn default_qemu_run_as_uid_from_env() -> u32 {
+    env::var("RESON_SANDBOX_QEMU_RUN_AS_UID")
+        .or_else(|_| env::var("BRACKET_SANDBOX_QEMU_RUN_AS_UID"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1000)
+}
+
+fn default_qemu_run_as_gid_from_env() -> u32 {
+    env::var("RESON_SANDBOX_QEMU_RUN_AS_GID")
+        .or_else(|_| env::var("BRACKET_SANDBOX_QEMU_RUN_AS_GID"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1000)
+}
+
+fn default_guest_dns_server_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_GUEST_DNS_SERVER")
+        .or_else(|_| env::var("BRACKET_SANDBOX_GUEST_DNS_SERVER"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_guest_http_proxy_guest_addr_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR")
+        .or_else(|_| env::var("BRACKET_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_guest_http_proxy_upstream_addr_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR")
+        .or_else(|_| env::var("BRACKET_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_envoy_bin_from_env() -> String {
+    env::var("RESON_SANDBOX_ENVOY_BIN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_ENVOY_BIN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "envoy".to_string())
+}
+
+fn default_envoy_log_level_from_env() -> String {
+    env::var("RESON_SANDBOX_ENVOY_LOG_LEVEL")
+        .or_else(|_| env::var("BRACKET_SANDBOX_ENVOY_LOG_LEVEL"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "info".to_string())
+}
+
+fn default_envoy_admin_addr_from_env() -> String {
+    env::var("RESON_SANDBOX_ENVOY_ADMIN_ADDR")
+        .or_else(|_| env::var("BRACKET_SANDBOX_ENVOY_ADMIN_ADDR"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:9901".to_string())
+}
+
+fn default_coredns_bin_from_env() -> String {
+    env::var("RESON_SANDBOX_COREDNS_BIN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_COREDNS_BIN"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "coredns".to_string())
+}
+
+fn default_coredns_bind_addr_from_env() -> String {
+    env::var("RESON_SANDBOX_COREDNS_BIND_ADDR")
+        .or_else(|_| env::var("BRACKET_SANDBOX_COREDNS_BIND_ADDR"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.53:53".to_string())
+}
+
+fn default_coredns_threat_hosts_path_from_env() -> String {
+    env::var("RESON_SANDBOX_COREDNS_THREAT_HOSTS_PATH")
+        .or_else(|_| env::var("BRACKET_SANDBOX_COREDNS_THREAT_HOSTS_PATH"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/opt/reson/network/threat-domains.hosts".to_string())
+}
+
+fn default_public_ingress_bind_addr_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_PUBLIC_INGRESS_BIND_ADDR")
+        .or_else(|_| env::var("BRACKET_SANDBOX_PUBLIC_INGRESS_BIND_ADDR"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_api_internal_base_url_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_API_INTERNAL_BASE_URL")
+        .or_else(|_| env::var("BRACKET_SANDBOX_API_INTERNAL_BASE_URL"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn default_security_from_env() -> SecurityConfig {
@@ -880,6 +1169,43 @@ fn normalize_nats_url(raw: &str) -> String {
     format!("nats://{trimmed}")
 }
 
+fn normalize_optional_ip_addr(value: Option<String>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value.map(|item| item.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let parsed = value
+        .parse::<std::net::IpAddr>()
+        .with_context(|| format!("invalid {field}: `{value}`"))?;
+    Ok(Some(parsed.to_string()))
+}
+
+fn normalize_optional_socket_addr(value: Option<String>, field: &str) -> Result<Option<String>> {
+    let Some(value) = value.map(|item| item.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let parsed = value
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid {field}: `{value}`"))?;
+    Ok(Some(parsed.to_string()))
+}
+
+fn normalize_socket_addr(raw: &str, field: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{field} must be provided");
+    }
+    let parsed = trimmed
+        .parse::<std::net::SocketAddr>()
+        .with_context(|| format!("invalid {field}: `{trimmed}`"))?;
+    Ok(parsed.to_string())
+}
+
 fn sanitize_jetstream_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -972,7 +1298,11 @@ fn enforce_continuity_policy(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{LazyLock, Mutex};
+
     use super::*;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn make_config(ha_mode: bool, tier: ContinuityTier, degraded_mode: bool) -> Config {
         Config {
@@ -1022,5 +1352,182 @@ mod tests {
     fn continuity_policy_rejects_degraded_mode_with_tier_b() {
         let cfg = make_config(true, ContinuityTier::TierB, true);
         assert!(enforce_continuity_policy(&cfg).is_err());
+    }
+
+    #[test]
+    fn nymfs_internal_service_token_prefers_reson_env_then_legacy_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::remove_var("RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
+            env::remove_var("BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
+        }
+        assert_eq!(default_nymfs_internal_service_token_from_env(), None);
+
+        unsafe {
+            env::set_var(
+                "BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN",
+                "legacy-token",
+            );
+        }
+        assert_eq!(
+            default_nymfs_internal_service_token_from_env().as_deref(),
+            Some("legacy-token")
+        );
+
+        unsafe {
+            env::set_var(
+                "RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN",
+                "primary-token",
+            );
+        }
+        assert_eq!(
+            default_nymfs_internal_service_token_from_env().as_deref(),
+            Some("primary-token")
+        );
+
+        unsafe {
+            env::remove_var("RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
+            env::remove_var("BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
+        }
+    }
+
+    #[test]
+    fn guest_network_from_env_prefers_reson_env_then_legacy_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::remove_var("RESON_SANDBOX_GUEST_DNS_SERVER");
+            env::remove_var("BRACKET_SANDBOX_GUEST_DNS_SERVER");
+            env::remove_var("RESON_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR");
+            env::remove_var("BRACKET_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR");
+            env::remove_var("RESON_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR");
+            env::remove_var("BRACKET_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR");
+        }
+
+        assert_eq!(
+            default_guest_network_from_env(),
+            GuestNetworkConfig::default()
+        );
+
+        unsafe {
+            env::set_var("BRACKET_SANDBOX_GUEST_DNS_SERVER", "10.0.2.3");
+            env::set_var(
+                "BRACKET_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR",
+                "10.0.2.100:3128",
+            );
+            env::set_var(
+                "BRACKET_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR",
+                "127.0.0.1:3128",
+            );
+        }
+        assert_eq!(
+            default_guest_network_from_env(),
+            GuestNetworkConfig {
+                dns_server: Some("10.0.2.3".to_string()),
+                http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
+                http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
+            }
+        );
+
+        unsafe {
+            env::set_var("RESON_SANDBOX_GUEST_DNS_SERVER", "10.0.2.4");
+            env::set_var(
+                "RESON_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR",
+                "10.0.2.101:3129",
+            );
+            env::set_var(
+                "RESON_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR",
+                "127.0.0.1:3129",
+            );
+        }
+        assert_eq!(
+            default_guest_network_from_env(),
+            GuestNetworkConfig {
+                dns_server: Some("10.0.2.4".to_string()),
+                http_proxy_guest_addr: Some("10.0.2.101:3129".to_string()),
+                http_proxy_upstream_addr: Some("127.0.0.1:3129".to_string()),
+            }
+        );
+
+        unsafe {
+            env::remove_var("RESON_SANDBOX_GUEST_DNS_SERVER");
+            env::remove_var("BRACKET_SANDBOX_GUEST_DNS_SERVER");
+            env::remove_var("RESON_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR");
+            env::remove_var("BRACKET_SANDBOX_GUEST_HTTP_PROXY_GUEST_ADDR");
+            env::remove_var("RESON_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR");
+            env::remove_var("BRACKET_SANDBOX_GUEST_HTTP_PROXY_UPSTREAM_ADDR");
+        }
+    }
+
+    #[test]
+    fn qemu_process_identity_from_env_prefers_reson_env_then_legacy_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::remove_var("RESON_SANDBOX_QEMU_RUN_AS_UID");
+            env::remove_var("BRACKET_SANDBOX_QEMU_RUN_AS_UID");
+            env::remove_var("RESON_SANDBOX_QEMU_RUN_AS_GID");
+            env::remove_var("BRACKET_SANDBOX_QEMU_RUN_AS_GID");
+        }
+
+        assert_eq!(default_qemu_run_as_uid_from_env(), 1000);
+        assert_eq!(default_qemu_run_as_gid_from_env(), 1000);
+
+        unsafe {
+            env::set_var("BRACKET_SANDBOX_QEMU_RUN_AS_UID", "2001");
+            env::set_var("BRACKET_SANDBOX_QEMU_RUN_AS_GID", "2002");
+        }
+        assert_eq!(default_qemu_run_as_uid_from_env(), 2001);
+        assert_eq!(default_qemu_run_as_gid_from_env(), 2002);
+
+        unsafe {
+            env::set_var("RESON_SANDBOX_QEMU_RUN_AS_UID", "3001");
+            env::set_var("RESON_SANDBOX_QEMU_RUN_AS_GID", "3002");
+        }
+        assert_eq!(default_qemu_run_as_uid_from_env(), 3001);
+        assert_eq!(default_qemu_run_as_gid_from_env(), 3002);
+
+        unsafe {
+            env::remove_var("RESON_SANDBOX_QEMU_RUN_AS_UID");
+            env::remove_var("BRACKET_SANDBOX_QEMU_RUN_AS_UID");
+            env::remove_var("RESON_SANDBOX_QEMU_RUN_AS_GID");
+            env::remove_var("BRACKET_SANDBOX_QEMU_RUN_AS_GID");
+        }
+    }
+
+    #[test]
+    fn guest_network_normalize_requires_complete_proxy_pair() {
+        let mut guest_network = GuestNetworkConfig {
+            dns_server: None,
+            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
+            http_proxy_upstream_addr: None,
+        };
+        assert!(guest_network.normalize().is_err());
+
+        let mut guest_network = GuestNetworkConfig {
+            dns_server: Some(" 10.0.2.3 ".to_string()),
+            http_proxy_guest_addr: Some(" 10.0.2.100:3128 ".to_string()),
+            http_proxy_upstream_addr: Some(" 127.0.0.1:3128 ".to_string()),
+        };
+        guest_network
+            .normalize()
+            .expect("guest network config should normalize");
+        assert_eq!(guest_network.dns_server.as_deref(), Some("10.0.2.3"));
+        assert_eq!(
+            guest_network.http_proxy_guest_addr.as_deref(),
+            Some("10.0.2.100:3128")
+        );
+        assert_eq!(
+            guest_network.http_proxy_upstream_addr.as_deref(),
+            Some("127.0.0.1:3128")
+        );
+
+        let mut guest_network = GuestNetworkConfig {
+            dns_server: None,
+            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
+            http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
+        };
+        guest_network
+            .normalize()
+            .expect("proxy-enabled guest should default slirp dns");
+        assert_eq!(guest_network.dns_server.as_deref(), Some("10.0.2.3"));
     }
 }

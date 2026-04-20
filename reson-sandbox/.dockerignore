@@ -1,0 +1,7 @@
+**
+!vmd/
+!vmd/**
+!proto/
+!proto/**
+!portproxy/bin/
+!portproxy/bin/**

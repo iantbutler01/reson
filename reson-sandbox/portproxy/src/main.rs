@@ -10,6 +10,7 @@ mod cli;
 mod daemon;
 mod port_forward;
 mod services;
+mod system_env;
 
 pub mod pb {
     pub mod bracket {

@@ -34,6 +34,7 @@ use {
         primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
     },
     futures::StreamExt,
+    std::collections::VecDeque,
     std::sync::Arc,
     tokio::sync::OnceCell,
 };
@@ -299,54 +300,104 @@ impl InferenceClient for BedrockClient {
                     ToolCallAccumulator::new(),
                     JsonStreamAccumulator::new(),
                     has_tools,
+                    VecDeque::<Result<StreamChunk>>::new(),
+                    false,
                 ),
-                |(mut recv, mut accumulator, mut json_parser, has_tools)| async move {
-                    match recv.recv().await {
-                        Ok(Some(event)) => {
-                            // Extract the chunk bytes from the AWS event
-                            // ResponseStream is an enum with a Chunk variant
-                            let chunk_bytes = match event {
-                                ResponseStream::Chunk(payload_part) => payload_part
-                                    .bytes
-                                    .map(|b| b.into_inner())
-                                    .unwrap_or_default(),
-                                _ => Vec::new(),
-                            };
-
-                            // Parse as Anthropic-format JSON event
-                            let chunks = match json_parser.push_bytes(&chunk_bytes) {
-                                Ok(values) => {
-                                    let mut out = Vec::new();
-                                    for json in values {
-                                        out.extend(
-                                            parse_anthropic_chunk(
-                                                &json,
-                                                &mut accumulator,
-                                                has_tools,
-                                            )
-                                            .into_iter()
-                                            .map(Ok),
-                                        );
-                                    }
-                                    out
-                                }
-                                Err(e) => vec![Err(e)],
-                            };
-                            Some((
-                                futures::stream::iter(chunks),
-                                (recv, accumulator, json_parser, has_tools),
-                            ))
+                |(
+                    mut recv,
+                    mut accumulator,
+                    mut json_parser,
+                    has_tools,
+                    mut pending,
+                    eof_flushed,
+                )| async move {
+                    loop {
+                        if let Some(item) = pending.pop_front() {
+                            return Some((
+                                futures::stream::iter(vec![item]),
+                                (
+                                    recv,
+                                    accumulator,
+                                    json_parser,
+                                    has_tools,
+                                    pending,
+                                    eof_flushed,
+                                ),
+                            ));
                         }
-                        Ok(None) => None, // Stream ended
-                        Err(e) => {
-                            // Return error and then end stream
-                            Some((
-                                futures::stream::iter(vec![Err(Error::Inference(format!(
-                                    "Bedrock stream error: {}",
-                                    e
-                                )))]),
-                                (recv, accumulator, json_parser, has_tools),
-                            ))
+
+                        if eof_flushed {
+                            return None;
+                        }
+
+                        match recv.recv().await {
+                            Ok(Some(event)) => {
+                                let chunk_bytes = match event {
+                                    ResponseStream::Chunk(payload_part) => payload_part
+                                        .bytes
+                                        .map(|b| b.into_inner())
+                                        .unwrap_or_default(),
+                                    _ => Vec::new(),
+                                };
+
+                                match json_parser.push_bytes(&chunk_bytes) {
+                                    Ok(values) => {
+                                        for json in values {
+                                            pending.extend(
+                                                parse_anthropic_chunk(
+                                                    &json,
+                                                    &mut accumulator,
+                                                    has_tools,
+                                                )
+                                                .into_iter()
+                                                .map(Ok),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        pending.push_back(Err(e));
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                let flushed = accumulator.drain_all_tools();
+                                if flushed.is_empty() {
+                                    return None;
+                                }
+
+                                tracing::warn!(
+                                    pending_tool_calls = flushed.len(),
+                                    "bedrock anthropic stream ended with unfinished tool calls; flushing pending tools at EOF"
+                                );
+                                pending.extend(
+                                    flushed
+                                        .into_iter()
+                                        .map(StreamChunk::ToolCallComplete)
+                                        .map(Ok),
+                                );
+                                return pending.pop_front().map(|item| {
+                                    (
+                                        futures::stream::iter(vec![item]),
+                                        (
+                                            recv,
+                                            accumulator,
+                                            json_parser,
+                                            has_tools,
+                                            pending,
+                                            true,
+                                        ),
+                                    )
+                                });
+                            }
+                            Err(e) => {
+                                return Some((
+                                    futures::stream::iter(vec![Err(Error::Inference(format!(
+                                        "Bedrock stream error: {}",
+                                        e
+                                    )))]),
+                                    (recv, accumulator, json_parser, has_tools, pending, true),
+                                ));
+                            }
                         }
                     }
                 },

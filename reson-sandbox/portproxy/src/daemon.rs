@@ -14,9 +14,12 @@ use tracing::{error, info, warn};
 
 use crate::child_tracker::ChildTracker;
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
+use crate::system_env::build_exec_env;
 
 const CHANNEL_CAPACITY: usize = 100;
 const BACKLOG_MAX_FRAMES: usize = 512;
+const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_EXEC_HOME: &str = "/root";
 
 #[derive(Error, Debug)]
 pub enum DaemonError {
@@ -68,7 +71,7 @@ impl DaemonRegistry {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         command.env_clear();
-        for (key, value) in &req.env {
+        for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, &req.env) {
             command.env(key, value);
         }
 
@@ -259,7 +262,7 @@ pub fn build_command_builder(
         builder.args(args);
     }
     builder.env_clear();
-    for (k, v) in env {
+    for (k, v) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, env) {
         builder.env(k, v);
     }
     if let Some(dir) = cwd {

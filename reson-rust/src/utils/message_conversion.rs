@@ -5,8 +5,8 @@
 
 use crate::error::Result;
 use crate::types::{
-    AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage,
-    Provider, ReasoningSegment, ResponsePart, ToolCall, ToolResult, VideoMetadata,
+    AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage, Provider,
+    ReasoningSegment, ResponsePart, ToolCall, ToolResult, VideoMetadata,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -857,9 +857,8 @@ pub fn convert_messages_to_provider_format(
                         converted_messages.push(assistant_response_to_google_message(response));
                     }
                     Provider::OpenAI | Provider::OpenRouter => {
-                        converted_messages.push(assistant_response_to_openai_chat_message(
-                            response,
-                        ));
+                        converted_messages
+                            .push(assistant_response_to_openai_chat_message(response));
                     }
                     Provider::OpenAIResponses | Provider::OpenRouterResponses => {
                         converted_messages.extend(assistant_response_to_responses_items(response));

@@ -270,10 +270,9 @@ impl AssistantResponse {
     /// Append ordered output, coalescing adjacent text-like chunks.
     pub fn push_output(&mut self, part: ResponsePart) {
         match (self.output.last_mut(), &part) {
-            (
-                Some(ResponsePart::Text { text: existing }),
-                ResponsePart::Text { text },
-            ) => existing.push_str(text),
+            (Some(ResponsePart::Text { text: existing }), ResponsePart::Text { text }) => {
+                existing.push_str(text)
+            }
             (
                 Some(ResponsePart::Reasoning { text: existing }),
                 ResponsePart::Reasoning { text },
@@ -988,14 +987,21 @@ impl ToolCall {
             Provider::OpenAI | Provider::OpenRouter => {
                 let function = &provider_format["function"];
                 let arguments = &function["arguments"];
+                let explicit_raw_arguments = provider_format
+                    .get("raw_arguments")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
                 // Handle both string (real API) and object (streaming accumulator) arguments
                 let (args, raw_arguments) = if let Some(args_str) = arguments.as_str() {
                     let parsed: serde_json::Value = serde_json::from_str(args_str)?;
-                    (parsed, Some(args_str.to_string()))
+                    (
+                        parsed,
+                        Some(explicit_raw_arguments.unwrap_or_else(|| args_str.to_string())),
+                    )
                 } else if arguments.is_object() {
                     let raw = serde_json::to_string(arguments)?;
-                    (arguments.clone(), Some(raw))
+                    (arguments.clone(), Some(explicit_raw_arguments.unwrap_or(raw)))
                 } else {
                     return Err(Error::Parse("Missing 'arguments' in tool call".to_string()));
                 };
@@ -1017,6 +1023,11 @@ impl ToolCall {
             }
             Provider::OpenAIResponses | Provider::OpenRouterResponses => {
                 let args_str = provider_format["arguments"].as_str().unwrap_or("");
+                let raw_arguments = provider_format
+                    .get("raw_arguments")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| args_str.to_string());
                 let call_id = provider_format
                     .get("call_id")
                     .and_then(|v| v.as_str())
@@ -1029,7 +1040,7 @@ impl ToolCall {
                         .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
                         .to_string(),
                     args: serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({})),
-                    raw_arguments: Some(args_str.to_string()),
+                    raw_arguments: Some(raw_arguments),
                     signature: None,
                     tool_obj: Some(provider_format),
                 })

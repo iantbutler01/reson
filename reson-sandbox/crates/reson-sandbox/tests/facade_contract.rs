@@ -813,6 +813,8 @@ async fn session_create_forwards_shared_mounts_contract() {
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
                 backend_profile: "shared-posix".to_string(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
             }],
             ..SessionOptions::default()
         })
@@ -864,6 +866,8 @@ async fn tier_b_session_rejects_node_local_shared_mounts() {
                 availability: SharedMountAvailability::NodeLocal,
                 continuity: SharedMountContinuity::RestartSameNode,
                 backend_profile: String::new(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
             }],
             ..SessionOptions::default()
         })
@@ -907,6 +911,8 @@ async fn tier_b_session_accepts_cross_node_shared_mounts() {
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
                 backend_profile: "shared-posix".to_string(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
             }],
             ..SessionOptions::default()
         })
@@ -934,6 +940,8 @@ async fn shared_storage_mount_requires_backend_profile() {
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
                 backend_profile: String::new(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
             }],
             ..SessionOptions::default()
         })

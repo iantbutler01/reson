@@ -48,6 +48,14 @@ pub struct StatusInfo {
 const DEFAULT_D2VM_IMAGE: &str = "ghcr.io/iantbutler01/reson/d2vm:latest";
 const D2VM_CONTAINER_DIR: &str = "/workspace";
 
+fn configured_d2vm_bin() -> Option<String> {
+    std::env::var("RESON_SANDBOX_D2VM_BIN")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_BIN"))
+        .map(|raw| raw.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
 fn configured_d2vm_image() -> String {
     std::env::var("RESON_SANDBOX_D2VM_IMAGE")
         .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_IMAGE"))
@@ -69,6 +77,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
     if opts.image.trim().is_empty() {
         bail!("d2vm image reference is required");
     }
+    let d2vm_bin = configured_d2vm_bin();
     let d2vm_image = configured_d2vm_image();
     let output_name = if opts.output.trim().is_empty() {
         "disk.qcow2".to_string()
@@ -88,10 +97,44 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         pull = opts.pull,
         include_bootstrap = opts.include_bootstrap,
         converter_image = %d2vm_image,
+        converter_bin = ?d2vm_bin,
         converter_platform = ?converter_platform,
         workdir = %host_dir.display(),
         "running d2vm conversion"
     );
+
+    if let Some(bin) = d2vm_bin {
+        let mut cmd = Command::new(&bin);
+        cmd.current_dir(&host_dir)
+            .arg("--verbose")
+            .arg("convert")
+            .arg(&opts.image)
+            .arg("--output")
+            .arg(&output_name)
+            .arg("--size")
+            .arg(format!("{disk_gb}G"))
+            .arg("--password")
+            .arg("root");
+        if opts.pull {
+            cmd.arg("--pull");
+        }
+        if let Some(platform) = &opts.platform {
+            if !platform.trim().is_empty() {
+                cmd.arg("--platform").arg(platform);
+            }
+        }
+        if opts.include_bootstrap {
+            cmd.arg("--include-bootstrap");
+        }
+        trace!(command = ?cmd, "spawning native d2vm");
+        let output = cmd.output().await.context("spawn native d2vm")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            bail!("d2vm convert failed: {stderr}");
+        }
+        debug!(output = %output_name, "d2vm conversion complete");
+        return Ok(());
+    }
 
     let build_cmd = |include_bootstrap: bool| {
         let mut cmd = Command::new(docker_bin);
@@ -141,21 +184,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
     let output = cmd.output().await.context("spawn docker d2vm")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if opts.include_bootstrap && stderr.contains("Unknown flag: --include-bootstrap") {
-            debug!("d2vm image does not support --include-bootstrap; retrying without it");
-            let retry_output = build_cmd(false)
-                .output()
-                .await
-                .context("spawn docker d2vm retry without bootstrap")?;
-            if !retry_output.status.success() {
-                bail!(
-                    "d2vm convert failed: {}",
-                    String::from_utf8_lossy(&retry_output.stderr)
-                );
-            }
-        } else {
-            bail!("d2vm convert failed: {stderr}");
-        }
+        bail!("d2vm convert failed: {stderr}");
     }
     debug!(output = %output_name, "d2vm conversion complete");
     Ok(())
@@ -191,20 +220,6 @@ pub async fn create_overlay(
         );
     }
     Ok(())
-}
-
-pub async fn create_snapshot_offline(
-    qemu_img_bin: &str,
-    disk_path: &Path,
-    name: &str,
-) -> Result<()> {
-    let args = [
-        OsStr::new("snapshot"),
-        OsStr::new("-c"),
-        OsStr::new(name),
-        disk_path.as_os_str(),
-    ];
-    run_qemu_img(qemu_img_bin, &args, "snapshot create").await
 }
 
 pub async fn delete_snapshot_offline(
@@ -303,28 +318,295 @@ pub async fn cont(monitor: &MonitorHandle) -> Result<()> {
     monitor.execute("cont", None).await.map(|_| ())
 }
 
-pub async fn save_vm(monitor: &MonitorHandle, name: &str) -> Result<()> {
-    let args = json!({ "command-line": format!("savevm {name}") });
+/// Tunables for the background-snapshot migrate path.
+///
+/// `max_bandwidth_bytes_per_sec` is passed to QMP `migrate-set-parameters`; the qemu default
+/// is 32 MiB/s which would cap our snapshot throughput absurdly low. We set this to a
+/// large value so the snapshot writes at the underlying storage's full speed.
+///
+/// **qemu 6.2 compatibility notes (empirically confirmed via direct QMP probing):**
+/// - `background-snapshot` capability requires `userfaultfd-WP` support (Linux ≥ 5.7).
+/// - `background-snapshot` is **incompatible with `compress`**:
+///   `"Background-snapshot is not compatible with compress"` — the legacy compress thread
+///   pool conflicts with the UFFD-WP migration worker.
+/// - `background-snapshot` is **incompatible with `multifd`**:
+///   `"Background-snapshot is not compatible with multifd"` — multifd requires the main
+///   migration thread to iterate, but background-snapshot runs the copy in a UFFD-WP
+///   worker thread that isn't multifd-aware.
+/// - So the only throughput knob we have is `max-bandwidth`, which we uncap. Guest is
+///   not frozen during the copy, so `max-bandwidth` only affects the wall-clock completion
+///   time of the background migration, not user-perceived latency.
+#[derive(Clone, Debug)]
+pub struct BackgroundSnapshotOptions {
+    pub max_bandwidth_bytes_per_sec: u64,
+}
+
+impl Default for BackgroundSnapshotOptions {
+    fn default() -> Self {
+        Self {
+            // 10 GiB/s — effectively uncapped; qemu clamps to real disk throughput anyway.
+            max_bandwidth_bytes_per_sec: 10u64 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Discover the qemu block device id backing `disk_path`. Required because our launch
+/// args use the `-drive` shorthand (no explicit node name), so qemu auto-generates ids
+/// like `virtio0` / `ide0-hd0` / `virtio-disk0`. We query `query-block`, find the device
+/// whose `inserted.file` matches our disk, and return its `device` name so we can use it
+/// as the target of `blockdev-snapshot-internal-sync`.
+pub async fn find_block_device_id(monitor: &MonitorHandle, disk_path: &Path) -> Result<String> {
+    let value = monitor.execute("query-block", None).await?;
+    let canon_disk = disk_path
+        .canonicalize()
+        .unwrap_or_else(|_| disk_path.to_path_buf());
+    let Some(array) = value.as_array() else {
+        bail!("query-block did not return an array: {value}");
+    };
+    for entry in array {
+        let file = entry
+            .get("inserted")
+            .and_then(|ins| ins.get("file"))
+            .and_then(|f| f.as_str());
+        let device = entry.get("device").and_then(|d| d.as_str());
+        if let (Some(file), Some(device)) = (file, device) {
+            let candidate = PathBuf::from(file);
+            let candidate = candidate.canonicalize().unwrap_or(candidate);
+            if candidate == canon_disk && !device.is_empty() {
+                return Ok(device.to_string());
+            }
+        }
+    }
+    bail!(
+        "query-block: no block device matches disk path {}",
+        disk_path.display()
+    )
+}
+
+/// Take a disk-only internal qcow2 snapshot via QMP `blockdev-snapshot-internal-sync`.
+/// Metadata-only operation, sub-millisecond even on slow storage.
+pub async fn blockdev_snapshot_internal_sync(
+    monitor: &MonitorHandle,
+    device: &str,
+    name: &str,
+) -> Result<()> {
+    let args = json!({ "device": device, "name": name });
     monitor
-        .execute("human-monitor-command", Some(args))
+        .execute("blockdev-snapshot-internal-sync", Some(args))
         .await
         .map(|_| ())
 }
 
-pub async fn load_vm(monitor: &MonitorHandle, name: &str) -> Result<()> {
-    let args = json!({ "command-line": format!("loadvm {name}") });
+/// Delete a disk-only internal qcow2 snapshot via QMP
+/// `blockdev-snapshot-delete-internal-sync`. Safe to call from the background task that
+/// created it; idempotent enough that callers can `let _ = …` on delete failures.
+pub async fn blockdev_snapshot_delete_internal_sync(
+    monitor: &MonitorHandle,
+    device: &str,
+    name: &str,
+) -> Result<()> {
+    let args = json!({ "device": device, "name": name });
     monitor
-        .execute("human-monitor-command", Some(args))
+        .execute("blockdev-snapshot-delete-internal-sync", Some(args))
         .await
         .map(|_| ())
 }
 
-pub async fn delete_snapshot(monitor: &MonitorHandle, name: &str) -> Result<()> {
-    let args = json!({ "command-line": format!("delvm {name}") });
+/// Enable the `background-snapshot` migration capability.
+///
+/// `background-snapshot` is the qemu ≥5.2 feature that lets the guest keep running during
+/// a RAM migration. It uses `userfaultfd-WP` to copy-on-write guest pages as the migration
+/// thread walks them, so there's no stop-the-world pause; the VM only briefly barriers on
+/// pages that the guest writes faster than the background thread can drain them.
+///
+/// No other capabilities are set here — qemu 6.2 rejects combining background-snapshot
+/// with either `compress` or `multifd`, which we confirmed empirically via QMP probing.
+async fn enable_background_snapshot_capabilities(monitor: &MonitorHandle) -> Result<()> {
+    let args = json!({
+        "capabilities": [
+            { "capability": "background-snapshot", "state": true }
+        ]
+    });
     monitor
-        .execute("human-monitor-command", Some(args))
+        .execute("migrate-set-capabilities", Some(args))
         .await
         .map(|_| ())
+}
+
+/// Configure migration runtime parameters for a background-snapshot save.
+async fn configure_background_snapshot_parameters(
+    monitor: &MonitorHandle,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
+    // Only the bandwidth cap is tunable; compress-threads/level have no effect without
+    // the `compress` capability which we cannot enable alongside background-snapshot.
+    let params = json!({ "max-bandwidth": opts.max_bandwidth_bytes_per_sec });
+    monitor
+        .execute("migrate-set-parameters", Some(params))
+        .await
+        .map(|_| ())
+}
+
+/// Status snapshot of an in-progress migration, as returned by QMP `query-migrate`.
+#[derive(Clone, Debug)]
+pub struct MigrationStatus {
+    pub status: String,
+    pub total_time_ms: Option<u64>,
+    pub bytes_transferred: Option<u64>,
+    pub expected_downtime_ms: Option<u64>,
+    pub error_desc: Option<String>,
+}
+
+/// Query the current migration state.
+pub async fn query_migrate(monitor: &MonitorHandle) -> Result<MigrationStatus> {
+    let value = monitor.execute("query-migrate", None).await?;
+    let status = value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let total_time_ms = value.get("total-time").and_then(|v| v.as_u64());
+    let bytes_transferred = value
+        .get("ram")
+        .and_then(|ram| ram.get("transferred"))
+        .and_then(|v| v.as_u64());
+    let expected_downtime_ms = value.get("expected-downtime").and_then(|v| v.as_u64());
+    let error_desc = value
+        .get("error-desc")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok(MigrationStatus {
+        status,
+        total_time_ms,
+        bytes_transferred,
+        expected_downtime_ms,
+        error_desc,
+    })
+}
+
+/// Take a live snapshot of a running VM using qemu's `background-snapshot` migration
+/// capability to write RAM to `ram_path` and the internal block-device snapshot `disk_snapshot_name`
+/// to pin the disk state. Guest execution is **not** paused for the RAM save: qemu installs
+/// userfaultfd-WP on guest memory and a background thread streams pages to the destination
+/// while the VM keeps running.
+///
+/// Caller must ensure the VM is in `Running` state and its monitor is available. Completion
+/// is observed via `query-migrate` (status transitions to `completed`). Returns when the
+/// migration has fully drained to disk.
+///
+/// Ordering inside this function:
+///   1. Discover the block device name via `query-block`.
+///   2. Take an internal disk snapshot pinning the point-in-time disk state.
+///   3. Enable `background-snapshot` on the migration channel (alone — qemu 6.2 rejects
+///      combining it with `compress` or `multifd`).
+///   4. Configure `max-bandwidth` to an effectively-uncapped value so the snapshot writes
+///      at the storage's real throughput instead of qemu's 32 MiB/s default.
+///   5. Issue `migrate file:<ram_path>` — qemu installs UFFD-WP and begins the async copy.
+///   6. Poll `query-migrate` until the migration finishes or fails.
+///
+/// On failure at any step, best-effort delete the disk snapshot and remove the partial RAM
+/// file so retries can start clean.
+pub async fn save_vm_background(
+    monitor: &MonitorHandle,
+    disk_path: &Path,
+    disk_snapshot_name: &str,
+    ram_path: &Path,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<MigrationStatus> {
+    let device = find_block_device_id(monitor, disk_path)
+        .await
+        .with_context(|| "resolve block device for background snapshot")?;
+
+    // @dive: The disk snapshot is metadata-only via blockdev-snapshot-internal-sync, so the
+    //        VM stays running throughout. Pinning disk state before the RAM migration begins
+    //        gives us a consistent point-in-time pair (disk ≤ ram_start_point) for restore.
+    blockdev_snapshot_internal_sync(monitor, &device, disk_snapshot_name)
+        .await
+        .with_context(|| "blockdev-snapshot-internal-sync for background save")?;
+
+    if let Err(err) = enable_background_snapshot_capabilities(monitor).await {
+        let _ = blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+        return Err(err.context("enable background-snapshot capabilities"));
+    }
+    if let Err(err) = configure_background_snapshot_parameters(monitor, opts).await {
+        let _ = blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+        return Err(err.context("configure migrate parameters"));
+    }
+
+    if let Some(parent) = ram_path.parent() {
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            let _ =
+                blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+            return Err(anyhow::anyhow!(err).context("create ram snapshot directory"));
+        }
+    }
+    // Best-effort clean any stale file from a prior failed save so qemu's O_CREAT|O_EXCL
+    // path doesn't trip over leftover state.
+    let _ = tokio::fs::remove_file(ram_path).await;
+
+    let migrate_uri = format!("file:{}", ram_path.display());
+    let migrate_args = json!({ "uri": migrate_uri });
+    if let Err(err) = monitor
+        .execute("migrate", Some(migrate_args))
+        .await
+        .map(|_| ())
+    {
+        let _ = blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+        let _ = tokio::fs::remove_file(ram_path).await;
+        return Err(err.context("initiate background-snapshot migrate"));
+    }
+
+    // Poll until the migration converges. background-snapshot does not iterate (no dirty
+    // re-tracking after the initial WP pass), so once qemu reports `completed` the RAM file
+    // is fully written. If qemu fails or the user cancels, surface the error.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let status = query_migrate(monitor).await?;
+        trace!(
+            status = %status.status,
+            bytes = ?status.bytes_transferred,
+            "background-snapshot migrate poll"
+        );
+        match status.status.as_str() {
+            "completed" => return Ok(status),
+            "failed" | "cancelled" | "cancelling" => {
+                let _ =
+                    blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name)
+                        .await;
+                let _ = tokio::fs::remove_file(ram_path).await;
+                bail!(
+                    "background-snapshot migrate ended in status {}: {}",
+                    status.status,
+                    status.error_desc.as_deref().unwrap_or("<no detail>")
+                );
+            }
+            // setup | active | pre-switchover | device | postcopy-* | wait-unplug — still in flight
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            let _ =
+                blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+            let _ = tokio::fs::remove_file(ram_path).await;
+            bail!("background-snapshot migrate timed out after 600s");
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Delete the paired {disk internal snapshot, RAM file} pair produced by
+/// [`save_vm_background`]. Best-effort: callers treat this like a GC step.
+pub async fn delete_background_snapshot(
+    monitor: &MonitorHandle,
+    disk_path: &Path,
+    disk_snapshot_name: &str,
+    ram_path: &Path,
+) -> Result<()> {
+    let device = find_block_device_id(monitor, disk_path)
+        .await
+        .with_context(|| "resolve block device for background snapshot delete")?;
+    let _ = blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+    let _ = tokio::fs::remove_file(ram_path).await;
+    Ok(())
 }
 
 pub async fn inspect_image_platforms(docker_bin: &str, reference: &str) -> Result<Vec<Platform>> {
@@ -498,6 +780,182 @@ fn clone_file_cow_sync(src: &Path, dst: &Path) -> Result<()> {
 fn clone_file_cow_sync(src: &Path, dst: &Path) -> Result<()> {
     let _ = (src, dst);
     bail!("CoW file cloning is not supported on this platform")
+}
+
+/// Handle to a running virtiofsd subprocess serving one shared mount to a guest VM.
+///
+/// Virtio-fs replaces the migration-incompatible virtio-9p (`-virtfs`) backend for
+/// host↔guest shared filesystems. Each shared mount gets its own virtiofsd subprocess,
+/// its own Unix socket under `<vm_dir>/virtiofsd-{index}.sock`, and its own qemu
+/// `-chardev socket,...` + `-device vhost-user-fs-pci,...` device pair.
+///
+/// virtiofsd exits automatically when qemu disconnects from the vhost-user socket, so
+/// normal VM-stop paths don't strictly need to kill it. This handle carries the PID so
+/// stop/force-stop code paths can best-effort reap the child and so crash-reclaim logic
+/// can surface orphans.
+#[derive(Clone, Debug)]
+pub struct VirtiofsdHandle {
+    pub pid: u32,
+    pub socket_path: PathBuf,
+    pub source_path: PathBuf,
+    pub tag: String,
+    pub read_only: bool,
+}
+
+/// Configuration knobs for a single virtiofsd spawn. Separate from `SharedMountSpec`
+/// so this module doesn't depend on state::types.
+#[derive(Clone, Debug)]
+pub struct VirtiofsdSpawn {
+    /// Host-side directory tree exposed to the guest.
+    pub source_path: PathBuf,
+    /// Vhost-user socket path (unique per shared mount).
+    pub socket_path: PathBuf,
+    /// Mount tag — the guest will `mount -t virtiofs <tag> <guest_path>`.
+    pub tag: String,
+    /// Read-only export.
+    pub read_only: bool,
+}
+
+/// Spawn a virtiofsd daemon as an async child process, wait for its vhost-user socket
+/// to appear, and return a handle with the PID + paths.
+///
+/// Target: **Rust virtiofsd** (`gitlab.com/virtio-fs/virtiofsd`, shipped in Ubuntu 24.04
+/// as `/usr/libexec/virtiofsd`). qemu 8.x is required for vhost-user-fs migration
+/// cooperation, and Ubuntu 24.04 ships both the correct qemu and the Rust virtiofsd
+/// version. The C virtiofsd bundled with qemu 6.2 on Ubuntu 22.04 used a different
+/// FUSE-style CLI (`-o source=`, `-o cache=`, etc.) which is NOT what we invoke here.
+///
+/// Invocation:
+///   `virtiofsd --socket-path=<sock> --shared-dir=<host> --cache=auto --sandbox=chroot
+///    --log-level=warn [--readonly]`
+///
+/// `--sandbox=chroot` is chosen because namespace-based sandboxing needs
+/// `CAP_SYS_ADMIN` and unshare privileges that container runtimes may refuse; `chroot`
+/// only needs read access to the source directory.
+///
+/// The parent directory of `socket_path` must already exist. Caller is expected to put
+/// it under `<vm_dir>/` alongside qmp.sock and qemu.pid.
+pub async fn spawn_virtiofsd(
+    virtiofsd_bin: &str,
+    spawn: &VirtiofsdSpawn,
+    log_path: &Path,
+) -> Result<VirtiofsdHandle> {
+    if !spawn.source_path.is_dir() {
+        bail!(
+            "virtiofsd source path does not exist or is not a directory: {}",
+            spawn.source_path.display()
+        );
+    }
+
+    // Pre-remove any stale socket from a prior crashed daemon so virtiofsd can bind.
+    let _ = std::fs::remove_file(&spawn.socket_path);
+
+    let mut cmd = Command::new(virtiofsd_bin);
+    cmd.arg(format!(
+        "--socket-path={}",
+        spawn.socket_path.to_string_lossy()
+    ));
+    cmd.arg(format!(
+        "--shared-dir={}",
+        spawn.source_path.to_string_lossy()
+    ));
+    cmd.arg("--cache=auto");
+    cmd.arg("--sandbox=chroot");
+    cmd.arg("--log-level=warn");
+    // @dive: `--migration-mode=find-paths` is required for vhost-user migration
+    //        cooperation. Without it, virtiofsd doesn't advertise the
+    //        `VHOST_USER_PROTOCOL_F_LOG_SHMFD` feature bit, and qemu rejects every
+    //        `migrate` call with "Migration disabled: vhost-user backend lacks
+    //        VHOST_USER_PROTOCOL_F_LOG_SHMFD feature". Added in virtiofsd 1.12.0,
+    //        stabilized in 1.13.0. The `find-paths` mode reconstructs open-file paths
+    //        from file handles during migrate, as opposed to `file-handles` which
+    //        serializes kernel file handles — `find-paths` is more portable across
+    //        filesystems (ext4/xfs/btrfs/etc).
+    cmd.arg("--migration-mode=find-paths");
+    // @dive: Read-only enforcement runs on two layers: (1) the host filesystem at the
+    //        nymfs export root is already mounted ro, and (2) bootstrap/init.sh appends
+    //        `,ro` to the guest `mount -t virtiofs` options when the SharedMountSpec
+    //        marks the mount read-only. Linux enforces it at the VFS layer, which is
+    //        sufficient — virtiofsd has no daemon-side `--readonly` flag.
+    let _ = spawn.read_only;
+
+    // Route stdout/stderr to a log file so failures leave a trail.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open virtiofsd log {}", log_path.display()))?;
+    let stderr_clone = log_file
+        .try_clone()
+        .with_context(|| format!("clone virtiofsd log fd {}", log_path.display()))?;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(log_file));
+    cmd.stderr(std::process::Stdio::from(stderr_clone));
+
+    let child = cmd.spawn().with_context(|| {
+        format!(
+            "spawn virtiofsd {} for source {} -> socket {}",
+            virtiofsd_bin,
+            spawn.source_path.display(),
+            spawn.socket_path.display()
+        )
+    })?;
+    let pid = child.id().unwrap_or(0);
+
+    // We intentionally detach the Child here: virtiofsd's lifetime is tied to qemu's
+    // vhost-user connection, not to this Rust future. Once qemu drops the socket
+    // virtiofsd exits; and if vmd needs to forcibly reap it, the PID in VirtiofsdHandle
+    // is what we use.
+    std::mem::forget(child);
+
+    // Wait for the vhost-user socket to appear so the subsequent qemu launch can
+    // connect to it immediately. virtiofsd creates the socket file as soon as it
+    // finishes its listen() call. 5 seconds is generous; usually it's <50 ms.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !spawn.socket_path.exists() {
+        if Instant::now() >= deadline {
+            // Try to reap the daemon if it died early so we don't leak a zombie.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            bail!(
+                "virtiofsd socket {} did not appear within 5s (daemon probably failed to start; check {})",
+                spawn.socket_path.display(),
+                log_path.display()
+            );
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    debug!(
+        pid,
+        socket = %spawn.socket_path.display(),
+        source = %spawn.source_path.display(),
+        tag = %spawn.tag,
+        read_only = spawn.read_only,
+        "virtiofsd ready"
+    );
+
+    Ok(VirtiofsdHandle {
+        pid,
+        socket_path: spawn.socket_path.clone(),
+        source_path: spawn.source_path.clone(),
+        tag: spawn.tag.clone(),
+        read_only: spawn.read_only,
+    })
+}
+
+/// Terminate a running virtiofsd by PID. Best-effort; if the daemon already exited
+/// (normal case when qemu closes the socket), this is a no-op.
+pub fn terminate_virtiofsd(handle: &VirtiofsdHandle) {
+    if handle.pid == 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(handle.pid as libc::pid_t, libc::SIGTERM);
+    }
+    // Best-effort unlink of the socket file (virtiofsd should have cleaned it up).
+    let _ = std::fs::remove_file(&handle.socket_path);
 }
 
 impl MonitorHandle {

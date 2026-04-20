@@ -29,11 +29,15 @@ use crate::pb::bracket::portproxy::v1::{
 };
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 use crate::pb::google::protobuf::Empty;
+use crate::system_env::build_exec_env;
 
 type ExecResponseStream = ReceiverStream<Result<ExecResponse, Status>>;
 type InteractiveResponseStream = ReceiverStream<Result<InteractiveShellResponse, Status>>;
 type AttachDaemonResponseStream =
     GuardedStream<ReceiverStream<Result<AttachDaemonResponse, Status>>>;
+
+const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_EXEC_HOME: &str = "/root";
 
 pub struct GuardedStream<S> {
     _guard: tokio::sync::OwnedMutexGuard<()>,
@@ -106,7 +110,7 @@ impl ShellExec for ShellExecService {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         command.env_clear();
-        for (key, value) in &start.env {
+        for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, &start.env) {
             command.env(key, value);
         }
 

@@ -2,6 +2,7 @@
 // @dive-rel: Consumes policy limits from vmd/src/config.rs and enforces them on mutating VM operations.
 // @dive-rel: Implements fork CoW lineage behavior that underpins facade-level Session::fork semantics.
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
@@ -17,13 +18,18 @@ use rand::RngCore;
 use serde_json::json;
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedMutexGuard, RwLock};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 use crate::bootstrap;
 use crate::config::{self, Config};
+use crate::fuse;
 use crate::image::{self, BASE_IMAGE_EXT, BASE_IMAGE_SIZE_GB, PrebuiltImageStatus};
+use crate::network;
 use crate::state::metadata::{load_metadata, save_metadata};
 use crate::state::runtime::VmRuntime;
 use crate::state::types::{
@@ -46,9 +52,16 @@ const META_FORK_DEPTH: &str = "reson.fork_depth";
 const META_STORAGE_PROFILE: &str = "reson.storage_profile";
 const META_FORK_DURABILITY_CLASS: &str = "reson.fork_durability_class";
 const META_FORK_RESTORE_SCOPE: &str = "reson.fork_restore_scope";
+const META_NYM_NETWORK_POLICY: &str = "nym_network_policy";
+const META_NYM_NETWORK_POLICY_PROXY_UPSTREAM: &str = "nym_network_policy_proxy_upstream";
+const META_NETWORK_EGRESS_SNAPSHOT: &str = "reson.network_egress";
 const MAINTENANCE_DIR_NAME: &str = "_maintenance";
 const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
-const LIVE_FORK_SNAPSHOT_TIMEOUT_SECS: u64 = 45;
+const ARM64_BIOS_CANDIDATES: [&str; 3] = [
+    "/usr/share/qemu/edk2-aarch64-code.fd",
+    "/usr/share/AAVMF/AAVMF_CODE.fd",
+    "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+];
 
 #[derive(Clone, Copy, Debug)]
 pub enum CreateVmStage {
@@ -132,6 +145,87 @@ impl Manager {
 
     pub fn normalize_architecture(&self, arch: &str) -> ManagerResult<String> {
         normalize_arch(arch)
+    }
+
+    async fn metadata_with_runtime_network_snapshot(&self, mut metadata: VmMetadata) -> VmMetadata {
+        match network::vm_proxy_activity_snapshot(&metadata.id, 50).await {
+            Ok(Some(snapshot)) => match serde_json::to_string(&snapshot) {
+                Ok(value) => {
+                    metadata
+                        .metadata
+                        .insert(META_NETWORK_EGRESS_SNAPSHOT.to_string(), value);
+                }
+                Err(err) => {
+                    warn!(
+                        vm_id = %metadata.id,
+                        error = %err,
+                        "failed serializing runtime network snapshot"
+                    );
+                    metadata.metadata.remove(META_NETWORK_EGRESS_SNAPSHOT);
+                }
+            },
+            Ok(None) => {
+                metadata.metadata.remove(META_NETWORK_EGRESS_SNAPSHOT);
+            }
+            Err(err) => {
+                warn!(
+                    vm_id = %metadata.id,
+                    error = %err,
+                    "failed loading runtime network snapshot"
+                );
+                metadata.metadata.remove(META_NETWORK_EGRESS_SNAPSHOT);
+            }
+        }
+        metadata
+    }
+
+    fn preserve_runtime_managed_metadata(
+        existing: &std::collections::HashMap<String, String>,
+        updated: &mut std::collections::HashMap<String, String>,
+    ) {
+        if let Some(value) = existing.get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM) {
+            updated.insert(
+                META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                value.clone(),
+            );
+        }
+    }
+
+    async fn reapply_runtime_network_policy(
+        &self,
+        vm_id: &str,
+        metadata: &std::collections::HashMap<String, String>,
+        runtime_state: VmState,
+    ) -> ManagerResult<()> {
+        if !matches!(runtime_state, VmState::Running | VmState::Paused) {
+            return Ok(());
+        }
+
+        let Some(upstream_addr) = metadata.get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM) else {
+            return Ok(());
+        };
+        let listen_addr = upstream_addr
+            .parse()
+            .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
+            .map_err(ManagerError::Other)?;
+
+        match metadata.get(META_NYM_NETWORK_POLICY) {
+            Some(policy_json) if !policy_json.trim().is_empty() => {
+                let policy = serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
+                    .with_context(|| format!("parse vm network policy for {vm_id}"))
+                    .map_err(ManagerError::Other)?;
+                network::register_vm_proxy_policy(vm_id, listen_addr, policy)
+                    .await
+                    .map_err(ManagerError::Other)?;
+            }
+            _ => {
+                network::unregister_vm_proxy_policy(vm_id)
+                    .await
+                    .map_err(ManagerError::Other)?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn discover(&self) -> ManagerResult<()> {
@@ -218,10 +312,16 @@ impl Manager {
 
     pub async fn list(&self) -> Vec<VmMetadata> {
         let guard = self.vms.read().await;
-        let mut vms = Vec::with_capacity(guard.len());
+        let mut snapshots = Vec::with_capacity(guard.len());
         for vm in guard.values() {
             let inner = vm.lock().await;
-            vms.push(inner.metadata.clone());
+            snapshots.push(inner.metadata.clone());
+        }
+        drop(guard);
+
+        let mut vms = Vec::with_capacity(snapshots.len());
+        for metadata in snapshots {
+            vms.push(self.metadata_with_runtime_network_snapshot(metadata).await);
         }
         vms
     }
@@ -229,13 +329,21 @@ impl Manager {
     pub async fn get(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
         let guard = vm.lock().await;
-        Ok(guard.metadata.clone())
+        let metadata = guard.metadata.clone();
+        drop(guard);
+        Ok(self.metadata_with_runtime_network_snapshot(metadata).await)
     }
 
     pub async fn get_with_runtime(&self, id: &str) -> ManagerResult<(VmMetadata, VmRuntime)> {
         let vm = self.vm_by_id(id).await?;
         let guard = vm.lock().await;
-        Ok((guard.metadata.clone(), guard.runtime.clone()))
+        let metadata = guard.metadata.clone();
+        let runtime = guard.runtime.clone();
+        drop(guard);
+        Ok((
+            self.metadata_with_runtime_network_snapshot(metadata).await,
+            runtime,
+        ))
     }
 
     async fn active_vm_count(&self) -> usize {
@@ -371,9 +479,7 @@ impl Manager {
             metadata: params.metadata.clone(),
             snapshots: Vec::new(),
             shared_mounts: params.shared_mounts.clone(),
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: String::new(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         meta.metadata.insert(
@@ -451,18 +557,26 @@ impl Manager {
     #[instrument(skip(self))]
     pub async fn update_vm(&self, id: &str, params: UpdateVmParams) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
-        {
+        let (updated_metadata, runtime_state) = {
             let mut inner = vm.lock().await;
-            if let Some(name) = params.name {
-                inner.metadata.name = sanitize_name(&name);
+            let existing_metadata = inner.metadata.metadata.clone();
+            {
+                if let Some(name) = params.name {
+                    inner.metadata.name = sanitize_name(&name);
+                }
+                if let Some(mut meta) = params.metadata {
+                    Self::preserve_runtime_managed_metadata(&existing_metadata, &mut meta);
+                    inner.metadata.metadata = meta;
+                }
+                save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
             }
-            if let Some(meta) = params.metadata {
-                inner.metadata.metadata = meta;
-            }
-            save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
-        }
-        let updated = vm.lock().await.metadata.clone();
-        Ok(updated)
+            (inner.metadata.clone(), inner.runtime.state)
+        };
+
+        self.reapply_runtime_network_policy(id, &updated_metadata.metadata, runtime_state)
+            .await?;
+
+        Ok(updated_metadata)
     }
 
     pub async fn delete_vm(&self, id: &str, _purge_snapshots: bool) -> ManagerResult<()> {
@@ -516,47 +630,22 @@ impl Manager {
                 label: format!("fork-{parent_id}"),
                 description: "reson fork point".to_string(),
             };
-            // @dive: Bound live savevm latency; if accelerator/platform blocks on snapshot, force-stop and take an offline snapshot to avoid indefinite fork hangs.
-            let snapshot = match timeout(
-                Duration::from_secs(LIVE_FORK_SNAPSHOT_TIMEOUT_SECS),
-                self.create_snapshot(parent_id, snapshot_params.clone()),
-            )
-            .await
-            {
-                Ok(Ok(snapshot)) => {
-                    self.force_stop_vm(parent_id).await?;
-                    snapshot
-                }
-                Ok(Err(err)) => {
-                    warn!(
-                        vm_id = %parent_id,
-                        error = %err,
-                        "live running-parent fork snapshot failed; retrying with stop + offline snapshot"
-                    );
-                    self.force_stop_vm(parent_id).await?;
-                    self.create_snapshot(parent_id, snapshot_params).await?
-                }
-                Err(_) => {
-                    warn!(
-                        vm_id = %parent_id,
-                        timeout_secs = LIVE_FORK_SNAPSHOT_TIMEOUT_SECS,
-                        "live running-parent fork snapshot timed out; retrying with stop + offline snapshot"
-                    );
-                    self.force_stop_vm(parent_id).await?;
-                    self.create_snapshot(parent_id, snapshot_params).await?
-                }
-            };
+            // @dive: With background-snapshot the live path does not freeze the guest,
+            //        so we take a single straight-line snapshot. No offline fallback:
+            //        fork is a live operation and if the snapshot fails the fork fails.
+            let snapshot = self.create_snapshot(parent_id, snapshot_params).await?;
+            self.force_stop_vm(parent_id).await?;
             fork_snapshot = Some(snapshot);
         }
-        let fork_snapshot_name = fork_snapshot.as_ref().map(|snapshot| snapshot.name.clone());
-        // @dive: Child VM keeps its own snapshot identity (new id, same snapshot name) so restore-by-id resolves correctly after failover.
+        // @dive: Child VM keeps its own snapshot identity (new id, same snapshot name)
+        //        so restore-by-id resolves correctly after failover.
         let child_restore_snapshot = fork_snapshot.as_ref().map(|snapshot| SnapshotMetadata {
             id: Uuid::new_v4().to_string(),
             name: snapshot.name.clone(),
             label: snapshot.label.clone(),
             description: snapshot.description.clone(),
             created_at: snapshot.created_at,
-            disk_only: snapshot.disk_only,
+            ram_file_name: snapshot.ram_file_name.clone(),
         });
 
         let (
@@ -662,9 +751,7 @@ impl Manager {
             metadata: child_metadata,
             snapshots: child_restore_snapshot.clone().into_iter().collect(),
             shared_mounts: parent_shared_mounts,
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: fork_snapshot_name.clone().unwrap_or_default(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         ensure_mount_profiles_supported(
@@ -678,8 +765,18 @@ impl Manager {
         };
 
         let parent_after;
-        if let Some(snapshot_name) = fork_snapshot_name.clone() {
+        if let Some(fork_snapshot_ref) = fork_snapshot.as_ref() {
+            let snapshot_name = fork_snapshot_ref.name.clone();
+            let snapshot_ram_file_name = fork_snapshot_ref.ram_file_name.clone();
             if let Err(err) = fs::create_dir_all(&child_dir) {
+                let _ = self.start_vm(parent_id).await;
+                return Err(ManagerError::Io(err));
+            }
+            // @dive: Pre-create the child's snapshots dir so the RAM reflink below has
+            //        somewhere to land, and so the child's vm_dir layout mirrors the
+            //        parent's (both store snapshot RAM files at <vm_dir>/snapshots/<name>).
+            if let Err(err) = fs::create_dir_all(child_dir.join("snapshots")) {
+                let _ = fs::remove_dir_all(&child_dir);
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Io(err));
             }
@@ -692,6 +789,26 @@ impl Manager {
                 let _ = self.start_vm(parent_id).await;
                 return Err(ManagerError::Other(err));
             }
+
+            // @dive: Reflink-clone the parent's external RAM file into the child's
+            //        snapshots dir. Same CoW semantic as the disk reflink above —
+            //        filesystem-level FICLONE where supported, byte copy fallback
+            //        otherwise. Child and parent will each relaunch with their own
+            //        -incoming file:<path> pointing at their own copy, and writes to
+            //        RAM diverge at the filesystem level on the first page touch.
+            let parent_ram_path = parent_vm
+                .dir
+                .join("snapshots")
+                .join(&snapshot_ram_file_name);
+            let child_ram_path = child_dir.join("snapshots").join(&snapshot_ram_file_name);
+            if let Err(err) =
+                virt::clone_file_cow(parent_ram_path.as_path(), child_ram_path.as_path()).await
+            {
+                let _ = fs::remove_dir_all(&child_dir);
+                let _ = self.start_vm(parent_id).await;
+                return Err(ManagerError::Other(err));
+            }
+            child_meta.boot_incoming_ram_path = child_ram_path.to_string_lossy().into_owned();
 
             let bootstrap_path = child_dir.join("bootstrap.iso");
             if let Err(err) = bootstrap::create_iso(
@@ -706,6 +823,7 @@ impl Manager {
                         .cloned()
                         .map(map_bootstrap_shared_mount)
                         .collect(),
+                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
                 },
             ) {
                 let _ = fs::remove_dir_all(&child_dir);
@@ -745,7 +863,11 @@ impl Manager {
                     .metadata
                     .insert(META_FORK_SNAPSHOT.to_string(), snapshot_name.clone());
                 inner.metadata.metadata.remove(META_FORK_BASE_PATH);
-                inner.metadata.boot_snapshot = snapshot_name;
+                // @dive: Parent relaunches from the snapshot via -incoming, consuming
+                //        its own (unchanged, parent-dir) copy of the RAM file. The
+                //        child got its own reflink-cloned copy above.
+                inner.metadata.boot_incoming_ram_path =
+                    parent_ram_path.to_string_lossy().into_owned();
                 if let Err(err) = save_metadata(&parent_vm.dir, &mut inner.metadata) {
                     let _ = fs::remove_dir_all(&child_dir);
                     let _ = self.start_vm(parent_id).await;
@@ -764,12 +886,12 @@ impl Manager {
 
             {
                 let mut inner = parent_vm.lock().await;
-                inner.metadata.boot_snapshot.clear();
+                inner.metadata.boot_incoming_ram_path.clear();
                 if let Err(err) = save_metadata(&parent_vm.dir, &mut inner.metadata) {
                     warn!(
                         vm_id = %parent_id,
                         error = %err,
-                        "failed to clear one-shot parent fork snapshot pointer"
+                        "failed to clear one-shot parent fork incoming path"
                     );
                 }
             }
@@ -845,6 +967,7 @@ impl Manager {
                         .cloned()
                         .map(map_bootstrap_shared_mount)
                         .collect(),
+                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
                 },
             ) {
                 Self::rollback_stopped_fork_artifacts(
@@ -963,37 +1086,51 @@ impl Manager {
         params: SnapshotParams,
     ) -> ManagerResult<SnapshotMetadata> {
         let vm = self.vm_by_id(vm_id).await?;
-        let (state, monitor, disk_path) = {
+        let (state, monitor, disk_path, vm_dir) = {
             let inner = vm.lock().await;
             (
                 inner.runtime.state,
                 inner.runtime.monitor.clone(),
                 vm.disk_path(),
+                vm.dir.clone(),
             )
         };
 
-        let mut meta = new_snapshot_metadata(params.label, params.description);
-
-        match state {
-            VmState::Running | VmState::Paused => {
-                let monitor = monitor
-                    .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
-                virt::save_vm(&monitor, &meta.name)
-                    .await
-                    .map_err(ManagerError::Other)?;
-            }
-            VmState::Stopped => {
-                virt::create_snapshot_offline(
-                    &self.cfg.qemu_img_bin,
-                    disk_path.as_path(),
-                    &meta.name,
-                )
-                .await
-                .map_err(ManagerError::Other)?;
-                meta.disk_only = true;
-            }
-            _ => return Err(ManagerError::InvalidState),
+        // @dive: Snapshots are always live, paired {disk internal snapshot, external RAM
+        //        file} pairs. Stopped VMs have no RAM state to preserve, and a disk-only
+        //        marker snapshot doesn't serve any real resume use case — see the plan at
+        //        /Users/crow/.claude/plans/immutable-munching-pearl.md for the rationale.
+        if !matches!(state, VmState::Running | VmState::Paused) {
+            return Err(ManagerError::InvalidState);
         }
+        let monitor =
+            monitor.ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
+
+        let meta = new_snapshot_metadata(params.label, params.description);
+        let snapshots_dir = vm_dir.join("snapshots");
+        tokio::fs::create_dir_all(&snapshots_dir)
+            .await
+            .with_context(|| format!("ensure snapshots dir {}", snapshots_dir.display()))
+            .map_err(ManagerError::Other)?;
+        let ram_path = snapshots_dir.join(&meta.ram_file_name);
+
+        let opts = virt::BackgroundSnapshotOptions::default();
+        let status = virt::save_vm_background(
+            &monitor,
+            disk_path.as_path(),
+            &meta.name,
+            ram_path.as_path(),
+            &opts,
+        )
+        .await
+        .map_err(ManagerError::Other)?;
+        debug!(
+            vm_id = %vm_id,
+            snapshot = %meta.name,
+            ram_bytes = ?status.bytes_transferred,
+            total_ms = ?status.total_time_ms,
+            "background snapshot completed"
+        );
 
         {
             let mut inner = vm.lock().await;
@@ -1012,7 +1149,7 @@ impl Manager {
 
     pub async fn delete_snapshot(&self, vm_id: &str, snapshot_id: &str) -> ManagerResult<()> {
         let vm = self.vm_by_id(vm_id).await?;
-        let (state, monitor, disk_path, snapshot, boot_snapshot_match) = {
+        let (state, monitor, disk_path, snapshot, vm_dir) = {
             let inner = vm.lock().await;
             let position = inner
                 .metadata
@@ -1021,23 +1158,32 @@ impl Manager {
                 .position(|snap| snap.id == snapshot_id)
                 .ok_or(ManagerError::SnapshotNotFound)?;
             let snapshot = inner.metadata.snapshots[position].clone();
-            let boot_match = inner.metadata.boot_snapshot == snapshot.name;
             (
                 inner.runtime.state,
                 inner.runtime.monitor.clone(),
                 vm.disk_path(),
                 snapshot,
-                boot_match,
+                vm.dir.clone(),
             )
         };
 
+        // @dive: Delete dispatches on current VM state. Running VMs own the qcow2 file
+        //        and the disk snapshot is removed via QMP; stopped VMs use the offline
+        //        qemu-img path. Both branches then unlink the external RAM file. This is
+        //        runtime dispatch, not a fallback.
         match state {
             VmState::Running | VmState::Paused => {
-                if let Some(monitor) = monitor {
-                    if let Err(err) = virt::delete_snapshot(&monitor, &snapshot.name).await {
-                        if !is_snapshot_not_found(&err) {
-                            return Err(ManagerError::Other(err));
-                        }
+                let monitor = monitor
+                    .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
+                let device = virt::find_block_device_id(&monitor, disk_path.as_path())
+                    .await
+                    .map_err(ManagerError::Other)?;
+                if let Err(err) =
+                    virt::blockdev_snapshot_delete_internal_sync(&monitor, &device, &snapshot.name)
+                        .await
+                {
+                    if !is_snapshot_not_found(&err) {
+                        return Err(ManagerError::Other(err));
                     }
                 }
             }
@@ -1053,15 +1199,26 @@ impl Manager {
             _ => return Err(ManagerError::InvalidState),
         }
 
+        // Always unlink the external RAM file regardless of VM state.
+        let ram_path = vm_dir.join("snapshots").join(&snapshot.ram_file_name);
+        if let Err(err) = tokio::fs::remove_file(&ram_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    vm_id = %vm_id,
+                    snapshot = %snapshot.name,
+                    path = %ram_path.display(),
+                    error = %err,
+                    "failed removing external ram snapshot file"
+                );
+            }
+        }
+
         {
             let mut inner = vm.lock().await;
             inner
                 .metadata
                 .snapshots
                 .retain(|snap| snap.id != snapshot_id);
-            if boot_snapshot_match {
-                inner.metadata.boot_snapshot.clear();
-            }
             save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
         }
 
@@ -1128,7 +1285,12 @@ impl Manager {
             inner.runtime.monitor = None;
             inner.runtime.command_pid = None;
             inner.runtime.started_at = None;
-            if let Ok(mut exit) = inner.runtime.exit_status.lock() {
+            {
+                let mut exit = inner
+                    .runtime
+                    .exit_status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 *exit = None;
             }
             inner.runtime.state = VmState::Creating;
@@ -1139,20 +1301,131 @@ impl Manager {
 
             (binary, snapshot, vm_dir, qmp_path, pid_path, log_path)
         };
+        let mut meta_snapshot = meta_snapshot;
 
         let mut port_map = HashMap::new();
         port_map.insert(meta_snapshot.network.proxy_port, 13337);
         port_map.insert(meta_snapshot.network.rpc_port, 13338);
+        let vm_proxy_upstream_addr =
+            if let Some(policy_json) = meta_snapshot.metadata.get(META_NYM_NETWORK_POLICY) {
+                let policy = serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
+                    .with_context(|| format!("parse vm network policy for {id}"))
+                    .map_err(ManagerError::Other)?;
+                let mut reserved_proxy_ports = port_map.keys().copied().collect::<HashSet<_>>();
+                let upstream_port = allocate_host_port(0, &mut reserved_proxy_ports)?;
+                let upstream_addr = format!("127.0.0.1:{upstream_port}");
+                network::register_vm_proxy_policy(
+                    id,
+                    upstream_addr
+                        .parse()
+                        .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
+                        .map_err(ManagerError::Other)?,
+                    policy,
+                )
+                .await
+                .map_err(ManagerError::Other)?;
+                meta_snapshot.metadata.insert(
+                    META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                    upstream_addr.clone(),
+                );
+                Some(upstream_addr)
+            } else {
+                None
+            };
 
-        let args = build_qemu_args(
+        // @dive: Spawn one virtiofsd subprocess per shared mount BEFORE launching
+        //        qemu. Each daemon creates its own vhost-user socket under <vm_dir>/,
+        //        which the `-chardev socket,path=...` + `-device vhost-user-fs-pci`
+        //        pair in the qemu args below connects to. If any spawn fails, reap
+        //        the already-spawned ones and mark the VM in Error state.
+        //
+        //        virtiofsd is Linux-only (it uses userfaultfd + Linux mount namespaces),
+        //        so on macOS / any host where the configured binary is missing we skip
+        //        the spawn entirely and let `build_qemu_args` fall back to the legacy
+        //        `-virtfs` (virtio-9p) shared-mount transport. That path doesn't support
+        //        live migration, but keeps the dev workflow running on non-Linux hosts.
+        let mut fuse_handles: Vec<fuse::FuseHandle> = Vec::new();
+        for mount in &mut meta_snapshot.shared_mounts {
+            if mount.is_fuse_backed() {
+                let handle = match fuse::mount_nymfs_fuse(&self.cfg, mount, vm_dir.as_path()).await
+                {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        if vm_proxy_upstream_addr.is_some() {
+                            let _ = network::unregister_vm_proxy_policy(id).await;
+                        }
+                        for previous in &fuse_handles {
+                            let _ = fuse::unmount_fuse(previous).await;
+                        }
+                        mark_vm_state(&vm, VmState::Error).await;
+                        return Err(ManagerError::Other(err));
+                    }
+                };
+                mount.host_path = handle.mountpoint().to_string_lossy().into_owned();
+                fuse_handles.push(handle);
+            }
+        }
+
+        let mut virtiofsd_handles: Vec<virt::VirtiofsdHandle> = Vec::new();
+        let can_use_virtiofsd = cfg!(target_os = "linux")
+            && !self.cfg.virtiofsd_bin.is_empty()
+            && Path::new(&self.cfg.virtiofsd_bin).exists();
+        if can_use_virtiofsd {
+            for (index, mount) in meta_snapshot.shared_mounts.iter().enumerate() {
+                let socket_path = vm_dir.join(format!("virtiofsd-{index}.sock"));
+                let log_path = vm_dir.join(format!("virtiofsd-{index}.log"));
+                let spawn = virt::VirtiofsdSpawn {
+                    source_path: PathBuf::from(&mount.host_path),
+                    socket_path,
+                    tag: mount.mount_tag.clone(),
+                    read_only: mount.read_only,
+                };
+                match virt::spawn_virtiofsd(&self.cfg.virtiofsd_bin, &spawn, log_path.as_path())
+                    .await
+                {
+                    Ok(handle) => virtiofsd_handles.push(handle),
+                    Err(err) => {
+                        if vm_proxy_upstream_addr.is_some() {
+                            let _ = network::unregister_vm_proxy_policy(id).await;
+                        }
+                        for previous in &virtiofsd_handles {
+                            virt::terminate_virtiofsd(previous);
+                        }
+                        for previous in &fuse_handles {
+                            let _ = fuse::unmount_fuse(previous).await;
+                        }
+                        mark_vm_state(&vm, VmState::Error).await;
+                        return Err(ManagerError::Other(err));
+                    }
+                }
+            }
+        } else if !meta_snapshot.shared_mounts.is_empty() {
+            debug!(
+                vm_id = %id,
+                virtiofsd_bin = %self.cfg.virtiofsd_bin,
+                "virtiofsd unavailable; falling back to legacy -virtfs shared mounts (dev path)"
+            );
+        }
+
+        let args = match build_qemu_args(
             &meta_snapshot,
             vm_dir.as_path(),
             qmp_path.as_path(),
             pid_path.as_path(),
             &self.host_arch,
+            &self.cfg.guest_network,
+            vm_proxy_upstream_addr.as_deref(),
             &port_map,
-        )
-        .map_err(ManagerError::Other)?;
+            &virtiofsd_handles,
+        ) {
+            Ok(args) => args,
+            Err(err) => {
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                return Err(ManagerError::Other(err));
+            }
+        };
         debug!(
             vm_id = %id,
             binary = %binary,
@@ -1165,6 +1438,8 @@ impl Manager {
         cmd.args(&args);
         cmd.current_dir(&vm_dir);
         cmd.stdin(std::process::Stdio::null());
+        configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), &self.cfg)
+            .map_err(ManagerError::Other)?;
 
         let log_file = OpenOptions::new()
             .create(true)
@@ -1186,6 +1461,15 @@ impl Manager {
         {
             Ok(child) => child,
             Err(err) => {
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
                 mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(err));
             }
@@ -1194,9 +1478,29 @@ impl Manager {
         let monitor =
             match virt::wait_for_monitor(qmp_path.as_path(), Duration::from_secs(20)).await {
                 Ok(handle) => handle,
-                Err(err) => return Err(abort_launch(vm.clone(), child, &log_path, err).await),
+                Err(err) => {
+                    if vm_proxy_upstream_addr.is_some() {
+                        let _ = network::unregister_vm_proxy_policy(id).await;
+                    }
+                    for handle in &virtiofsd_handles {
+                        virt::terminate_virtiofsd(handle);
+                    }
+                    for handle in &fuse_handles {
+                        let _ = fuse::unmount_fuse(handle).await;
+                    }
+                    return Err(abort_launch(vm.clone(), child, &log_path, err).await);
+                }
             };
         if let Err(err) = virt::wait_for_running(&monitor, Duration::from_secs(20)).await {
+            if vm_proxy_upstream_addr.is_some() {
+                let _ = network::unregister_vm_proxy_policy(id).await;
+            }
+            for handle in &virtiofsd_handles {
+                virt::terminate_virtiofsd(handle);
+            }
+            for handle in &fuse_handles {
+                let _ = fuse::unmount_fuse(handle).await;
+            }
             return Err(abort_launch(vm.clone(), child, &log_path, err).await);
         }
 
@@ -1206,13 +1510,36 @@ impl Manager {
             inner.runtime.state = VmState::Running;
             inner.runtime.started_at = Some(Utc::now());
             inner.runtime.command_pid = child.id();
-            if let Ok(mut exit) = inner.runtime.exit_status.lock() {
+            inner.runtime.virtiofsd_handles = virtiofsd_handles;
+            inner.runtime.fuse_handles = fuse_handles;
+            {
+                let mut exit = inner
+                    .runtime
+                    .exit_status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 *exit = None;
             }
             inner.metadata.state = VmState::Running;
             inner.metadata.started_at = inner.runtime.started_at;
+            if let Some(upstream_addr) = &vm_proxy_upstream_addr {
+                inner.metadata.metadata.insert(
+                    META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                    upstream_addr.clone(),
+                );
+            } else {
+                inner
+                    .metadata
+                    .metadata
+                    .remove(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM);
+            }
             if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
                 warn!(vm_id = %id, error = %err, "failed to persist metadata after start");
+            }
+        }
+        if let Some(pid) = child.id() {
+            if let Err(err) = network::register_vm_process(id, pid).await {
+                warn!(vm_id = %id, pid, error = %err, "failed to register vm process for network guardrails");
             }
         }
 
@@ -1350,6 +1677,14 @@ impl Manager {
             .await
             .map_err(ManagerError::Other)?;
             if reclaimed {
+                let _ = network::unregister_vm_proxy_policy(id).await;
+                let fuse_handles = {
+                    let mut inner = vm.lock().await;
+                    std::mem::take(&mut inner.runtime.fuse_handles)
+                };
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
                 // @dive: Attach/failover paths can invoke force-stop without local runtime bookkeeping; persist stopped state after reclaim.
                 mark_vm_state(&vm, VmState::Stopped).await;
             }
@@ -1365,7 +1700,7 @@ impl Manager {
         snapshot_id: &str,
     ) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(vm_id).await?;
-        let (state, snapshot, disk_path, monitor) = {
+        let (state, snapshot, disk_path, vm_dir) = {
             let inner = vm.lock().await;
             let state = inner.runtime.state;
             let snapshot = inner
@@ -1376,52 +1711,58 @@ impl Manager {
                 .cloned()
                 .ok_or(ManagerError::SnapshotNotFound)?;
             let disk_path = vm.disk_path();
-            let monitor = inner.runtime.monitor.clone();
-            (state, snapshot, disk_path, monitor)
+            (state, snapshot, disk_path, vm.dir.clone())
         };
 
-        match state {
-            VmState::Running | VmState::Paused => {
-                if snapshot.disk_only {
-                    return Err(ManagerError::InvalidState);
-                }
-                let monitor = monitor
-                    .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
-                virt::stop(&monitor).await.map_err(ManagerError::Other)?;
-                virt::load_vm(&monitor, &snapshot.name)
-                    .await
-                    .map_err(ManagerError::Other)?;
-                virt::cont(&monitor).await.map_err(ManagerError::Other)?;
-
-                let mut inner = vm.lock().await;
-                inner.runtime.state = VmState::Running;
-                inner.runtime.started_at = Some(Utc::now());
-                inner.metadata.state = VmState::Running;
-                inner.metadata.started_at = inner.runtime.started_at;
-                if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
-                    warn!(vm_id = %vm_id, error = %err, "persist metadata after restore failed");
-                }
-            }
-            VmState::Stopped => {
-                virt::revert_snapshot_offline(
-                    &self.cfg.qemu_img_bin,
-                    disk_path.as_path(),
-                    &snapshot.name,
-                )
-                .await
-                .map_err(ManagerError::Other)?;
-                let mut inner = vm.lock().await;
-                inner.runtime.state = VmState::Stopped;
-                inner.metadata.state = VmState::Stopped;
-                inner.metadata.started_at = None;
-                if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
-                    warn!(vm_id = %vm_id, error = %err, "persist metadata after restore failed");
-                }
-            }
-            _ => return Err(ManagerError::InvalidState),
+        // @dive: Single restore path for the background-snapshot world. qemu's `-incoming`
+        //        flag can only be consumed at launch, so we always: stop the current qemu
+        //        process (if any), revert the qcow2 disk state offline via `qemu-img
+        //        snapshot -a`, set `boot_incoming_ram_path` on the metadata for the next
+        //        launch, and restart via `start_vm`. After the launch we clear the
+        //        one-shot path so subsequent boots of this VM don't loop back.
+        if matches!(state, VmState::Running | VmState::Paused) {
+            self.force_stop_vm(vm_id).await?;
         }
 
-        Ok(vm.lock().await.metadata.clone())
+        virt::revert_snapshot_offline(&self.cfg.qemu_img_bin, disk_path.as_path(), &snapshot.name)
+            .await
+            .map_err(ManagerError::Other)?;
+
+        let ram_path = vm_dir.join("snapshots").join(&snapshot.ram_file_name);
+        if !ram_path.exists() {
+            return Err(ManagerError::Other(anyhow!(
+                "snapshot {} missing ram file at {}",
+                snapshot.name,
+                ram_path.display()
+            )));
+        }
+
+        {
+            let mut inner = vm.lock().await;
+            inner.metadata.boot_incoming_ram_path = ram_path.to_string_lossy().into_owned();
+            inner.metadata.state = VmState::Stopped;
+            inner.runtime.state = VmState::Stopped;
+            if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
+                warn!(vm_id = %vm_id, error = %err, "persist metadata before incoming restart failed");
+            }
+        }
+
+        // Relaunch qemu; `-incoming file:<path>` consumes the RAM file and brings the
+        // guest back to the running state of the snapshot moment.
+        let result = self.start_vm(vm_id).await;
+
+        // Clear the one-shot incoming pointer so future restarts of this VM don't loop
+        // back to the same RAM file. The RAM file itself stays on disk as a valid future
+        // restore target until explicitly deleted via `delete_snapshot`.
+        {
+            let mut inner = vm.lock().await;
+            inner.metadata.boot_incoming_ram_path.clear();
+            if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
+                warn!(vm_id = %vm_id, error = %err, "clear boot_incoming_ram_path failed");
+            }
+        }
+
+        result
     }
 
     async fn create_from_docker(
@@ -1653,6 +1994,7 @@ impl Manager {
                 .cloned()
                 .map(map_bootstrap_shared_mount)
                 .collect(),
+            http_proxy_url: self.cfg.guest_network.http_proxy_url(),
         };
         bootstrap::create_iso(&bootstrap_path, cfg).map_err(ManagerError::Other)?;
 
@@ -1676,7 +2018,7 @@ impl Manager {
             snapshot_id = %record.snapshot.id,
             "restoring VM disk from snapshot"
         );
-        let (snapshot, src_disk, dst_disk) = {
+        let (snapshot, src_disk, dst_disk, src_ram, dst_ram) = {
             let source = source_vm.lock().await;
             let src_snap = source
                 .metadata
@@ -1687,7 +2029,12 @@ impl Manager {
                 .ok_or(ManagerError::SnapshotNotFound)?;
             let src_disk = source_vm.disk_path();
             let dst_disk = vm.disk_path();
-            (src_snap, src_disk, dst_disk)
+            let src_ram = source_vm
+                .dir
+                .join("snapshots")
+                .join(&src_snap.ram_file_name);
+            let dst_ram = vm.dir.join("snapshots").join(&src_snap.ram_file_name);
+            (src_snap, src_disk, dst_disk, src_ram, dst_ram)
         };
 
         virt::copy_file(&src_disk, &dst_disk)
@@ -1699,10 +2046,18 @@ impl Manager {
             "copied base disk from snapshot"
         );
 
-        if !snapshot.disk_only {
-            guard.metadata.boot_snapshot = snapshot.name;
-            save_metadata(&vm.dir, &mut guard.metadata).map_err(ManagerError::Other)?;
-        }
+        // Carry the external RAM file across so the new VM can launch via -incoming.
+        tokio::fs::create_dir_all(vm.dir.join("snapshots"))
+            .await
+            .with_context(|| format!("ensure snapshots dir for {}", vm_id))
+            .map_err(ManagerError::Other)?;
+        virt::copy_file(&src_ram, &dst_ram)
+            .await
+            .map_err(ManagerError::Other)?;
+        guard.metadata.boot_incoming_ram_path = dst_ram.to_string_lossy().into_owned();
+        // The snapshot record was cloned into the new VM by the caller; no-op here.
+        let _ = snapshot;
+        save_metadata(&vm.dir, &mut guard.metadata).map_err(ManagerError::Other)?;
 
         Ok(guard)
     }
@@ -1894,7 +2249,10 @@ fn build_qemu_args(
     qmp_path: &Path,
     pid_path: &Path,
     host_arch: &str,
+    guest_network: &config::GuestNetworkConfig,
+    guest_http_proxy_upstream_override: Option<&str>,
     port_map: &HashMap<i32, i32>,
+    virtiofsd_handles: &[virt::VirtiofsdHandle],
 ) -> Result<Vec<String>> {
     let guest_arch = if meta.architecture.trim().is_empty() {
         ARCH_AMD64
@@ -1905,38 +2263,78 @@ fn build_qemu_args(
     let running_on_linux = cfg!(target_os = "linux");
     let running_on_macos = cfg!(target_os = "macos");
 
+    // @dive: virtio-fs (and qemu migration generally) requires shared-memory guest RAM
+    //        backing so the host-side daemons can mmap guest pages. `memory-backend-memfd`
+    //        creates an anonymous memfd-backed mapping marked `share=on`, which also
+    //        satisfies userfaultfd-WP prerequisites for `background-snapshot` migration.
+    //        The machine line references the backend via `memory-backend=mem`.
+    //
+    //        memfd_create is Linux-only, so we only emit the memfd backend when we're
+    //        actually running virtio-fs (i.e. virtiofsd_handles non-empty). On macOS /
+    //        other hosts we keep standard anonymous-mmap RAM backing, which in turn
+    //        means we take the legacy -virtfs path for shared mounts below.
+    let use_virtiofs = !virtiofsd_handles.is_empty();
+    let memory_backend_suffix = if use_virtiofs {
+        ",memory-backend=mem"
+    } else {
+        ""
+    };
+
     let (machine, cpu, bios) = match guest_arch {
         ARCH_AMD64 => {
-            let (machine, cpu) = if host_arch == ARCH_AMD64 && running_on_linux {
+            let (machine_base, cpu) = if host_arch == ARCH_AMD64 && running_on_linux {
                 ("q35,accel=kvm:tcg", "host")
             } else if host_arch == ARCH_AMD64 && running_on_macos {
                 ("q35,accel=hvf:tcg", "host")
             } else {
                 ("q35,accel=tcg", "qemu64")
             };
-            (machine.to_string(), cpu.to_string(), None)
+            (
+                format!("{machine_base}{memory_backend_suffix}"),
+                cpu.to_string(),
+                None,
+            )
         }
         ARCH_ARM64 => {
-            let mut machine = "virt,accel=tcg".to_string();
-            let mut cpu = "cortex-a72".to_string();
-            if host_arch == ARCH_ARM64 && running_on_linux {
-                machine = "virt,accel=kvm:tcg".to_string();
-                cpu = "host".to_string();
+            let machine_base = if host_arch == ARCH_ARM64 && running_on_linux {
+                "virt,accel=kvm:tcg"
             } else if host_arch == ARCH_ARM64 && running_on_macos {
-                machine = "virt,accel=hvf:tcg".to_string();
-                cpu = "host".to_string();
-            }
-            (machine, cpu, Some("edk2-aarch64-code.fd".to_string()))
+                "virt,accel=hvf:tcg"
+            } else {
+                "virt,accel=tcg"
+            };
+            let cpu = if host_arch == ARCH_ARM64 && (running_on_linux || running_on_macos) {
+                "host".to_string()
+            } else {
+                "cortex-a72".to_string()
+            };
+            (
+                format!("{machine_base}{memory_backend_suffix}"),
+                cpu,
+                Some(resolve_arm64_bios_path()?),
+            )
         }
         other => bail!("unsupported architecture: {other}"),
     };
 
     let disk_path = vm_dir.join("disk.qcow2");
+    let port_forward_bind = port_forward_bind_address();
     let mut netdev = String::from("user,id=net0");
+    if let Some(dns_server) = guest_network.dns_server.as_deref() {
+        netdev.push_str(&format!(",dns={dns_server}"));
+    }
+    if let (Some(guest_addr), Some(upstream_addr)) = (
+        guest_network.http_proxy_guest_addr.as_deref(),
+        guest_http_proxy_upstream_override.or(guest_network.http_proxy_upstream_addr.as_deref()),
+    ) {
+        netdev.push_str(&format!(",guestfwd=tcp:{guest_addr}-tcp:{upstream_addr}"));
+    }
     for (host_port, guest_port) in port_map {
+        // @dive: Distributed in-cluster callers need guest RPC and stream forwards reachable on the
+        // pod interface, while local dev keeps the same loopback-only default unless explicitly widened.
         netdev.push_str(&format!(
-            ",hostfwd=tcp:127.0.0.1:{}-:{}",
-            host_port, guest_port
+            ",hostfwd=tcp:{bind_addr}:{host_port}-:{guest_port}",
+            bind_addr = port_forward_bind,
         ));
     }
 
@@ -1949,6 +2347,17 @@ fn build_qemu_args(
     args.push(meta.resources.vcpu.to_string());
     args.push("-m".to_string());
     args.push(meta.resources.memory_mb.to_string());
+    // Memfd-backed guest RAM. `share=on` is the critical flag: it marks the mapping
+    // as MAP_SHARED so vhost-user-fs daemons can mmap the pages, and it's what enables
+    // UFFD-WP-based `background-snapshot` migration to preserve page state correctly.
+    // Only emitted when we're actually using virtio-fs (Linux production path).
+    if use_virtiofs {
+        args.push("-object".to_string());
+        args.push(format!(
+            "memory-backend-memfd,id=mem,size={}M,share=on",
+            meta.resources.memory_mb
+        ));
+    }
     args.push("-drive".to_string());
     args.push(format!(
         "file={},if=virtio,index=0,cache=none,aio=threads,format=qcow2",
@@ -1970,14 +2379,41 @@ fn build_qemu_args(
     args.push("-pidfile".to_string());
     args.push(pid_path.display().to_string());
 
-    for (index, mount) in meta.shared_mounts.iter().enumerate() {
-        // @dive: Typed shared mounts become explicit QEMU shares so guest bootstrap can mount the same durable tags every boot.
-        args.push("-virtfs".to_string());
-        let readonly = if mount.read_only { ",readonly=on" } else { "" };
-        args.push(format!(
-            "local,id=share{index},path={},security_model=none,multidevs=remap,mount_tag={}{}",
-            mount.host_path, mount.mount_tag, readonly
-        ));
+    // @dive: Shared mounts are served differently depending on whether we can use
+    //        virtio-fs on the host. The Linux production path pre-spawns virtiofsd
+    //        per mount (a vhost-user daemon) and consumes it via `-chardev` +
+    //        `-device vhost-user-fs-pci`. virtio-fs is required in production because
+    //        virtio-9p (`-virtfs`) blocks qemu migration entirely and we need
+    //        migration-capable VMs for `background-snapshot`.
+    //
+    //        On macOS / any host where virtiofsd is unavailable, the caller passes an
+    //        empty `virtiofsd_handles` slice and we fall back to `-virtfs local,...`.
+    //        That legacy path doesn't support migration but lets developers run vmd
+    //        locally without needing a Linux-only daemon.
+    if use_virtiofs {
+        for (index, handle) in virtiofsd_handles.iter().enumerate() {
+            let chardev_id = format!("vfsd{index}");
+            args.push("-chardev".to_string());
+            args.push(format!(
+                "socket,id={chardev_id},path={}",
+                handle.socket_path.display()
+            ));
+            args.push("-device".to_string());
+            args.push(format!(
+                "vhost-user-fs-pci,queue-size=1024,chardev={chardev_id},tag={}",
+                handle.tag
+            ));
+        }
+    } else {
+        for (index, mount) in meta.shared_mounts.iter().enumerate() {
+            // Legacy virtio-9p fallback for non-Linux dev hosts.
+            args.push("-virtfs".to_string());
+            let readonly = if mount.read_only { ",readonly=on" } else { "" };
+            args.push(format!(
+                "local,id=share{index},path={},security_model=none,multidevs=remap,mount_tag={}{}",
+                mount.host_path, mount.mount_tag, readonly
+            ));
+        }
     }
 
     if let Some(bios) = bios {
@@ -1985,9 +2421,12 @@ fn build_qemu_args(
         args.push(bios);
     }
 
-    if !meta.boot_snapshot.is_empty() {
-        args.push("-loadvm".to_string());
-        args.push(meta.boot_snapshot.clone());
+    // @dive: `-incoming file:<path>` restores the VM from a background-snapshot RAM
+    //        file (paired with an already-reverted qcow2 disk snapshot). This is the
+    //        only restore mechanism — there is no legacy `-loadvm` path.
+    if !meta.boot_incoming_ram_path.is_empty() {
+        args.push("-incoming".to_string());
+        args.push(format!("file:{}", meta.boot_incoming_ram_path));
     }
 
     let bootstrap_iso = vm_dir.join("bootstrap.iso");
@@ -2000,6 +2439,19 @@ fn build_qemu_args(
     }
 
     Ok(args)
+}
+
+fn resolve_arm64_bios_path() -> Result<String> {
+    for candidate in ARM64_BIOS_CANDIDATES {
+        if Path::new(candidate).exists() {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    bail!(
+        "no arm64 UEFI firmware found; tried {}",
+        ARM64_BIOS_CANDIDATES.join(", ")
+    )
 }
 
 fn map_bootstrap_shared_mount(mount: SharedMountSpec) -> bootstrap::SharedMount {
@@ -2020,9 +2472,17 @@ fn normalize_shared_mounts(
     for (index, mount) in shared_mounts.into_iter().enumerate() {
         let host_path = mount.host_path.trim();
         let guest_path = mount.guest_path.trim();
-        if host_path.is_empty() {
+        let vfs_endpoint = mount.vfs_endpoint.trim();
+        let vfs_scope_path = mount.vfs_scope_path.trim();
+        let is_fuse_backed = !vfs_endpoint.is_empty();
+        if host_path.is_empty() && !is_fuse_backed {
             return Err(ManagerError::Other(anyhow!(
                 "shared mount host_path is required"
+            )));
+        }
+        if is_fuse_backed && mount.host_path.contains('\0') {
+            return Err(ManagerError::Other(anyhow!(
+                "shared mount host_path must not contain NUL bytes"
             )));
         }
         if guest_path.is_empty() {
@@ -2037,9 +2497,15 @@ fn normalize_shared_mounts(
             )));
         }
 
-        let canonical_host = fs::canonicalize(host_path)
-            .with_context(|| format!("canonicalize shared mount host path {}", host_path))
-            .map_err(ManagerError::Other)?;
+        let normalized_host = if is_fuse_backed {
+            String::new()
+        } else {
+            fs::canonicalize(host_path)
+                .with_context(|| format!("canonicalize shared mount host path {}", host_path))
+                .map_err(ManagerError::Other)?
+                .to_string_lossy()
+                .to_string()
+        };
         let guest_path = guest_path.to_string();
         if !guest_paths.insert(guest_path.clone()) {
             return Err(ManagerError::Other(anyhow!(
@@ -2069,13 +2535,15 @@ fn normalize_shared_mounts(
         }
 
         normalized.push(SharedMountSpec {
-            host_path: canonical_host.to_string_lossy().to_string(),
+            host_path: normalized_host,
             guest_path,
             mount_tag,
             read_only: mount.read_only,
             availability,
             continuity,
             backend_profile,
+            vfs_endpoint: vfs_endpoint.to_string(),
+            vfs_scope_path: vfs_scope_path.to_string(),
         });
     }
 
@@ -2217,15 +2685,16 @@ async fn wait_for_exit(vm: &Arc<Vm>, timeout: Duration) -> ManagerResult<()> {
 }
 
 fn allocate_host_port(preferred: i32, reserved: &mut HashSet<i32>) -> Result<i32> {
+    let bind_address = port_forward_bind_address();
     if preferred > 0 && !reserved.contains(&preferred) {
-        if port_available(preferred) {
+        if port_available(preferred, bind_address.as_str()) {
             reserved.insert(preferred);
             return Ok(preferred);
         }
     }
 
     loop {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = TcpListener::bind(format!("{bind_address}:0"))?;
         let port = listener.local_addr()?.port() as i32;
         drop(listener);
         if reserved.contains(&port) {
@@ -2236,17 +2705,26 @@ fn allocate_host_port(preferred: i32, reserved: &mut HashSet<i32>) -> Result<i32
     }
 }
 
-fn port_available(port: i32) -> bool {
+fn port_available(port: i32, bind_address: &str) -> bool {
     if port <= 0 {
         return false;
     }
-    match TcpListener::bind(("127.0.0.1", port as u16)) {
+    match TcpListener::bind(format!("{bind_address}:{port}")) {
         Ok(listener) => {
             drop(listener);
             true
         }
         Err(_) => false,
     }
+}
+
+fn port_forward_bind_address() -> String {
+    env::var("RESON_SANDBOX_PORT_FORWARD_BIND_ADDRESS")
+        .or_else(|_| env::var("BRACKET_SANDBOX_PORT_FORWARD_BIND_ADDRESS"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
 fn read_log_tail(path: &Path, limit: usize) -> Option<String> {
@@ -2291,16 +2769,29 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
 
         let mut inner = vm.lock().await;
         let vm_id = inner.metadata.id.clone();
+        let vm_id_for_proxy_cleanup = vm_id.clone();
         inner.runtime.monitor = None;
         inner.runtime.command_pid = None;
         inner.runtime.started_at = None;
+
+        // @dive: virtiofsd normally self-exits when qemu drops the vhost-user socket,
+        //        but we still SIGTERM any straggler to make cleanup deterministic and
+        //        to unlink the socket file.
+        let handles = std::mem::take(&mut inner.runtime.virtiofsd_handles);
+        for handle in &handles {
+            virt::terminate_virtiofsd(handle);
+        }
+        let fuse_handles = std::mem::take(&mut inner.runtime.fuse_handles);
+        for handle in &fuse_handles {
+            let _ = fuse::unmount_fuse(handle).await;
+        }
 
         {
             let mut exit_guard = inner
                 .runtime
                 .exit_status
                 .lock()
-                .expect("exit status lock poisoned");
+                .unwrap_or_else(|error| error.into_inner());
             *exit_guard = exit_error.take();
         }
 
@@ -2319,7 +2810,123 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
         if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
             warn!(vm_id = %vm_id, error = %err, "persist metadata after exit failed");
         }
+        drop(inner);
+        if let Err(err) = network::unregister_vm_proxy_policy(&vm_id_for_proxy_cleanup).await {
+            warn!(
+                vm_id = %vm_id_for_proxy_cleanup,
+                error = %err,
+                "failed to unregister vm proxy policy after exit"
+            );
+        }
     });
+}
+
+#[cfg(unix)]
+fn configure_qemu_process_identity(cmd: &mut Command, vm_dir: &Path, cfg: &Config) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+
+    recursively_chown_path_skipping(
+        vm_dir,
+        cfg.qemu_process.run_as_uid,
+        cfg.qemu_process.run_as_gid,
+        &[vm_dir.join("fuse-mounts")],
+    )
+    .with_context(|| format!("chown vm dir {} for qemu user", vm_dir.display()))?;
+
+    let uid = cfg.qemu_process.run_as_uid;
+    let gid = cfg.qemu_process.run_as_gid;
+    unsafe {
+        cmd.pre_exec(move || {
+            let groups = [gid as libc::gid_t];
+            #[cfg(target_os = "linux")]
+            let ngroups = groups.len();
+            #[cfg(not(target_os = "linux"))]
+            let ngroups: libc::c_int = groups
+                .len()
+                .try_into()
+                .expect("supplementary group count fits in c_int");
+
+            if libc::setgroups(ngroups, groups.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(gid as libc::gid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid as libc::uid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_qemu_process_identity(
+    _cmd: &mut Command,
+    _vm_dir: &Path,
+    _cfg: &Config,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recursively_chown_path_skipping(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    skipped_roots: &[PathBuf],
+) -> Result<()> {
+    if should_skip_chown_path(path, skipped_roots) {
+        return Ok(());
+    }
+
+    chown_single_path(path, uid, gid)?;
+    if path.is_dir() {
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("read directory for chown {}", path.display()))?
+        {
+            let entry = entry.with_context(|| format!("walk directory {}", path.display()))?;
+            let entry_path = entry.path();
+            if should_skip_chown_path(entry_path.as_path(), skipped_roots) {
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("stat {}", entry_path.display()))?;
+            if file_type.is_dir() {
+                recursively_chown_path_skipping(entry_path.as_path(), uid, gid, skipped_roots)?;
+            } else {
+                chown_single_path(entry_path.as_path(), uid, gid)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn should_skip_chown_path(path: &Path, skipped_roots: &[PathBuf]) -> bool {
+    skipped_roots.iter().any(|root| path.starts_with(root))
+}
+
+#[cfg(unix)]
+fn chown_single_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    let c_path = std::ffi::CString::new(bytes)
+        .with_context(|| format!("convert path to cstring {}", path.display()))?;
+    let rc = unsafe { libc::chown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("chown {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn recursively_chown_path(_path: &Path, _uid: u32, _gid: u32) -> Result<()> {
+    Ok(())
 }
 
 fn kill_process(pid: u32) -> Result<()> {
@@ -2691,6 +3298,7 @@ mod tests {
             qemu_bin: "qemu-system-x86_64".to_string(),
             qemu_arm64_bin: "qemu-system-aarch64".to_string(),
             qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
@@ -2702,6 +3310,10 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
+            nymfs_internal_service_token: None,
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
             security: Default::default(),
         };
 
@@ -2775,10 +3387,10 @@ mod tests {
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
                 backend_profile: "shared-posix".to_string(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
             }],
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: String::new(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         save_metadata(&parent_dir, &mut parent_meta).expect("save parent metadata");
@@ -2916,9 +3528,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: String::new(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         save_metadata(&vm_dir, &mut meta).expect("save vm metadata");
@@ -2929,6 +3539,7 @@ mod tests {
             qemu_bin: "qemu-system-x86_64".to_string(),
             qemu_arm64_bin: "qemu-system-aarch64".to_string(),
             qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
@@ -2940,6 +3551,10 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
+            nymfs_internal_service_token: None,
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
             security: Default::default(),
         };
 
@@ -2973,6 +3588,7 @@ mod tests {
             qemu_bin: "qemu-system-x86_64".to_string(),
             qemu_arm64_bin: "qemu-system-aarch64".to_string(),
             qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
@@ -2984,6 +3600,10 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
+            nymfs_internal_service_token: None,
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
             security: Default::default(),
         };
 
@@ -3022,9 +3642,7 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: String::new(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         manager.vms.write().await.insert(
@@ -3063,6 +3681,7 @@ mod tests {
             qemu_bin: "qemu-system-x86_64".to_string(),
             qemu_arm64_bin: "qemu-system-aarch64".to_string(),
             qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
             docker_bin: "docker".to_string(),
             log_level: "info".to_string(),
             force_local_build: false,
@@ -3074,6 +3693,10 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
+            nymfs_internal_service_token: None,
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
             security: Default::default(),
         };
 
@@ -3112,9 +3735,7 @@ mod tests {
             metadata: HashMap::from([(META_FORK_DEPTH.to_string(), "1".to_string())]),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: String::new(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         save_metadata(&parent_dir, &mut metadata).expect("save parent metadata");
@@ -3150,6 +3771,491 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_rejects_stopped_vm() {
+        // @dive: Strict live semantics — snapshots are a live-VM operation. Stopped VMs
+        //        have no RAM state to preserve, so create_snapshot must reject rather
+        //        than silently produce a disk-only record.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
+
+        let cfg = Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: data_dir.to_string_lossy().to_string(),
+            qemu_bin: "qemu-system-x86_64".to_string(),
+            qemu_arm64_bin: "qemu-system-aarch64".to_string(),
+            qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
+            docker_bin: "docker".to_string(),
+            log_level: "info".to_string(),
+            force_local_build: false,
+            max_active_vms: None,
+            max_fork_chain_depth: 8,
+            fork_compaction_depth_threshold: 8,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string()],
+            ha_mode: false,
+            node_registry: None,
+            control_bus: None,
+            nymfs_internal_service_token: None,
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
+            security: Default::default(),
+        };
+
+        let manager = Manager {
+            cfg,
+            host_arch: ARCH_AMD64.to_string(),
+            vms: RwLock::new(HashMap::new()),
+            snapshots: RwLock::new(HashMap::new()),
+        };
+
+        let vm_id = "vm-stopped".to_string();
+        let vm_dir = data_dir.join(&vm_id);
+        fs::create_dir_all(&vm_dir).expect("create vm dir");
+
+        let mut metadata = VmMetadata {
+            id: vm_id.clone(),
+            name: "vm-stopped".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:10".to_string(),
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        save_metadata(&vm_dir, &mut metadata).expect("save metadata");
+        manager.vms.write().await.insert(
+            vm_id.clone(),
+            Arc::new(Vm::new(metadata, VmRuntime::new(&vm_dir), vm_dir.clone())),
+        );
+
+        let err = manager
+            .create_snapshot(
+                &vm_id,
+                SnapshotParams {
+                    label: "attempt".to_string(),
+                    description: "should be rejected".to_string(),
+                },
+            )
+            .await
+            .expect_err("create_snapshot on Stopped must fail with InvalidState");
+        assert!(
+            matches!(err, ManagerError::InvalidState),
+            "expected InvalidState, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_vm_preserves_runtime_managed_proxy_upstream_metadata() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        fs::create_dir_all(data_dir.join(config::BASE_IMAGES_DIR_NAME))
+            .expect("create base images");
+
+        let cfg = Config {
+            listen_address: "127.0.0.1:0".to_string(),
+            data_dir: data_dir.to_string_lossy().to_string(),
+            qemu_bin: "qemu-system-x86_64".to_string(),
+            qemu_arm64_bin: "qemu-system-aarch64".to_string(),
+            qemu_img_bin: "qemu-img".to_string(),
+            virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
+            docker_bin: "docker".to_string(),
+            log_level: "info".to_string(),
+            force_local_build: false,
+            max_active_vms: None,
+            max_fork_chain_depth: 8,
+            fork_compaction_depth_threshold: 8,
+            storage_profile: config::StorageProfile::LocalEphemeral,
+            shared_mount_profiles: vec!["local-path".to_string()],
+            ha_mode: false,
+            node_registry: None,
+            control_bus: None,
+            nymfs_internal_service_token: None,
+            qemu_process: Default::default(),
+            guest_network: Default::default(),
+            network_services: Default::default(),
+            security: Default::default(),
+        };
+
+        let manager = Manager {
+            cfg,
+            host_arch: ARCH_AMD64.to_string(),
+            vms: RwLock::new(HashMap::new()),
+            snapshots: RwLock::new(HashMap::new()),
+        };
+
+        let vm_id = "vm-update-policy".to_string();
+        let vm_dir = data_dir.join(&vm_id);
+        fs::create_dir_all(&vm_dir).expect("create vm dir");
+
+        let mut metadata = VmMetadata {
+            id: vm_id.clone(),
+            name: "vm-update-policy".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:14".to_string(),
+                proxy_port: 0,
+                rpc_port: 0,
+            },
+            metadata: HashMap::from([
+                (
+                    META_NYM_NETWORK_POLICY.to_string(),
+                    "{\"domain_allowlist\":[\"github.com\"],\"domain_blocklist\":[],\"custom_port_allowlist\":[],\"bandwidth_cap_mb_per_hour\":1024,\"max_connections_per_minute\":1000}".to_string(),
+                ),
+                (
+                    META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                    "127.0.0.1:43128".to_string(),
+                ),
+            ]),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        save_metadata(&vm_dir, &mut metadata).expect("save metadata");
+        manager.vms.write().await.insert(
+            vm_id.clone(),
+            Arc::new(Vm::new(metadata, VmRuntime::new(&vm_dir), vm_dir.clone())),
+        );
+
+        let updated = manager
+            .update_vm(
+                &vm_id,
+                UpdateVmParams {
+                    name: None,
+                    metadata: Some(HashMap::from([(
+                        META_NYM_NETWORK_POLICY.to_string(),
+                        "{\"domain_allowlist\":[\"api.openai.com\"],\"domain_blocklist\":[],\"custom_port_allowlist\":[8080],\"bandwidth_cap_mb_per_hour\":512,\"max_connections_per_minute\":100}".to_string(),
+                    )])),
+                },
+            )
+            .await
+            .expect("update vm metadata");
+
+        assert_eq!(
+            updated
+                .metadata
+                .get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM)
+                .map(String::as_str),
+            Some("127.0.0.1:43128")
+        );
+        assert!(
+            updated
+                .metadata
+                .get(META_NYM_NETWORK_POLICY)
+                .is_some_and(|value| value.contains("api.openai.com"))
+        );
+    }
+
+    #[test]
+    fn build_qemu_args_falls_back_to_virtfs_when_virtiofsd_unavailable() {
+        // @dive: Dev hosts (notably macOS) cannot run virtiofsd, so vmd passes an empty
+        //        handle slice and the builder must fall back to legacy `-virtfs`
+        //        shared-mount emission. Also: no memfd backend on this path (the qemu
+        //        machine line stays clean) because virtio-9p doesn't need shared memory.
+        let meta = VmMetadata {
+            id: "vm-9p-fallback".to_string(),
+            name: "dev9p".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:12".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: vec![SharedMountSpec {
+                host_path: "/tmp/nymfs".to_string(),
+                guest_path: "/nym".to_string(),
+                mount_tag: "nymfs".to_string(),
+                read_only: true,
+                availability: SharedMountAvailability::SharedStorage,
+                continuity: SharedMountContinuity::RestoreCrossNode,
+                backend_profile: "shared-posix".to_string(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
+            }],
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        let mut port_map = HashMap::new();
+        port_map.insert(3000, 13337);
+
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-9p"),
+            Path::new("/tmp/vm-9p/qmp.sock"),
+            Path::new("/tmp/vm-9p/qemu.pid"),
+            ARCH_AMD64,
+            &config::GuestNetworkConfig::default(),
+            None,
+            &port_map,
+            &[],
+        )
+        .expect("build qemu args");
+
+        // No memfd backend on the fallback path — virtio-9p doesn't need shared memory.
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("memory-backend-memfd")),
+            "fallback path must not emit memfd memory backend"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("memory-backend=mem")),
+            "fallback path must not reference the memfd backend on the machine line"
+        );
+
+        // Legacy -virtfs device with the same mount tag and readonly flag.
+        assert!(args.iter().any(|arg| arg == "-virtfs"));
+        assert!(args.iter().any(|arg| {
+            arg.contains("path=/tmp/nymfs")
+                && arg.contains("mount_tag=nymfs")
+                && arg.contains("readonly=on")
+        }));
+    }
+
+    #[test]
+    fn build_qemu_args_emits_incoming_when_boot_incoming_ram_path_set() {
+        // @dive: Verifies the one-shot -incoming restore path. When boot_incoming_ram_path
+        //        is populated, build_qemu_args must emit -incoming file:<path> so qemu
+        //        consumes the background-snapshot RAM file on launch.
+        let meta = VmMetadata {
+            id: "vm-incoming".to_string(),
+            name: "incoming".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:11".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            boot_incoming_ram_path: "/srv/reson/vms/vm-incoming/snapshots/snap-abc.ram".to_string(),
+            started_at: None,
+        };
+        let mut port_map = HashMap::new();
+        port_map.insert(3000, 13337);
+
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-incoming"),
+            Path::new("/tmp/vm-incoming/qmp.sock"),
+            Path::new("/tmp/vm-incoming/qemu.pid"),
+            ARCH_AMD64,
+            &config::GuestNetworkConfig::default(),
+            None,
+            &port_map,
+            &[],
+        )
+        .expect("build qemu args");
+
+        // `-incoming` must be present, followed by `file:<path>`.
+        let incoming_idx = args
+            .iter()
+            .position(|a| a == "-incoming")
+            .expect("`-incoming` flag missing from qemu args");
+        let next = args
+            .get(incoming_idx + 1)
+            .expect("`-incoming` missing its value arg");
+        assert_eq!(
+            next, "file:/srv/reson/vms/vm-incoming/snapshots/snap-abc.ram",
+            "unexpected -incoming value"
+        );
+    }
+
+    #[test]
+    fn build_qemu_args_emits_guest_dns_and_proxy_forwarding_when_configured() {
+        let meta = VmMetadata {
+            id: "vm-guest-network".to_string(),
+            name: "guest-network".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:10".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        let guest_network = config::GuestNetworkConfig {
+            dns_server: Some("10.0.2.3".to_string()),
+            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
+            http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
+        };
+        let mut port_map = HashMap::new();
+        port_map.insert(3000, 13337);
+
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-guest-network"),
+            Path::new("/tmp/vm-guest-network/qmp.sock"),
+            Path::new("/tmp/vm-guest-network/qemu.pid"),
+            ARCH_AMD64,
+            &guest_network,
+            None,
+            &port_map,
+            &[],
+        )
+        .expect("build qemu args");
+
+        let netdev_idx = args
+            .iter()
+            .position(|arg| arg == "-netdev")
+            .expect("missing -netdev arg");
+        let netdev = args
+            .get(netdev_idx + 1)
+            .expect("missing user netdev value after -netdev");
+        assert!(netdev.starts_with("user,id=net0"));
+        assert!(netdev.contains("dns=10.0.2.3"));
+        assert!(netdev.contains("guestfwd=tcp:10.0.2.100:3128-tcp:127.0.0.1:3128"));
+        assert!(netdev.contains("hostfwd=tcp:"));
+    }
+
+    #[test]
+    fn build_qemu_args_prefers_vm_proxy_upstream_override_when_present() {
+        let meta = VmMetadata {
+            id: "vm-guest-network-override".to_string(),
+            name: "guest-network-override".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:13".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        let guest_network = config::GuestNetworkConfig {
+            dns_server: Some("10.0.2.3".to_string()),
+            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
+            http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
+        };
+        let mut port_map = HashMap::new();
+        port_map.insert(3000, 13337);
+
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-guest-network-override"),
+            Path::new("/tmp/vm-guest-network-override/qmp.sock"),
+            Path::new("/tmp/vm-guest-network-override/qemu.pid"),
+            ARCH_AMD64,
+            &guest_network,
+            Some("127.0.0.1:43128"),
+            &port_map,
+            &[],
+        )
+        .expect("build qemu args");
+
+        let netdev_idx = args
+            .iter()
+            .position(|arg| arg == "-netdev")
+            .expect("missing -netdev arg");
+        let netdev = args
+            .get(netdev_idx + 1)
+            .expect("missing user netdev value after -netdev");
+        assert!(netdev.contains("guestfwd=tcp:10.0.2.100:3128-tcp:127.0.0.1:43128"));
+        assert!(!netdev.contains("guestfwd=tcp:10.0.2.100:3128-tcp:127.0.0.1:3128"));
+    }
+
+    #[test]
+    fn new_snapshot_metadata_derives_ram_file_name_from_snapshot_name() {
+        // @dive: Contract between `new_snapshot_metadata` and `create_snapshot`'s
+        //        `<vm_dir>/snapshots/<ram_file_name>` layout. If this ever drifts,
+        //        restore/delete will look at the wrong filename.
+        let meta = new_snapshot_metadata("label".to_string(), "desc".to_string());
+        assert!(meta.name.starts_with("snap-"));
+        assert_eq!(meta.ram_file_name, format!("{}.ram", meta.name));
     }
 
     #[test]
@@ -3209,7 +4315,11 @@ mod tests {
     }
 
     #[test]
-    fn build_qemu_args_emits_shared_mounts_as_virtfs() {
+    fn build_qemu_args_emits_shared_mounts_as_virtiofs() {
+        // @dive: Shared mounts now flow through pre-spawned virtiofsd daemons and
+        //        qemu consumes them via vhost-user-fs-pci. Verify the builder emits a
+        //        matching -chardev + -device pair for each handle, plus the memfd
+        //        memory backend that vhost-user needs.
         let meta = VmMetadata {
             id: "vm-shared-mounts".to_string(),
             name: "shared".to_string(),
@@ -3241,14 +4351,21 @@ mod tests {
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
                 backend_profile: "shared-posix".to_string(),
+                vfs_endpoint: String::new(),
+                vfs_scope_path: String::new(),
             }],
-            suspended_snapshot: String::new(),
-            suspended_boot_snapshot: String::new(),
-            boot_snapshot: String::new(),
+            boot_incoming_ram_path: String::new(),
             started_at: None,
         };
         let mut port_map = HashMap::new();
         port_map.insert(3000, 13337);
+        let virtiofsd_handles = vec![virt::VirtiofsdHandle {
+            pid: 0,
+            socket_path: PathBuf::from("/tmp/vm-shared/virtiofsd-0.sock"),
+            source_path: PathBuf::from("/tmp/nymfs"),
+            tag: "nymfs".to_string(),
+            read_only: true,
+        }];
 
         let args = build_qemu_args(
             &meta,
@@ -3256,15 +4373,38 @@ mod tests {
             Path::new("/tmp/vm-shared/qmp.sock"),
             Path::new("/tmp/vm-shared/qemu.pid"),
             ARCH_AMD64,
+            &config::GuestNetworkConfig::default(),
+            None,
             &port_map,
+            &virtiofsd_handles,
         )
         .expect("build qemu args");
 
-        assert!(args.iter().any(|arg| arg == "-virtfs"));
+        // memfd memory backend with share=on — required for both vhost-user-fs and
+        // `background-snapshot` migration.
+        assert!(
+            args.iter()
+                .any(|arg| { arg.starts_with("memory-backend-memfd") && arg.contains("share=on") })
+        );
+        // Machine line threads the memfd backend into the machine definition.
+        assert!(args.iter().any(|arg| arg.contains("memory-backend=mem")));
+
+        // `-virtfs` must be gone — it would block qemu migration.
+        assert!(
+            !args.iter().any(|arg| arg == "-virtfs"),
+            "build_qemu_args must not emit legacy -virtfs"
+        );
+
+        // `-chardev socket,id=vfsd0,path=...` pairing with a `-device
+        // vhost-user-fs-pci ...,chardev=vfsd0,tag=nymfs`.
         assert!(args.iter().any(|arg| {
-            arg.contains("path=/tmp/nymfs")
-                && arg.contains("mount_tag=nymfs")
-                && arg.contains("readonly=on")
+            arg.starts_with("socket,id=vfsd0")
+                && arg.contains("path=/tmp/vm-shared/virtiofsd-0.sock")
+        }));
+        assert!(args.iter().any(|arg| {
+            arg.starts_with("vhost-user-fs-pci")
+                && arg.contains("chardev=vfsd0")
+                && arg.contains("tag=nymfs")
         }));
     }
 
@@ -3282,6 +4422,8 @@ mod tests {
             availability: SharedMountAvailability::NodeLocal,
             continuity: SharedMountContinuity::RestartSameNode,
             backend_profile: String::new(),
+            vfs_endpoint: String::new(),
+            vfs_scope_path: String::new(),
         }])
         .expect("normalize shared mount");
 
@@ -3310,6 +4452,8 @@ mod tests {
             availability: SharedMountAvailability::NodeLocal,
             continuity: SharedMountContinuity::RestoreCrossNode,
             backend_profile: String::new(),
+            vfs_endpoint: String::new(),
+            vfs_scope_path: String::new(),
         }])
         .expect_err("node-local mount should reject cross-node continuity");
 
@@ -3330,10 +4474,38 @@ mod tests {
             availability: SharedMountAvailability::SharedStorage,
             continuity: SharedMountContinuity::RestoreCrossNode,
             backend_profile: String::new(),
+            vfs_endpoint: String::new(),
+            vfs_scope_path: String::new(),
         }])
         .expect_err("shared-storage mount should require backend_profile");
 
         assert!(format!("{err}").contains("backend_profile"));
+    }
+
+    #[test]
+    fn normalize_shared_mounts_allows_fuse_backed_mounts_without_host_path() {
+        let normalized = normalize_shared_mounts(vec![SharedMountSpec {
+            host_path: String::new(),
+            guest_path: "/nym".to_string(),
+            mount_tag: "nymfs".to_string(),
+            read_only: true,
+            availability: SharedMountAvailability::SharedStorage,
+            continuity: SharedMountContinuity::RestoreCrossNode,
+            backend_profile: "gcs-vfs-fuse".to_string(),
+            vfs_endpoint: " http://nym-api.reson-vm.svc.cluster.local:3001/v1/internal/nymfs/123 "
+                .to_string(),
+            vfs_scope_path: " conversations/example/shared ".to_string(),
+        }])
+        .expect("normalize fuse-backed mount");
+
+        assert_eq!(normalized.len(), 1);
+        assert!(normalized[0].host_path.is_empty());
+        assert_eq!(
+            normalized[0].vfs_endpoint,
+            "http://nym-api.reson-vm.svc.cluster.local:3001/v1/internal/nymfs/123"
+        );
+        assert_eq!(normalized[0].vfs_scope_path, "conversations/example/shared");
+        assert!(normalized[0].is_fuse_backed());
     }
 
     #[tokio::test]
@@ -3366,6 +4538,7 @@ mod tests {
                 qemu_bin: "qemu-system-x86_64".to_string(),
                 qemu_arm64_bin: "qemu-system-aarch64".to_string(),
                 qemu_img_bin: "qemu-img".to_string(),
+                virtiofsd_bin: "/usr/lib/qemu/virtiofsd".to_string(),
                 docker_bin: fake_docker.to_string_lossy().to_string(),
                 log_level: "info".to_string(),
                 force_local_build: false,
@@ -3377,6 +4550,10 @@ mod tests {
                 ha_mode: false,
                 node_registry: None,
                 control_bus: None,
+                nymfs_internal_service_token: None,
+                qemu_process: Default::default(),
+                guest_network: Default::default(),
+                network_services: Default::default(),
                 security: Default::default(),
             },
             host_arch: ARCH_ARM64.to_string(),
@@ -3395,5 +4572,21 @@ mod tests {
             !fake_docker.with_extension("log").exists(),
             "explicit architecture should not invoke docker manifest/pull probes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_skip_chown_path_matches_fuse_mount_subtree() {
+        let vm_dir = PathBuf::from("/tmp/example-vm");
+        let skipped = vec![vm_dir.join("fuse-mounts")];
+
+        assert!(should_skip_chown_path(
+            &vm_dir.join("fuse-mounts").join("nymfs"),
+            &skipped
+        ));
+        assert!(!should_skip_chown_path(
+            &vm_dir.join("disk.qcow2"),
+            &skipped
+        ));
     }
 }

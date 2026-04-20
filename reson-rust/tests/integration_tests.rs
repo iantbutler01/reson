@@ -281,9 +281,7 @@ fn require_i64_field<T: ToolCallCarrier>(
     })
 }
 
-fn require_tool_call_id<T: ToolCallCarrier>(
-    tool_call: &T,
-) -> reson_agentic::error::Result<String> {
+fn require_tool_call_id<T: ToolCallCarrier>(tool_call: &T) -> reson_agentic::error::Result<String> {
     let tool_call = tool_call.first_tool_call_value()?;
     let id = tool_call
         .get("id")

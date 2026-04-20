@@ -289,9 +289,8 @@ mod agentic_macro_tests {
             String,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<reson_agentic::types::AssistantResponse>,
-                    > + Send,
+                dyn std::future::Future<Output = Result<reson_agentic::types::AssistantResponse>>
+                    + Send,
             >,
         > = |input| Box::pin(simple_agentic_fn(input));
     }
@@ -326,9 +325,8 @@ mod agentic_macro_tests {
             i32,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<reson_agentic::types::AssistantResponse>,
-                    > + Send,
+                dyn std::future::Future<Output = Result<reson_agentic::types::AssistantResponse>>
+                    + Send,
             >,
         > = |data| Box::pin(no_model_agentic_fn(data));
     }
@@ -365,9 +363,8 @@ mod agentic_macro_tests {
             u32,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<reson_agentic::types::AssistantResponse>,
-                    > + Send,
+                dyn std::future::Future<Output = Result<reson_agentic::types::AssistantResponse>>
+                    + Send,
             >,
         > = |name, count| Box::pin(multi_param_fn(name, count));
     }

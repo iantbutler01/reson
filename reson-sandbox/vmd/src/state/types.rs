@@ -122,8 +122,29 @@ pub struct SharedMountSpec {
     pub continuity: SharedMountContinuity,
     #[serde(default)]
     pub backend_profile: String,
+    #[serde(default)]
+    pub vfs_endpoint: String,
+    #[serde(default)]
+    pub vfs_scope_path: String,
 }
 
+impl SharedMountSpec {
+    pub fn is_fuse_backed(&self) -> bool {
+        !self.vfs_endpoint.trim().is_empty()
+    }
+}
+
+/// On-disk snapshot record.
+///
+/// Every snapshot is a live background snapshot produced by [`virt::save_vm_background`].
+/// The disk state is pinned via a `blockdev-snapshot-internal-sync` internal snapshot
+/// sharing the same `name`, and the RAM state is written as an external file at
+/// `<vm_dir>/snapshots/<ram_file_name>`. Restored by reverting the disk snapshot offline
+/// (`qemu-img snapshot -a`) and relaunching qemu with `-incoming file:<ram_path>`. See
+/// `state::manager::restore_snapshot` for the pairing logic.
+///
+/// There is intentionally no "disk-only" or offline snapshot mode — snapshots exist to
+/// resume a live VM, not to mark the state of a stopped one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
     pub id: String,
@@ -134,8 +155,8 @@ pub struct SnapshotMetadata {
     pub description: String,
     #[serde(with = "iso8601")]
     pub created_at: DateTime<Utc>,
-    #[serde(default)]
-    pub disk_only: bool,
+    /// Filename of the external RAM state file under `<vm_dir>/snapshots/`. Required.
+    pub ram_file_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,12 +179,12 @@ pub struct VmMetadata {
     pub snapshots: Vec<SnapshotMetadata>,
     #[serde(default)]
     pub shared_mounts: Vec<SharedMountSpec>,
-    #[serde(default)]
-    pub suspended_snapshot: String,
-    #[serde(default)]
-    pub suspended_boot_snapshot: String,
-    #[serde(default)]
-    pub boot_snapshot: String,
+    /// Absolute path of an external RAM file for the next `start_vm` to consume via
+    /// `-incoming file:<path>`. Set transiently by `restore_snapshot` (and by fork Path
+    /// A for both parent and child) right before the launch, cleared after the launch
+    /// completes so subsequent boots of the VM don't loop back to the same RAM file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boot_incoming_ram_path: String,
     #[serde(default, with = "iso8601::option")]
     pub started_at: Option<DateTime<Utc>>,
 }
@@ -294,13 +315,15 @@ pub mod iso8601 {
 
 pub fn new_snapshot_metadata(label: String, description: String) -> SnapshotMetadata {
     let id = Uuid::new_v4().to_string();
+    let name = format!("snap-{id}");
+    let ram_file_name = format!("{name}.ram");
     SnapshotMetadata {
-        name: format!("snap-{id}"),
         id,
+        name,
         label,
         description,
         created_at: Utc::now(),
-        disk_only: false,
+        ram_file_name,
     }
 }
 

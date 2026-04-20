@@ -84,6 +84,8 @@ message SharedMount {
   SharedMountAvailability availability = 5;
   SharedMountContinuity continuity = 6;
   string backend_profile = 7;
+  string vfs_endpoint = 8;
+  string vfs_scope_path = 9;
 }
 
 message Snapshot {

@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
@@ -17,7 +18,9 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
+use crate::types::{
+    AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall,
+};
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
 
 /// Anthropic API client
@@ -207,7 +210,10 @@ impl AnthropicClient {
                     }
                     Some("tool_use") => {
                         response.push_output(ResponsePart::Tool {
-                            call: ToolCall::from_provider_format(block.clone(), Provider::Anthropic)?,
+                            call: ToolCall::from_provider_format(
+                                block.clone(),
+                                Provider::Anthropic,
+                            )?,
                         });
                         if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
                             response.push_output(ResponsePart::Signature {
@@ -372,26 +378,62 @@ impl InferenceClient for AnthropicClient {
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
 
-        // Parse SSE stream
         let sse_stream = parse_sse_stream(response);
 
-        // Process chunks with tool accumulator
-        let chunk_stream = sse_stream.scan(
-            ToolCallAccumulator::new(),
-            move |accumulator, sse_result| {
-                let sse_json = match sse_result {
-                    Ok(json) => json,
-                    Err(e) => return futures::future::ready(Some(vec![Err(e)])),
-                };
+        let chunk_stream = futures::stream::unfold(
+            (
+                sse_stream,
+                ToolCallAccumulator::new(),
+                VecDeque::<Result<StreamChunk>>::new(),
+                false,
+            ),
+            move |(mut sse_stream, mut accumulator, mut pending, eof_flushed)| async move {
+                loop {
+                    if let Some(item) = pending.pop_front() {
+                        return Some((item, (sse_stream, accumulator, pending, eof_flushed)));
+                    }
 
-                // Parse chunk and emit StreamChunks
-                let chunks = parse_anthropic_chunk(&sse_json, accumulator, has_tools);
-                futures::future::ready(Some(chunks.into_iter().map(Ok).collect()))
+                    if eof_flushed {
+                        return None;
+                    }
+
+                    match sse_stream.next().await {
+                        Some(Ok(sse_json)) => {
+                            pending.extend(
+                                parse_anthropic_chunk(&sse_json, &mut accumulator, has_tools)
+                                    .into_iter()
+                                    .map(Ok),
+                            );
+                        }
+                        Some(Err(e)) => {
+                            return Some((Err(e), (sse_stream, accumulator, pending, true)));
+                        }
+                        None => {
+                            let flushed = accumulator.drain_all_tools();
+                            if flushed.is_empty() {
+                                return None;
+                            }
+
+                            tracing::warn!(
+                                pending_tool_calls = flushed.len(),
+                                "anthropic SSE stream ended with unfinished tool calls; flushing pending tools at EOF"
+                            );
+                            pending.extend(
+                                flushed
+                                    .into_iter()
+                                    .map(StreamChunk::ToolCallComplete)
+                                    .map(Ok),
+                            );
+                            return pending.pop_front().map(|item| {
+                                (item, (sse_stream, accumulator, pending, true))
+                            });
+                        }
+                    }
+                }
             },
         );
 
-        // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(chunk_stream.flat_map(futures::stream::iter)))
+        Ok(Box::pin(chunk_stream))
     }
 
     fn provider(&self) -> Provider {

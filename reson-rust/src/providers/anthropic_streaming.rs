@@ -63,16 +63,41 @@ impl ToolCallAccumulator {
     /// Complete and remove a tool call
     pub fn complete_tool(&mut self, index: usize) -> Option<Value> {
         if let Some(tool) = self.current_tool_blocks.remove(&index) {
+            let raw_arguments = tool.input.clone();
+
             // Parse JSON into Value (consistent with OpenAI accumulator)
-            let arguments = if tool.input.is_empty() {
+            let arguments = if raw_arguments.is_empty() {
                 json!({})
             } else {
-                parse_json_value_strict_str(&tool.input).unwrap_or_else(|_| json!({}))
+                match parse_or_repair_tool_arguments(&raw_arguments) {
+                    Ok(ParseRepairOutcome::Parsed(value)) => value,
+                    Ok(ParseRepairOutcome::Repaired { value, repaired }) => {
+                        tracing::warn!(
+                            tool_id = %tool.id,
+                            tool_name = %tool.name,
+                            repaired_arguments = %repaired,
+                            "anthropic streamed tool arguments were truncated or malformed; repaired structurally"
+                        );
+                        value
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            tool_id = %tool.id,
+                            tool_name = %tool.name,
+                            error = %error,
+                            raw_arguments = %raw_arguments,
+                            "anthropic streamed tool arguments were malformed and unrecoverable; falling back to empty object"
+                        );
+                        json!({})
+                    }
+                }
             };
 
             // Return OpenAI-format complete tool call
             Some(json!({
                 "id": tool.id,
+                "type": "function",
+                "raw_arguments": raw_arguments,
                 "function": {
                     "name": tool.name,
                     "arguments": arguments
@@ -81,6 +106,130 @@ impl ToolCallAccumulator {
         } else {
             None
         }
+    }
+
+    /// Complete and remove all tracked tool calls in deterministic index order.
+    pub fn drain_all_tools(&mut self) -> Vec<Value> {
+        let mut indices: Vec<usize> = self.current_tool_blocks.keys().copied().collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|index| self.complete_tool(index))
+            .collect()
+    }
+
+    pub fn pending_tool_count(&self) -> usize {
+        self.current_tool_blocks.len()
+    }
+}
+
+#[derive(Debug)]
+enum ParseRepairOutcome {
+    Parsed(Value),
+    Repaired { value: Value, repaired: String },
+}
+
+fn parse_or_repair_tool_arguments(raw: &str) -> Result<ParseRepairOutcome, serde_json::Error> {
+    match parse_json_value_strict_str(raw) {
+        Ok(value) => Ok(ParseRepairOutcome::Parsed(value)),
+        Err(initial_error) => {
+            if let Some((value, repaired)) = repair_partial_json(raw) {
+                Ok(ParseRepairOutcome::Repaired { value, repaired })
+            } else {
+                Err(initial_error)
+            }
+        }
+    }
+}
+
+fn repair_partial_json(raw: &str) -> Option<(Value, String)> {
+    let mut boundaries: Vec<usize> = raw.char_indices().map(|(idx, _)| idx).collect();
+    boundaries.push(raw.len());
+
+    for end in boundaries.into_iter().rev() {
+        let prefix = trim_incomplete_json_tail(&raw[..end]);
+        if prefix.is_empty() {
+            continue;
+        }
+
+        let repaired = close_json_fragment(prefix);
+        if repaired.trim().is_empty() {
+            continue;
+        }
+
+        if let Ok(value) = parse_json_value_strict_str(&repaired) {
+            return Some((value, repaired));
+        }
+    }
+
+    None
+}
+
+fn trim_incomplete_json_tail(input: &str) -> &str {
+    input.trim_end_matches(|c: char| c.is_whitespace() || c == ',' || c == ':')
+}
+
+fn close_json_fragment(input: &str) -> String {
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaping = false;
+
+    for ch in input.chars() {
+        if in_string {
+            if escaping {
+                escaping = false;
+                continue;
+            }
+
+            match ch {
+                '\\' => escaping = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.last().copied() == Some(ch) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut repaired = input.to_string();
+    if in_string {
+        repaired.push('"');
+    }
+    while let Some(close) = stack.pop() {
+        repaired.push(close);
+    }
+    repaired
+}
+
+fn flush_pending_tools(
+    results: &mut Vec<StreamChunk>,
+    accumulator: &mut ToolCallAccumulator,
+    reason: &str,
+) {
+    let pending = accumulator.pending_tool_count();
+    if pending == 0 {
+        return;
+    }
+
+    tracing::warn!(
+        pending_tool_calls = pending,
+        reason,
+        "anthropic stream ended a message with unfinished tool calls; flushing pending tools"
+    );
+
+    for complete_tool in accumulator.drain_all_tools() {
+        results.push(StreamChunk::ToolCallComplete(complete_tool));
     }
 }
 
@@ -165,6 +314,15 @@ pub fn parse_anthropic_chunk(
                     });
                 }
             }
+
+            if has_tools
+                && chunk_json["delta"]["stop_reason"]
+                    .as_str()
+                    .map(|reason| !reason.is_empty())
+                    .unwrap_or(false)
+            {
+                flush_pending_tools(&mut results, accumulator, "message_delta_stop_reason");
+            }
         }
 
         "message_start" => {
@@ -184,6 +342,12 @@ pub fn parse_anthropic_chunk(
                         cached_tokens,
                     });
                 }
+            }
+        }
+
+        "message_stop" => {
+            if has_tools {
+                flush_pending_tools(&mut results, accumulator, "message_stop");
             }
         }
 
@@ -301,6 +465,86 @@ mod tests {
             }
             _ => panic!("Expected ToolCallComplete"),
         }
+    }
+
+    #[test]
+    fn test_message_stop_flushes_pending_tool() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.start_tool(0, "toolu_123".to_string(), "write_file".to_string());
+        acc.accumulate_input(0, "{\"path\":\"notes.md\",\"content\":\"hi\"}");
+
+        let stop_chunk = json!({
+            "type": "message_stop"
+        });
+
+        let chunks = parse_anthropic_chunk(&stop_chunk, &mut acc, true);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::ToolCallComplete(tool) => {
+                assert_eq!(tool["id"], "toolu_123");
+                assert_eq!(tool["function"]["name"], "write_file");
+                assert_eq!(tool["function"]["arguments"]["path"], "notes.md");
+            }
+            _ => panic!("Expected ToolCallComplete"),
+        }
+    }
+
+    #[test]
+    fn test_message_delta_stop_reason_flushes_pending_tool() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.start_tool(0, "toolu_123".to_string(), "write_file".to_string());
+        acc.accumulate_input(0, "{\"path\":\"notes.md\",\"content\":\"hi\"}");
+
+        let delta_chunk = json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "max_tokens"
+            },
+            "usage": {
+                "output_tokens": 42
+            }
+        });
+
+        let chunks = parse_anthropic_chunk(&delta_chunk, &mut acc, true);
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(&chunks[0], StreamChunk::Usage { .. }));
+        match &chunks[1] {
+            StreamChunk::ToolCallComplete(tool) => {
+                assert_eq!(tool["id"], "toolu_123");
+                assert_eq!(tool["function"]["name"], "write_file");
+                assert_eq!(tool["function"]["arguments"]["path"], "notes.md");
+            }
+            _ => panic!("Expected ToolCallComplete"),
+        }
+    }
+
+    #[test]
+    fn test_repair_partial_json_salvages_truncated_string() {
+        let (value, repaired) =
+            repair_partial_json("{\"path\":\"report.md\",\"content\":\"hel").unwrap();
+        assert_eq!(value["path"], "report.md");
+        assert_eq!(value["content"], "hel");
+        assert_eq!(repaired, "{\"path\":\"report.md\",\"content\":\"hel\"}");
+    }
+
+    #[test]
+    fn test_repair_partial_json_salvages_longest_valid_prefix() {
+        let (value, repaired) =
+            repair_partial_json("{\"path\":\"report.md\",\"content\":").unwrap();
+        assert_eq!(value["path"], "report.md");
+        assert_eq!(repaired, "{\"path\":\"report.md\"}");
+    }
+
+    #[test]
+    fn test_complete_tool_preserves_raw_arguments() {
+        let mut acc = ToolCallAccumulator::new();
+        acc.start_tool(0, "toolu_123".to_string(), "write_file".to_string());
+        acc.accumulate_input(0, "{\"path\":\"notes.md\",\"content\":\"hel");
+
+        let complete = acc.complete_tool(0).unwrap();
+        assert_eq!(complete["raw_arguments"], "{\"path\":\"notes.md\",\"content\":\"hel");
+        assert_eq!(complete["function"]["arguments"]["path"], "notes.md");
+        assert_eq!(complete["function"]["arguments"]["content"], "hel");
     }
 
     #[test]

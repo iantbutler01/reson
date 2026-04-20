@@ -9,6 +9,7 @@ __pycache__/
 
 # Temp and logs
 .tmp/
+.run/
 *.log
 
 # Real integration harness artifact bundles

@@ -431,12 +431,11 @@ mod tests {
     #[test]
     fn test_generation_response_with_tool_calls() {
         let mut response = GenerationResponse::text("Using tools...");
-        response.response.push_output(crate::types::ResponsePart::Tool {
-            call: crate::types::ToolCall::new(
-                "get_weather",
-                serde_json::json!({"city": "SF"}),
-            ),
-        });
+        response
+            .response
+            .push_output(crate::types::ResponsePart::Tool {
+                call: crate::types::ToolCall::new("get_weather", serde_json::json!({"city": "SF"})),
+            });
         assert!(response.has_tool_calls());
     }
 }

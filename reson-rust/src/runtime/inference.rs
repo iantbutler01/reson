@@ -42,7 +42,9 @@ async fn stream_chunk_to_runtime_events(
                 let mut response = response.write().await;
                 response.push_output(ResponsePart::Text { text: text.clone() });
             }
-            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Text { text })])
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Text {
+                text,
+            })])
         }
         StreamChunk::Reasoning(text) => {
             let mut acc = accumulators.write().await;
@@ -55,7 +57,8 @@ async fn stream_chunk_to_runtime_events(
                     last.content = updated_content;
                 }
             } else {
-                let segment = ReasoningSegment::with_index(text.clone(), acc.reasoning_segments.len());
+                let segment =
+                    ReasoningSegment::with_index(text.clone(), acc.reasoning_segments.len());
                 acc.reasoning_segments.push(segment.clone());
                 acc.current_reasoning_segment = Some(segment);
             }
@@ -66,7 +69,9 @@ async fn stream_chunk_to_runtime_events(
                 response.push_output(ResponsePart::Reasoning { text: text.clone() });
             }
 
-            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Reasoning { text })])
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Reasoning {
+                text,
+            })])
         }
         StreamChunk::Signature(sig) => {
             let mut acc = accumulators.write().await;
@@ -703,21 +708,23 @@ pub async fn call_llm_stream(
     let response = Arc::new(RwLock::new(AssistantResponse::default()));
     let stream_response = response.clone();
 
-    let transformed = stream.then(move |chunk_result| {
-        let accumulators = accumulators.clone();
-        let response = stream_response.clone();
-        async move {
-            match chunk_result {
-                Ok(chunk) => match stream_chunk_to_runtime_events(chunk, accumulators, response).await
-                {
-                    Ok(events) => events.into_iter().map(Ok).collect(),
+    let transformed = stream
+        .then(move |chunk_result| {
+            let accumulators = accumulators.clone();
+            let response = stream_response.clone();
+            async move {
+                match chunk_result {
+                    Ok(chunk) => {
+                        match stream_chunk_to_runtime_events(chunk, accumulators, response).await {
+                            Ok(events) => events.into_iter().map(Ok).collect(),
+                            Err(e) => vec![Err(e)],
+                        }
+                    }
                     Err(e) => vec![Err(e)],
-                },
-                Err(e) => vec![Err(e)],
+                }
             }
-        }
-    })
-    .flat_map(futures::stream::iter);
+        })
+        .flat_map(futures::stream::iter);
 
     let final_response = response.clone();
     let completed = futures::stream::once(async move {

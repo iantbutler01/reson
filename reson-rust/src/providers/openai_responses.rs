@@ -189,10 +189,13 @@ impl OpenAIResponsesClient {
         if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
             for item in output {
                 match item.get("type").and_then(|v| v.as_str()) {
-                    Some("message") if item.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+                    Some("message")
+                        if item.get("role").and_then(|v| v.as_str()) == Some("assistant") =>
+                    {
                         if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
                             for part in parts {
-                                if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                                {
                                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                         if !text.is_empty() {
                                             response.push_output(ResponsePart::Text {
@@ -236,10 +239,7 @@ impl OpenAIResponsesClient {
                     }
                     Some("function_call") => {
                         response.push_output(ResponsePart::Tool {
-                            call: ToolCall::from_provider_format(
-                                item.clone(),
-                                self.provider,
-                            )?,
+                            call: ToolCall::from_provider_format(item.clone(), self.provider)?,
                         });
                     }
                     _ => {}

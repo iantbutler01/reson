@@ -59,6 +59,8 @@ fn failover_sandbox_config(secondary_endpoint: String) -> SandboxConfig {
         daemon_start_timeout: Duration::from_secs(30),
         portproxy_ready_timeout: Duration::from_secs(180),
         control_gateway_endpoints: vec![secondary_endpoint],
+        endpoint_overrides: parse_endpoint_overrides_env("RESON_SANDBOX_REAL_ENDPOINT_OVERRIDES"),
+        auth_token: optional_env("RESON_SANDBOX_REAL_AUTH_TOKEN"),
         ..SandboxConfig::default()
     }
 }
@@ -273,6 +275,24 @@ fn parse_csv_env(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_endpoint_overrides_env(name: &str) -> HashMap<String, String> {
+    optional_env(name)
+        .map(|raw| {
+            raw.split(';')
+                .filter_map(|entry| {
+                    let (from, to) = entry.split_once('=')?;
+                    let from = from.trim();
+                    let to = to.trim();
+                    if from.is_empty() || to.is_empty() {
+                        return None;
+                    }
+                    Some((from.to_string(), to.to_string()))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default()
+}
+
 fn distributed_control_config_from_env() -> DistributedControlConfig {
     let mut cfg = DistributedControlConfig::default();
     let etcd_endpoints = parse_csv_env("RESON_SANDBOX_REAL_ETCD_ENDPOINTS");
@@ -298,6 +318,7 @@ fn distributed_control_config_from_env() -> DistributedControlConfig {
 fn distributed_failover_sandbox_config(secondary_endpoint: String) -> SandboxConfig {
     let mut cfg = failover_sandbox_config(secondary_endpoint);
     cfg.distributed_control = Some(distributed_control_config_from_env());
+    cfg.default_architecture = optional_env("RESON_SANDBOX_REAL_DEFAULT_ARCHITECTURE");
     cfg
 }
 
