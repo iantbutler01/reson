@@ -48,16 +48,12 @@ pub struct GoogleAnthropicClient {
 
 #[cfg(feature = "google-adc")]
 impl GoogleAnthropicClient {
-    fn strict_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
         tools
             .iter()
             .cloned()
             .map(|mut tool| {
                 fix_tool_schema_for_provider(&mut tool, "google-anthropic");
-                if let Some(obj) = tool.as_object_mut() {
-                    obj.entry("strict".to_string())
-                        .or_insert_with(|| serde_json::json!(true));
-                }
                 tool
             })
             .collect()
@@ -215,7 +211,7 @@ impl GoogleAnthropicClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.strict_tools(tools));
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -389,8 +385,9 @@ impl GoogleAnthropicClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<serde_json::Value> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), timeout).await?;
@@ -417,7 +414,7 @@ impl InferenceClient for GoogleAnthropicClient {
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
         let body = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         // Parse usage statistics
@@ -455,7 +452,7 @@ impl InferenceClient for GoogleAnthropicClient {
         let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();
@@ -583,7 +580,7 @@ mod tests {
             .build_request_body(&messages, &config, false)
             .unwrap();
 
-        assert_eq!(body["tools"][0]["strict"], true);
+        assert!(body["tools"][0].get("strict").is_none());
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }

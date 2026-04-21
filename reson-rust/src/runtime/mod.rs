@@ -36,6 +36,7 @@ pub struct ToolSchemaInfo {
     pub name: String,
     pub description: String,
     pub fields: Vec<crate::parsers::FieldDescription>,
+    pub strict: Option<bool>,
 }
 
 /// Runtime - Main execution environment for agentic functions
@@ -88,6 +89,10 @@ pub struct RunParams {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub timeout: Option<std::time::Duration>,
+    /// Retry policy for the provider request. When `None`, providers fall back
+    /// to `RetryConfig::default()`. Inject a longer-horizon policy from the
+    /// caller for LLM workloads that may exceed the 60s default max_time.
+    pub retry_config: Option<crate::retry::RetryConfig>,
 }
 
 /// Metadata about a tool call for execution context
@@ -98,6 +103,23 @@ pub struct ToolCallContext {
 }
 
 impl Runtime {
+    fn strip_nulls_for_non_required_fields(
+        mut json_value: serde_json::Value,
+        fields: &[crate::parsers::FieldDescription],
+    ) -> serde_json::Value {
+        let Some(object) = json_value.as_object_mut() else {
+            return json_value;
+        };
+
+        for field in fields.iter().filter(|field| !field.required) {
+            if object.get(&field.name).is_some_and(|value| value.is_null()) {
+                object.remove(&field.name);
+            }
+        }
+
+        json_value
+    }
+
     /// Create a new Runtime with default memory storage
     pub fn new() -> Self {
         Self {
@@ -218,6 +240,7 @@ impl Runtime {
             name: name.clone(),
             description,
             fields,
+            strict: schema.get("strict").and_then(|value| value.as_bool()),
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(name, schema_info);
@@ -332,8 +355,11 @@ impl Runtime {
 
         // Wrap the typed handler to deserialize JSON -> T before calling
         let handler = Arc::new(handler);
+        let nullable_field_descriptions = T::field_descriptions();
         let wrapped_handler = Box::new(move |json_value: serde_json::Value| {
             let handler = handler.clone();
+            let json_value =
+                Self::strip_nulls_for_non_required_fields(json_value, &nullable_field_descriptions);
             Box::pin(async move {
                 // Deserialize JSON into the typed struct T
                 let typed_args: T = T::from_partial(json_value)?;
@@ -356,6 +382,7 @@ impl Runtime {
             name: tool_name.clone(),
             description: format!("Tool: {}", tool_name), // Default description
             fields: field_descriptions,
+            strict: None,
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(tool_name.clone(), schema_info);
@@ -363,7 +390,9 @@ impl Runtime {
 
         // Store constructor for NativeToolParser (streaming use case)
         let tool_name_clone = tool_name.clone();
+        let parser_field_descriptions = T::field_descriptions();
         let constructor: ToolConstructor = Box::new(move |json: serde_json::Value| {
+            let json = Self::strip_nulls_for_non_required_fields(json, &parser_field_descriptions);
             T::from_partial(json.clone()).map(|tool| {
                 ParsedTool {
                     tool_name: tool_name_clone.clone(),
@@ -431,6 +460,7 @@ impl Runtime {
             params.top_p,
             params.max_tokens,
             params.timeout,
+            params.retry_config,
             self.current_call_args.clone(),
         )
         .await?;
@@ -494,6 +524,7 @@ impl Runtime {
             params.top_p,
             params.max_tokens,
             params.timeout,
+            params.retry_config,
             self.current_call_args.clone(),
             self.accumulators.clone(),
         )
@@ -850,6 +881,18 @@ mod tests {
         unit: Option<String>,
     }
 
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct SearchWithDefaultCategory {
+        #[serde(default)]
+        text: String,
+        #[serde(default = "default_test_category")]
+        category: String,
+    }
+
+    fn default_test_category() -> String {
+        "general".to_string()
+    }
+
     impl crate::parsers::Deserializable for WeatherQuery {
         fn from_partial(partial: serde_json::Value) -> crate::error::Result<Self> {
             serde_json::from_value(partial)
@@ -877,6 +920,34 @@ mod tests {
                     name: "unit".to_string(),
                     field_type: "string".to_string(),
                     description: "Temperature unit (celsius or fahrenheit)".to_string(),
+                    required: false,
+                },
+            ]
+        }
+    }
+
+    impl crate::parsers::Deserializable for SearchWithDefaultCategory {
+        fn from_partial(partial: serde_json::Value) -> crate::error::Result<Self> {
+            serde_json::from_value(partial)
+                .map_err(|e| crate::error::Error::NonRetryable(format!("Parse error: {}", e)))
+        }
+
+        fn validate_complete(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn field_descriptions() -> Vec<crate::parsers::FieldDescription> {
+            vec![
+                crate::parsers::FieldDescription {
+                    name: "text".to_string(),
+                    field_type: "string".to_string(),
+                    description: "Search text".to_string(),
+                    required: true,
+                },
+                crate::parsers::FieldDescription {
+                    name: "category".to_string(),
+                    field_type: "string".to_string(),
+                    description: "Category".to_string(),
                     required: false,
                 },
             ]
@@ -946,6 +1017,35 @@ mod tests {
             .fields
             .iter()
             .any(|f| f.name == "unit" && !f.required));
+    }
+
+    #[tokio::test]
+    async fn test_typed_tool_treats_null_optional_fields_as_missing() {
+        use futures::future::BoxFuture;
+
+        let runtime = Runtime::new();
+        runtime
+            .tool::<SearchWithDefaultCategory, _>(
+                |query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move { Ok(query.category) })
+                },
+                Some("search"),
+            )
+            .await
+            .unwrap();
+
+        let result = runtime
+            .execute_tool_call(&crate::types::ToolCall::new(
+                "search",
+                serde_json::json!({
+                    "text": "python tutorials",
+                    "category": null
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result, "general");
     }
 
     #[tokio::test]

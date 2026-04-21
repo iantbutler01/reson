@@ -75,6 +75,12 @@ pub struct GenerationConfig {
 
     /// Request timeout (overrides provider default)
     pub timeout: Option<std::time::Duration>,
+
+    /// Retry policy for this request. When `None`, providers fall back to
+    /// `RetryConfig::default()` (60s max_time, 3 retries) — the library-level
+    /// baseline. LLM-heavy callers should inject their own policy here so
+    /// long-running generations don't get killed by the conservative default.
+    pub retry_config: Option<crate::retry::RetryConfig>,
 }
 
 impl Default for GenerationConfig {
@@ -91,6 +97,7 @@ impl Default for GenerationConfig {
             output_schema: None,
             output_type_name: None,
             timeout: None,
+            retry_config: None,
         }
     }
 }
@@ -154,6 +161,12 @@ impl GenerationConfig {
     /// Set request timeout
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Set retry policy
+    pub fn with_retry_config(mut self, retry_config: crate::retry::RetryConfig) -> Self {
+        self.retry_config = Some(retry_config);
         self
     }
 }

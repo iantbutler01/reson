@@ -47,6 +47,7 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
                         .unwrap_or_default()
                         .to_string(),
                     function["parameters"].clone(),
+                    function.get("strict").and_then(|value| value.as_bool()),
                 )
             })
             .or_else(|| {
@@ -55,6 +56,7 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
                         tool["name"].as_str().unwrap_or_default().to_string(),
                         tool["description"].as_str().unwrap_or_default().to_string(),
                         tool["parameters"].clone(),
+                        tool.get("strict").and_then(|value| value.as_bool()),
                     )
                 })
             })
@@ -67,14 +69,16 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
                             .cloned()
                             .or_else(|| tool.get("parameters").cloned())
                             .unwrap_or(Value::Null),
+                        tool.get("strict").and_then(|value| value.as_bool()),
                     )
                 })
             });
 
-        if let Some((name, description, mut parameters)) = extracted {
+        if let Some((name, description, mut parameters, strict)) = extracted {
             if !name.is_empty() && !parameters.is_null() {
                 fix_output_schema_for_provider(&mut parameters, provider);
                 *tool = generator.generate_schema(&name, &description, parameters);
+                apply_tool_strict_for_provider(tool, provider, strict);
                 return;
             }
         }
@@ -112,19 +116,14 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
 
 /// Fix schema for OpenAI's strict structured outputs
 /// - Add `additionalProperties: false` to all objects
-/// - Make all properties required (OpenAI requires this)
+/// - Convert optional fields to required+nullable
 fn fix_schema_for_openai(schema: &mut Value) {
     if let Value::Object(map) = schema {
         // If this is an object type with properties
-        if map.get("type") == Some(&Value::String("object".to_string())) {
+        if schema_type_includes(map, "object") {
             // Add additionalProperties: false
             map.insert("additionalProperties".to_string(), Value::Bool(false));
-
-            // Make all properties required (OpenAI strict mode requirement)
-            if let Some(Value::Object(props)) = map.get("properties") {
-                let all_keys: Vec<Value> = props.keys().map(|k| Value::String(k.clone())).collect();
-                map.insert("required".to_string(), Value::Array(all_keys));
-            }
+            require_all_properties_with_nullable_optionals(map);
         }
 
         // Recurse into nested schemas
@@ -134,17 +133,116 @@ fn fix_schema_for_openai(schema: &mut Value) {
 
 /// Fix schema for Anthropic's structured outputs
 /// - Add `additionalProperties: false` to all objects
-/// - Keep original required fields (Anthropic doesn't require all fields)
+/// - Convert optional fields to required+nullable to avoid strict grammar blowups
 fn fix_schema_for_anthropic(schema: &mut Value) {
     if let Value::Object(map) = schema {
         // If this is an object type with properties
-        if map.get("type") == Some(&Value::String("object".to_string())) {
+        if schema_type_includes(map, "object") {
             // Add additionalProperties: false
             map.insert("additionalProperties".to_string(), Value::Bool(false));
+            require_all_properties_with_nullable_optionals(map);
         }
 
         // Recurse into nested schemas
         recurse_schema_fix(schema, fix_schema_for_anthropic);
+    }
+}
+
+fn schema_type_includes(map: &serde_json::Map<String, Value>, expected: &str) -> bool {
+    match map.get("type") {
+        Some(Value::String(kind)) => kind == expected,
+        Some(Value::Array(kinds)) => kinds.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn require_all_properties_with_nullable_optionals(map: &mut serde_json::Map<String, Value>) {
+    let mut required: Vec<String> = map
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(Value::Object(props)) = map.get_mut("properties") {
+        for (name, prop_schema) in props.iter_mut() {
+            if !required.iter().any(|entry| entry == name) {
+                if is_degenerate_empty_object_schema(prop_schema) {
+                    continue;
+                }
+                make_schema_nullable(prop_schema);
+                required.push(name.clone());
+            }
+        }
+    }
+
+    map.insert(
+        "required".to_string(),
+        Value::Array(required.into_iter().map(Value::String).collect()),
+    );
+}
+
+fn is_degenerate_empty_object_schema(schema: &Value) -> bool {
+    let Value::Object(map) = schema else {
+        return false;
+    };
+
+    if !schema_type_includes(map, "object") {
+        return false;
+    }
+
+    let has_properties = map
+        .get("properties")
+        .and_then(|value| value.as_object())
+        .is_some_and(|properties| !properties.is_empty());
+    let has_items = map.get("items").is_some();
+    let has_combinators = ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|key| map.get(*key).is_some());
+    // @dive: `additionalProperties: false` alone (without any properties/patternProperties)
+    //        is NOT a shape constraint that disqualifies a schema from being degenerate-empty.
+    //        Treating it as one broke idempotence: after one pass of the fixer adds
+    //        `additionalProperties: false`, a second pass would see the schema as non-degenerate
+    //        and nullable-promote it, producing unions that bloat the strict-mode grammar.
+    //        Only treat `additionalProperties: <schema>` (not bool) as a real shape constraint.
+    let has_shape_constraints = map.get("enum").is_some()
+        || map.get("const").is_some()
+        || map.get("patternProperties").is_some()
+        || map
+            .get("additionalProperties")
+            .is_some_and(|value| value.is_object());
+
+    !has_properties && !has_items && !has_combinators && !has_shape_constraints
+}
+
+fn make_schema_nullable(schema: &mut Value) {
+    if let Value::Object(map) = schema {
+        match map.get_mut("type") {
+            Some(Value::String(kind)) => {
+                if kind != "null" {
+                    let original = kind.clone();
+                    map.insert(
+                        "type".to_string(),
+                        Value::Array(vec![Value::String(original), Value::String("null".into())]),
+                    );
+                }
+            }
+            Some(Value::Array(kinds)) => {
+                let has_null = kinds.iter().any(|value| value.as_str() == Some("null"));
+                if !has_null {
+                    kinds.push(Value::String("null".into()));
+                }
+            }
+            _ => {
+                let original = Value::Object(map.clone());
+                *schema = serde_json::json!({
+                    "anyOf": [original, { "type": "null" }]
+                });
+            }
+        }
     }
 }
 
@@ -334,6 +432,35 @@ impl SchemaGenerator for GoogleSchemaGenerator {
     }
 }
 
+pub(crate) fn apply_tool_strict_for_provider(
+    tool: &mut Value,
+    provider: &str,
+    strict: Option<bool>,
+) {
+    let Some(strict) = strict else { return };
+    match provider {
+        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
+            if let Some(object) = tool.as_object_mut() {
+                object.insert("strict".to_string(), Value::Bool(strict));
+            }
+        }
+        "openai" | "openrouter" | "custom-openai" => {
+            if let Some(function) = tool
+                .get_mut("function")
+                .and_then(|value| value.as_object_mut())
+            {
+                function.insert("strict".to_string(), Value::Bool(strict));
+            }
+        }
+        "openai-responses" | "openrouter-responses" => {
+            if let Some(object) = tool.as_object_mut() {
+                object.insert("strict".to_string(), Value::Bool(strict));
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Get appropriate schema generator for provider
 pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> {
     match provider {
@@ -414,6 +541,75 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_schema_preserves_strict_when_requested() {
+        let generator = AnthropicSchemaGenerator;
+        let mut schema = generator.generate_schema(
+            "get_weather",
+            "Get weather for location",
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
+        apply_tool_strict_for_provider(&mut schema, "anthropic", Some(true));
+
+        assert_eq!(schema["strict"], true);
+    }
+
+    #[test]
+    fn test_openai_schema_preserves_strict_when_requested() {
+        let generator = OpenAISchemaGenerator;
+        let mut schema = generator.generate_schema(
+            "get_weather",
+            "Get weather for location",
+            serde_json::json!({"type": "object", "properties": {}}),
+        );
+        apply_tool_strict_for_provider(&mut schema, "openai", Some(true));
+
+        assert_eq!(schema["function"]["strict"], true);
+    }
+
+    #[test]
+    fn test_fix_tool_schema_for_provider_preserves_openai_function_strict() {
+        let mut tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for location",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                }
+            }
+        });
+
+        fix_tool_schema_for_provider(&mut tool, "openai");
+
+        assert_eq!(tool["function"]["strict"], true);
+    }
+
+    #[test]
+    fn test_fix_tool_schema_for_provider_preserves_anthropic_tool_strict() {
+        let mut tool = serde_json::json!({
+            "name": "get_weather",
+            "description": "Get weather for location",
+            "strict": false,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                },
+                "required": ["location"]
+            }
+        });
+
+        fix_tool_schema_for_provider(&mut tool, "anthropic");
+
+        assert_eq!(tool["strict"], false);
+    }
+
+    #[test]
     fn test_get_schema_generator_anthropic() {
         let result = get_schema_generator("anthropic");
         assert!(result.is_ok());
@@ -461,4 +657,215 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_strict_schema_fixers_make_30_optionals_nullable_and_required() {
+        let mut properties = serde_json::Map::new();
+        for idx in 0..30 {
+            properties.insert(
+                format!("optional_{idx:02}"),
+                serde_json::json!({"type": "string"}),
+            );
+        }
+
+        for provider in ["anthropic", "openai", "openrouter", "bedrock", "vertexai"] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": properties.clone(),
+                "required": []
+            });
+
+            fix_output_schema_for_provider(&mut schema, provider);
+
+            assert_eq!(schema["additionalProperties"], false, "provider={provider}");
+            let required = schema["required"].as_array().unwrap();
+            assert_eq!(required.len(), 30, "provider={provider}");
+            for idx in 0..30 {
+                let field = format!("optional_{idx:02}");
+                assert!(
+                    required.iter().any(|value| value.as_str() == Some(&field)),
+                    "provider={provider} missing required field {field}"
+                );
+                assert_eq!(
+                    schema["properties"][&field]["type"],
+                    serde_json::json!(["string", "null"]),
+                    "provider={provider} field={field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_required_fields_stay_non_nullable_under_strict_fixers() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "required_field": {"type": "string"},
+                "optional_field": {"type": "integer"}
+            },
+            "required": ["required_field"]
+        });
+
+        fix_output_schema_for_provider(&mut schema, "openai");
+
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["required_field", "optional_field"])
+        );
+        assert_eq!(schema["properties"]["required_field"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["optional_field"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
+    }
+
+    #[test]
+    fn test_strict_schema_fixers_leave_optional_empty_objects_optional() {
+        for provider in ["anthropic", "openai"] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" },
+                    "context": { "type": "object" }
+                },
+                "required": ["message"]
+            });
+
+            fix_output_schema_for_provider(&mut schema, provider);
+
+            assert_eq!(schema["additionalProperties"], false, "provider={provider}");
+            assert_eq!(
+                schema["required"],
+                serde_json::json!(["message"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["context"]["type"], "object",
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["context"]["additionalProperties"], false,
+                "provider={provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_schema_fixers_rewrite_nested_optional_objects_recursively() {
+        for provider in ["anthropic", "openai"] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string" },
+                            "limits": {
+                                "type": "object",
+                                "properties": {
+                                    "soft": { "type": "integer" },
+                                    "hard": { "type": "integer" }
+                                },
+                                "required": ["hard"]
+                            }
+                        },
+                        "required": ["label"]
+                    }
+                },
+                "required": []
+            });
+
+            fix_output_schema_for_provider(&mut schema, provider);
+
+            assert_eq!(
+                schema["properties"]["config"]["type"],
+                serde_json::json!(["object", "null"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["config"]["additionalProperties"], false,
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["config"]["required"],
+                serde_json::json!(["label", "limits"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["config"]["properties"]["limits"]["type"],
+                serde_json::json!(["object", "null"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["config"]["properties"]["limits"]["required"],
+                serde_json::json!(["hard", "soft"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["config"]["properties"]["limits"]["properties"]["soft"]
+                    ["type"],
+                serde_json::json!(["integer", "null"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["config"]["properties"]["limits"]["properties"]["hard"]
+                    ["type"],
+                "integer",
+                "provider={provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_schema_fixers_rewrite_arrays_and_array_items_recursively() {
+        for provider in ["anthropic", "openai"] {
+            let mut schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "tags": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            },
+                            "required": ["title"]
+                        }
+                    }
+                },
+                "required": []
+            });
+
+            fix_output_schema_for_provider(&mut schema, provider);
+
+            assert_eq!(
+                schema["properties"]["steps"]["type"],
+                serde_json::json!(["array", "null"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["steps"]["items"]["additionalProperties"], false,
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["steps"]["items"]["required"],
+                serde_json::json!(["title", "tags"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["steps"]["items"]["properties"]["tags"]["type"],
+                serde_json::json!(["array", "null"]),
+                "provider={provider}"
+            );
+            assert_eq!(
+                schema["properties"]["steps"]["items"]["properties"]["tags"]["items"]["type"],
+                "string",
+                "provider={provider}"
+            );
+        }
+    }
 }

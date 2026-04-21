@@ -69,7 +69,8 @@ impl OAIClient {
             Provider::OpenRouter => "openrouter",
             _ => "openai",
         };
-        tools.iter()
+        tools
+            .iter()
             .cloned()
             .map(|mut tool| {
                 fix_tool_schema_for_provider(&mut tool, provider);
@@ -285,8 +286,9 @@ impl OAIClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<String> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), timeout).await?;
@@ -312,7 +314,7 @@ impl InferenceClient for OAIClient {
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
         let response_text = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         // Parse JSON - provide better error context if it fails
@@ -386,7 +388,7 @@ impl InferenceClient for OAIClient {
         let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();

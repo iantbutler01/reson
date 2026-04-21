@@ -72,7 +72,8 @@ impl OpenAIResponsesClient {
             Provider::OpenRouterResponses => "openrouter-responses",
             _ => "openai-responses",
         };
-        tools.iter()
+        tools
+            .iter()
             .cloned()
             .map(|mut tool| {
                 fix_tool_schema_for_provider(&mut tool, provider);
@@ -309,8 +310,9 @@ impl OpenAIResponsesClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<String> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), timeout).await?;
@@ -336,7 +338,7 @@ impl InferenceClient for OpenAIResponsesClient {
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
         let response_text = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         let body: serde_json::Value = parse_json_value_strict_str(&response_text).map_err(|e| {
@@ -399,7 +401,7 @@ impl InferenceClient for OpenAIResponsesClient {
         let request_body = self.build_request_body(messages, config, true)?;
         let timeout = config.timeout;
 
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();

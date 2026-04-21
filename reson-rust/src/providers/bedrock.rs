@@ -55,16 +55,12 @@ pub struct BedrockClient {
 
 #[cfg(feature = "bedrock")]
 impl BedrockClient {
-    fn strict_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
         tools
             .iter()
             .cloned()
             .map(|mut tool| {
                 fix_tool_schema_for_provider(&mut tool, "bedrock");
-                if let Some(obj) = tool.as_object_mut() {
-                    obj.entry("strict".to_string())
-                        .or_insert_with(|| serde_json::json!(true));
-                }
                 tool
             })
             .collect()
@@ -152,7 +148,7 @@ impl BedrockClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.strict_tools(tools));
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -542,7 +538,7 @@ mod tests {
 
         let body = client.build_request_body(&messages, &config).unwrap();
 
-        assert_eq!(body["tools"][0]["strict"], true);
+        assert!(body["tools"][0].get("strict").is_none());
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }

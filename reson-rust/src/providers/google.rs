@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
+use std::collections::HashMap;
 use std::pin::Pin;
 #[cfg(feature = "google-adc")]
 use std::sync::Arc;
@@ -94,6 +95,355 @@ pub struct UploadedFile {
     /// Error details if state is FAILED
     #[serde(default)]
     pub error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct PartialGoogleToolCall {
+    id: String,
+    name: String,
+    args: serde_json::Value,
+}
+
+#[derive(Debug, Default)]
+struct GoogleToolCallAccumulator {
+    current_tool_calls: HashMap<(usize, usize), PartialGoogleToolCall>,
+}
+
+impl GoogleToolCallAccumulator {
+    fn update_partial(
+        &mut self,
+        candidate_index: usize,
+        part_index: usize,
+        function_call: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let key = (candidate_index, part_index);
+        let name = function_call
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = function_call
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let entry = self.current_tool_calls.entry(key).or_insert_with(|| {
+            let effective_name = if name.is_empty() {
+                "tool".to_string()
+            } else {
+                name.clone()
+            };
+            PartialGoogleToolCall {
+                id: id.unwrap_or_else(|| {
+                    format!(
+                        "google_{}_stream_{}_{}",
+                        effective_name, candidate_index, part_index
+                    )
+                }),
+                name: effective_name,
+                args: serde_json::json!({}),
+            }
+        });
+
+        if let Some(id) = function_call.get("id").and_then(|v| v.as_str()) {
+            entry.id = id.to_string();
+        }
+        if !name.is_empty() {
+            entry.name = name;
+        }
+
+        if let Some(partial_args) = function_call.get("partialArgs").and_then(|v| v.as_array()) {
+            for fragment in partial_args {
+                apply_google_partial_arg(&mut entry.args, fragment);
+            }
+        }
+
+        Some(openai_style_partial_tool_call(
+            &entry.id,
+            &entry.name,
+            &entry.args,
+        ))
+    }
+
+    fn complete(
+        &mut self,
+        candidate_index: usize,
+        part_index: usize,
+        function_call: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let key = (candidate_index, part_index);
+        let name = function_call
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = function_call
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let args = function_call
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let mut entry = self.current_tool_calls.remove(&key).unwrap_or_else(|| {
+            let effective_name = if name.is_empty() {
+                "tool".to_string()
+            } else {
+                name.clone()
+            };
+            PartialGoogleToolCall {
+                id: id.unwrap_or_else(|| {
+                    format!(
+                        "google_{}_stream_{}_{}",
+                        effective_name, candidate_index, part_index
+                    )
+                }),
+                name: effective_name,
+                args: serde_json::json!({}),
+            }
+        });
+
+        if let Some(id) = function_call.get("id").and_then(|v| v.as_str()) {
+            entry.id = id.to_string();
+        }
+        if !name.is_empty() {
+            entry.name = name;
+        }
+        entry.args = args;
+
+        Some(openai_style_complete_tool_call(
+            &entry.id,
+            &entry.name,
+            &entry.args,
+        ))
+    }
+}
+
+fn openai_style_partial_tool_call(
+    id: &str,
+    name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "function": {
+            "name": name,
+            "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
+        }
+    })
+}
+
+fn openai_style_complete_tool_call(
+    id: &str,
+    name: &str,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "_tool_name": name,
+        "_tool_use_id": id,
+        "name": name,
+        "input": args,
+        "type": "function",
+        "raw_arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
+        "function": {
+            "name": name,
+            "arguments": args
+        }
+    })
+}
+
+fn google_partial_fragment_value(fragment: &serde_json::Value) -> Option<serde_json::Value> {
+    for key in [
+        "stringValue",
+        "numberValue",
+        "intValue",
+        "boolValue",
+        "objectValue",
+        "listValue",
+    ] {
+        if let Some(value) = fragment.get(key) {
+            return Some(value.clone());
+        }
+    }
+
+    if fragment
+        .get("nullValue")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Some(serde_json::Value::Null);
+    }
+
+    None
+}
+
+#[derive(Debug)]
+enum JsonPathSegment {
+    Key(String),
+    Index(usize),
+}
+
+fn parse_google_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
+    if !path.starts_with('$') {
+        return None;
+    }
+
+    let mut chars = path[1..].chars().peekable();
+    let mut segments = Vec::new();
+
+    while let Some(ch) = chars.peek().copied() {
+        match ch {
+            '.' => {
+                chars.next();
+                let mut key = String::new();
+                while let Some(next) = chars.peek().copied() {
+                    if matches!(next, '.' | '[') {
+                        break;
+                    }
+                    key.push(next);
+                    chars.next();
+                }
+                if key.is_empty() {
+                    return None;
+                }
+                segments.push(JsonPathSegment::Key(key));
+            }
+            '[' => {
+                chars.next();
+                let mut index = String::new();
+                while let Some(next) = chars.peek().copied() {
+                    if next == ']' {
+                        break;
+                    }
+                    index.push(next);
+                    chars.next();
+                }
+                if chars.next() != Some(']') {
+                    return None;
+                }
+                segments.push(JsonPathSegment::Index(index.parse().ok()?));
+            }
+            _ => return None,
+        }
+    }
+
+    Some(segments)
+}
+
+fn set_value_at_path(
+    root: &mut serde_json::Value,
+    path: &[JsonPathSegment],
+    value: serde_json::Value,
+) {
+    if path.is_empty() {
+        *root = value;
+        return;
+    }
+
+    match &path[0] {
+        JsonPathSegment::Key(key) => {
+            if !root.is_object() {
+                *root = serde_json::json!({});
+            }
+            let map = root.as_object_mut().expect("object just created");
+            let entry = map
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::Value::Null);
+            set_value_at_path(entry, &path[1..], value);
+        }
+        JsonPathSegment::Index(index) => {
+            if !root.is_array() {
+                *root = serde_json::json!([]);
+            }
+            let array = root.as_array_mut().expect("array just created");
+            while array.len() <= *index {
+                array.push(serde_json::Value::Null);
+            }
+            set_value_at_path(&mut array[*index], &path[1..], value);
+        }
+    }
+}
+
+fn apply_google_partial_arg(target: &mut serde_json::Value, fragment: &serde_json::Value) {
+    let Some(path) = fragment.get("jsonPath").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(value) = google_partial_fragment_value(fragment) else {
+        return;
+    };
+    let Some(segments) = parse_google_json_path(path) else {
+        return;
+    };
+    if target.is_null() {
+        *target = serde_json::json!({});
+    }
+    set_value_at_path(target, &segments, value);
+}
+
+fn parse_google_stream_value(
+    json: &serde_json::Value,
+    accumulator: &mut GoogleToolCallAccumulator,
+) -> Vec<Result<StreamChunk>> {
+    let mut chunks = Vec::new();
+
+    if let Some(candidates) = json.get("candidates").and_then(|c| c.as_array()) {
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            if let Some(parts) = candidate["content"]["parts"].as_array() {
+                for (part_index, part) in parts.iter().enumerate() {
+                    if let Some(func_call) = part.get("functionCall") {
+                        if func_call.get("args").is_some() {
+                            if let Some(tool_call) =
+                                accumulator.complete(candidate_index, part_index, func_call)
+                            {
+                                chunks.push(Ok(StreamChunk::ToolCallComplete(tool_call)));
+                            }
+                        } else if func_call.get("name").is_some()
+                            || func_call.get("partialArgs").is_some()
+                            || func_call
+                                .get("willContinue")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                        {
+                            if let Some(partial) =
+                                accumulator.update_partial(candidate_index, part_index, func_call)
+                            {
+                                chunks.push(Ok(StreamChunk::ToolCallPartial(partial)));
+                            }
+                        }
+                    } else if part
+                        .get("thought")
+                        .and_then(|t| t.as_bool())
+                        .unwrap_or(false)
+                    {
+                        if let Some(text) = part["text"].as_str() {
+                            chunks.push(Ok(StreamChunk::Reasoning(text.to_string())));
+                        }
+                    } else if let Some(sig) = part.get("thoughtSignature").and_then(|s| s.as_str())
+                    {
+                        chunks.push(Ok(StreamChunk::Signature(sig.to_string())));
+                    } else if let Some(text) = part["text"].as_str() {
+                        chunks.push(Ok(StreamChunk::Content(text.to_string())));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(usage) = json.get("usageMetadata") {
+        let input = usage["promptTokenCount"].as_u64().unwrap_or(0);
+        let output = usage["candidatesTokenCount"].as_u64().unwrap_or(0);
+        let cached = usage["cachedContentTokenCount"].as_u64().unwrap_or(0);
+
+        chunks.push(Ok(StreamChunk::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+        }));
+    }
+
+    chunks
 }
 
 /// Google Generative AI (Gemini) client
@@ -523,6 +873,7 @@ impl GoogleGenAIClient {
         &self,
         messages: &[ConversationMessage],
         config: &GenerationConfig,
+        stream: bool,
     ) -> Result<serde_json::Value> {
         // Extract system instruction if present
         let (system_instruction, messages) = self.extract_system_message(messages)?;
@@ -560,6 +911,10 @@ impl GoogleGenAIClient {
                 // Check if tools are already in Google format or need conversion
                 let google_tools = self.convert_tools_to_google_format(tools)?;
                 request["tools"] = google_tools;
+                if stream {
+                    request["toolConfig"]["functionCallingConfig"]["streamFunctionCallArguments"] =
+                        serde_json::json!(true);
+                }
             }
         }
 
@@ -929,8 +1284,9 @@ impl GoogleGenAIClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<serde_json::Value> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), false, timeout).await?;
@@ -960,9 +1316,9 @@ impl InferenceClient for GoogleGenAIClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<GenerationResponse> {
-        let request_body = self.build_request_body(messages, config)?;
+        let request_body = self.build_request_body(messages, config, false)?;
         let body = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         // Parse response
@@ -993,11 +1349,11 @@ impl InferenceClient for GoogleGenAIClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        let request_body = self.build_request_body(messages, config)?;
+        let request_body = self.build_request_body(messages, config, true)?;
         let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self
                 .make_request(request_body.clone(), true, timeout)
@@ -1026,128 +1382,49 @@ impl InferenceClient for GoogleGenAIClient {
 
         Ok(Box::pin(
             stream
-                .scan(JsonStreamAccumulator::new(), move |parser, chunk_result| {
-                    let mut chunks = Vec::new();
+                .scan(
+                    (
+                        JsonStreamAccumulator::new(),
+                        GoogleToolCallAccumulator::default(),
+                    ),
+                    move |state, chunk_result| {
+                        let mut chunks = Vec::new();
+                        let (parser, tool_accumulator) = state;
 
-                    match chunk_result {
-                        Ok(bytes) => {
-                            if google_stream_debug_enabled() {
-                                let text = String::from_utf8_lossy(&bytes);
-                                eprintln!("google stream chunk: {}", text);
-                            }
-                            match parser.push_bytes(&bytes) {
-                                Ok(values) => {
-                                    for json in values {
-                                        if let Some(candidates) =
-                                            json.get("candidates").and_then(|c| c.as_array())
-                                        {
-                                            for candidate in candidates {
-                                                if let Some(parts) =
-                                                    candidate["content"]["parts"].as_array()
-                                                {
-                                                    for part in parts {
-                                                        if let Some(func_call) =
-                                                            part.get("functionCall")
-                                                        {
-                                                            let name = func_call["name"]
-                                                                .as_str()
-                                                                .unwrap_or("");
-                                                            let args = func_call
-                                                                .get("args")
-                                                                .cloned()
-                                                                .unwrap_or(serde_json::json!({}));
-
-                                                            let id = format!(
-                                                                "google_{}_{}",
-                                                                name,
-                                                                rand_id()
-                                                            );
-
-                                                            let tool_call = serde_json::json!({
-                                                                "id": id,
-                                                                "_tool_name": name,
-                                                                "_tool_use_id": id,
-                                                                "name": name,
-                                                                "input": args,
-                                                                "function": {
-                                                                    "name": name,
-                                                                    "arguments": args
-                                                                }
-                                                            });
-
-                                                            chunks.push(Ok(
-                                                                StreamChunk::ToolCallComplete(
-                                                                    tool_call,
-                                                                ),
-                                                            ));
-                                                        } else if part
-                                                            .get("thought")
-                                                            .and_then(|t| t.as_bool())
-                                                            .unwrap_or(false)
-                                                        {
-                                                            if let Some(text) =
-                                                                part["text"].as_str()
-                                                            {
-                                                                chunks.push(Ok(
-                                                                    StreamChunk::Reasoning(
-                                                                        text.to_string(),
-                                                                    ),
-                                                                ));
-                                                            }
-                                                        } else if let Some(sig) = part
-                                                            .get("thoughtSignature")
-                                                            .and_then(|s| s.as_str())
-                                                        {
-                                                            chunks.push(Ok(
-                                                                StreamChunk::Signature(
-                                                                    sig.to_string(),
-                                                                ),
-                                                            ));
-                                                        } else if let Some(text) =
-                                                            part["text"].as_str()
-                                                        {
-                                                            chunks.push(Ok(StreamChunk::Content(
-                                                                text.to_string(),
-                                                            )));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if let Some(usage) = json.get("usageMetadata") {
-                                            let input =
-                                                usage["promptTokenCount"].as_u64().unwrap_or(0);
-                                            let output =
-                                                usage["candidatesTokenCount"].as_u64().unwrap_or(0);
-                                            let cached = usage["cachedContentTokenCount"]
-                                                .as_u64()
-                                                .unwrap_or(0);
-
-                                            chunks.push(Ok(StreamChunk::Usage {
-                                                input_tokens: input,
-                                                output_tokens: output,
-                                                cached_tokens: cached,
-                                            }));
+                        match chunk_result {
+                            Ok(bytes) => {
+                                if google_stream_debug_enabled() {
+                                    let text = String::from_utf8_lossy(&bytes);
+                                    eprintln!("google stream chunk: {}", text);
+                                }
+                                match parser.push_bytes(&bytes) {
+                                    Ok(values) => {
+                                        for json in values {
+                                            chunks.extend(parse_google_stream_value(
+                                                &json,
+                                                tool_accumulator,
+                                            ));
                                         }
                                     }
-                                }
-                                Err(err) => {
-                                    if google_stream_debug_enabled() {
-                                        eprintln!("google stream parse error: {}", err);
+                                    Err(err) => {
+                                        if google_stream_debug_enabled() {
+                                            eprintln!("google stream parse error: {}", err);
+                                        }
+                                        chunks.push(Err(err));
                                     }
-                                    chunks.push(Err(err));
                                 }
                             }
+                            Err(e) => {
+                                chunks.push(Err(Error::Inference(format!(
+                                    "Google stream error: {}",
+                                    e
+                                ))));
+                            }
                         }
-                        Err(e) => {
-                            chunks
-                                .push(Err(Error::Inference(format!("Google stream error: {}", e))));
-                        }
-                    }
 
-                    futures::future::ready(Some(chunks))
-                })
+                        futures::future::ready(Some(chunks))
+                    },
+                )
                 .flat_map(futures::stream::iter),
         ))
     }
@@ -1159,15 +1436,6 @@ impl InferenceClient for GoogleGenAIClient {
     fn set_trace_callback(&mut self, callback: TraceCallback) {
         self.trace_callback = Some(callback);
     }
-}
-
-/// Generate a simple random ID for tool calls
-fn rand_id() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1262,7 +1530,9 @@ mod tests {
             .with_max_tokens(1024)
             .with_temperature(0.7);
 
-        let body = client.build_request_body(&messages, &config).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert!(body["contents"].is_array());
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 1024);
@@ -1278,7 +1548,9 @@ mod tests {
         ];
         let config = GenerationConfig::new("gemini-1.5-pro");
 
-        let body = client.build_request_body(&messages, &config).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert!(body["systemInstruction"].is_object());
         assert_eq!(
@@ -1296,7 +1568,9 @@ mod tests {
         let messages = vec![ConversationMessage::Chat(ChatMessage::user("Think"))];
         let config = GenerationConfig::new("gemini-1.5-pro");
 
-        let body = client.build_request_body(&messages, &config).unwrap();
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
 
         assert!(body["generationConfig"]["thinkingConfig"].is_object());
         assert_eq!(
@@ -1407,5 +1681,135 @@ mod tests {
     fn test_provider() {
         let client = GoogleGenAIClient::new("test-key", "gemini-1.5-pro");
         assert_eq!(client.provider(), Provider::GoogleGenAI);
+    }
+
+    #[test]
+    fn test_build_request_body_enables_streaming_function_call_arguments() {
+        let client = GoogleGenAIClient::new("test-key", "gemini-2.5-pro");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("gemini-2.5-pro").with_tools(vec![serde_json::json!({
+            "name": "get_weather",
+            "description": "Get weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"}
+                }
+            }
+        })]);
+
+        let body = client.build_request_body(&messages, &config, true).unwrap();
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["streamFunctionCallArguments"],
+            true
+        );
+    }
+
+    #[test]
+    fn test_parse_google_stream_value_emits_partial_and_complete_tool_calls() {
+        let mut accumulator = GoogleToolCallAccumulator::default();
+
+        let name_chunk = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "id": "fc_123",
+                            "name": "get_weather",
+                            "willContinue": true
+                        }
+                    }]
+                }
+            }]
+        });
+        let chunks = parse_google_stream_value(&name_chunk, &mut accumulator);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            Ok(StreamChunk::ToolCallPartial(tool)) => {
+                assert_eq!(tool["id"], "fc_123");
+                assert_eq!(tool["function"]["name"], "get_weather");
+                assert_eq!(tool["function"]["arguments"], "{}");
+            }
+            other => panic!("expected ToolCallPartial, got {:?}", other),
+        }
+
+        let partial_chunk = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "partialArgs": [{
+                                "jsonPath": "$.location",
+                                "stringValue": "San Francisco"
+                            }],
+                            "willContinue": true
+                        }
+                    }]
+                }
+            }]
+        });
+        let chunks = parse_google_stream_value(&partial_chunk, &mut accumulator);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            Ok(StreamChunk::ToolCallPartial(tool)) => {
+                assert_eq!(tool["id"], "fc_123");
+                assert_eq!(
+                    tool["function"]["arguments"],
+                    "{\"location\":\"San Francisco\"}"
+                );
+            }
+            other => panic!("expected ToolCallPartial, got {:?}", other),
+        }
+
+        let complete_chunk = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "id": "fc_123",
+                            "name": "get_weather",
+                            "args": {
+                                "location": "San Francisco"
+                            }
+                        }
+                    }]
+                }
+            }]
+        });
+        let chunks = parse_google_stream_value(&complete_chunk, &mut accumulator);
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            Ok(StreamChunk::ToolCallComplete(tool)) => {
+                assert_eq!(tool["id"], "fc_123");
+                assert_eq!(tool["_tool_name"], "get_weather");
+                assert_eq!(tool["name"], "get_weather");
+                assert_eq!(tool["input"]["location"], "San Francisco");
+                assert_eq!(tool["function"]["name"], "get_weather");
+                assert_eq!(tool["function"]["arguments"]["location"], "San Francisco");
+            }
+            other => panic!("expected ToolCallComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_apply_google_partial_arg_handles_nested_objects_and_arrays() {
+        let mut args = serde_json::json!({});
+        apply_google_partial_arg(
+            &mut args,
+            &serde_json::json!({
+                "jsonPath": "$.doc.title",
+                "stringValue": "Hello"
+            }),
+        );
+        apply_google_partial_arg(
+            &mut args,
+            &serde_json::json!({
+                "jsonPath": "$.items[0].name",
+                "stringValue": "first"
+            }),
+        );
+
+        assert_eq!(args["doc"]["title"], "Hello");
+        assert_eq!(args["items"][0]["name"], "first");
     }
 }

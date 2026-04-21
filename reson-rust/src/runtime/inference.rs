@@ -13,7 +13,7 @@ use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient, StreamChunk,
 };
-use crate::schema::fix_output_schema_for_provider;
+use crate::schema::{apply_tool_strict_for_provider, fix_output_schema_for_provider};
 use crate::types::{
     AssistantResponse, ChatMessage, CreateResult, ReasoningSegment, ResponsePart,
     ResponseStreamEvent, TokenUsage, ToolCall,
@@ -333,7 +333,10 @@ fn generate_tool_schemas(
                 "required": required
             });
             fix_output_schema_for_provider(&mut parameters, &provider);
-            generator.generate_schema(tool_name, &schema_info.description, parameters)
+            let mut tool_schema =
+                generator.generate_schema(tool_name, &schema_info.description, parameters);
+            apply_tool_strict_for_provider(&mut tool_schema, &provider, schema_info.strict);
+            tool_schema
         } else {
             // No schema info - generate minimal schema
             let mut parameters = serde_json::json!({
@@ -549,6 +552,7 @@ pub async fn call_llm(
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
+    retry_config: Option<crate::retry::RetryConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 ) -> Result<CallResult> {
     // Create client
@@ -606,6 +610,7 @@ pub async fn call_llm(
         output_schema: fixed_output_schema,
         output_type_name,
         timeout,
+        retry_config,
     };
 
     // Make API call
@@ -638,6 +643,7 @@ pub async fn call_llm_stream(
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
+    retry_config: Option<crate::retry::RetryConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
     accumulators: Arc<RwLock<Accumulators>>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
@@ -696,6 +702,7 @@ pub async fn call_llm_stream(
         output_schema: fixed_output_schema,
         output_type_name,
         timeout,
+        retry_config,
     };
 
     // Get streaming response
@@ -845,6 +852,7 @@ mod tests {
                     description: "The city name".to_string(),
                     required: true,
                 }],
+                strict: None,
             },
         );
 
@@ -884,6 +892,7 @@ mod tests {
                     description: "Math expression to evaluate".to_string(),
                     required: true,
                 }],
+                strict: None,
             },
         );
 
@@ -940,6 +949,7 @@ mod tests {
                         required: false,
                     },
                 ],
+                strict: None,
             },
         );
 
