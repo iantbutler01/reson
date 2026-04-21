@@ -86,5 +86,13 @@ mcp = ["dep:reson-mcp"]
 mcp-apps = ["mcp", "reson-mcp/apps"]
 sandbox = ["dep:reson-sandbox"]
 
+[[example]]
+name = "sandbox_agent_demo"
+required-features = ["sandbox"]
+
+[[example]]
+name = "sandbox_agent_tools_demo"
+required-features = ["sandbox"]
+
 [lints.rust]
 warnings = "deny"

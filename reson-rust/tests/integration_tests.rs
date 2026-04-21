@@ -1330,14 +1330,14 @@ async fn test_google_with_thinking() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_anthropic_model() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![
         ConversationMessage::Chat(ChatMessage::system("Be very concise.")),
         ConversationMessage::Chat(ChatMessage::user("What is 7+7? Just number.")),
     ];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(100)
         .with_temperature(0.0);
 
@@ -1352,13 +1352,13 @@ async fn test_openrouter_anthropic_model() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_with_tools() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "You must use the add_numbers tool to calculate 25 + 35. Do not calculate it yourself - use the tool.",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![openai_add_tool()])
         .with_native_tools(true);
@@ -1380,13 +1380,13 @@ async fn test_openrouter_with_tools_streaming() {
     for attempt in 1..=3 {
         let attempt_result = timeout(Duration::from_secs(20), async {
             let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-            let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+            let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
             let messages = vec![ConversationMessage::Chat(ChatMessage::user(
                 "You must use the add_numbers tool to calculate 25 + 35. Do not calculate it yourself - use the tool.",
             ))];
 
-            let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+            let config = GenerationConfig::new("anthropic/claude-sonnet-4")
                 .with_max_tokens(1024)
                 .with_tools(vec![openai_add_tool()])
                 .with_native_tools(true);
@@ -1541,9 +1541,9 @@ async fn test_openrouter_responses_multi_turn_with_tools() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_5_turn_tool_conversation() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![openai_add_tool(), openai_multiply_tool()])
         .with_native_tools(true);

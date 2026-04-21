@@ -847,6 +847,10 @@ pub struct ToolCall {
 impl ToolCall {
     /// Create a new tool call
     pub fn new(tool_name: impl Into<String>, args: serde_json::Value) -> Self {
+        if let Ok(CreateResult::Single(tool_call)) = Self::create(args.clone()) {
+            return tool_call;
+        }
+
         Self {
             tool_use_id: Uuid::new_v4().to_string(),
             tool_name: tool_name.into(),
@@ -1001,7 +1005,10 @@ impl ToolCall {
                     )
                 } else if arguments.is_object() {
                     let raw = serde_json::to_string(arguments)?;
-                    (arguments.clone(), Some(explicit_raw_arguments.unwrap_or(raw)))
+                    (
+                        arguments.clone(),
+                        Some(explicit_raw_arguments.unwrap_or(raw)),
+                    )
                 } else {
                     return Err(Error::Parse("Missing 'arguments' in tool call".to_string()));
                 };

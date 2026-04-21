@@ -29,7 +29,7 @@ impl OpenRouterClient {
     ///
     /// # Arguments
     /// * `api_key` - OpenRouter API key
-    /// * `model` - Model name (e.g., "anthropic/claude-3-5-sonnet")
+    /// * `model` - Model name (e.g., "anthropic/claude-sonnet-4")
     /// * `referer` - Optional HTTP-Referer header for ranking
     /// * `title` - Optional X-Title header for ranking
     pub fn new(
@@ -106,7 +106,7 @@ mod tests {
     fn test_new_client() {
         let client = OpenRouterClient::new(
             "test-key",
-            "anthropic/claude-3-5-sonnet",
+            "anthropic/claude-sonnet-4",
             Some("https://example.com".to_string()),
             Some("Test App".to_string()),
         );
@@ -116,14 +116,14 @@ mod tests {
 
     #[test]
     fn test_new_client_without_headers() {
-        let client = OpenRouterClient::new("test-key", "anthropic/claude-3-5-sonnet", None, None);
+        let client = OpenRouterClient::new("test-key", "anthropic/claude-sonnet-4", None, None);
 
         assert_eq!(client.provider(), Provider::OpenRouter);
     }
 
     #[test]
     fn test_with_reasoning() {
-        let client = OpenRouterClient::new("test-key", "anthropic/claude-3-5-sonnet", None, None)
+        let client = OpenRouterClient::new("test-key", "anthropic/claude-sonnet-4", None, None)
             .with_reasoning("high");
 
         assert_eq!(client.provider(), Provider::OpenRouter);

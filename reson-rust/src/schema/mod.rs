@@ -30,6 +30,86 @@ pub fn fix_output_schema_for_provider(schema: &mut Value, provider: &str) {
     }
 }
 
+/// Fix a provider-specific tool schema in-place.
+///
+/// This normalizes manually supplied tool schemas before they are sent to a
+/// provider client. Runtime-generated schemas already pass through
+/// `fix_output_schema_for_provider`.
+pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
+    if let Ok(generator) = get_schema_generator(provider) {
+        let extracted = tool
+            .get("function")
+            .map(|function| {
+                (
+                    function["name"].as_str().unwrap_or_default().to_string(),
+                    function["description"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    function["parameters"].clone(),
+                )
+            })
+            .or_else(|| {
+                (tool.get("type").and_then(|v| v.as_str()) == Some("function")).then(|| {
+                    (
+                        tool["name"].as_str().unwrap_or_default().to_string(),
+                        tool["description"].as_str().unwrap_or_default().to_string(),
+                        tool["parameters"].clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                tool.get("name").and_then(|name| name.as_str()).map(|name| {
+                    (
+                        name.to_string(),
+                        tool["description"].as_str().unwrap_or_default().to_string(),
+                        tool.get("input_schema")
+                            .cloned()
+                            .or_else(|| tool.get("parameters").cloned())
+                            .unwrap_or(Value::Null),
+                    )
+                })
+            });
+
+        if let Some((name, description, mut parameters)) = extracted {
+            if !name.is_empty() && !parameters.is_null() {
+                fix_output_schema_for_provider(&mut parameters, provider);
+                *tool = generator.generate_schema(&name, &description, parameters);
+                return;
+            }
+        }
+    }
+
+    match provider {
+        "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
+            if let Some(input_schema) = tool.get_mut("input_schema") {
+                fix_output_schema_for_provider(input_schema, provider);
+            }
+        }
+        "openai" | "openrouter" => {
+            if let Some(parameters) = tool
+                .get_mut("function")
+                .and_then(|v| v.get_mut("parameters"))
+            {
+                fix_output_schema_for_provider(parameters, provider);
+            }
+        }
+        "openai-responses"
+        | "openrouter-responses"
+        | "google"
+        | "google_gemini"
+        | "vertex_gemini"
+        | "gemini"
+        | "google-genai"
+        | "google-gemini" => {
+            if let Some(parameters) = tool.get_mut("parameters") {
+                fix_output_schema_for_provider(parameters, provider);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Fix schema for OpenAI's strict structured outputs
 /// - Add `additionalProperties: false` to all objects
 /// - Make all properties required (OpenAI requires this)
@@ -380,4 +460,5 @@ mod tests {
         let result = get_schema_generator("unsupported");
         assert!(result.is_err());
     }
+
 }

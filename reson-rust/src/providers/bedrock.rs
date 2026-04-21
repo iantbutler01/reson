@@ -21,6 +21,8 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 #[cfg(feature = "bedrock")]
+use crate::schema::fix_tool_schema_for_provider;
+#[cfg(feature = "bedrock")]
 use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
 #[cfg(feature = "bedrock")]
 use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
@@ -53,6 +55,21 @@ pub struct BedrockClient {
 
 #[cfg(feature = "bedrock")]
 impl BedrockClient {
+    fn strict_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, "bedrock");
+                if let Some(obj) = tool.as_object_mut() {
+                    obj.entry("strict".to_string())
+                        .or_insert_with(|| serde_json::json!(true));
+                }
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new Bedrock client
     ///
     /// # Arguments
@@ -135,7 +152,7 @@ impl BedrockClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.strict_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -514,6 +531,20 @@ mod tests {
         assert!(first_msg["content"].is_array());
         assert_eq!(first_msg["content"][0]["type"], "text");
         assert_eq!(first_msg["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_build_request_body_with_tools_defaults_to_strict() {
+        let client = BedrockClient::new("test-model", None);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![serde_json::json!({"name": "get_weather"})];
+        let config = GenerationConfig::new("test-model").with_tools(tools);
+
+        let body = client.build_request_body(&messages, &config).unwrap();
+
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }
 
     #[tokio::test]

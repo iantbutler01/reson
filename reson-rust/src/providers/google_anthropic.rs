@@ -23,6 +23,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{
     AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall,
 };
@@ -47,6 +48,21 @@ pub struct GoogleAnthropicClient {
 
 #[cfg(feature = "google-adc")]
 impl GoogleAnthropicClient {
+    fn strict_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, "google-anthropic");
+                if let Some(obj) = tool.as_object_mut() {
+                    obj.entry("strict".to_string())
+                        .or_insert_with(|| serde_json::json!(true));
+                }
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new Google Anthropic client with Application Default Credentials (ADC)
     ///
     /// The project ID is automatically extracted from the service account JSON file
@@ -199,7 +215,7 @@ impl GoogleAnthropicClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.strict_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -500,9 +516,9 @@ impl InferenceClient for GoogleAnthropicClient {
                                     .map(StreamChunk::ToolCallComplete)
                                     .map(Ok),
                             );
-                            return pending.pop_front().map(|item| {
-                                (item, (sse_stream, accumulator, pending, true))
-                            });
+                            return pending
+                                .pop_front()
+                                .map(|item| (item, (sse_stream, accumulator, pending, true)));
                         }
                     }
                 }
@@ -524,6 +540,7 @@ impl InferenceClient for GoogleAnthropicClient {
 #[cfg(all(test, feature = "google-adc"))]
 mod tests {
     use super::*;
+    use crate::types::ChatMessage;
 
     #[test]
     fn test_endpoint_url() {
@@ -549,5 +566,25 @@ mod tests {
         .with_thinking_budget(1024);
 
         assert_eq!(client.thinking_budget, Some(1024));
+    }
+
+    #[test]
+    fn test_build_request_with_tools_defaults_to_strict() {
+        let client = GoogleAnthropicClient::from_adc_with_project(
+            "claude-3-5-sonnet-v2@20241022",
+            "my-project",
+            "us-east5",
+        );
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![serde_json::json!({"name": "get_weather"})];
+        let config = GenerationConfig::new("claude-3-5-sonnet-v2@20241022").with_tools(tools);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }
 }

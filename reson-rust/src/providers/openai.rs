@@ -17,6 +17,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
     convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
@@ -63,6 +64,20 @@ impl std::fmt::Debug for OAIClient {
 }
 
 impl OAIClient {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        let provider = match self.provider {
+            Provider::OpenRouter => "openrouter",
+            _ => "openai",
+        };
+        tools.iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, provider);
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new OpenAI client
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -161,7 +176,7 @@ impl OAIClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 request["tool_choice"] = serde_json::json!("auto");
             }
         }

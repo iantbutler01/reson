@@ -542,7 +542,10 @@ mod tests {
         acc.accumulate_input(0, "{\"path\":\"notes.md\",\"content\":\"hel");
 
         let complete = acc.complete_tool(0).unwrap();
-        assert_eq!(complete["raw_arguments"], "{\"path\":\"notes.md\",\"content\":\"hel");
+        assert_eq!(
+            complete["raw_arguments"],
+            "{\"path\":\"notes.md\",\"content\":\"hel"
+        );
         assert_eq!(complete["function"]["arguments"]["path"], "notes.md");
         assert_eq!(complete["function"]["arguments"]["content"], "hel");
     }

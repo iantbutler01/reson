@@ -327,26 +327,22 @@ fn generate_tool_schemas(
                 }
             }
 
-            generator.generate_schema(
-                tool_name,
-                &schema_info.description,
-                serde_json::json!({
-                    "type": "object",
-                    "properties": properties,
-                    "required": required
-                }),
-            )
+            let mut parameters = serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            });
+            fix_output_schema_for_provider(&mut parameters, &provider);
+            generator.generate_schema(tool_name, &schema_info.description, parameters)
         } else {
             // No schema info - generate minimal schema
-            generator.generate_schema(
-                tool_name,
-                &format!("Tool: {}", tool_name),
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            )
+            let mut parameters = serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            });
+            fix_output_schema_for_provider(&mut parameters, &provider);
+            generator.generate_schema(tool_name, &format!("Tool: {}", tool_name), parameters)
         };
 
         schemas.push(tool_schema);
@@ -859,6 +855,7 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "get_weather");
         assert!(schemas[0]["input_schema"].is_object());
+        assert_eq!(schemas[0]["input_schema"]["additionalProperties"], false);
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["location"]["type"],
             "string"
@@ -897,6 +894,10 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["type"], "function");
         assert_eq!(schemas[0]["function"]["name"], "calculate");
+        assert_eq!(
+            schemas[0]["function"]["parameters"]["additionalProperties"],
+            false
+        );
         assert_eq!(
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
@@ -948,6 +949,7 @@ mod tests {
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "search");
+        assert_eq!(schemas[0]["input_schema"]["additionalProperties"], false);
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["ids"]["items"]["type"],
             "integer"

@@ -18,6 +18,7 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{
     AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall,
 };
@@ -34,6 +35,21 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    fn strict_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, "anthropic");
+                if let Some(obj) = tool.as_object_mut() {
+                    obj.entry("strict".to_string())
+                        .or_insert_with(|| serde_json::json!(true));
+                }
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new Anthropic client
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -99,7 +115,7 @@ impl AnthropicClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.strict_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -424,9 +440,9 @@ impl InferenceClient for AnthropicClient {
                                     .map(StreamChunk::ToolCallComplete)
                                     .map(Ok),
                             );
-                            return pending.pop_front().map(|item| {
-                                (item, (sse_stream, accumulator, pending, true))
-                            });
+                            return pending
+                                .pop_front()
+                                .map(|item| (item, (sse_stream, accumulator, pending, true)));
                         }
                     }
                 }
@@ -581,8 +597,23 @@ mod tests {
             .unwrap();
 
         assert!(body["tools"].is_array());
+        assert_eq!(body["tools"][0]["strict"], true);
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
+    fn test_build_request_with_tools_preserves_explicit_strict() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![serde_json::json!({"name": "get_weather", "strict": false})];
+        let config = GenerationConfig::new("claude-3-opus-20240229").with_tools(tools);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["tools"][0]["strict"], false);
     }
 
     #[test]

@@ -57,6 +57,7 @@ impl JsonStreamAccumulator {
             let deserializer = serde_json::Deserializer::from_slice(&self.buffer);
             let mut iter = deserializer.into_iter::<serde_json::Value>();
             let mut parsed_any = false;
+            let mut await_more_bytes = false;
 
             for value_result in iter.by_ref() {
                 match value_result {
@@ -68,6 +69,10 @@ impl JsonStreamAccumulator {
                         break;
                     }
                     Err(err) => {
+                        if parsed_any {
+                            await_more_bytes = true;
+                            break;
+                        }
                         self.buffer.clear();
                         return Err(Error::Inference(format!(
                             "JSON stream parse error: {}",
@@ -81,7 +86,7 @@ impl JsonStreamAccumulator {
             if consumed > 0 {
                 self.buffer.drain(0..consumed);
             }
-            if !parsed_any {
+            if await_more_bytes || !parsed_any {
                 break;
             }
         }
