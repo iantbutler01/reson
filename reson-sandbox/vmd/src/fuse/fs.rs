@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use fuser::{
@@ -10,6 +10,7 @@ use fuser::{
     KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
+use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 
 use super::cache::NymFuseCache;
@@ -19,6 +20,8 @@ const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO_RAW: u64 = 1;
 const ROOT_INO: INodeNo = INodeNo(ROOT_INO_RAW);
 const LARGE_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_INODES: usize = 65_536;
+const MAX_OPEN_HANDLES: usize = 8_192;
 
 type FuseResult<T> = std::result::Result<T, Errno>;
 
@@ -26,7 +29,12 @@ type FuseResult<T> = std::result::Result<T, Errno>;
 struct InodeTable {
     next: u64,
     path_to_ino: HashMap<String, INodeNo>,
-    ino_to_path: HashMap<INodeNo, String>,
+    ino_to_path: HashMap<INodeNo, InodeRecord>,
+}
+
+struct InodeRecord {
+    path: String,
+    last_access: Instant,
 }
 
 impl InodeTable {
@@ -37,23 +45,58 @@ impl InodeTable {
             ino_to_path: HashMap::new(),
         };
         table.path_to_ino.insert(String::new(), ROOT_INO);
-        table.ino_to_path.insert(ROOT_INO, String::new());
+        table.ino_to_path.insert(
+            ROOT_INO,
+            InodeRecord {
+                path: String::new(),
+                last_access: Instant::now(),
+            },
+        );
         table
     }
 
     fn ensure(&mut self, path: &str) -> INodeNo {
         if let Some(ino) = self.path_to_ino.get(path) {
+            if let Some(record) = self.ino_to_path.get_mut(ino) {
+                record.last_access = Instant::now();
+            }
             return *ino;
         }
         let ino = INodeNo(self.next);
         self.next += 1;
         self.path_to_ino.insert(path.to_string(), ino);
-        self.ino_to_path.insert(ino, path.to_string());
+        self.ino_to_path.insert(
+            ino,
+            InodeRecord {
+                path: path.to_string(),
+                last_access: Instant::now(),
+            },
+        );
+        self.evict_to_capacity(MAX_INODES);
         ino
     }
 
-    fn path(&self, ino: INodeNo) -> Option<String> {
-        self.ino_to_path.get(&ino).cloned()
+    fn path(&mut self, ino: INodeNo) -> Option<String> {
+        let record = self.ino_to_path.get_mut(&ino)?;
+        record.last_access = Instant::now();
+        Some(record.path.clone())
+    }
+
+    fn evict_to_capacity(&mut self, max_entries: usize) {
+        while self.ino_to_path.len() > max_entries.max(1) {
+            let Some(oldest_ino) = self
+                .ino_to_path
+                .iter()
+                .filter(|(ino, _)| **ino != ROOT_INO)
+                .min_by_key(|(_, record)| record.last_access)
+                .map(|(ino, _)| *ino)
+            else {
+                break;
+            };
+            if let Some(record) = self.ino_to_path.remove(&oldest_ino) {
+                self.path_to_ino.remove(record.path.as_str());
+            }
+        }
     }
 }
 
@@ -77,6 +120,8 @@ struct FileState {
     buffer: Vec<u8>,
     dirty: bool,
     loaded: bool,
+    base_content_hash: Option<String>,
+    revision: u64,
 }
 
 pub struct NymFuseFs {
@@ -260,8 +305,17 @@ impl NymFuseFs {
         Ok(bytes)
     }
 
-    fn next_handle(&self, path: &str, initial: Vec<u8>, loaded: bool) -> FuseResult<u64> {
+    fn next_handle(
+        &self,
+        path: &str,
+        initial: Vec<u8>,
+        loaded: bool,
+        base_content_hash: Option<String>,
+    ) -> FuseResult<u64> {
         let mut handles = self.lock_handles()?;
+        if handles.files.len() >= MAX_OPEN_HANDLES {
+            return Err(Errno::EMFILE);
+        }
         let fh = handles.next;
         handles.next += 1;
         handles.files.insert(
@@ -271,6 +325,8 @@ impl NymFuseFs {
                 buffer: initial,
                 dirty: false,
                 loaded,
+                base_content_hash,
+                revision: 0,
             },
         );
         Ok(fh)
@@ -295,24 +351,46 @@ impl NymFuseFs {
                     .acquire_lease(&state.path, 1, "flush nymfs fuse writes"),
             )
             .map_err(|_| Errno::EIO)?;
-        let metadata = self.stat_path(&state.path)?.unwrap_or(RemoteMetadata {
-            kind: "file".to_string(),
-            size_bytes: 0,
-            content_hash: None,
-            updated_at: None,
-        });
+        let metadata = match self.stat_path(&state.path) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => RemoteMetadata {
+                kind: "file".to_string(),
+                size_bytes: 0,
+                content_hash: None,
+                updated_at: None,
+            },
+            Err(err) => {
+                let _ = self.tokio.block_on(self.client.release_lease(&lease));
+                return Err(err);
+            }
+        };
+        let next_content_hash = content_hash_for_bytes(&state.buffer);
+        let already_persisted =
+            metadata.content_hash.as_deref() == Some(next_content_hash.as_str());
+        if content_hash_conflicts(
+            state.base_content_hash.as_deref(),
+            metadata.content_hash.as_deref(),
+        ) && !already_persisted
+        {
+            let _ = self.tokio.block_on(self.client.release_lease(&lease));
+            return Err(Errno::EBUSY);
+        }
         let surface = if state.path.contains("/shared") {
             "vm_conversation_shared_fuse"
         } else {
             "vm_task_overlay_fuse"
         };
-        let write_result = self.tokio.block_on(self.client.write_file(
-            &state.path,
-            &state.buffer,
-            &lease,
-            surface,
-            "fuse_write_through",
-        ));
+        let write_result = if already_persisted {
+            Ok(())
+        } else {
+            self.tokio.block_on(self.client.write_file(
+                &state.path,
+                &state.buffer,
+                &lease,
+                surface,
+                "fuse_write_through",
+            ))
+        };
         let _ = self.tokio.block_on(self.client.release_lease(&lease));
         write_result.map_err(|_| Errno::EIO)?;
 
@@ -323,13 +401,16 @@ impl NymFuseFs {
             Some(RemoteMetadata {
                 kind: "file".to_string(),
                 size_bytes: state.buffer.len() as u64,
-                content_hash: metadata.content_hash,
+                content_hash: Some(next_content_hash.clone()),
                 updated_at: metadata.updated_at,
             }),
         );
         if let Some(handle) = self.lock_handles()?.files.get_mut(&fh) {
-            handle.dirty = false;
             handle.loaded = true;
+            handle.base_content_hash = Some(next_content_hash);
+            if handle.revision == state.revision {
+                handle.dirty = false;
+            }
         }
         Ok(())
     }
@@ -374,6 +455,9 @@ impl NymFuseFs {
             .map_err(|_| Errno::EIO)?;
         let mut handles = self.lock_handles()?;
         let handle = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
+        if handle.loaded || handle.dirty || handle.revision != state.revision {
+            return Ok(());
+        }
         handle.buffer = bytes;
         handle.loaded = true;
         Ok(())
@@ -414,11 +498,31 @@ impl NymFuseFs {
     }
 }
 
+fn content_hash_conflicts(base: Option<&str>, current: Option<&str>) -> bool {
+    matches!((base, current), (Some(base), Some(current)) if base != current)
+}
+
+fn content_hash_for_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(hasher.finalize().as_ref())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use fuser::InitFlags;
 
-    use super::NymFuseFs;
+    use super::{InodeTable, NymFuseFs, ROOT_INO, content_hash_conflicts, content_hash_for_bytes};
 
     #[test]
     fn same_scope_accepts_same_task_workspace_and_rejects_cross_scope_rename() {
@@ -441,6 +545,35 @@ mod tests {
         assert_eq!(
             NymFuseFs::requested_init_capabilities_for(true),
             InitFlags::empty()
+        );
+    }
+
+    #[test]
+    fn inode_table_evicts_lru_without_removing_root() {
+        let mut table = InodeTable::new();
+        let first = table.ensure("a");
+        let _second = table.ensure("b");
+
+        table.evict_to_capacity(2);
+
+        assert_eq!(table.path(ROOT_INO).as_deref(), Some(""));
+        assert!(table.path(first).is_none());
+    }
+
+    #[test]
+    fn content_hash_conflict_requires_two_different_known_hashes() {
+        assert!(content_hash_conflicts(Some("base"), Some("current")));
+        assert!(!content_hash_conflicts(Some("same"), Some("same")));
+        assert!(!content_hash_conflicts(None, Some("current")));
+        assert!(!content_hash_conflicts(Some("base"), None));
+        assert!(!content_hash_conflicts(None, None));
+    }
+
+    #[test]
+    fn content_hash_for_bytes_matches_sha256_hex() {
+        assert_eq!(
+            content_hash_for_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 }
@@ -552,19 +685,37 @@ impl Filesystem for NymFuseFs {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let result: FuseResult<u64> = (|| {
             let path = self.path_for_ino(ino)?;
             let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
             if metadata.kind == "directory" {
                 return Err(Errno::EISDIR);
             }
-            let (initial, loaded) = self
-                .cache
-                .get_file(&path)
-                .map(|(bytes, _)| (bytes, true))
-                .unwrap_or_else(|| (Vec::new(), false));
-            let fh = self.next_handle(&path, initial, loaded)?;
+            let truncate = flags.0 & libc::O_TRUNC != 0;
+            if truncate && self.read_only {
+                return Err(Errno::EROFS);
+            }
+            let (initial, loaded, dirty) = if truncate {
+                (Vec::new(), true, true)
+            } else {
+                self.cache
+                    .get_file(&path)
+                    .map(|(bytes, _)| (bytes, true, false))
+                    .unwrap_or_else(|| (Vec::new(), false, false))
+            };
+            let base_content_hash = if truncate {
+                None
+            } else {
+                metadata.content_hash.clone()
+            };
+            let fh = self.next_handle(&path, initial, loaded, base_content_hash)?;
+            if dirty {
+                let mut handles = self.lock_handles()?;
+                let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
+                state.dirty = true;
+                state.revision = state.revision.saturating_add(1);
+            }
             Ok(fh)
         })();
         match result {
@@ -585,16 +736,13 @@ impl Filesystem for NymFuseFs {
         reply: ReplyData,
     ) {
         let result: FuseResult<Vec<u8>> = (|| {
-            if let Some(state) = self
-                .lock_handles()?
-                .files
-                .get(&fh.0)
-                .cloned()
-                .filter(|state| state.loaded || state.dirty)
-            {
-                let start = (offset as usize).min(state.buffer.len());
-                let end = start.saturating_add(size as usize).min(state.buffer.len());
-                return Ok(state.buffer[start..end].to_vec());
+            if let Some(state) = self.lock_handles()?.files.get(&fh.0).cloned() {
+                if state.loaded || state.dirty {
+                    let start = (offset as usize).min(state.buffer.len());
+                    let end = start.saturating_add(size as usize).min(state.buffer.len());
+                    return Ok(state.buffer[start..end].to_vec());
+                }
+                return self.read_bytes(&state.path, offset, size);
             }
             let path = self.path_for_ino(ino)?;
             self.read_bytes(&path, offset, size)
@@ -635,6 +783,7 @@ impl Filesystem for NymFuseFs {
             state.buffer[start..start + data.len()].copy_from_slice(data);
             state.dirty = true;
             state.loaded = true;
+            state.revision = state.revision.saturating_add(1);
             Ok(data.len() as u32)
         })();
         match result {
@@ -681,11 +830,14 @@ impl Filesystem for NymFuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let _ = self.flush_handle(fh.0);
+        let flush_result = self.flush_handle(fh.0);
         let _ = self
             .lock_handles()
             .map(|mut handles| handles.files.remove(&fh.0));
-        reply.ok();
+        match flush_result {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err),
+        }
     }
 
     fn mkdir(
@@ -810,7 +962,7 @@ impl Filesystem for NymFuseFs {
                 updated_at: None,
             });
             let attr = self.attr_for_path(&path, &metadata);
-            let fh = self.next_handle(&path, Vec::new(), true)?;
+            let fh = self.next_handle(&path, Vec::new(), true, None)?;
             Ok((attr, fh))
         })();
         match result {

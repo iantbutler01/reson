@@ -2,6 +2,9 @@
 // @dive-rel: Consumes node/control-bus config from vmd/src/config.rs and runs under orchestration in vmd/src/app.rs.
 // @dive-rel: Maintains partitioned session-route scanning + resume checkpoints to reduce hotspot risk with sharded etcd keyspaces.
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +31,7 @@ pub struct ReconcileConfig {
     pub node_endpoint: String,
     pub interval: Duration,
     pub nats_url: Option<String>,
+    pub nats_auth_token: Option<String>,
     pub nats_subject_prefix: String,
     pub session_shard_count: u8,
 }
@@ -85,7 +89,7 @@ pub async fn start(
 
     let mut nats = None;
     if let Some(url) = config.nats_url.as_ref() {
-        match async_nats::connect(url.clone()).await {
+        match connect_nats(url, config.nats_auth_token.as_deref()).await {
             Ok(client) => nats = Some(client),
             Err(err) => {
                 warn!(url = %url, err = %err, "reconcile nats connect failed; continuing without event publish")
@@ -147,23 +151,26 @@ fn derive_config(
         return None;
     }
 
-    let (nats_url, nats_subject_prefix, node_id) = if let Some(control) = control_bus {
-        (
-            Some(control.nats_url),
-            control.subject_prefix,
-            if control.node_id.trim().is_empty() {
-                node_registry.node_id.clone()
-            } else {
-                control.node_id
-            },
-        )
-    } else {
-        (
-            None,
-            "reson.sandbox.control".to_string(),
-            node_registry.node_id.clone(),
-        )
-    };
+    let (nats_url, nats_auth_token, nats_subject_prefix, node_id) =
+        if let Some(control) = control_bus {
+            (
+                Some(control.nats_url),
+                control.nats_auth_token,
+                control.subject_prefix,
+                if control.node_id.trim().is_empty() {
+                    node_registry.node_id.clone()
+                } else {
+                    control.node_id
+                },
+            )
+        } else {
+            (
+                None,
+                None,
+                "reson.sandbox.control".to_string(),
+                node_registry.node_id.clone(),
+            )
+        };
 
     Some(ReconcileConfig {
         etcd_endpoints: node_registry.etcd_endpoints,
@@ -172,9 +179,23 @@ fn derive_config(
         node_endpoint: node_registry.advertise_endpoint,
         interval: Duration::from_secs(30),
         nats_url,
+        nats_auth_token,
         nats_subject_prefix,
         session_shard_count: DEFAULT_SESSION_SHARD_COUNT,
     })
+}
+
+async fn connect_nats(url: &str, auth_token: Option<&str>) -> Result<async_nats::Client> {
+    let token = auth_token.map(str::trim).filter(|value| !value.is_empty());
+    match token {
+        Some(token) => {
+            async_nats::ConnectOptions::with_token(token.to_string())
+                .connect(url.to_string())
+                .await
+        }
+        None => async_nats::connect(url.to_string()).await,
+    }
+    .context("connect nats for reconciliation events")
 }
 
 async fn reconcile_once(
@@ -194,6 +215,8 @@ async fn reconcile_once(
     let (routes, observed_revision) = load_partitioned_session_routes(&mut client, config).await?;
 
     let plan = plan_reconcile(
+        config.etcd_prefix.trim_end_matches('/'),
+        config.session_shard_count,
         &config.node_endpoint,
         &config.node_id,
         &local_sessions,
@@ -212,11 +235,13 @@ async fn reconcile_once(
         }
     }
     for route in &plan.upserts {
-        let key = format!(
-            "{}/sessions/{}",
+        let key = session_route_key(
             config.etcd_prefix.trim_end_matches('/'),
-            route.session_id
+            config.session_shard_count,
+            &route.session_id,
         );
+        let legacy_key =
+            legacy_session_route_key(config.etcd_prefix.trim_end_matches('/'), &route.session_id);
         let payload = serde_json::to_vec(&json!({
             "session_id": route.session_id,
             "vm_id": route.vm_id,
@@ -230,6 +255,7 @@ async fn reconcile_once(
             .put(key, payload, None)
             .await
             .context("upsert reconciled session route")?;
+        let _ = client.delete(legacy_key, None).await;
     }
 
     let summary = json!({
@@ -243,10 +269,9 @@ async fn reconcile_once(
         "updated_at_unix_ms": unix_millis(),
     });
     let reconcile_key = format!(
-        "{}/reconcile/{}/{}",
+        "{}/reconcile/latest/{}",
         config.etcd_prefix.trim_end_matches('/'),
-        config.node_id,
-        unix_millis()
+        config.node_id
     );
     let _ = client
         .put(reconcile_key, summary.to_string(), None)
@@ -424,6 +449,8 @@ fn decode_route_entry(key: String, raw: &[u8]) -> Result<SessionRouteEntry> {
 }
 
 fn plan_reconcile(
+    etcd_prefix: &str,
+    session_shard_count: u8,
     node_endpoint: &str,
     node_id: &str,
     local_sessions: &HashMap<String, String>,
@@ -431,6 +458,11 @@ fn plan_reconcile(
 ) -> ReconcilePlan {
     let mut plan = ReconcilePlan::default();
     let mut seen_valid_sessions = HashMap::new();
+    let non_local_sessions = remote_routes
+        .iter()
+        .filter(|entry| entry.route.endpoint != node_endpoint)
+        .map(|entry| entry.route.session_id.clone())
+        .collect::<HashSet<_>>();
 
     for entry in remote_routes {
         if entry.route.endpoint != node_endpoint {
@@ -438,10 +470,36 @@ fn plan_reconcile(
         }
         match local_sessions.get(&entry.route.session_id) {
             Some(vm_id) if *vm_id == entry.route.vm_id => {
+                let canonical_key =
+                    session_route_key(etcd_prefix, session_shard_count, &entry.route.session_id);
+                if entry.key != canonical_key {
+                    plan.delete_keys.push(entry.key);
+                    plan.upserts.push(SessionRoute {
+                        session_id: entry.route.session_id.clone(),
+                        vm_id: vm_id.clone(),
+                        endpoint: node_endpoint.to_string(),
+                        node_id: Some(node_id.to_string()),
+                        fork_id: entry.route.fork_id.clone(),
+                    });
+                }
                 seen_valid_sessions.insert(entry.route.session_id, true);
             }
-            _ => {
+            Some(_) => {
                 plan.delete_keys.push(entry.key);
+            }
+            None => {
+                plan.delete_keys.push(entry.key);
+                if !non_local_sessions.contains(&entry.route.session_id) {
+                    plan.delete_keys.push(session_fence_key(
+                        etcd_prefix,
+                        session_shard_count,
+                        &entry.route.session_id,
+                    ));
+                    plan.delete_keys.push(legacy_session_fence_key(
+                        etcd_prefix,
+                        &entry.route.session_id,
+                    ));
+                }
             }
         }
     }
@@ -460,6 +518,33 @@ fn plan_reconcile(
     }
 
     plan
+}
+
+fn session_route_key(etcd_prefix: &str, shard_count: u8, session_id: &str) -> String {
+    let shard = shard_for_key(session_id, shard_count);
+    format!("{etcd_prefix}/sessions/{shard:02}/{session_id}")
+}
+
+fn legacy_session_route_key(etcd_prefix: &str, session_id: &str) -> String {
+    format!("{etcd_prefix}/sessions/{session_id}")
+}
+
+fn session_fence_key(etcd_prefix: &str, shard_count: u8, session_id: &str) -> String {
+    let shard = shard_for_key(session_id, shard_count);
+    format!("{etcd_prefix}/session_fences/{shard:02}/{session_id}")
+}
+
+fn legacy_session_fence_key(etcd_prefix: &str, session_id: &str) -> String {
+    format!("{etcd_prefix}/session_fences/{session_id}")
+}
+
+fn shard_for_key(key: &str, shard_count: u8) -> u8 {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as u8) % shard_count
 }
 
 fn unix_millis() -> u64 {
@@ -502,12 +587,71 @@ mod tests {
             },
         ];
 
-        let plan = plan_reconcile("http://node-a", "node-a", &local, routes);
-        assert_eq!(plan.delete_keys, vec!["/reson-sandbox/sessions/s_stale"]);
-        assert_eq!(plan.upserts.len(), 1);
-        assert_eq!(plan.upserts[0].session_id, "s2");
-        assert_eq!(plan.upserts[0].vm_id, "vm2");
-        assert_eq!(plan.upserts[0].endpoint, "http://node-a");
+        let plan = plan_reconcile(
+            "/reson-sandbox",
+            16,
+            "http://node-a",
+            "node-a",
+            &local,
+            routes,
+        );
+        assert_eq!(
+            plan.delete_keys,
+            vec![
+                "/reson-sandbox/sessions/s1".to_string(),
+                "/reson-sandbox/sessions/s_stale".to_string(),
+                session_fence_key("/reson-sandbox", 16, "s_stale"),
+                legacy_session_fence_key("/reson-sandbox", "s_stale"),
+            ]
+        );
+        assert_eq!(plan.upserts.len(), 2);
+        assert!(plan.upserts.iter().any(|route| route.session_id == "s1"
+            && route.vm_id == "vm1"
+            && route.endpoint == "http://node-a"));
+        assert!(plan.upserts.iter().any(|route| route.session_id == "s2"
+            && route.vm_id == "vm2"
+            && route.endpoint == "http://node-a"));
+    }
+
+    #[test]
+    fn reconcile_plan_preserves_fence_when_session_has_nonlocal_route() {
+        let local = HashMap::new();
+        let routes = vec![
+            SessionRouteEntry {
+                key: "/reson-sandbox/sessions/01/s1".to_string(),
+                route: SessionRoute {
+                    session_id: "s1".to_string(),
+                    vm_id: "old-local".to_string(),
+                    endpoint: "http://node-a".to_string(),
+                    node_id: Some("node-a".to_string()),
+                    fork_id: None,
+                },
+            },
+            SessionRouteEntry {
+                key: "/reson-sandbox/sessions/02/s1".to_string(),
+                route: SessionRoute {
+                    session_id: "s1".to_string(),
+                    vm_id: "current-remote".to_string(),
+                    endpoint: "http://node-b".to_string(),
+                    node_id: Some("node-b".to_string()),
+                    fork_id: None,
+                },
+            },
+        ];
+
+        let plan = plan_reconcile(
+            "/reson-sandbox",
+            16,
+            "http://node-a",
+            "node-a",
+            &local,
+            routes,
+        );
+
+        assert_eq!(
+            plan.delete_keys,
+            vec!["/reson-sandbox/sessions/01/s1".to_string()]
+        );
     }
 
     #[test]

@@ -109,6 +109,7 @@ impl NodeRegistryConfig {
 #[derive(Clone, Debug)]
 pub struct ControlBusConfig {
     pub nats_url: String,
+    pub nats_auth_token: Option<String>,
     pub subject_prefix: String,
     pub cluster_id: String,
     pub node_id: String,
@@ -807,6 +808,10 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
 
     Some(ControlBusConfig {
         nats_url,
+        nats_auth_token: optional_env_string(&[
+            "RESON_SANDBOX_NATS_AUTH_TOKEN",
+            "BRACKET_SANDBOX_NATS_AUTH_TOKEN",
+        ]),
         subject_prefix: subject_prefix.clone(),
         cluster_id,
         node_id,
@@ -1120,6 +1125,15 @@ fn parse_csv_env(name: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(endpoints)
+}
+
+fn optional_env_string(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn parse_csv_list(raw: &str) -> Vec<String> {

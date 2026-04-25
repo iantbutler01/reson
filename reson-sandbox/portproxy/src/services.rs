@@ -29,7 +29,9 @@ use crate::pb::bracket::portproxy::v1::{
 };
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 use crate::pb::google::protobuf::Empty;
+use crate::process_group::{configure_child_process_group, signal_process_group_or_pid};
 use crate::system_env::build_exec_env;
+use nix::sys::signal::Signal;
 
 type ExecResponseStream = ReceiverStream<Result<ExecResponse, Status>>;
 type InteractiveResponseStream = ReceiverStream<Result<InteractiveShellResponse, Status>>;
@@ -66,6 +68,8 @@ where
 }
 
 const READ_BUFFER: usize = 4096;
+const MAX_FILE_RPC_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 pub struct ShellExecService {
@@ -113,6 +117,7 @@ impl ShellExec for ShellExecService {
         for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, &start.env) {
             command.env(key, value);
         }
+        configure_child_process_group(&mut command);
 
         let mut child = command
             .spawn()
@@ -204,9 +209,12 @@ impl ShellExec for ShellExecService {
                     }
                 }
                 Err(_) => {
-                    debug!("command timed out, killing pid {pid}");
-                    if let Err(err) = child.start_kill() {
-                        debug!("failed to kill timed out process: {err}");
+                    debug!("command timed out, killing process group for pid {pid}");
+                    if let Err(err) = signal_process_group_or_pid(pid, Signal::SIGKILL) {
+                        debug!("failed to kill timed out process group: {err}");
+                        if let Err(err) = child.start_kill() {
+                            debug!("failed to kill timed out process: {err}");
+                        }
                     }
                     let _ = tx
                         .send(Ok(ExecResponse {
@@ -437,15 +445,12 @@ impl PortProxyService {
 #[tonic::async_trait]
 impl PortProxy for PortProxyService {
     async fn prepare_shutdown(&self, _request: Request<Empty>) -> Result<Response<Empty>, Status> {
-        use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
-
         let pids = self.tracker.snapshot().await;
         for pid in &pids {
             if *pid <= 0 {
                 continue;
             }
-            if let Err(err) = kill(Pid::from_raw(*pid), Signal::SIGTERM) {
+            if let Err(err) = signal_process_group_or_pid(*pid, Signal::SIGTERM) {
                 warn!("failed to send SIGTERM to pid {}: {}", pid, err);
             }
         }
@@ -456,7 +461,7 @@ impl PortProxy for PortProxyService {
             if pid <= 0 {
                 continue;
             }
-            if let Err(err) = kill(Pid::from_raw(pid), Signal::SIGKILL) {
+            if let Err(err) = signal_process_group_or_pid(pid, Signal::SIGKILL) {
                 warn!("failed to send SIGKILL to pid {}: {}", pid, err);
             }
         }
@@ -468,10 +473,13 @@ impl PortProxy for PortProxyService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileResponse>, Status> {
         let path = validate_path(&request.get_ref().path)?;
-        match fs::read(&path).await {
+        match read_file_bounded(&path).await {
             Ok(data) => Ok(Response::new(ReadFileResponse { data })),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 Err(Status::not_found(format!("path {:?} not found", path)))
+            }
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                Err(Status::resource_exhausted(format!("{err}")))
             }
             Err(err) => Err(Status::internal(format!(
                 "failed to read file {:?}: {err}",
@@ -486,6 +494,12 @@ impl PortProxy for PortProxyService {
     ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
         let path = validate_path(&req.path)?;
+        if req.data.len() > MAX_FILE_RPC_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "write_file payload exceeds {} bytes",
+                MAX_FILE_RPC_BYTES
+            )));
+        }
         if req.create_parents {
             if let Some(parent) = path.parent() {
                 if let Err(err) = fs::create_dir_all(parent).await {
@@ -516,6 +530,12 @@ impl PortProxy for PortProxyService {
 
         let mut resp = ListDirectoryResponse { entries: vec![] };
         while let Some(entry) = entries.next_entry().await? {
+            if resp.entries.len() >= MAX_DIRECTORY_ENTRIES {
+                return Err(Status::resource_exhausted(format!(
+                    "directory listing exceeds {} entries",
+                    MAX_DIRECTORY_ENTRIES
+                )));
+            }
             let file_type = entry.file_type().await.map_err(|err| {
                 Status::internal(format!(
                     "failed to read metadata for {:?}: {err}",
@@ -768,6 +788,21 @@ fn map_fs_error(err: std::io::Error, path: &PathBuf) -> Status {
         }
         _ => Status::internal(format!("failed to list {:?}: {err}", path)),
     }
+}
+
+async fn read_file_bounded(path: &PathBuf) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path).await?;
+    let mut data = Vec::new();
+    file.take((MAX_FILE_RPC_BYTES + 1) as u64)
+        .read_to_end(&mut data)
+        .await?;
+    if data.len() > MAX_FILE_RPC_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {MAX_FILE_RPC_BYTES} bytes"),
+        ));
+    }
+    Ok(data)
 }
 
 fn spawn_reader<R, F>(mut reader: R, tx: mpsc::Sender<Result<ExecResponse, Status>>, build: F)

@@ -5,8 +5,9 @@
 
 use crate::error::Result;
 use crate::types::{
-    AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage, Provider,
-    ReasoningSegment, ResponsePart, ToolCall, ToolResult, VideoMetadata,
+    AssistantResponse, CacheMarker, ChatMessage, ChatRole, MediaPart, MediaSource,
+    MultimodalMessage, Provider, ReasoningSegment, ResponsePart, ToolCall, ToolResult,
+    VideoMetadata,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -419,6 +420,17 @@ fn tool_call_to_provider_part(tool_call: &ToolCall, provider: Provider) -> Value
     }
 }
 
+fn anthropic_text_block(text: &str, cache_marker: Option<&CacheMarker>) -> Value {
+    let mut block = json!({
+        "type": "text",
+        "text": text
+    });
+    if let Some(marker) = cache_marker {
+        block["cache_control"] = marker.anthropic_cache_control();
+    }
+    block
+}
+
 fn attach_signature_to_value(value: &mut Value, signature: &str, provider: Provider) {
     match provider {
         Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
@@ -792,10 +804,10 @@ pub fn convert_messages_to_provider_format(
                         // Only add text block if content is non-empty
                         // (Anthropic rejects "text content blocks must be non-empty")
                         if !chat_msg.content.is_empty() {
-                            pending_anthropic_blocks.push(json!({
-                                "type": "text",
-                                "text": chat_msg.content
-                            }));
+                            pending_anthropic_blocks.push(anthropic_text_block(
+                                &chat_msg.content,
+                                chat_msg.cache_marker.as_ref(),
+                            ));
                         }
                         flush_pending(
                             &mut converted_messages,
@@ -835,10 +847,21 @@ pub fn convert_messages_to_provider_format(
                     ChatRole::Tool => "tool",
                 };
 
-                converted_messages.push(json!({
-                    "role": role,
-                    "content": chat_msg.content
-                }));
+                if matches!(
+                    provider,
+                    Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic
+                ) && chat_msg.cache_marker.is_some()
+                {
+                    converted_messages.push(json!({
+                        "role": role,
+                        "content": [anthropic_text_block(&chat_msg.content, chat_msg.cache_marker.as_ref())]
+                    }));
+                } else {
+                    converted_messages.push(json!({
+                        "role": role,
+                        "content": chat_msg.content
+                    }));
+                }
             }
 
             ConversationMessage::AssistantResponse(response) => {
@@ -1111,5 +1134,36 @@ mod tests {
         // Reasoning segments should be separate messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1]["type"], "thinking");
+    }
+
+    #[test]
+    fn test_anthropic_chat_cache_marker_becomes_cache_control_block() {
+        let messages = vec![ConversationMessage::Chat(
+            ChatMessage::user("Large reusable context").with_cache_marker(CacheMarker::Ephemeral),
+        )];
+
+        let result = convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["role"], "user");
+        let content = result[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Large reusable context");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_anthropic_chat_one_hour_cache_marker_adds_ttl() {
+        let messages = vec![ConversationMessage::Chat(
+            ChatMessage::user("Long-lived reusable context")
+                .with_cache_marker(CacheMarker::Ephemeral1h),
+        )];
+
+        let formatted =
+            convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+        let content = formatted[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h");
     }
 }

@@ -24,6 +24,8 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::bootstrap;
 use crate::config::{self, Config};
@@ -55,8 +57,12 @@ const META_FORK_RESTORE_SCOPE: &str = "reson.fork_restore_scope";
 const META_NYM_NETWORK_POLICY: &str = "nym_network_policy";
 const META_NYM_NETWORK_POLICY_PROXY_UPSTREAM: &str = "nym_network_policy_proxy_upstream";
 const META_NETWORK_EGRESS_SNAPSHOT: &str = "reson.network_egress";
+const META_PORTPROXY_AUTH_TOKEN: &str = "reson.portproxy_auth_token";
 const MAINTENANCE_DIR_NAME: &str = "_maintenance";
 const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
+const MAX_VM_VCPU: i32 = 8;
+const MAX_VM_MEMORY_MB: i32 = 16 * 1024;
+const MAX_VM_DISK_GB: i32 = 100;
 const ARM64_BIOS_CANDIDATES: [&str; 3] = [
     "/usr/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
@@ -183,6 +189,10 @@ impl Manager {
         existing: &std::collections::HashMap<String, String>,
         updated: &mut std::collections::HashMap<String, String>,
     ) {
+        updated.remove(META_PORTPROXY_AUTH_TOKEN);
+        if let Some(value) = existing.get(META_PORTPROXY_AUTH_TOKEN) {
+            updated.insert(META_PORTPROXY_AUTH_TOKEN.to_string(), value.clone());
+        }
         if let Some(value) = existing.get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM) {
             updated.insert(
                 META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
@@ -376,6 +386,31 @@ impl Manager {
         Ok(())
     }
 
+    async fn insert_creating_vm_with_capacity(&self, id: String, vm: Arc<Vm>) -> ManagerResult<()> {
+        let mut guard = self.vms.write().await;
+        if let Some(limit) = self.cfg.max_active_vms {
+            let mut current = 0usize;
+            for existing in guard.values() {
+                let inner = existing.lock().await;
+                if matches!(
+                    inner.metadata.state,
+                    VmState::Running | VmState::Paused | VmState::Creating
+                ) {
+                    current += 1;
+                }
+            }
+            if current >= limit {
+                return Err(ManagerError::CapacityExceeded {
+                    resource: "active_vms",
+                    limit,
+                    current,
+                });
+            }
+        }
+        guard.insert(id, vm);
+        Ok(())
+    }
+
     pub async fn create_vm(
         &self,
         params: CreateVmParams,
@@ -391,6 +426,7 @@ impl Manager {
         if params.resources.disk_gb <= 0 {
             params.resources.disk_gb = 10;
         }
+        enforce_resource_bounds(&params.resources)?;
         self.enforce_create_vm_capacity().await?;
         let name = sanitize_name(&params.name);
         // @dive: Shared mounts are normalized before persistence so mount tags and host paths stay stable across restarts and forks.
@@ -486,47 +522,58 @@ impl Manager {
             META_STORAGE_PROFILE.to_string(),
             self.cfg.storage_profile.as_str().to_string(),
         );
+        assign_new_portproxy_auth_token(&mut meta.metadata);
 
         save_metadata(&vm_dir, &mut meta).map_err(ManagerError::Other)?;
 
         let runtime = VmRuntime::new(&vm_dir);
         let vm = Arc::new(Vm::new(meta.clone(), runtime, vm_dir.clone()));
+        self.insert_creating_vm_with_capacity(id.clone(), vm.clone())
+            .await?;
         let mut vm_guard = vm.lock_owned().await;
 
-        match params.source.source_type {
+        let create_result = match params.source.source_type {
             VmSourceType::Docker => {
-                vm_guard = self
-                    .create_from_docker(
-                        &vm,
-                        vm_guard,
-                        &params.source.reference,
-                        &arch,
-                        platform.as_deref(),
-                        progress.clone(),
-                    )
-                    .await?;
+                self.create_from_docker(
+                    &vm,
+                    vm_guard,
+                    &params.source.reference,
+                    &arch,
+                    platform.as_deref(),
+                    progress.clone(),
+                )
+                .await
             }
             VmSourceType::Snapshot => {
                 if let (Some(source), Some(record)) = (source_vm, snapshot_record) {
-                    vm_guard = self
-                        .create_from_snapshot(&vm, vm_guard, &source, &record)
-                        .await?;
+                    self.create_from_snapshot(&vm, vm_guard, &source, &record)
+                        .await
                 } else {
-                    return Err(ManagerError::Other(anyhow!(
+                    Err(ManagerError::Other(anyhow!(
                         "snapshot source missing required metadata"
-                    )));
+                    )))
                 }
             }
-        }
+        };
+        vm_guard = match create_result {
+            Ok(vm_guard) => vm_guard,
+            Err(err) => {
+                self.vms.write().await.remove(&id);
+                let _ = fs::remove_dir_all(&vm_dir);
+                return Err(err);
+            }
+        };
 
         vm_guard.metadata.state = VmState::Stopped;
-        save_metadata(&vm.dir, &mut vm_guard.metadata).map_err(ManagerError::Other)?;
+        if let Err(err) = save_metadata(&vm.dir, &mut vm_guard.metadata) {
+            self.vms.write().await.remove(&id);
+            let _ = fs::remove_dir_all(&vm_dir);
+            return Err(ManagerError::Other(err));
+        }
 
         let created_metadata = vm_guard.metadata.clone();
         let vm_name = created_metadata.name.clone();
         drop(vm_guard);
-
-        self.vms.write().await.insert(id.clone(), vm.clone());
 
         if params.auto_start {
             emit_stage_progress(
@@ -713,6 +760,7 @@ impl Manager {
             META_FORK_RESTORE_SCOPE.to_string(),
             fork_restore_scope.to_string(),
         );
+        assign_new_portproxy_auth_token(&mut child_metadata);
         child_metadata.remove(META_FORK_BASE_PATH);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_ID);
         child_metadata.remove(META_EXEC_RESTORE_SNAPSHOT_NAME);
@@ -824,6 +872,10 @@ impl Manager {
                         .map(map_bootstrap_shared_mount)
                         .collect(),
                     http_proxy_url: self.cfg.guest_network.http_proxy_url(),
+                    portproxy_auth_token: child_meta
+                        .metadata
+                        .get(META_PORTPROXY_AUTH_TOKEN)
+                        .cloned(),
                 },
             ) {
                 let _ = fs::remove_dir_all(&child_dir);
@@ -968,6 +1020,10 @@ impl Manager {
                         .map(map_bootstrap_shared_mount)
                         .collect(),
                     http_proxy_url: self.cfg.guest_network.http_proxy_url(),
+                    portproxy_auth_token: child_meta
+                        .metadata
+                        .get(META_PORTPROXY_AUTH_TOKEN)
+                        .cloned(),
                 },
             ) {
                 Self::rollback_stopped_fork_artifacts(
@@ -1111,6 +1167,9 @@ impl Manager {
         tokio::fs::create_dir_all(&snapshots_dir)
             .await
             .with_context(|| format!("ensure snapshots dir {}", snapshots_dir.display()))
+            .map_err(ManagerError::Other)?;
+        ensure_qemu_writable_snapshot_dir(snapshots_dir.as_path(), &self.cfg)
+            .with_context(|| format!("prepare snapshots dir {}", snapshots_dir.display()))
             .map_err(ManagerError::Other)?;
         let ram_path = snapshots_dir.join(&meta.ram_file_name);
 
@@ -1455,7 +1514,7 @@ impl Manager {
         cmd.stdout(std::process::Stdio::from(log_file));
         cmd.stderr(std::process::Stdio::from(stderr_file));
 
-        let child = match cmd
+        let mut child = match cmd
             .spawn()
             .with_context(|| format!("spawn qemu {}", binary))
         {
@@ -1537,10 +1596,37 @@ impl Manager {
                 warn!(vm_id = %id, error = %err, "failed to persist metadata after start");
             }
         }
-        if let Some(pid) = child.id() {
-            if let Err(err) = network::register_vm_process(id, pid).await {
-                warn!(vm_id = %id, pid, error = %err, "failed to register vm process for network guardrails");
+        match child.id() {
+            Some(pid) => {
+                if let Err(err) = network::register_vm_process(id, pid).await {
+                    if self.cfg.ha_mode {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        if vm_proxy_upstream_addr.is_some() {
+                            let _ = network::unregister_vm_proxy_policy(id).await;
+                        }
+                        cleanup_runtime_mounts(&vm).await;
+                        mark_vm_state(&vm, VmState::Error).await;
+                        return Err(ManagerError::Other(
+                            err.context("failed to register vm process for network guardrails"),
+                        ));
+                    }
+                    warn!(vm_id = %id, pid, error = %err, "failed to register vm process for network guardrails");
+                }
             }
+            None if self.cfg.ha_mode => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                cleanup_runtime_mounts(&vm).await;
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(anyhow!(
+                    "failed to register vm process for network guardrails: missing qemu pid"
+                )));
+            }
+            None => {}
         }
 
         spawn_exit_task(vm.clone(), child, log_path);
@@ -1551,21 +1637,23 @@ impl Manager {
 
     pub async fn stop_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
-        let monitor = {
-            let inner = vm.lock().await;
-            match inner.runtime.state {
-                VmState::Running => inner
-                    .runtime
-                    .monitor
-                    .clone()
-                    .ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?,
-                VmState::Paused => {
-                    return Ok(inner.metadata.clone());
+        let (state, monitor) =
+            {
+                let inner = vm.lock().await;
+                match inner.runtime.state {
+                    VmState::Running | VmState::Paused => (
+                        inner.runtime.state,
+                        inner.runtime.monitor.clone().ok_or_else(|| {
+                            ManagerError::Other(anyhow!("vm monitor unavailable"))
+                        })?,
+                    ),
+                    _ => return Ok(inner.metadata.clone()),
                 }
-                _ => return Ok(inner.metadata.clone()),
-            }
-        };
+            };
 
+        if matches!(state, VmState::Paused) {
+            virt::cont(&monitor).await.map_err(ManagerError::Other)?;
+        }
         virt::system_powerdown(&monitor)
             .await
             .map_err(ManagerError::Other)?;
@@ -1714,6 +1802,15 @@ impl Manager {
             (state, snapshot, disk_path, vm.dir.clone())
         };
 
+        let ram_path = vm_dir.join("snapshots").join(&snapshot.ram_file_name);
+        if !ram_path.exists() {
+            return Err(ManagerError::Other(anyhow!(
+                "snapshot {} missing ram file at {}",
+                snapshot.name,
+                ram_path.display()
+            )));
+        }
+
         // @dive: Single restore path for the background-snapshot world. qemu's `-incoming`
         //        flag can only be consumed at launch, so we always: stop the current qemu
         //        process (if any), revert the qcow2 disk state offline via `qemu-img
@@ -1727,15 +1824,6 @@ impl Manager {
         virt::revert_snapshot_offline(&self.cfg.qemu_img_bin, disk_path.as_path(), &snapshot.name)
             .await
             .map_err(ManagerError::Other)?;
-
-        let ram_path = vm_dir.join("snapshots").join(&snapshot.ram_file_name);
-        if !ram_path.exists() {
-            return Err(ManagerError::Other(anyhow!(
-                "snapshot {} missing ram file at {}",
-                snapshot.name,
-                ram_path.display()
-            )));
-        }
 
         {
             let mut inner = vm.lock().await;
@@ -1983,6 +2071,7 @@ impl Manager {
             &guard.metadata.shared_mounts,
             &self.cfg.shared_mount_profiles,
         )?;
+        ensure_portproxy_auth_token(&mut guard.metadata.metadata);
         let cfg = bootstrap::Config {
             instance_id: guard.metadata.id.clone(),
             hostname: guard.metadata.name.clone(),
@@ -1995,6 +2084,11 @@ impl Manager {
                 .map(map_bootstrap_shared_mount)
                 .collect(),
             http_proxy_url: self.cfg.guest_network.http_proxy_url(),
+            portproxy_auth_token: guard
+                .metadata
+                .metadata
+                .get(META_PORTPROXY_AUTH_TOKEN)
+                .cloned(),
         };
         bootstrap::create_iso(&bootstrap_path, cfg).map_err(ManagerError::Other)?;
 
@@ -2036,6 +2130,14 @@ impl Manager {
             let dst_ram = vm.dir.join("snapshots").join(&src_snap.ram_file_name);
             (src_snap, src_disk, dst_disk, src_ram, dst_ram)
         };
+
+        if !src_ram.exists() {
+            return Err(ManagerError::Other(anyhow!(
+                "snapshot {} missing ram file at {}",
+                snapshot.name,
+                src_ram.display()
+            )));
+        }
 
         virt::copy_file(&src_disk, &dst_disk)
             .await
@@ -2646,6 +2748,22 @@ async fn mark_vm_state(vm: &Arc<Vm>, state: VmState) {
     }
 }
 
+async fn cleanup_runtime_mounts(vm: &Arc<Vm>) {
+    let (virtiofsd_handles, fuse_handles) = {
+        let mut inner = vm.lock().await;
+        (
+            std::mem::take(&mut inner.runtime.virtiofsd_handles),
+            std::mem::take(&mut inner.runtime.fuse_handles),
+        )
+    };
+    for handle in &virtiofsd_handles {
+        virt::terminate_virtiofsd(handle);
+    }
+    for handle in &fuse_handles {
+        let _ = fuse::unmount_fuse(handle).await;
+    }
+}
+
 async fn abort_launch(
     vm: Arc<Vm>,
     mut child: Child,
@@ -2912,11 +3030,28 @@ fn should_skip_chown_path(path: &Path, skipped_roots: &[PathBuf]) -> bool {
 }
 
 #[cfg(unix)]
+fn ensure_qemu_writable_snapshot_dir(path: &Path, cfg: &Config) -> Result<()> {
+    chown_single_path(
+        path,
+        cfg.qemu_process.run_as_uid,
+        cfg.qemu_process.run_as_gid,
+    )?;
+    let permissions = fs::Permissions::from_mode(0o2770);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("chmod qemu-writable snapshot dir {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_qemu_writable_snapshot_dir(_path: &Path, _cfg: &Config) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn chown_single_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
     let bytes = path.as_os_str().as_bytes();
     let c_path = std::ffi::CString::new(bytes)
         .with_context(|| format!("convert path to cstring {}", path.display()))?;
-    let rc = unsafe { libc::chown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+    let rc = unsafe { libc::lchown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("chown {}", path.display()));
@@ -3158,6 +3293,30 @@ fn random_mac() -> Result<String> {
     ))
 }
 
+fn ensure_portproxy_auth_token(metadata: &mut HashMap<String, String>) -> String {
+    match metadata
+        .get(META_PORTPROXY_AUTH_TOKEN)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        Some(token) => token.to_string(),
+        None => assign_new_portproxy_auth_token(metadata),
+    }
+}
+
+fn assign_new_portproxy_auth_token(metadata: &mut HashMap<String, String>) -> String {
+    let mut bytes = [0u8; 32];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut bytes);
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    metadata.insert(META_PORTPROXY_AUTH_TOKEN.to_string(), token.clone());
+    token
+}
+
 fn platform_supports_architecture(platforms: &[virt::Platform], arch: &str) -> bool {
     platforms.iter().any(|p| {
         p.os.to_lowercase() == "linux"
@@ -3235,6 +3394,31 @@ fn fork_snapshot_durability(
             "durable-storage-daemon-restart",
         ),
     }
+}
+
+fn enforce_resource_bounds(resources: &crate::state::ResourceSpec) -> ManagerResult<()> {
+    if resources.vcpu > MAX_VM_VCPU {
+        return Err(ManagerError::CapacityExceeded {
+            resource: "vcpu",
+            limit: MAX_VM_VCPU as usize,
+            current: resources.vcpu as usize,
+        });
+    }
+    if resources.memory_mb > MAX_VM_MEMORY_MB {
+        return Err(ManagerError::CapacityExceeded {
+            resource: "memory_mb",
+            limit: MAX_VM_MEMORY_MB as usize,
+            current: resources.memory_mb as usize,
+        });
+    }
+    if resources.disk_gb > MAX_VM_DISK_GB {
+        return Err(ManagerError::CapacityExceeded {
+            resource: "disk_gb",
+            limit: MAX_VM_DISK_GB as usize,
+            current: resources.disk_gb as usize,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3941,6 +4125,10 @@ mod tests {
                     META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
                     "127.0.0.1:43128".to_string(),
                 ),
+                (
+                    META_PORTPROXY_AUTH_TOKEN.to_string(),
+                    "existing-portproxy-token".to_string(),
+                ),
             ]),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
@@ -3961,6 +4149,9 @@ mod tests {
                     metadata: Some(HashMap::from([(
                         META_NYM_NETWORK_POLICY.to_string(),
                         "{\"domain_allowlist\":[\"api.openai.com\"],\"domain_blocklist\":[],\"custom_port_allowlist\":[8080],\"bandwidth_cap_mb_per_hour\":512,\"max_connections_per_minute\":100}".to_string(),
+                    ), (
+                        META_PORTPROXY_AUTH_TOKEN.to_string(),
+                        "caller-supplied-token".to_string(),
                     )])),
                 },
             )
@@ -3973,6 +4164,13 @@ mod tests {
                 .get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM)
                 .map(String::as_str),
             Some("127.0.0.1:43128")
+        );
+        assert_eq!(
+            updated
+                .metadata
+                .get(META_PORTPROXY_AUTH_TOKEN)
+                .map(String::as_str),
+            Some("existing-portproxy-token")
         );
         assert!(
             updated

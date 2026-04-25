@@ -16,11 +16,11 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, parse_json_value_strict_str,
 };
 
 /// OpenAI API client (also serves as base for OpenRouter)
@@ -168,6 +168,12 @@ impl OAIClient {
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
+
+        if matches!(self.provider, Provider::OpenAI) {
+            if let Some(retention) = config.prompt_cache_retention {
+                request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
+            }
+        }
 
         // Add stream_options for usage tracking when streaming
         if stream {
@@ -381,7 +387,7 @@ impl InferenceClient for OAIClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::openai_streaming::{parse_openai_chunk, OpenAIToolAccumulator};
+        use crate::providers::openai_streaming::{OpenAIToolAccumulator, parse_openai_chunk};
         use crate::utils::parse_sse_stream;
 
         let request_body = self.build_request_body(messages, config, true)?;
@@ -503,6 +509,38 @@ mod tests {
 
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn test_build_request_with_prompt_cache_retention() {
+        use crate::providers::PromptCacheRetention;
+
+        let client = OAIClient::new("test-key", "gpt-4");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config =
+            GenerationConfig::new("gpt-4").with_prompt_cache_retention(PromptCacheRetention::H24);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn test_build_request_ignores_prompt_cache_retention_for_openrouter() {
+        use crate::providers::PromptCacheRetention;
+
+        let client = OAIClient::new("test-key", "gpt-4").with_provider(Provider::OpenRouter);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config =
+            GenerationConfig::new("gpt-4").with_prompt_cache_retention(PromptCacheRetention::H24);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]

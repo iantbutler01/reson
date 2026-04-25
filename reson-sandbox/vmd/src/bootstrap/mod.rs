@@ -24,6 +24,7 @@ pub struct Config {
     pub arch: String,
     pub shared_mounts: Vec<SharedMount>,
     pub http_proxy_url: Option<String>,
+    pub portproxy_auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,7 +46,11 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
 
     let bin = portproxy::binary(cfg.arch.as_str())
         .with_context(|| "bootstrap iso: locate portproxy binary")?;
-    let init = build_init_script(&hostname, cfg.http_proxy_url.as_deref());
+    let init = build_init_script(
+        &hostname,
+        cfg.http_proxy_url.as_deref(),
+        cfg.portproxy_auth_token.as_deref(),
+    );
     let shared_mounts = build_shared_mounts_file(&cfg.shared_mounts);
     let entries = vec![
         IsoEntry::new(INIT_SCRIPT_NAME, init.into_bytes()),
@@ -63,9 +68,14 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
     write_iso(path.as_ref(), VOLUME_ID, &entries)
 }
 
-fn build_init_script(hostname: &str, http_proxy_url: Option<&str>) -> String {
+fn build_init_script(
+    hostname: &str,
+    http_proxy_url: Option<&str>,
+    portproxy_auth_token: Option<&str>,
+) -> String {
     let host_value = shell_escape(hostname);
     let proxy_setup = build_proxy_setup_script(http_proxy_url);
+    let portproxy_auth_setup = build_portproxy_auth_setup_script(portproxy_auth_token);
     format!(
         r#"#!/bin/bash
 set -euxo pipefail
@@ -138,6 +148,8 @@ fi
 
 {proxy_setup}
 
+{portproxy_auth_setup}
+
 cat <<'EOF' >/etc/systemd/system/portproxy.service
 [Unit]
 Description=Bracket PortProxy
@@ -147,6 +159,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=RUST_LOG=trace
+EnvironmentFile=-/etc/reson/portproxy.env
 ExecStartPre=/bin/sh -c 'echo "portproxy.service preflight: $(date -Iseconds) starting /usr/sbin/portproxy --server"'
 ExecStart=/usr/sbin/portproxy --server
 Restart=on-failure
@@ -474,6 +487,29 @@ chmod 0644 /root/.config/pip/pip.conf"#
 {remove_lines}"#
             )
         }
+    }
+}
+
+fn build_portproxy_auth_setup_script(portproxy_auth_token: Option<&str>) -> String {
+    match portproxy_auth_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        Some(token) => {
+            let token = shell_escape(token);
+            format!(
+                r#"log "configuring managed portproxy auth"
+mkdir -p /etc/reson
+umask 077
+set +x
+printf 'RESON_PORTPROXY_AUTH_TOKEN=%s\n' {token} >/etc/reson/portproxy.env
+set -x
+chmod 0600 /etc/reson/portproxy.env"#
+            )
+        }
+        None => r#"log "managed portproxy auth disabled; removing managed auth file"
+rm -f /etc/reson/portproxy.env"#
+            .to_string(),
     }
 }
 
@@ -868,6 +904,7 @@ mod tests {
                 read_only: false,
             }],
             http_proxy_url: None,
+            portproxy_auth_token: Some("test-token".to_string()),
         };
         create_iso(&iso_path, cfg)?;
 
@@ -910,7 +947,7 @@ mod tests {
 
     #[test]
     fn init_script_precreates_guest_paths_before_mount_phase() {
-        let script = build_init_script("vm-test", None);
+        let script = build_init_script("vm-test", None, None);
         let precreate = script
             .find("mkdir -p \"$GUEST\"")
             .expect("precreate loop present");
@@ -926,7 +963,7 @@ mod tests {
 
     #[test]
     fn init_script_configures_managed_proxy_files_when_proxy_url_present() {
-        let script = build_init_script("vm-test", Some("http://10.0.2.100:3128"));
+        let script = build_init_script("vm-test", Some("http://10.0.2.100:3128"), None);
         assert!(script.contains("log \"configuring managed guest proxy environment\""));
         assert!(script.contains("HTTP_PROXY_URL='http://10.0.2.100:3128'"));
         assert!(script.contains("cat <<EOF >/etc/reson/proxy.env"));
@@ -936,12 +973,30 @@ mod tests {
 
     #[test]
     fn init_script_removes_managed_proxy_files_when_proxy_url_absent() {
-        let script = build_init_script("vm-test", None);
+        let script = build_init_script("vm-test", None, None);
         assert!(script.contains("managed guest proxy disabled; removing managed proxy files"));
         assert!(script.contains("rm -f /etc/reson/proxy.env"));
         assert!(script.contains("rm -f /etc/profile.d/reson-proxy.sh"));
         assert!(script.contains("rm -f /etc/apt/apt.conf.d/90reson-proxy"));
         assert!(script.contains("rm -f /root/.config/pip/pip.conf"));
+    }
+
+    #[test]
+    fn init_script_configures_portproxy_auth_env_file_when_token_present() {
+        let script = build_init_script("vm-test", None, Some("guest-token"));
+        assert!(script.contains("log \"configuring managed portproxy auth\""));
+        assert!(script.contains("RESON_PORTPROXY_AUTH_TOKEN=%s"));
+        assert!(script.contains("'guest-token' >/etc/reson/portproxy.env"));
+        assert!(script.contains("chmod 0600 /etc/reson/portproxy.env"));
+        assert!(script.contains("EnvironmentFile=-/etc/reson/portproxy.env"));
+    }
+
+    #[test]
+    fn init_script_removes_portproxy_auth_env_file_when_token_absent() {
+        let script = build_init_script("vm-test", None, None);
+        assert!(script.contains("managed portproxy auth disabled; removing managed auth file"));
+        assert!(script.contains("rm -f /etc/reson/portproxy.env"));
+        assert!(script.contains("EnvironmentFile=-/etc/reson/portproxy.env"));
     }
 
     fn read_root_entries(path: &Path) -> Result<Vec<String>> {

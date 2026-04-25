@@ -6,7 +6,7 @@ mod vm_counters;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::config::Config;
 use vm_counters::{VmCounters, VmProxyLimitSnapshot};
@@ -73,6 +74,7 @@ impl NetworkServicesHandle {
 struct ManagedProcessHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<()>>,
+    service_firewall: Option<firewall::ServiceProcessFirewallHandle>,
 }
 
 impl ManagedProcessHandle {
@@ -82,6 +84,9 @@ impl ManagedProcessHandle {
         }
         if let Some(join) = self.join.take() {
             let _ = join.await;
+        }
+        if let Some(handle) = self.service_firewall.take() {
+            handle.shutdown();
         }
     }
 }
@@ -127,6 +132,20 @@ struct VmGuardrail {
     last_byte_counter: Option<u64>,
     conn_deltas: VecDeque<CounterDeltaEvent>,
     byte_deltas: VecDeque<CounterDeltaEvent>,
+}
+
+struct EnvoyRuntimeConfig {
+    default_listen_addr: Option<SocketAddr>,
+    probe_addr: SocketAddr,
+    dns_resolver_addr: SocketAddr,
+    admin_addr: SocketAddr,
+}
+
+struct EnvoyRuntimePaths {
+    work_dir: PathBuf,
+    config_path: PathBuf,
+    access_log_path: PathBuf,
+    process_log_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -263,6 +282,7 @@ async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
     Ok(ManagedProcessHandle {
         stop_tx: Some(stop_tx),
         join: Some(join),
+        service_firewall: None,
     })
 }
 
@@ -270,6 +290,230 @@ async fn start_envoy(
     config: &Config,
     vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
 ) -> Result<ManagedProcessHandle> {
+    let runtime = envoy_runtime_config(config, vm_proxy_policies)?;
+    let paths = envoy_runtime_paths(config);
+    tokio::fs::create_dir_all(&paths.work_dir)
+        .await
+        .with_context(|| format!("create envoy work dir {}", paths.work_dir.display()))?;
+
+    write_envoy_config(
+        &paths.config_path,
+        runtime.default_listen_addr,
+        vm_proxy_policies,
+        runtime.admin_addr,
+        runtime.dns_resolver_addr,
+        &paths.access_log_path,
+    )
+    .await?;
+
+    let process_log = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.process_log_path)
+        .await
+        .with_context(|| {
+            format!(
+                "open envoy process log {}",
+                paths.process_log_path.display()
+            )
+        })?;
+    let process_log_err = process_log.try_clone().await.with_context(|| {
+        format!(
+            "clone envoy process log {}",
+            paths.process_log_path.display()
+        )
+    })?;
+
+    let mut service_cgroup = if config.ha_mode {
+        Some(
+            firewall::prepare_service_process_cgroup("envoy")?
+                .context("envoy service cgroup is required in ha mode")?,
+        )
+    } else {
+        None
+    };
+
+    let mut child = Command::new(&config.network_services.envoy_bin);
+    child
+        .arg("-c")
+        .arg(&paths.config_path)
+        .arg("--log-level")
+        .arg(&config.network_services.envoy_log_level)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(process_log.into_std().await))
+        .stderr(Stdio::from(process_log_err.into_std().await));
+
+    let mut service_firewall = None;
+    if let Some(cgroup) = service_cgroup.take() {
+        if let Err(err) = configure_child_cgroup(&mut child, cgroup.cgroup_procs_path()) {
+            cgroup.cleanup();
+            return Err(err);
+        }
+        service_firewall = Some(firewall::protect_service_cgroup_private_egress(
+            cgroup,
+            Some(runtime.dns_resolver_addr),
+        )?);
+    }
+
+    let mut child = match child
+        .spawn()
+        .with_context(|| format!("spawn envoy binary {}", config.network_services.envoy_bin))
+    {
+        Ok(child) => child,
+        Err(err) => {
+            if let Some(handle) = service_firewall.take() {
+                handle.shutdown();
+            }
+            return Err(err);
+        }
+    };
+    if service_firewall.is_some() {
+        if let Some(pid) = child.id() {
+            debug!(pid, "installed envoy cgroup private-egress firewall rules");
+        }
+    }
+
+    if let Err(err) = wait_for_listener(
+        runtime.probe_addr,
+        &mut child,
+        "envoy",
+        ENVOY_READY_TIMEOUT,
+        ENVOY_READY_POLL_INTERVAL,
+    )
+    .await
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        if let Some(handle) = service_firewall.take() {
+            handle.shutdown();
+        }
+        return Err(err);
+    }
+
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut stop_rx => {
+                if let Some(pid) = child.id() {
+                    debug!(pid, "stopping envoy");
+                }
+                if let Err(err) = child.start_kill() {
+                    warn!(error = %err, "failed to signal envoy for shutdown");
+                }
+                if let Err(err) = child.wait().await {
+                    warn!(error = %err, "failed waiting for envoy shutdown");
+                }
+            }
+            status = child.wait() => {
+                match status {
+                    Ok(status) => warn!(?status, "envoy exited"),
+                    Err(err) => warn!(error = %err, "envoy wait failed"),
+                }
+            }
+        }
+    });
+
+    Ok(ManagedProcessHandle {
+        stop_tx: Some(stop_tx),
+        join: Some(join),
+        service_firewall,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn configure_child_cgroup(command: &mut Command, cgroup_procs_path: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(cgroup_procs_path.as_os_str().as_bytes()).with_context(|| {
+        format!(
+            "convert cgroup.procs path to cstring {}",
+            cgroup_procs_path.display()
+        )
+    })?;
+    unsafe {
+        command.pre_exec(move || {
+            let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let mut buf = [0_u8; 32];
+            let len = encode_pid_line(libc::getpid() as u64, &mut buf);
+            let mut offset = 0;
+            while offset < len {
+                let written = libc::write(
+                    fd,
+                    buf[offset..len].as_ptr().cast(),
+                    (len - offset) as libc::size_t,
+                );
+                if written < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let _ = libc::close(fd);
+                    return Err(err);
+                }
+                offset += written as usize;
+            }
+
+            if libc::close(fd) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn encode_pid_line(mut pid: u64, buf: &mut [u8; 32]) -> usize {
+    let mut digits = [0_u8; 20];
+    let mut len = 0;
+    if pid == 0 {
+        digits[len] = b'0';
+        len += 1;
+    } else {
+        while pid > 0 {
+            digits[len] = b'0' + (pid % 10) as u8;
+            pid /= 10;
+            len += 1;
+        }
+    }
+    for index in 0..len {
+        buf[index] = digits[len - index - 1];
+    }
+    buf[len] = b'\n';
+    len + 1
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_child_cgroup(_command: &mut Command, _cgroup_procs_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+async fn wait_for_listener(
+    addr: SocketAddr,
+    child: &mut tokio::process::Child,
+    label: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().context("poll child readiness")? {
+            bail!("{label} exited before becoming ready: {status}");
+        }
+        if TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    bail!("{label} did not become ready on {addr} within 5s");
+}
+
+fn envoy_runtime_config(
+    config: &Config,
+    vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
+) -> Result<EnvoyRuntimeConfig> {
     let default_listen_addr = config
         .guest_network
         .http_proxy_upstream_addr
@@ -309,105 +553,97 @@ async fn start_envoy(
             )
         })?;
 
-    let work_dir = Path::new(&config.data_dir).join("_network").join("envoy");
-    tokio::fs::create_dir_all(&work_dir)
-        .await
-        .with_context(|| format!("create envoy work dir {}", work_dir.display()))?;
-
-    let config_path = work_dir.join("envoy.yaml");
-    let access_log_path = work_dir.join("access.log");
-    let process_log_path = work_dir.join("process.log");
-    write_envoy_config(
-        &config_path,
+    Ok(EnvoyRuntimeConfig {
         default_listen_addr,
-        vm_proxy_policies,
-        admin_addr,
-        dns_resolver_addr,
-        &access_log_path,
-    )
-    .await?;
-
-    let process_log = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&process_log_path)
-        .await
-        .with_context(|| format!("open envoy process log {}", process_log_path.display()))?;
-    let process_log_err = process_log
-        .try_clone()
-        .await
-        .with_context(|| format!("clone envoy process log {}", process_log_path.display()))?;
-
-    let mut child = Command::new(&config.network_services.envoy_bin);
-    child
-        .arg("-c")
-        .arg(&config_path)
-        .arg("--log-level")
-        .arg(&config.network_services.envoy_log_level)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(process_log.into_std().await))
-        .stderr(Stdio::from(process_log_err.into_std().await));
-
-    let mut child = child
-        .spawn()
-        .with_context(|| format!("spawn envoy binary {}", config.network_services.envoy_bin))?;
-
-    wait_for_listener(
         probe_addr,
-        &mut child,
-        "envoy",
-        ENVOY_READY_TIMEOUT,
-        ENVOY_READY_POLL_INTERVAL,
-    )
-    .await?;
-
-    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-    let join = tokio::spawn(async move {
-        tokio::select! {
-            _ = &mut stop_rx => {
-                if let Some(pid) = child.id() {
-                    debug!(pid, "stopping envoy");
-                }
-                if let Err(err) = child.start_kill() {
-                    warn!(error = %err, "failed to signal envoy for shutdown");
-                }
-                if let Err(err) = child.wait().await {
-                    warn!(error = %err, "failed waiting for envoy shutdown");
-                }
-            }
-            status = child.wait() => {
-                match status {
-                    Ok(status) => warn!(?status, "envoy exited"),
-                    Err(err) => warn!(error = %err, "envoy wait failed"),
-                }
-            }
-        }
-    });
-
-    Ok(ManagedProcessHandle {
-        stop_tx: Some(stop_tx),
-        join: Some(join),
+        dns_resolver_addr,
+        admin_addr,
     })
 }
 
-async fn wait_for_listener(
-    addr: SocketAddr,
-    child: &mut tokio::process::Child,
-    label: &str,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().context("poll child readiness")? {
-            bail!("{label} exited before becoming ready: {status}");
-        }
-        if TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(poll_interval).await;
+fn envoy_runtime_paths(config: &Config) -> EnvoyRuntimePaths {
+    let work_dir = Path::new(&config.data_dir).join("_network").join("envoy");
+    EnvoyRuntimePaths {
+        config_path: work_dir.join("envoy.yaml"),
+        access_log_path: work_dir.join("access.log"),
+        process_log_path: work_dir.join("process.log"),
+        work_dir,
     }
-    bail!("{label} did not become ready on {addr} within 5s");
+}
+
+fn should_run_envoy(
+    config: &Config,
+    vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
+) -> bool {
+    config.guest_network.http_proxy_upstream_addr.is_some() || !vm_proxy_policies.is_empty()
+}
+
+async fn validate_envoy_candidate_config(
+    config: &Config,
+    vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
+) -> Result<()> {
+    let runtime = envoy_runtime_config(config, vm_proxy_policies)?;
+    let paths = envoy_runtime_paths(config);
+    tokio::fs::create_dir_all(&paths.work_dir)
+        .await
+        .with_context(|| format!("create envoy work dir {}", paths.work_dir.display()))?;
+    let validation_path = paths
+        .work_dir
+        .join(format!(".envoy-validate-{}.yaml", Uuid::new_v4()));
+
+    let result = async {
+        write_envoy_config(
+            &validation_path,
+            runtime.default_listen_addr,
+            vm_proxy_policies,
+            runtime.admin_addr,
+            runtime.dns_resolver_addr,
+            &paths.access_log_path,
+        )
+        .await?;
+
+        let output = Command::new(&config.network_services.envoy_bin)
+            .arg("--mode")
+            .arg("validate")
+            .arg("-c")
+            .arg(&validation_path)
+            .arg("--log-level")
+            .arg(&config.network_services.envoy_log_level)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| {
+                format!(
+                    "validate envoy config with {}",
+                    config.network_services.envoy_bin
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "envoy config validation failed: status={} stderr={} stdout={}",
+                output.status,
+                process_output_excerpt(&output.stderr),
+                process_output_excerpt(&output.stdout)
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&validation_path).await;
+    result
+}
+
+fn process_output_excerpt(bytes: &[u8]) -> String {
+    const MAX_CHARS: usize = 4096;
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut excerpt = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    excerpt.push_str("...<truncated>");
+    excerpt
 }
 
 async fn write_coredns_config(
@@ -416,16 +652,7 @@ async fn write_coredns_config(
     threat_hosts_path: &Path,
 ) -> Result<()> {
     let contents = render_coredns_config(bind_addr, threat_hosts_path);
-    let mut file = tokio::fs::File::create(path)
-        .await
-        .with_context(|| format!("create coredns config {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .await
-        .with_context(|| format!("write coredns config {}", path.display()))?;
-    file.flush()
-        .await
-        .with_context(|| format!("flush coredns config {}", path.display()))?;
-    Ok(())
+    write_text_file_atomic(path, &contents, "coredns config").await
 }
 
 async fn write_coredns_threat_hosts(path: &Path) -> Result<()> {
@@ -433,16 +660,7 @@ async fn write_coredns_threat_hosts(path: &Path) -> Result<()> {
         .iter()
         .map(|host| format!("0.0.0.0 {host}\n"))
         .collect::<String>();
-    let mut file = tokio::fs::File::create(path)
-        .await
-        .with_context(|| format!("create coredns threat hosts {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .await
-        .with_context(|| format!("write coredns threat hosts {}", path.display()))?;
-    file.flush()
-        .await
-        .with_context(|| format!("flush coredns threat hosts {}", path.display()))?;
-    Ok(())
+    write_text_file_atomic(path, &contents, "coredns threat hosts").await
 }
 
 async fn resolve_coredns_threat_hosts_path(
@@ -474,16 +692,43 @@ async fn write_envoy_config(
         dns_resolver_addr,
         access_log_path,
     );
-    let mut file = tokio::fs::File::create(path)
-        .await
-        .with_context(|| format!("create envoy config {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .await
-        .with_context(|| format!("write envoy config {}", path.display()))?;
-    file.flush()
-        .await
-        .with_context(|| format!("flush envoy config {}", path.display()))?;
-    Ok(())
+    write_text_file_atomic(path, &contents, "envoy config").await
+}
+
+async fn write_text_file_atomic(path: &Path, contents: &str, label: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config");
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await
+            .with_context(|| format!("create temporary {label} {}", tmp_path.display()))?;
+        file.write_all(contents.as_bytes())
+            .await
+            .with_context(|| format!("write temporary {label} {}", tmp_path.display()))?;
+        file.flush()
+            .await
+            .with_context(|| format!("flush temporary {label} {}", tmp_path.display()))?;
+        drop(file);
+        tokio::fs::rename(&tmp_path, path)
+            .await
+            .with_context(|| format!("publish {label} {}", path.display()))?;
+        Ok(())
+    }
+    .await;
+    if write_result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+    write_result
 }
 
 fn render_coredns_config(bind_addr: SocketAddr, threat_hosts_path: &Path) -> String {
@@ -764,11 +1009,17 @@ fn render_envoy_listener_block(
 
 fn authority_allow_regex(domain_allowlist: Option<&[String]>, allowed_ports: &[u16]) -> String {
     let host_regex = match domain_allowlist {
-        Some(domains) if !domains.is_empty() => domains
-            .iter()
-            .map(|domain| format!(r"(.*\.)?{}", escape_regex_literal(domain)))
-            .collect::<Vec<_>>()
-            .join("|"),
+        Some(domains) => {
+            if domains.is_empty() {
+                String::from("__nym_no_hosts_allowed__")
+            } else {
+                domains
+                    .iter()
+                    .map(|domain| format!(r"(.*\.)?{}", escape_regex_literal(domain)))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            }
+        }
         _ => String::from(r"[^:]+"),
     };
     let ports_regex = allowed_ports
@@ -1180,13 +1431,16 @@ pub async fn register_vm_proxy_policy(
     };
     let max_connections_per_minute = policy.max_connections_per_minute;
     let bandwidth_cap_mb_per_hour = policy.bandwidth_cap_mb_per_hour;
-    state.vm_proxy_policies.insert(
+    let mut next_policies = state.vm_proxy_policies.clone();
+    next_policies.insert(
         vm_id.to_string(),
         VmProxyListener {
             listen_addr,
             policy,
         },
     );
+    restart_envoy_locked(state, &next_policies).await?;
+    state.vm_proxy_policies = next_policies;
     state
         .vm_guardrails
         .entry(vm_id.to_string())
@@ -1205,7 +1459,6 @@ pub async fn register_vm_proxy_policy(
             conn_deltas: VecDeque::new(),
             byte_deltas: VecDeque::new(),
         });
-    restart_envoy_locked(state).await?;
     firewall::allow_proxy_listener(listen_addr)?;
     Ok(())
 }
@@ -1218,12 +1471,24 @@ pub async fn register_vm_process(vm_id: &str, pid: u32) -> Result<()> {
     let Some(state) = guard.as_mut() else {
         return Ok(());
     };
+    if state.config.ha_mode
+        && !state
+            .firewall
+            .as_ref()
+            .is_some_and(firewall::FirewallHandle::is_installed)
+    {
+        bail!("network guardrails are required in ha mode but qemu firewall is not installed");
+    }
+    let cgroup_path = firewall::cgroup_path_for_pid(pid);
+    if state.config.ha_mode && cgroup_path.is_none() {
+        bail!("network guardrails are required in ha mode but qemu cgroup path is unavailable");
+    }
     let entry = state
         .vm_guardrails
         .entry(vm_id.to_string())
         .or_insert(VmGuardrail {
             pid: Some(pid),
-            cgroup_path: firewall::cgroup_path_for_pid(pid),
+            cgroup_path: cgroup_path.clone(),
             max_connections_per_minute: 1000,
             bandwidth_cap_mb_per_hour: 1024,
             blocked_until: None,
@@ -1246,7 +1511,7 @@ pub async fn register_vm_process(vm_id: &str, pid: u32) -> Result<()> {
             entry.byte_deltas.clear();
         }
     }
-    entry.cgroup_path = firewall::cgroup_path_for_pid(pid);
+    entry.cgroup_path = cgroup_path;
     firewall::install_vm_counter_rules(vm_id, pid, entry.cgroup_path.as_deref())?;
     Ok(())
 }
@@ -1259,6 +1524,13 @@ pub async fn unregister_vm_proxy_policy(vm_id: &str) -> Result<()> {
     let Some(state) = guard.as_mut() else {
         return Ok(());
     };
+    let removed_listener = state.vm_proxy_policies.get(vm_id).cloned();
+    if removed_listener.is_some() {
+        let mut next_policies = state.vm_proxy_policies.clone();
+        next_policies.remove(vm_id);
+        restart_envoy_locked(state, &next_policies).await?;
+        state.vm_proxy_policies = next_policies;
+    }
     let removed_guardrail = state.vm_guardrails.remove(vm_id);
     if let Some(guardrail) = &removed_guardrail {
         if let Some(pid) = guardrail.pid {
@@ -1266,10 +1538,8 @@ pub async fn unregister_vm_proxy_policy(vm_id: &str) -> Result<()> {
             firewall::remove_vm_counter_rules(vm_id, pid, guardrail.cgroup_path.as_deref())?;
         }
     }
-    let removed = state.vm_proxy_policies.remove(vm_id);
-    if let Some(listener) = removed {
+    if let Some(listener) = removed_listener {
         firewall::revoke_proxy_listener(listener.listen_addr)?;
-        restart_envoy_locked(state).await?;
     }
     Ok(())
 }
@@ -1345,18 +1615,19 @@ pub async fn vm_proxy_activity_snapshot(
     Ok(Some(activity_snapshot))
 }
 
-async fn restart_envoy_locked(state: &mut NetworkController) -> Result<()> {
+async fn restart_envoy_locked(
+    state: &mut NetworkController,
+    vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
+) -> Result<()> {
+    let should_run = should_run_envoy(&state.config, vm_proxy_policies);
+    if should_run && state.envoy.is_some() {
+        validate_envoy_candidate_config(&state.config, vm_proxy_policies).await?;
+    }
     if let Some(handle) = state.envoy.take() {
         handle.shutdown().await;
     }
-    let should_run = state
-        .config
-        .guest_network
-        .http_proxy_upstream_addr
-        .is_some()
-        || !state.vm_proxy_policies.is_empty();
     state.envoy = if should_run {
-        Some(start_envoy(&state.config, &state.vm_proxy_policies).await?)
+        Some(start_envoy(&state.config, vm_proxy_policies).await?)
     } else {
         None
     };
@@ -1366,6 +1637,59 @@ async fn restart_envoy_locked(state: &mut NetworkController) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_vm_proxy_listener(listen_addr: &str) -> VmProxyListener {
+        VmProxyListener {
+            listen_addr: listen_addr.parse().expect("listen addr"),
+            policy: VmProxyPolicyConfig {
+                nym_id: Some("nym-123".to_string()),
+                domain_allowlist: Some(vec!["api.github.com".to_string()]),
+                domain_blocklist: vec!["bad.example".to_string()],
+                custom_port_allowlist: vec![8080],
+                bandwidth_cap_mb_per_hour: 1024,
+                max_connections_per_minute: 1000,
+            },
+        }
+    }
+
+    #[test]
+    fn should_run_envoy_when_default_proxy_or_vm_policy_exists() {
+        let mut config = Config::default();
+        config.guest_network.http_proxy_upstream_addr = None;
+        let empty_policies = BTreeMap::new();
+        assert!(!should_run_envoy(&config, &empty_policies));
+
+        config.guest_network.http_proxy_upstream_addr = Some("127.0.0.1:3128".to_string());
+        assert!(should_run_envoy(&config, &empty_policies));
+
+        config.guest_network.http_proxy_upstream_addr = None;
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "vm-123".to_string(),
+            test_vm_proxy_listener("127.0.0.1:43128"),
+        );
+        assert!(should_run_envoy(&config, &policies));
+    }
+
+    #[test]
+    fn envoy_runtime_config_uses_vm_listener_as_probe_without_default_proxy() {
+        let mut config = Config::default();
+        config.guest_network.http_proxy_upstream_addr = None;
+        config.network_services.coredns_bind_addr = "127.0.0.53:53".to_string();
+        config.network_services.envoy_admin_addr = "127.0.0.1:9901".to_string();
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "vm-123".to_string(),
+            test_vm_proxy_listener("127.0.0.1:43128"),
+        );
+
+        let runtime = envoy_runtime_config(&config, &policies).expect("runtime config");
+
+        assert_eq!(runtime.default_listen_addr, None);
+        assert_eq!(runtime.probe_addr, "127.0.0.1:43128".parse().unwrap());
+        assert_eq!(runtime.dns_resolver_addr, "127.0.0.53:53".parse().unwrap());
+        assert_eq!(runtime.admin_addr, "127.0.0.1:9901".parse().unwrap());
+    }
 
     #[test]
     fn render_coredns_config_includes_bind_and_forwarders() {

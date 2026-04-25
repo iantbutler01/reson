@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
     if has_control_overrides {
         let mut control = cfg.control_bus.clone().unwrap_or(ControlBusConfig {
             nats_url: "nats://127.0.0.1:4222".to_string(),
+            nats_auth_token: None,
             subject_prefix: "reson.sandbox.control".to_string(),
             cluster_id: "reson-sandbox-cluster".to_string(),
             node_id: "vmd-node".to_string(),

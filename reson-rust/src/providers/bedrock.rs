@@ -25,15 +25,15 @@ use crate::schema::fix_tool_schema_for_provider;
 #[cfg(feature = "bedrock")]
 use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
 #[cfg(feature = "bedrock")]
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::utils::{ConversationMessage, convert_messages_to_provider_format};
 
 #[cfg(feature = "bedrock")]
 use {
-    crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator},
     crate::providers::TokenUsage,
-    crate::utils::{parse_json_value_strict_bytes, JsonStreamAccumulator},
+    crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk},
+    crate::utils::{JsonStreamAccumulator, parse_json_value_strict_bytes},
     aws_sdk_bedrockruntime::{
-        primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
+        Client as BedrockRuntimeClient, primitives::Blob, types::ResponseStream,
     },
     futures::StreamExt,
     std::collections::VecDeque,

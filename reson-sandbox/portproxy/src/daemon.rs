@@ -14,7 +14,9 @@ use tracing::{error, info, warn};
 
 use crate::child_tracker::ChildTracker;
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
+use crate::process_group::{configure_child_process_group, signal_process_group_or_pid};
 use crate::system_env::build_exec_env;
+use nix::sys::signal::Signal;
 
 const CHANNEL_CAPACITY: usize = 100;
 const BACKLOG_MAX_FRAMES: usize = 512;
@@ -74,6 +76,7 @@ impl DaemonRegistry {
         for (key, value) in build_exec_env(DEFAULT_EXEC_PATH, DEFAULT_EXEC_HOME, &req.env) {
             command.env(key, value);
         }
+        configure_child_process_group(&mut command);
 
         let mut child = command.spawn()?;
 
@@ -134,23 +137,55 @@ impl DaemonRegistry {
         );
         spawn_reader(
             stderr,
-            stderr_tx,
-            output_backlog,
+            stderr_tx.clone(),
+            output_backlog.clone(),
             OutputKind::Stderr,
             format!("stderr({})", req.name),
         );
 
         let daemons = self.daemons.clone();
         let tracker = self.tracker.clone();
+        let timeout = req
+            .timeout
+            .filter(|secs| *secs > 0)
+            .map(|secs| std::time::Duration::from_secs(secs as u64));
         tokio::spawn(async move {
-            let status = match child.wait().await {
-                Ok(status) => status,
-                Err(err) => {
-                    error!("daemon {} wait failed: {}", req.name, err);
-                    return;
-                }
+            let exit_code = match timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
+                    Ok(Ok(status)) => status.code(),
+                    Ok(Err(err)) => {
+                        error!("daemon {} wait failed: {}", req.name, err);
+                        return;
+                    }
+                    Err(_) => {
+                        let timeout_message = b"\n(Command timed out)".to_vec();
+                        {
+                            let mut guard = output_backlog.lock().await;
+                            guard.push(OutputKind::Stderr, timeout_message.clone());
+                        }
+                        let _ = stderr_tx.send(timeout_message);
+                        if let Err(err) = signal_process_group_or_pid(pid, Signal::SIGKILL) {
+                            warn!("daemon {} timeout kill failed: {}", req.name, err);
+                            let _ = child.start_kill();
+                        }
+                        match child.wait().await {
+                            Ok(_) => Some(124),
+                            Err(err) => {
+                                error!("daemon {} wait after timeout failed: {}", req.name, err);
+                                return;
+                            }
+                        }
+                    }
+                },
+                None => match child.wait().await {
+                    Ok(status) => status.code(),
+                    Err(err) => {
+                        error!("daemon {} wait failed: {}", req.name, err);
+                        return;
+                    }
+                },
             };
-            let _ = exit_tx.send(status.code());
+            let _ = exit_tx.send(exit_code);
             if pid > 0 {
                 tracker.unregister(pid).await;
             }
@@ -159,7 +194,7 @@ impl DaemonRegistry {
                 let mut guard = daemons.write().await;
                 guard.remove(&req.name);
             }
-            info!("daemon {} exited with {}", req.name, status);
+            info!("daemon {} exited with {:?}", req.name, exit_code);
         });
 
         Ok(ExecDaemonResponse { is_new: true })
@@ -295,6 +330,8 @@ mod tests {
                 "echo preattach-output; sleep 1".to_string(),
             ],
             env: HashMap::new(),
+            timeout: None,
+            detach: false,
         };
 
         registry

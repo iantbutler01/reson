@@ -988,6 +988,7 @@ async fn anthropic_mcp_tool_agent(
             model: None,
             api_key: None,
             timeout: None,
+            ..Default::default()
         })
         .await?;
 
@@ -1034,6 +1035,7 @@ async fn anthropic_mcp_tool_agent(
             model: None,
             api_key: None,
             timeout: None,
+            ..Default::default()
         })
         .await?;
 
@@ -1065,6 +1067,7 @@ async fn google_mcp_tool_agent(
             model: None,
             api_key: None,
             timeout: None,
+            ..Default::default()
         })
         .await?;
 
@@ -1108,6 +1111,7 @@ async fn google_mcp_tool_agent(
             model: None,
             api_key: None,
             timeout: None,
+            ..Default::default()
         })
         .await?;
 

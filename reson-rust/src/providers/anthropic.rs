@@ -15,14 +15,13 @@ use std::pin::Pin;
 
 use crate::error::{Error, Result};
 use crate::providers::{
-    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
+    GenerationConfig, GenerationResponse, InferenceClient, ProviderConfig, StreamChunk,
+    TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
-use crate::types::{
-    AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall,
-};
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
+use crate::utils::{ConversationMessage, convert_messages_to_provider_format};
 
 /// Anthropic API client
 #[derive(Clone)]
@@ -108,10 +107,30 @@ impl AnthropicClient {
             request["system"] = system;
         }
 
+        if let Some(ProviderConfig::Anthropic(provider_config)) = config.provider_config.as_ref() {
+            if let Some(marker) = provider_config.automatic_prompt_caching.as_ref() {
+                request["cache_control"] = marker.anthropic_cache_control();
+            }
+        }
+
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.normalized_tools(tools));
+                let mut normalized_tools = self.normalized_tools(tools);
+                if let Some(ProviderConfig::Anthropic(provider_config)) =
+                    config.provider_config.as_ref()
+                {
+                    if let Some(marker) = provider_config.tool_definitions_cache_breakpoint.as_ref()
+                    {
+                        if let Some(last_tool) = normalized_tools.last_mut() {
+                            if last_tool.get("cache_control").is_none() {
+                                last_tool["cache_control"] = marker.anthropic_cache_control();
+                            }
+                        }
+                    }
+                }
+
+                request["tools"] = serde_json::json!(normalized_tools);
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -151,21 +170,37 @@ impl AnthropicClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<serde_json::Value>, &'a [ConversationMessage])> {
-        if let Some(ConversationMessage::Chat(first)) = messages.first() {
-            if first.role == ChatRole::System {
-                let mut system_dict = serde_json::json!({
-                    "type": "text",
-                    "text": first.content
-                });
+        let mut system_blocks = Vec::new();
+        let mut consumed = 0usize;
 
-                // Add cache control if marked
-                if first.cache_marker == Some(CacheMarker::Ephemeral) {
-                    system_dict["cache_control"] = serde_json::json!({"type": "ephemeral"});
-                }
-
-                return Ok((Some(serde_json::json!([system_dict])), &messages[1..]));
+        for message in messages {
+            let ConversationMessage::Chat(chat) = message else {
+                break;
+            };
+            if chat.role != ChatRole::System {
+                break;
             }
+
+            let mut system_dict = serde_json::json!({
+                "type": "text",
+                "text": chat.content
+            });
+
+            if let Some(marker) = chat.cache_marker.as_ref() {
+                system_dict["cache_control"] = marker.anthropic_cache_control();
+            }
+
+            system_blocks.push(system_dict);
+            consumed += 1;
         }
+
+        if !system_blocks.is_empty() {
+            return Ok((
+                Some(serde_json::json!(system_blocks)),
+                &messages[consumed..],
+            ));
+        }
+
         Ok((None, messages))
     }
 
@@ -370,7 +405,7 @@ impl InferenceClient for AnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
+        use crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk};
         use crate::utils::parse_sse_stream;
 
         let use_structured_outputs = config.output_schema.is_some();
@@ -466,7 +501,7 @@ impl InferenceClient for AnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::{CacheMarker, ChatMessage};
 
     #[test]
     fn test_client_creation() {
@@ -511,6 +546,42 @@ mod tests {
         let system_val = system.unwrap();
         assert!(system_val[0]["cache_control"].is_object());
         assert_eq!(system_val[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_extract_system_with_one_hour_cache_marker() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(
+            ChatMessage::system("Long-lived context").with_cache_marker(CacheMarker::Ephemeral1h),
+        )];
+
+        let (system, _) = client.extract_system_message(&messages).unwrap();
+        let system_val = system.unwrap();
+        assert_eq!(system_val[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system_val[0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn test_extract_multiple_system_messages() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![
+            ConversationMessage::Chat(
+                ChatMessage::system("Stable runtime contract")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(
+                ChatMessage::system("<soul>Durable identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(ChatMessage::user("Hello")),
+        ];
+
+        let (system, remaining) = client.extract_system_message(&messages).unwrap();
+        let system_val = system.unwrap();
+        assert_eq!(system_val.as_array().unwrap().len(), 2);
+        assert_eq!(system_val[0]["text"], "Stable runtime contract");
+        assert_eq!(system_val[1]["text"], "<soul>Durable identity</soul>");
+        assert_eq!(remaining.len(), 1);
     }
 
     #[test]
@@ -602,6 +673,49 @@ mod tests {
         assert!(body["tools"][0].get("strict").is_none());
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
+    fn test_build_request_with_automatic_prompt_caching() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("claude-3-opus-20240229").with_provider_config(
+            ProviderConfig::Anthropic(crate::providers::AnthropicProviderConfig {
+                automatic_prompt_caching: Some(CacheMarker::Ephemeral),
+                tool_definitions_cache_breakpoint: None,
+            }),
+        );
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_build_request_with_tool_definitions_cache_breakpoint() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![
+            serde_json::json!({"name": "get_weather"}),
+            serde_json::json!({"name": "get_time"}),
+        ];
+        let config = GenerationConfig::new("claude-3-opus-20240229")
+            .with_tools(tools)
+            .with_provider_config(ProviderConfig::Anthropic(
+                crate::providers::AnthropicProviderConfig {
+                    automatic_prompt_caching: None,
+                    tool_definitions_cache_breakpoint: Some(CacheMarker::Ephemeral),
+                },
+            ));
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

@@ -75,6 +75,7 @@ const META_EXEC_RESTORE_SNAPSHOT_ID: &str = "reson.execution_restore_snapshot_id
 const META_EXEC_RESTORE_SNAPSHOT_NAME: &str = "reson.execution_restore_snapshot_name";
 const META_TIER_B_ELIGIBLE: &str = "reson.tier_b_eligible";
 const META_EXECUTION_FIDELITY_REQUIREMENT: &str = "reson.execution_fidelity_requirement";
+const META_PORTPROXY_AUTH_TOKEN: &str = "reson.portproxy_auth_token";
 
 #[derive(Clone, Debug)]
 pub struct DistributedControlConfig {
@@ -82,6 +83,7 @@ pub struct DistributedControlConfig {
     pub etcd_prefix: String,
     pub cluster_id: String,
     pub nats_url: String,
+    pub nats_auth_token: Option<String>,
     pub nats_subject_prefix: String,
     pub nats_stream_name: String,
     pub nats_stream_max_age_secs: u64,
@@ -103,6 +105,7 @@ impl Default for DistributedControlConfig {
             etcd_prefix: "/reson-sandbox".to_string(),
             cluster_id: "reson-sandbox-cluster".to_string(),
             nats_url: "nats://127.0.0.1:4222".to_string(),
+            nats_auth_token: None,
             nats_subject_prefix: subject_prefix.clone(),
             nats_stream_name: "RESON_SANDBOX_CONTROL".to_string(),
             nats_stream_max_age_secs: 60 * 60 * 24 * 7,
@@ -407,6 +410,7 @@ struct PortLifecycleContext {
     session_id: String,
     vm_id: String,
     node_endpoint: String,
+    ownership_fence: Option<String>,
 }
 
 struct ForwardRegistration {
@@ -622,6 +626,7 @@ impl ForwardHandle {
                         "endpoint": ctx.node_endpoint.as_str(),
                         "guest_port": self.guest_port,
                         "host_port": self.host_port,
+                        "expected_fence": ctx.ownership_fence.as_deref(),
                     }),
                 )
                 .await;
@@ -681,6 +686,18 @@ pub struct Session {
     ownership_fence: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct GuestRpcAccess {
+    endpoint: String,
+    rpc_port: i32,
+    auth_header: Option<MetadataValue<Ascii>>,
+}
+
+struct PortproxyClientAccess {
+    client: PortProxyClient<tonic::transport::Channel>,
+    auth_header: Option<MetadataValue<Ascii>>,
+}
+
 impl Session {
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -737,12 +754,12 @@ impl Session {
         Ok(resolved_endpoint)
     }
 
-    async fn ensure_session_rpc_endpoint(&self) -> Result<String> {
+    async fn ensure_session_rpc_access(&self) -> Result<GuestRpcAccess> {
         let current_endpoint = self.current_node_endpoint().await;
         let expected_fence = self.ownership_fence().await;
-        let (resolved_endpoint, rpc_port, next_fence) = self
+        let (resolved_endpoint, access, next_fence) = self
             .sandbox
-            .ensure_vm_and_get_rpc_port_for_session(
+            .ensure_vm_and_get_rpc_access_for_session(
                 &self.session_id,
                 &self.vm_id,
                 &current_endpoint,
@@ -751,11 +768,7 @@ impl Session {
             .await?;
         self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
             .await;
-        rpc_endpoint(
-            &self.sandbox.inner.cfg.endpoint_overrides,
-            &resolved_endpoint,
-            rpc_port,
-        )
+        Ok(access)
     }
 
     async fn invalidate_exec_transport_path(&self, endpoint: &str) {
@@ -781,8 +794,8 @@ impl Session {
 
         let started = Instant::now();
         for establish_attempt in 0..3 {
-            let endpoint = match self.ensure_session_rpc_endpoint().await {
-                Ok(endpoint) => endpoint,
+            let access = match self.ensure_session_rpc_access().await {
+                Ok(access) => access,
                 Err(err) => {
                     if is_rebind_candidate_error(&err) && establish_attempt < 2 {
                         let fallback_endpoint = self.current_node_endpoint().await;
@@ -800,7 +813,7 @@ impl Session {
             };
             let recovery_endpoint = self.current_node_endpoint().await;
 
-            let mut client = match ShellExecClient::connect(endpoint.clone()).await {
+            let mut client = match ShellExecClient::connect(access.endpoint.clone()).await {
                 Ok(client) => client,
                 Err(err) => {
                     let err = SandboxError::Transport(err);
@@ -840,7 +853,10 @@ impl Session {
 
             let exec_result = tokio::time::timeout(
                 self.sandbox.inner.cfg.connect_timeout,
-                client.exec(Request::new(ReceiverStream::new(req_rx))),
+                client.exec(request_with_optional_auth(
+                    ReceiverStream::new(req_rx),
+                    access.auth_header.as_ref(),
+                )),
             )
             .await;
 
@@ -1017,6 +1033,7 @@ impl Session {
             .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
         let stream_id = Uuid::new_v4().to_string();
         let start_idempotency_key = format!("exec-stream-start-{stream_id}");
+        let expected_fence = self.ownership_fence().await;
         let distributed::ExecStreamSubscription {
             events: stream_events,
             started,
@@ -1040,6 +1057,7 @@ impl Session {
             "timeout_secs": timeout_secs,
             "timeout_ms": (timeout_secs as u64) * 1000,
             "idempotency_key": start_idempotency_key.as_str(),
+            "expected_fence": expected_fence.as_deref(),
         });
 
         let command_id = control
@@ -1131,6 +1149,7 @@ impl Session {
         let resume_idempotency_key = format!(
             "exec-stream-resume-{logical_stream_id}-{producer_epoch}-{resume_after_event_seq}"
         );
+        let expected_fence = self.ownership_fence().await;
         let payload = json!({
             "stream_id": logical_stream_id,
             "logical_stream_id": logical_stream_id,
@@ -1148,6 +1167,7 @@ impl Session {
             "timeout_secs": timeout_secs,
             "timeout_ms": (timeout_secs as u64) * 1000,
             "idempotency_key": resume_idempotency_key.as_str(),
+            "expected_fence": expected_fence.as_deref(),
         });
         let command_id = control
             .publish_command(
@@ -1594,6 +1614,7 @@ impl Session {
             .shell
             .clone()
             .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
+        let expected_fence = self.ownership_fence().await;
         let command_id = control
             .publish_command(
                 "exec.run",
@@ -1608,6 +1629,7 @@ impl Session {
                     "detach": opts.detach,
                     "shell": shell,
                     "timeout_secs": timeout_secs,
+                    "expected_fence": expected_fence.as_deref(),
                 }),
             )
             .await?;
@@ -1673,8 +1695,8 @@ impl Session {
 
     pub async fn shell(&self, opts: ShellOptions) -> Result<ShellHandle> {
         let started = Instant::now();
-        let endpoint = self.ensure_session_rpc_endpoint().await?;
-        let mut client = ShellExecClient::connect(endpoint).await?;
+        let access = self.ensure_session_rpc_access().await?;
+        let mut client = ShellExecClient::connect(access.endpoint).await?;
 
         let shell = opts
             .shell
@@ -1698,7 +1720,10 @@ impl Session {
 
         let shell_response = tokio::time::timeout(
             self.sandbox.inner.cfg.connect_timeout,
-            client.interactive_shell(Request::new(ReceiverStream::new(req_rx))),
+            client.interactive_shell(request_with_optional_auth(
+                ReceiverStream::new(req_rx),
+                access.auth_header.as_ref(),
+            )),
         )
         .await
         .map_err(|_| {
@@ -1774,14 +1799,18 @@ impl Session {
 
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let endpoint = self.resolve_session_endpoint().await?;
-        let mut client = self
+        let mut access = self
             .sandbox
             .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
-        let response = client
-            .read_file(Request::new(ReadFileRequest {
-                path: path.to_string(),
-            }))
+        let response = access
+            .client
+            .read_file(request_with_optional_auth(
+                ReadFileRequest {
+                    path: path.to_string(),
+                },
+                access.auth_header.as_ref(),
+            ))
             .await?
             .into_inner();
         Ok(response.data)
@@ -1789,16 +1818,20 @@ impl Session {
 
     pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<()> {
         let endpoint = self.resolve_session_endpoint().await?;
-        let mut client = self
+        let mut access = self
             .sandbox
             .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
-        client
-            .write_file(Request::new(WriteFileRequest {
-                path: path.to_string(),
-                data,
-                create_parents: true,
-            }))
+        access
+            .client
+            .write_file(request_with_optional_auth(
+                WriteFileRequest {
+                    path: path.to_string(),
+                    data,
+                    create_parents: true,
+                },
+                access.auth_header.as_ref(),
+            ))
             .await?;
         Ok(())
     }
@@ -1808,14 +1841,18 @@ impl Session {
         path: &str,
     ) -> Result<Vec<proto::bracket::portproxy::v1::DirectoryEntry>> {
         let endpoint = self.resolve_session_endpoint().await?;
-        let mut client = self
+        let mut access = self
             .sandbox
             .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
-        let response = client
-            .list_directory(Request::new(ListDirectoryRequest {
-                path: path.to_string(),
-            }))
+        let response = access
+            .client
+            .list_directory(request_with_optional_auth(
+                ListDirectoryRequest {
+                    path: path.to_string(),
+                },
+                access.auth_header.as_ref(),
+            ))
             .await?
             .into_inner();
         Ok(response.entries)
@@ -1823,14 +1860,18 @@ impl Session {
 
     pub async fn delete_path(&self, path: &str) -> Result<()> {
         let endpoint = self.resolve_session_endpoint().await?;
-        let mut client = self
+        let mut access = self
             .sandbox
             .portproxy_client_for_vm(&self.vm_id, &endpoint)
             .await?;
-        client
-            .delete_path(Request::new(DeletePathRequest {
-                path: path.to_string(),
-            }))
+        access
+            .client
+            .delete_path(request_with_optional_auth(
+                DeletePathRequest {
+                    path: path.to_string(),
+                },
+                access.auth_header.as_ref(),
+            ))
             .await?;
         Ok(())
     }
@@ -1887,6 +1928,9 @@ impl Session {
             };
 
         #[cfg(feature = "distributed-control")]
+        let ownership_fence = self.ownership_fence().await;
+
+        #[cfg(feature = "distributed-control")]
         self.sandbox
             .publish_control_command(
                 "port.alloc",
@@ -1897,6 +1941,7 @@ impl Session {
                     "endpoint": node_endpoint.as_str(),
                     "guest_port": guest_port,
                     "host_port": host_port,
+                    "expected_fence": ownership_fence.as_deref(),
                 }),
             )
             .await?;
@@ -1916,6 +1961,7 @@ impl Session {
                 session_id: self.session_id.clone(),
                 vm_id: self.vm_id.clone(),
                 node_endpoint,
+                ownership_fence,
             }),
         };
         log_slo_observation("port.forward.establish", started.elapsed(), "ok");
@@ -2135,8 +2181,7 @@ impl Sandbox {
             let _ = self
                 .restore_execution_state_if_needed(&session_id, &vm.id, &node_endpoint, &vm, false)
                 .await?;
-            let _ = self
-                .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
+            self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
                 .await?;
             let next_fence = self
                 .bind_session_route(
@@ -2279,8 +2324,7 @@ impl Sandbox {
 
         let running_state = proto::vmd::v1::VmState::Running as i32;
         if auto_start || vm.state == running_state {
-            let _ = self
-                .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
+            self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
                 .await?;
         }
 
@@ -2345,15 +2389,7 @@ impl Sandbox {
         let _ = self
             .restore_execution_state_if_needed(session_id, &vm.id, &node_endpoint, &vm, false)
             .await?;
-        #[cfg(feature = "distributed-control")]
-        if !matches!(&self.inner.control_backend, ControlBackend::Distributed(_)) {
-            let _ = self
-                .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
-                .await?;
-        }
-        #[cfg(not(feature = "distributed-control"))]
-        let _ = self
-            .ensure_vm_and_get_rpc_port(&vm.id, &node_endpoint)
+        self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
             .await?;
         let next_fence = self
             .bind_session_route(
@@ -2394,12 +2430,12 @@ impl Sandbox {
         }
 
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend
-            && let Some(route) = control.get_session_route(session_id).await?
-        {
-            return self
-                .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
-                .await;
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route) = control.get_session_route(session_id).await? {
+                return self
+                    .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
+                    .await;
+            }
         }
 
         Ok(())
@@ -2985,21 +3021,21 @@ impl Sandbox {
         Ok(None)
     }
 
-    async fn ensure_vm_and_get_rpc_port_for_session(
+    async fn ensure_vm_and_get_rpc_access_for_session(
         &self,
         session_id: &str,
         vm_id: &str,
         endpoint: &str,
         expected_fence: Option<&str>,
-    ) -> Result<(String, i32, Option<String>)> {
+    ) -> Result<(String, GuestRpcAccess, Option<String>)> {
         let (resolved_endpoint, next_fence) = self
             .resolve_session_endpoint(session_id, vm_id, endpoint, expected_fence)
             .await?;
         match self
-            .ensure_vm_and_get_rpc_port(vm_id, &resolved_endpoint)
+            .ensure_vm_and_get_rpc_access(vm_id, &resolved_endpoint)
             .await
         {
-            Ok(rpc_port) => Ok((resolved_endpoint, rpc_port, next_fence)),
+            Ok(access) => Ok((resolved_endpoint, access, next_fence)),
             Err(err) => {
                 if !is_rebind_candidate_error(&err) {
                     return Err(err);
@@ -3016,10 +3052,10 @@ impl Sandbox {
                     )
                     .await?
                 {
-                    let rpc_port = self
-                        .ensure_vm_and_get_rpc_port(vm_id, &candidate_endpoint)
+                    let access = self
+                        .ensure_vm_and_get_rpc_access(vm_id, &candidate_endpoint)
                         .await?;
-                    return Ok((candidate_endpoint, rpc_port, rebound_fence.or(next_fence)));
+                    return Ok((candidate_endpoint, access, rebound_fence.or(next_fence)));
                 }
 
                 Err(err)
@@ -3441,51 +3477,82 @@ impl Sandbox {
     }
 
     async fn ensure_vm_and_get_rpc_port(&self, vm_id: &str, endpoint: &str) -> Result<i32> {
-        let mut vm = self.ensure_vm_running(vm_id, endpoint).await?;
-        let mut rpc_port = vm
-            .network
-            .and_then(|network| network.portproxy_ports)
-            .map(|ports| ports.rpc_port)
-            .filter(|port| *port > 0)
-            .ok_or_else(|| SandboxError::InvalidResponse("VM missing rpc port".into()))?;
+        Ok(self
+            .ensure_vm_and_get_rpc_access(vm_id, endpoint)
+            .await?
+            .rpc_port)
+    }
 
-        match self.ensure_portproxy_ready(vm_id, endpoint, rpc_port).await {
-            Ok(()) => Ok(rpc_port),
+    async fn maybe_wait_for_session_guest_rpc(&self, vm_id: &str, endpoint: &str) -> Result<()> {
+        #[cfg(feature = "distributed-control")]
+        if matches!(&self.inner.control_backend, ControlBackend::Distributed(_)) {
+            // Distributed sessions are route-bound before guest RPC is required; exec/watch paths
+            // own readiness probing so a slow portproxy cannot orphan an otherwise valid session.
+            return Ok(());
+        }
+
+        let _ = self.ensure_vm_and_get_rpc_port(vm_id, endpoint).await?;
+        Ok(())
+    }
+
+    async fn ensure_vm_and_get_rpc_access(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+    ) -> Result<GuestRpcAccess> {
+        let mut vm = self.ensure_vm_running(vm_id, endpoint).await?;
+        let mut access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
+
+        match self.ensure_portproxy_ready(vm_id, endpoint, &access).await {
+            Ok(()) => Ok(access),
             Err(err) if is_rebind_candidate_error(&err) => {
                 // @dive: VM runtime can survive daemon fail-stop while guest RPC sidecars are stale; force one clean local restart before cross-node escalation.
                 self.invalidate_ready_vm_rpc(vm_id, endpoint).await;
                 self.restart_vm_on_endpoint(vm_id, endpoint).await?;
                 vm = self.ensure_vm_running(vm_id, endpoint).await?;
-                rpc_port = vm
-                    .network
-                    .and_then(|network| network.portproxy_ports)
-                    .map(|ports| ports.rpc_port)
-                    .filter(|port| *port > 0)
-                    .ok_or_else(|| SandboxError::InvalidResponse("VM missing rpc port".into()))?;
-                self.ensure_portproxy_ready(vm_id, endpoint, rpc_port)
+                access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
+                self.ensure_portproxy_ready(vm_id, endpoint, &access)
                     .await?;
-                Ok(rpc_port)
+                Ok(access)
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn guest_rpc_access_from_vm(&self, vm: &Vm, endpoint: &str) -> Result<GuestRpcAccess> {
+        let rpc_port = vm
+            .network
+            .as_ref()
+            .and_then(|network| network.portproxy_ports.as_ref())
+            .map(|ports| ports.rpc_port)
+            .filter(|port| *port > 0)
+            .ok_or_else(|| SandboxError::InvalidResponse("VM missing rpc port".into()))?;
+        Ok(GuestRpcAccess {
+            endpoint: rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?,
+            rpc_port,
+            auth_header: portproxy_auth_header_from_metadata(&vm.metadata)?,
+        })
     }
 
     async fn ensure_portproxy_ready(
         &self,
         vm_id: &str,
         endpoint: &str,
-        rpc_port: i32,
+        access: &GuestRpcAccess,
     ) -> Result<()> {
         let cache_key = ready_key(endpoint, vm_id);
         let cached_ready = {
             let ready = self.inner.ready_vm_rpc.lock().await;
-            ready.get(&cache_key).copied() == Some(rpc_port)
+            ready.get(&cache_key).copied() == Some(access.rpc_port)
         };
         if cached_ready {
-            let probe_endpoint =
-                rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?;
             // @dive: Cached readiness must be validated with a full probe RPC so broken streams after failover don't loop on stale cache.
-            if probe_shell_exec_ready(probe_endpoint.as_str(), self.inner.cfg.connect_timeout).await
+            if probe_shell_exec_ready(
+                access.endpoint.as_str(),
+                self.inner.cfg.connect_timeout,
+                access.auth_header.as_ref(),
+            )
+            .await
             {
                 return Ok(());
             }
@@ -3494,12 +3561,17 @@ impl Sandbox {
             ready.remove(&cache_key);
         }
 
-        let endpoint = rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?;
         let start = Instant::now();
         let mut consecutive_successes = 0u8;
 
         while start.elapsed() < self.inner.cfg.portproxy_ready_timeout {
-            if probe_shell_exec_ready(endpoint.as_str(), self.inner.cfg.connect_timeout).await {
+            if probe_shell_exec_ready(
+                access.endpoint.as_str(),
+                self.inner.cfg.connect_timeout,
+                access.auth_header.as_ref(),
+            )
+            .await
+            {
                 consecutive_successes = consecutive_successes.saturating_add(1);
                 if consecutive_successes < 2 {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3507,7 +3579,7 @@ impl Sandbox {
                 }
 
                 let mut ready = self.inner.ready_vm_rpc.lock().await;
-                ready.insert(cache_key.clone(), rpc_port);
+                ready.insert(cache_key.clone(), access.rpc_port);
                 return Ok(());
             }
             consecutive_successes = 0;
@@ -3515,7 +3587,8 @@ impl Sandbox {
         }
 
         Err(SandboxError::DaemonUnavailable(format!(
-            "sandbox guest RPC did not become ready for vm {vm_id} on {endpoint}"
+            "sandbox guest RPC did not become ready for vm {vm_id} on {}",
+            access.endpoint.as_str()
         )))
     }
 
@@ -3523,10 +3596,12 @@ impl Sandbox {
         &self,
         vm_id: &str,
         endpoint: &str,
-    ) -> Result<PortProxyClient<tonic::transport::Channel>> {
-        let rpc_port = self.ensure_vm_and_get_rpc_port(vm_id, endpoint).await?;
-        let endpoint = rpc_endpoint(&self.inner.cfg.endpoint_overrides, endpoint, rpc_port)?;
-        Ok(PortProxyClient::connect(endpoint).await?)
+    ) -> Result<PortproxyClientAccess> {
+        let access = self.ensure_vm_and_get_rpc_access(vm_id, endpoint).await?;
+        Ok(PortproxyClientAccess {
+            client: PortProxyClient::connect(access.endpoint).await?,
+            auth_header: access.auth_header,
+        })
     }
 
     async fn discard_vm(
@@ -3570,7 +3645,11 @@ impl Sandbox {
     }
 }
 
-async fn probe_shell_exec_ready(endpoint: &str, establish_timeout: Duration) -> bool {
+async fn probe_shell_exec_ready(
+    endpoint: &str,
+    establish_timeout: Duration,
+    auth_header: Option<&MetadataValue<Ascii>>,
+) -> bool {
     let Ok(mut client) = ShellExecClient::connect(endpoint.to_string()).await else {
         return false;
     };
@@ -3594,7 +3673,10 @@ async fn probe_shell_exec_ready(endpoint: &str, establish_timeout: Duration) -> 
 
     let exec_result = tokio::time::timeout(
         establish_timeout,
-        client.exec(Request::new(ReceiverStream::new(req_rx))),
+        client.exec(request_with_optional_auth(
+            ReceiverStream::new(req_rx),
+            auth_header,
+        )),
     )
     .await;
 
@@ -3665,6 +3747,31 @@ fn compile_auth_header(raw_token: Option<&str>) -> Result<Option<MetadataValue<A
         SandboxError::InvalidConfig(format!("authorization token is not valid ASCII: {err}"))
     })?;
     Ok(Some(metadata))
+}
+
+fn portproxy_auth_header_from_metadata(
+    metadata: &HashMap<String, String>,
+) -> Result<Option<MetadataValue<Ascii>>> {
+    compile_auth_header(
+        metadata
+            .get(META_PORTPROXY_AUTH_TOKEN)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty()),
+    )
+}
+
+fn request_with_optional_auth<T>(
+    message: T,
+    auth_header: Option<&MetadataValue<Ascii>>,
+) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(value) = auth_header {
+        request
+            .metadata_mut()
+            .insert("authorization", value.clone());
+    }
+    request
 }
 
 fn normalize_endpoint(raw: &str) -> Result<String> {
@@ -4112,5 +4219,32 @@ mod tests {
             .expect("auth header should compile")
             .expect("auth header should be present");
         assert_eq!(value.to_str().expect("ascii header"), "Bearer token-value");
+    }
+
+    #[test]
+    fn portproxy_auth_header_uses_vm_metadata_token() {
+        let metadata = HashMap::from([(
+            META_PORTPROXY_AUTH_TOKEN.to_string(),
+            "guest-token".to_string(),
+        )]);
+        let value = portproxy_auth_header_from_metadata(&metadata)
+            .expect("portproxy auth header should compile")
+            .expect("portproxy auth header should be present");
+        assert_eq!(value.to_str().expect("ascii header"), "Bearer guest-token");
+    }
+
+    #[test]
+    fn request_with_optional_auth_inserts_authorization_metadata() {
+        let value = compile_auth_header(Some("guest-token"))
+            .expect("auth header should compile")
+            .expect("auth header should be present");
+        let request = request_with_optional_auth((), Some(&value));
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer guest-token")
+        );
     }
 }

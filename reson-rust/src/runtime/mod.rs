@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
+use crate::providers::ProviderConfig;
 use crate::types::{AssistantResponse, ReasoningSegment, ResponseStreamEvent, ToolCall};
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;
@@ -52,6 +53,8 @@ pub struct Runtime {
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
     tool_constructors: Arc<RwLock<HashMap<String, Arc<ToolConstructor>>>>, // For NativeToolParser
     default_prompt: Arc<RwLock<String>>,
+    system_messages: Arc<RwLock<Vec<crate::types::ChatMessage>>>,
+    provider_config: Arc<RwLock<Option<ProviderConfig>>>,
     return_type: Arc<RwLock<Option<String>>>, // Store type name as string
     accumulators: Arc<RwLock<Accumulators>>,
     #[allow(dead_code)]
@@ -131,6 +134,8 @@ impl Runtime {
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
             default_prompt: Arc::new(RwLock::new(String::new())),
+            system_messages: Arc::new(RwLock::new(Vec::new())),
+            provider_config: Arc::new(RwLock::new(None)),
             return_type: Arc::new(RwLock::new(None)),
             accumulators: Arc::new(RwLock::new(Accumulators::default())),
             messages: Arc::new(RwLock::new(Vec::new())),
@@ -149,6 +154,8 @@ impl Runtime {
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
             default_prompt: Arc::new(RwLock::new(String::new())),
+            system_messages: Arc::new(RwLock::new(Vec::new())),
+            provider_config: Arc::new(RwLock::new(None)),
             return_type: Arc::new(RwLock::new(None)),
             accumulators: Arc::new(RwLock::new(Accumulators::default())),
             messages: Arc::new(RwLock::new(Vec::new())),
@@ -444,6 +451,8 @@ impl Runtime {
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
 
         let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
+        let runtime_system_messages = self.system_messages.read().await.clone();
+        let runtime_provider_config = self.provider_config.read().await.clone();
 
         // Call inference utilities
         let result = inference::call_llm(
@@ -455,12 +464,14 @@ impl Runtime {
             params.output_schema,
             effective_api_key.as_deref(),
             params.system.as_deref(),
+            Some(runtime_system_messages),
             params.history,
             params.temperature,
             params.top_p,
             params.max_tokens,
             params.timeout,
             params.retry_config,
+            runtime_provider_config,
             self.current_call_args.clone(),
         )
         .await?;
@@ -508,6 +519,8 @@ impl Runtime {
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
 
         let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
+        let runtime_system_messages = self.system_messages.read().await.clone();
+        let runtime_provider_config = self.provider_config.read().await.clone();
 
         // Call streaming inference
         inference::call_llm_stream(
@@ -519,12 +532,14 @@ impl Runtime {
             params.output_schema,
             effective_api_key.as_deref(),
             params.system.as_deref(),
+            Some(runtime_system_messages),
             params.history,
             params.temperature,
             params.top_p,
             params.max_tokens,
             params.timeout,
             params.retry_config,
+            runtime_provider_config,
             self.current_call_args.clone(),
             self.accumulators.clone(),
         )
@@ -609,6 +624,18 @@ impl Runtime {
     pub async fn set_default_prompt(&self, prompt: impl Into<String>) {
         let mut default_prompt = self.default_prompt.write().await;
         *default_prompt = prompt.into();
+    }
+
+    /// Set the structured system-message prefix for subsequent runs.
+    pub async fn set_system_messages(&self, messages: Vec<crate::types::ChatMessage>) {
+        let mut system_messages = self.system_messages.write().await;
+        *system_messages = messages;
+    }
+
+    /// Set provider-specific request shaping options for subsequent runs.
+    pub async fn set_provider_config(&self, config: Option<ProviderConfig>) {
+        let mut provider_config = self.provider_config.write().await;
+        *provider_config = config;
     }
 
     /// Set return type
@@ -1009,14 +1036,18 @@ mod tests {
         assert_eq!(schemas.len(), 1);
 
         let weather_schema = schemas.get("get_weather").unwrap();
-        assert!(weather_schema
-            .fields
-            .iter()
-            .any(|f| f.name == "location" && f.required));
-        assert!(weather_schema
-            .fields
-            .iter()
-            .any(|f| f.name == "unit" && !f.required));
+        assert!(
+            weather_schema
+                .fields
+                .iter()
+                .any(|f| f.name == "location" && f.required)
+        );
+        assert!(
+            weather_schema
+                .fields
+                .iter()
+                .any(|f| f.name == "unit" && !f.required)
+        );
     }
 
     #[tokio::test]

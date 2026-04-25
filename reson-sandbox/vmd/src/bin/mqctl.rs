@@ -87,6 +87,7 @@ fn default_control_config() -> ControlBusConfig {
     let subject_prefix = "reson.sandbox.control".to_string();
     ControlBusConfig {
         nats_url: "nats://127.0.0.1:4222".to_string(),
+        nats_auth_token: None,
         subject_prefix: subject_prefix.clone(),
         cluster_id: "reson-sandbox-cluster".to_string(),
         node_id: "mqctl".to_string(),

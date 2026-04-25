@@ -9,21 +9,21 @@
 //! Run with: cargo test --test integration_tests -- --ignored
 //! Or specific test: cargo test --test integration_tests test_anthropic_simple -- --ignored
 
+use reson_agentic::Tool;
 use reson_agentic::agentic;
 use reson_agentic::providers::{
-    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenRouterClient,
+    AnthropicClient, AnthropicProviderConfig, GenerationConfig, GoogleGenAIClient, InferenceClient,
+    OAIClient, OpenRouterClient, ProviderConfig,
 };
 use reson_agentic::runtime::{RunParams, Runtime, ToolFunction};
 use reson_agentic::schema::{
     AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator,
 };
 use reson_agentic::types::{
-    AssistantResponse, ChatMessage, Provider, ResponsePart, ResponseStreamEvent, ToolCall,
-    ToolResult,
+    AssistantResponse, CacheMarker, ChatMessage, Provider, ResponsePart, ResponseStreamEvent,
+    TokenUsage, ToolCall, ToolResult,
 };
 use reson_agentic::utils::ConversationMessage;
-use reson_agentic::Tool;
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -45,6 +45,19 @@ fn get_google_key() -> Option<String> {
 
 fn get_openrouter_key() -> Option<String> {
     env::var("OPENROUTER_API_KEY").ok()
+}
+
+fn long_cacheable_text(label: &str) -> String {
+    // Anthropic currently requires a 4096-token minimum cacheable prefix for Claude Haiku 4.5.
+    // Keep this fixture comfortably above that threshold even when the explicit cache breakpoint
+    // only covers a single marked block.
+    (0..320)
+        .map(|i| {
+            format!(
+                "{label} block {i}: stable cached context about system design, tool orchestration, memory continuity, and artifact handling.\n"
+            )
+        })
+        .collect::<String>()
 }
 
 fn run_params(
@@ -71,7 +84,38 @@ fn run_params(
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
+        ..Default::default()
     }
+}
+
+async fn stream_to_text_and_usage(
+    runtime: &mut Runtime,
+    params: RunParams,
+) -> reson_agentic::error::Result<(String, TokenUsage)> {
+    use futures::StreamExt;
+
+    let mut stream = runtime.run_stream(params).await?;
+    let mut text = String::new();
+    let mut usage = TokenUsage::default();
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            ResponseStreamEvent::Output(ResponsePart::Text { text: chunk }) => {
+                text.push_str(&chunk);
+            }
+            ResponseStreamEvent::Usage(value) => {
+                usage = value;
+            }
+            ResponseStreamEvent::Complete(response) => {
+                if text.is_empty() {
+                    text = response.text();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((text, usage))
 }
 
 /// Common parameters for add_numbers tool
@@ -1025,6 +1069,159 @@ async fn test_anthropic_simple_generation() {
 
 #[tokio::test]
 #[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_user_cache_marker_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
+
+    let messages = vec![
+        ConversationMessage::Chat(
+            ChatMessage::user(long_cacheable_text("ephemeral-user"))
+                .with_cache_marker(CacheMarker::Ephemeral),
+        ),
+        ConversationMessage::Chat(ChatMessage::user("Return exactly the word READY.")),
+    ];
+
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001")
+        .with_max_tokens(32)
+        .with_temperature(0.0);
+
+    let response1 = client.get_generation(&messages, &config).await.unwrap();
+    let response2 = client.get_generation(&messages, &config).await.unwrap();
+
+    println!(
+        "Anthropic ephemeral user cache usage: first={} second={}",
+        response1.usage.cached_tokens, response2.usage.cached_tokens
+    );
+
+    assert!(response1.content.contains("READY"));
+    assert!(response2.content.contains("READY"));
+    assert!(
+        response2.usage.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_system_one_hour_cache_marker_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
+
+    let messages = vec![
+        ConversationMessage::Chat(
+            ChatMessage::system(long_cacheable_text("system-1h"))
+                .with_cache_marker(CacheMarker::Ephemeral1h),
+        ),
+        ConversationMessage::Chat(ChatMessage::user("Return exactly the word READY.")),
+    ];
+
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001")
+        .with_max_tokens(32)
+        .with_temperature(0.0);
+
+    let response1 = client.get_generation(&messages, &config).await.unwrap();
+    let response2 = client.get_generation(&messages, &config).await.unwrap();
+
+    println!(
+        "Anthropic 1h system cache usage: first={} second={}",
+        response1.usage.cached_tokens, response2.usage.cached_tokens
+    );
+
+    assert!(response1.content.contains("READY"));
+    assert!(response2.content.contains("READY"));
+    assert!(
+        response2.usage.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_runtime_automatic_prompt_caching_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let mut runtime = Runtime::new();
+    runtime
+        .set_provider_config(Some(ProviderConfig::Anthropic(AnthropicProviderConfig {
+            automatic_prompt_caching: Some(CacheMarker::Ephemeral),
+            tool_definitions_cache_breakpoint: None,
+        })))
+        .await;
+
+    let params = RunParams {
+        prompt: Some(format!(
+            "{}\n\nReturn exactly the word READY.",
+            long_cacheable_text("runtime-prompt-ephemeral")
+        )),
+        model: Some("anthropic:claude-haiku-4-5-20251001".to_string()),
+        api_key: Some(api_key.clone()),
+        max_tokens: Some(32),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    let (text1, usage1) = stream_to_text_and_usage(&mut runtime, params.clone())
+        .await
+        .unwrap();
+    let (text2, usage2) = stream_to_text_and_usage(&mut runtime, params)
+        .await
+        .unwrap();
+
+    println!(
+        "Anthropic runtime prompt cache usage: first={} second={}",
+        usage1.cached_tokens, usage2.cached_tokens
+    );
+
+    assert!(!text1.trim().is_empty());
+    assert!(!text2.trim().is_empty());
+    assert!(
+        usage2.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_runtime_system_message_cache_marker_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let mut runtime = Runtime::new();
+    runtime
+        .set_system_messages(vec![
+            ChatMessage::system(long_cacheable_text("runtime-system-1h"))
+                .with_cache_marker(CacheMarker::Ephemeral1h),
+        ])
+        .await;
+
+    let params = RunParams {
+        prompt: Some("Return exactly the word READY.".to_string()),
+        model: Some("anthropic:claude-haiku-4-5-20251001".to_string()),
+        api_key: Some(api_key.clone()),
+        max_tokens: Some(32),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    let (text1, usage1) = stream_to_text_and_usage(&mut runtime, params.clone())
+        .await
+        .unwrap();
+    let (text2, usage2) = stream_to_text_and_usage(&mut runtime, params)
+        .await
+        .unwrap();
+
+    println!(
+        "Anthropic runtime system cache usage: first={} second={}",
+        usage1.cached_tokens, usage2.cached_tokens
+    );
+
+    assert!(text1.contains("READY"));
+    assert!(text2.contains("READY"));
+    assert!(
+        usage2.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
 async fn test_anthropic_with_tools() {
     let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
     let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
@@ -1148,6 +1345,36 @@ async fn test_openai_simple_generation() {
 
 #[tokio::test]
 #[ignore = "Requires OPENAI_API_KEY"]
+async fn test_openai_runtime_model_string_with_cache_retention() {
+    let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
+    let mut runtime = Runtime::new();
+
+    let response = runtime
+        .run(run_params(
+            Some("What is 3+3? Just the number."),
+            Some("You are helpful. Be concise."),
+            None,
+            None,
+            None,
+            Some(0.0),
+            None,
+            Some(100),
+            Some("openai:gpt-4o-mini@cache=24h"),
+            Some(&api_key),
+        ))
+        .await
+        .unwrap();
+
+    let response_str = response
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| response.to_string());
+    println!("Response: {}", response_str);
+    assert!(response_str.contains("6"));
+}
+
+#[tokio::test]
+#[ignore = "Requires OPENAI_API_KEY"]
 async fn test_openai_with_tools() {
     let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
     let client = OAIClient::new(api_key, "gpt-4o-mini");
@@ -1182,6 +1409,40 @@ async fn test_openai_responses_simple_generation() {
 
     println!("Response: {}", response);
     let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
+    assert_eq!(value, 6);
+}
+
+#[tokio::test]
+#[ignore = "Requires OPENAI_API_KEY"]
+async fn test_openai_responses_runtime_model_string_with_cache_retention() {
+    let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
+    let mut runtime = Runtime::new();
+
+    let response = runtime
+        .run(run_params(
+            Some("What is 3+3? Just the number."),
+            Some("You are helpful. Be concise."),
+            None,
+            None,
+            None,
+            Some(0.0),
+            None,
+            Some(100),
+            Some("openai:resp:gpt-4o-mini@cache=in_memory"),
+            Some(&api_key),
+        ))
+        .await
+        .unwrap();
+
+    let response_str = response
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| response.to_string());
+    println!("Response: {}", response_str);
+    let value = response_str
         .trim()
         .parse::<i64>()
         .expect("Response should be an integer");
@@ -1373,7 +1634,7 @@ async fn test_openrouter_with_tools() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_with_tools_streaming() {
     use futures::StreamExt;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let mut last_error = None;
 

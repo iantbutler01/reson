@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 const MAX_RECENT_EVENTS_PER_VM: usize = 200;
+const MAX_ACCESS_LOG_READ_BYTES_PER_REFRESH: u64 = 1024 * 1024;
+const MAX_VM_COUNTER_STATES: usize = 2048;
 const CONNECTION_WINDOW_SECS: i64 = 60;
 const BANDWIDTH_WINDOW_SECS: i64 = 60 * 60;
 
@@ -122,6 +124,7 @@ impl VmCounters {
         for state in self.by_vm.values_mut() {
             state.prune_usage_windows(now);
         }
+        self.prune_counter_states();
         Ok(())
     }
 
@@ -130,7 +133,11 @@ impl VmCounters {
         vm_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<VmProxyLimitSnapshot>> {
-        self.refresh()?;
+        self.sync_from_access_log()?;
+        for state in self.by_vm.values_mut() {
+            state.prune_usage_windows(now);
+        }
+        self.prune_counter_states();
         Ok(self.by_vm.get(vm_id).map(|state| state.limit_snapshot(now)))
     }
 
@@ -184,18 +191,26 @@ impl VmCounters {
 
         file.seek(SeekFrom::Start(self.read_offset))
             .with_context(|| format!("seek envoy access log {}", self.access_log_path.display()))?;
-        let mut buf = String::new();
-        file.read_to_string(&mut buf)
+        let remaining = file_len.saturating_sub(self.read_offset);
+        let read_limit = remaining.min(MAX_ACCESS_LOG_READ_BYTES_PER_REFRESH);
+        let mut buf = Vec::with_capacity(read_limit.min(64 * 1024) as usize);
+        file.take(read_limit)
+            .read_to_end(&mut buf)
             .with_context(|| format!("read envoy access log {}", self.access_log_path.display()))?;
-        self.read_offset = file_len;
-        self.last_modified_at = modified_at;
+        self.read_offset = self
+            .read_offset
+            .saturating_add(buf.len() as u64)
+            .min(file_len);
+        if self.read_offset == file_len {
+            self.last_modified_at = modified_at;
+        }
 
         if buf.is_empty() {
             return Ok(());
         }
 
         let mut combined = std::mem::take(&mut self.partial_line);
-        combined.push_str(&buf);
+        combined.push_str(&String::from_utf8_lossy(&buf));
         let ends_with_newline = combined.ends_with('\n');
         let mut lines = combined.lines().map(str::to_owned).collect::<Vec<_>>();
         if !ends_with_newline {
@@ -207,6 +222,22 @@ impl VmCounters {
         }
 
         Ok(())
+    }
+
+    fn prune_counter_states(&mut self) {
+        if self.by_vm.len() <= MAX_VM_COUNTER_STATES {
+            return;
+        }
+        let mut states = self
+            .by_vm
+            .iter()
+            .map(|(vm_id, state)| (vm_id.clone(), state.updated_at))
+            .collect::<Vec<_>>();
+        states.sort_by_key(|(_, updated_at)| *updated_at);
+        let remove_count = self.by_vm.len().saturating_sub(MAX_VM_COUNTER_STATES);
+        for (vm_id, _) in states.into_iter().take(remove_count) {
+            self.by_vm.remove(&vm_id);
+        }
     }
 
     fn ingest_line(&mut self, line: &str) {

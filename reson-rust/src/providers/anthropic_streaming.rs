@@ -2,7 +2,7 @@
 //!
 //! Handles SSE parsing and progressive tool call accumulation for Anthropic API.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::utils::parse_json_value_strict_str;
 use std::collections::HashMap;
@@ -14,6 +14,7 @@ use crate::providers::StreamChunk;
 pub struct ToolCallAccumulator {
     /// Track tool blocks by index
     current_tool_blocks: HashMap<usize, PartialToolCall>,
+    usage: StreamUsageAccumulator,
 }
 
 #[derive(Debug, Clone)]
@@ -23,10 +24,18 @@ struct PartialToolCall {
     input: String, // Accumulated JSON
 }
 
+#[derive(Debug, Default)]
+struct StreamUsageAccumulator {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+}
+
 impl ToolCallAccumulator {
     pub fn new() -> Self {
         Self {
             current_tool_blocks: HashMap::new(),
+            usage: StreamUsageAccumulator::default(),
         }
     }
 
@@ -120,6 +129,29 @@ impl ToolCallAccumulator {
 
     pub fn pending_tool_count(&self) -> usize {
         self.current_tool_blocks.len()
+    }
+
+    fn update_usage(
+        &mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
+    ) -> StreamChunk {
+        if let Some(value) = input_tokens {
+            self.usage.input_tokens = value;
+        }
+        if let Some(value) = output_tokens {
+            self.usage.output_tokens = value;
+        }
+        if let Some(value) = cached_tokens {
+            self.usage.cached_tokens = value;
+        }
+
+        StreamChunk::Usage {
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            cached_tokens: self.usage.cached_tokens,
+        }
     }
 }
 
@@ -307,11 +339,7 @@ pub fn parse_anthropic_chunk(
                 let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
                 // message_delta carries output_tokens; input comes from message_start
                 if output_tokens > 0 || input_tokens > 0 {
-                    results.push(StreamChunk::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cached_tokens: 0,
-                    });
+                    results.push(accumulator.update_usage(None, Some(output_tokens), None));
                 }
             }
 
@@ -336,11 +364,11 @@ pub fn parse_anthropic_chunk(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 if input_tokens > 0 {
-                    results.push(StreamChunk::Usage {
-                        input_tokens,
-                        output_tokens: 0,
-                        cached_tokens,
-                    });
+                    results.push(accumulator.update_usage(
+                        Some(input_tokens),
+                        Some(0),
+                        Some(cached_tokens),
+                    ));
                 }
             }
         }
@@ -515,6 +543,59 @@ mod tests {
                 assert_eq!(tool["function"]["arguments"]["path"], "notes.md");
             }
             _ => panic!("Expected ToolCallComplete"),
+        }
+    }
+
+    #[test]
+    fn test_usage_preserves_cached_tokens_across_message_start_and_delta() {
+        let mut acc = ToolCallAccumulator::new();
+
+        let message_start = json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 1200,
+                    "cache_read_input_tokens": 900
+                }
+            }
+        });
+
+        let start_chunks = parse_anthropic_chunk(&message_start, &mut acc, false);
+        assert_eq!(start_chunks.len(), 1);
+        match &start_chunks[0] {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                assert_eq!(*input_tokens, 1200);
+                assert_eq!(*output_tokens, 0);
+                assert_eq!(*cached_tokens, 900);
+            }
+            _ => panic!("Expected Usage chunk"),
+        }
+
+        let message_delta = json!({
+            "type": "message_delta",
+            "delta": {},
+            "usage": {
+                "output_tokens": 42
+            }
+        });
+
+        let delta_chunks = parse_anthropic_chunk(&message_delta, &mut acc, false);
+        assert_eq!(delta_chunks.len(), 1);
+        match &delta_chunks[0] {
+            StreamChunk::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                assert_eq!(*input_tokens, 1200);
+                assert_eq!(*output_tokens, 42);
+                assert_eq!(*cached_tokens, 900);
+            }
+            _ => panic!("Expected Usage chunk"),
         }
     }
 

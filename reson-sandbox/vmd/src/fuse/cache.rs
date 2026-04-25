@@ -8,6 +8,8 @@ const FILE_TTL: Duration = Duration::from_secs(60);
 const DIR_TTL: Duration = Duration::from_secs(5);
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DIRS: usize = 4_096;
+const MAX_DIR_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 struct CachedFile {
@@ -94,15 +96,31 @@ impl NymFuseCache {
     }
 
     pub fn put_dir(&self, path: &str, entries: Vec<RemoteDirEntry>) {
+        if entries.len() > MAX_DIR_ENTRIES {
+            return;
+        }
         let mut inner = self.lock_inner();
+        let now = Instant::now();
+        inner.dirs.retain(|_, value| value.expires_at > now);
         inner.dirs.insert(
             path.to_string(),
             CachedDir {
                 entries,
-                expires_at: Instant::now() + DIR_TTL,
-                last_access: Instant::now(),
+                expires_at: now + DIR_TTL,
+                last_access: now,
             },
         );
+        while inner.dirs.len() > MAX_DIRS {
+            let Some(oldest_key) = inner
+                .dirs
+                .iter()
+                .min_by_key(|(_, value)| value.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            inner.dirs.remove(oldest_key.as_str());
+        }
     }
 
     pub fn invalidate(&self, path: &str) {
@@ -130,4 +148,40 @@ fn parent_path(path: &str) -> Option<String> {
         .rsplit_once('/')
         .map(|(parent, _)| parent.to_string())
         .or(Some(String::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DIR_ENTRIES, MAX_DIRS, NymFuseCache};
+    use crate::fuse::client::RemoteDirEntry;
+
+    fn entry(name: &str) -> RemoteDirEntry {
+        RemoteDirEntry {
+            name: name.to_string(),
+            kind: "file".to_string(),
+            size_bytes: 0,
+            content_hash: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn directory_cache_evicts_by_capacity() {
+        let cache = NymFuseCache::default();
+        for index in 0..=MAX_DIRS {
+            cache.put_dir(&format!("dir-{index}"), vec![entry("file")]);
+        }
+        assert!(cache.get_dir("dir-0").is_none());
+        assert!(cache.get_dir(&format!("dir-{MAX_DIRS}")).is_some());
+    }
+
+    #[test]
+    fn directory_cache_skips_oversized_directories() {
+        let cache = NymFuseCache::default();
+        let entries = (0..=MAX_DIR_ENTRIES)
+            .map(|index| entry(&format!("file-{index}")))
+            .collect();
+        cache.put_dir("huge", entries);
+        assert!(cache.get_dir("huge").is_none());
+    }
 }

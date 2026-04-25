@@ -1,8 +1,9 @@
 // @dive-file: Pod-local iptables enforcement for guest egress hard barriers keyed to the non-root qemu UID.
 // @dive-rel: Installed once at daemon startup so slirp-originated guest traffic is forced through proxy/DNS carveouts and denied elsewhere.
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::process::Command;
-use std::{fs, path::Path};
+use std::{fs, path::Path, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use tracing::warn;
@@ -20,6 +21,18 @@ const PRIVATE_RANGES: [&str; 4] = [
     "192.168.0.0/16",
     "100.64.0.0/10",
 ];
+const RESOLVED_IP_BLOCK_RANGES: [&str; 10] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
 const WEBRTC_ICE_PORTS: &str = "19302,3478";
 const WEBRTC_EPHEMERAL_PORT_RANGE: &str = "32768:65535";
 const WEBRTC_NEW_FLOW_LIMIT: &str = "240/minute";
@@ -28,6 +41,26 @@ const WEBRTC_NEW_FLOW_BURST: &str = "48";
 pub struct FirewallHandle {
     installed: bool,
     qemu_uid: u32,
+}
+
+pub struct ServiceProcessFirewallHandle {
+    service: String,
+    cgroup_path: String,
+    cgroup_dir: PathBuf,
+    dns_resolver_addr: Option<SocketAddr>,
+}
+
+pub struct PreparedServiceCgroup {
+    service: String,
+    cgroup_path: String,
+    cgroup_dir: PathBuf,
+    cgroup_procs_path: PathBuf,
+}
+
+impl FirewallHandle {
+    pub fn is_installed(&self) -> bool {
+        self.installed
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -157,19 +190,21 @@ pub fn install(config: &Config) -> Result<FirewallHandle> {
     ])?;
 
     for cidr in PRIVATE_RANGES {
-        // Local/browser watch sessions often advertise host ICE candidates on RFC1918 or
-        // carrier-grade NAT space. Allow only high-port UDP so WebRTC media can flow without
-        // reopening private-range TCP access or low-port service scanning inside the cluster.
-        append_rule(&[
-            "-p",
-            "udp",
-            "-d",
-            cidr,
-            "--dport",
-            WEBRTC_EPHEMERAL_PORT_RANGE,
-            "-j",
-            "ACCEPT",
-        ])?;
+        if allow_private_webrtc_udp(config) {
+            // Local/browser watch sessions can advertise host ICE candidates on RFC1918 or
+            // carrier-grade NAT space. In HA/prod mode this carveout is disabled so private
+            // cluster ranges are never reachable through direct high-port UDP.
+            append_rule(&[
+                "-p",
+                "udp",
+                "-d",
+                cidr,
+                "--dport",
+                WEBRTC_EPHEMERAL_PORT_RANGE,
+                "-j",
+                "ACCEPT",
+            ])?;
+        }
         append_rule(&["-d", cidr, "-j", "DROP"])?;
     }
 
@@ -292,6 +327,106 @@ pub fn install(config: &Config) -> Result<FirewallHandle> {
         installed: true,
         qemu_uid: config.qemu_process.run_as_uid,
     })
+}
+
+impl ServiceProcessFirewallHandle {
+    pub fn shutdown(self) {
+        if let Err(err) = remove_service_private_egress_rules(
+            &self.service,
+            &self.cgroup_path,
+            self.dns_resolver_addr,
+        ) {
+            warn!(
+                service = %self.service,
+                cgroup_path = %self.cgroup_path,
+                error = %err,
+                "failed removing service private-egress firewall rules"
+            );
+        }
+        if let Err(err) = remove_service_cgroup_dir(&self.cgroup_dir) {
+            warn!(
+                service = %self.service,
+                cgroup_path = %self.cgroup_path,
+                error = %err,
+                "failed removing service cgroup"
+            );
+        }
+    }
+}
+
+impl PreparedServiceCgroup {
+    pub fn cgroup_procs_path(&self) -> &Path {
+        self.cgroup_procs_path.as_path()
+    }
+
+    pub fn cleanup(self) {
+        if let Err(err) = remove_service_cgroup_dir(&self.cgroup_dir) {
+            warn!(
+                service = %self.service,
+                cgroup_path = %self.cgroup_path,
+                error = %err,
+                "failed removing prepared service cgroup"
+            );
+        }
+    }
+}
+
+pub fn prepare_service_process_cgroup(service: &str) -> Result<Option<PreparedServiceCgroup>> {
+    if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 {
+        return Ok(None);
+    }
+    let parent = cgroup_path_for_pid_allow_root(std::process::id())
+        .context("service process cgroup requires vmd cgroup path")?;
+    let service_component = sanitize_cgroup_component(service);
+    let suffix = unique_cgroup_suffix();
+    let cgroup_path = join_cgroup_paths(
+        &parent,
+        &format!("reson-services/{service_component}-{suffix}"),
+    );
+    let cgroup_dir = cgroup_fs_path(&cgroup_path)?;
+    fs::create_dir_all(&cgroup_dir)
+        .with_context(|| format!("create service cgroup {}", cgroup_dir.display()))?;
+    let cgroup_procs_path = cgroup_dir.join("cgroup.procs");
+    fs::metadata(&cgroup_procs_path)
+        .with_context(|| format!("stat service cgroup.procs {}", cgroup_procs_path.display()))?;
+    Ok(Some(PreparedServiceCgroup {
+        service: service.to_string(),
+        cgroup_path,
+        cgroup_dir,
+        cgroup_procs_path,
+    }))
+}
+
+pub fn protect_service_cgroup_private_egress(
+    cgroup: PreparedServiceCgroup,
+    dns_resolver_addr: Option<SocketAddr>,
+) -> Result<ServiceProcessFirewallHandle> {
+    if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 {
+        return Ok(ServiceProcessFirewallHandle {
+            service: cgroup.service,
+            cgroup_path: cgroup.cgroup_path,
+            cgroup_dir: cgroup.cgroup_dir,
+            dns_resolver_addr,
+        });
+    }
+    if let Err(err) = install_service_private_egress_rules(
+        &cgroup.service,
+        &cgroup.cgroup_path,
+        dns_resolver_addr,
+    ) {
+        cgroup.cleanup();
+        return Err(err);
+    }
+    Ok(ServiceProcessFirewallHandle {
+        service: cgroup.service,
+        cgroup_path: cgroup.cgroup_path,
+        cgroup_dir: cgroup.cgroup_dir,
+        dns_resolver_addr,
+    })
+}
+
+fn allow_private_webrtc_udp(config: &Config) -> bool {
+    !config.ha_mode
 }
 
 fn guest_dns_redirect_addr(config: &Config) -> Option<&str> {
@@ -425,52 +560,12 @@ pub fn block_vm_process(vm_id: &str, pid: u32, cgroup_path: Option<&str>) -> Res
         return run_iptables(cgroup_rule)
             .with_context(|| format!("install vm-specific qemu DROP rule for {vm_id}"));
     }
-
-    let pid = pid.to_string();
-    let check_args = [
-        "-t",
-        FILTER_TABLE,
-        "-C",
-        CHAIN_NAME,
-        "-m",
-        "comment",
-        "--comment",
-        comment.as_str(),
-        "-m",
-        "owner",
-        "--pid-owner",
-        pid.as_str(),
-        "-j",
-        "DROP",
-    ];
-    if Command::new("iptables")
-        .args(check_args)
-        .status()
-        .context("check vm-specific qemu DROP rule")?
-        .success()
-    {
-        return Ok(());
-    }
-
-    let pid_rule = [
-        "-t",
-        FILTER_TABLE,
-        "-I",
-        CHAIN_NAME,
-        "1",
-        "-m",
-        "comment",
-        "--comment",
-        comment.as_str(),
-        "-m",
-        "owner",
-        "--pid-owner",
-        pid.as_str(),
-        "-j",
-        "DROP",
-    ];
-    run_iptables(pid_rule)
-        .with_context(|| format!("install vm-specific qemu DROP rule for {vm_id}"))
+    warn!(
+        vm_id = %vm_id,
+        pid,
+        "skipping vm-specific qemu DROP rule because cgroup path is unavailable"
+    );
+    Ok(())
 }
 
 pub fn unblock_vm_process(vm_id: &str, pid: u32, cgroup_path: Option<&str>) -> Result<()> {
@@ -499,35 +594,176 @@ pub fn unblock_vm_process(vm_id: &str, pid: u32, cgroup_path: Option<&str>) -> R
             .args(cgroup_args)
             .status()
             .context("remove vm-specific qemu DROP cgroup rule")?;
+    }
+    Ok(())
+}
+
+fn install_service_private_egress_rules(
+    service: &str,
+    cgroup_path: &str,
+    dns_resolver_addr: Option<SocketAddr>,
+) -> Result<()> {
+    if let Some(dns_addr) = dns_resolver_addr {
+        for protocol in ["udp", "tcp"] {
+            ensure_service_dns_allow_rule(service, cgroup_path, dns_addr, protocol)?;
+        }
+    }
+    for cidr in RESOLVED_IP_BLOCK_RANGES {
+        ensure_service_private_drop_rule(service, cgroup_path, cidr)?;
+    }
+    Ok(())
+}
+
+fn remove_service_private_egress_rules(
+    service: &str,
+    cgroup_path: &str,
+    dns_resolver_addr: Option<SocketAddr>,
+) -> Result<()> {
+    if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-
-    let pid = pid.to_string();
-    let pid_args = [
-        "-t",
-        FILTER_TABLE,
-        "-D",
-        CHAIN_NAME,
-        "-m",
-        "comment",
-        "--comment",
-        comment.as_str(),
-        "-m",
-        "owner",
-        "--pid-owner",
-        pid.as_str(),
-        "-j",
-        "DROP",
-    ];
-    let _ = Command::new("iptables")
-        .args(pid_args)
-        .status()
-        .context("remove vm-specific qemu DROP rule")?;
+    for cidr in RESOLVED_IP_BLOCK_RANGES {
+        let _ = Command::new("iptables")
+            .args(service_private_drop_rule_args(
+                "-D",
+                service,
+                cgroup_path,
+                cidr,
+            ))
+            .status()
+            .with_context(|| format!("remove {service} private egress DROP rule"))?;
+    }
+    if let Some(dns_addr) = dns_resolver_addr {
+        for protocol in ["udp", "tcp"] {
+            let _ = Command::new("iptables")
+                .args(service_dns_allow_rule_args(
+                    "-D",
+                    service,
+                    cgroup_path,
+                    dns_addr,
+                    protocol,
+                ))
+                .status()
+                .with_context(|| format!("remove {service} DNS allow rule"))?;
+        }
+    }
     Ok(())
+}
+
+fn ensure_service_dns_allow_rule(
+    service: &str,
+    cgroup_path: &str,
+    dns_addr: SocketAddr,
+    protocol: &str,
+) -> Result<()> {
+    let check_args = service_dns_allow_rule_args("-C", service, cgroup_path, dns_addr, protocol);
+    if Command::new("iptables")
+        .args(&check_args)
+        .status()
+        .with_context(|| format!("check {service} DNS allow rule"))?
+        .success()
+    {
+        return Ok(());
+    }
+    run_iptables(service_dns_allow_rule_args(
+        "-A",
+        service,
+        cgroup_path,
+        dns_addr,
+        protocol,
+    ))
+    .with_context(|| format!("install {service} DNS allow rule"))
+}
+
+fn ensure_service_private_drop_rule(service: &str, cgroup_path: &str, cidr: &str) -> Result<()> {
+    let check_args = service_private_drop_rule_args("-C", service, cgroup_path, cidr);
+    if Command::new("iptables")
+        .args(&check_args)
+        .status()
+        .with_context(|| format!("check {service} private egress DROP rule"))?
+        .success()
+    {
+        return Ok(());
+    }
+    run_iptables(service_private_drop_rule_args(
+        "-A",
+        service,
+        cgroup_path,
+        cidr,
+    ))
+    .with_context(|| format!("install {service} private egress DROP rule"))
+}
+
+fn service_dns_allow_rule_args(
+    operation: &'static str,
+    service: &str,
+    cgroup_path: &str,
+    dns_addr: SocketAddr,
+    protocol: &str,
+) -> Vec<String> {
+    vec![
+        "-t".to_string(),
+        FILTER_TABLE.to_string(),
+        operation.to_string(),
+        "OUTPUT".to_string(),
+        "-m".to_string(),
+        "comment".to_string(),
+        "--comment".to_string(),
+        service_private_egress_comment(service),
+        "-m".to_string(),
+        "cgroup".to_string(),
+        "--path".to_string(),
+        cgroup_path.to_string(),
+        "-p".to_string(),
+        protocol.to_string(),
+        "-d".to_string(),
+        dns_addr.ip().to_string(),
+        "--dport".to_string(),
+        dns_addr.port().to_string(),
+        "-j".to_string(),
+        "ACCEPT".to_string(),
+    ]
+}
+
+fn service_private_drop_rule_args(
+    operation: &'static str,
+    service: &str,
+    cgroup_path: &str,
+    cidr: &str,
+) -> Vec<String> {
+    vec![
+        "-t".to_string(),
+        FILTER_TABLE.to_string(),
+        operation.to_string(),
+        "OUTPUT".to_string(),
+        "-m".to_string(),
+        "comment".to_string(),
+        "--comment".to_string(),
+        service_private_egress_comment(service),
+        "-m".to_string(),
+        "cgroup".to_string(),
+        "--path".to_string(),
+        cgroup_path.to_string(),
+        "-d".to_string(),
+        cidr.to_string(),
+        "-j".to_string(),
+        "DROP".to_string(),
+    ]
 }
 
 pub fn install_vm_counter_rules(vm_id: &str, pid: u32, cgroup_path: Option<&str>) -> Result<()> {
     if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 || pid == 0 {
+        return Ok(());
+    }
+    if cgroup_path
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        warn!(
+            vm_id = %vm_id,
+            pid,
+            "skipping vm accounting rules because cgroup path is unavailable"
+        );
         return Ok(());
     }
     install_counter_rule(
@@ -595,11 +831,27 @@ pub fn cgroup_path_for_pid(pid: u32) -> Option<String> {
     parse_cgroup_path(&fs::read_to_string(path).ok()?)
 }
 
+fn cgroup_path_for_pid_allow_root(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let path = format!("/proc/{pid}/cgroup");
+    parse_cgroup_path_allow_root(&fs::read_to_string(path).ok()?)
+}
+
 fn parse_cgroup_path(contents: &str) -> Option<String> {
+    parse_cgroup_path_inner(contents, false)
+}
+
+fn parse_cgroup_path_allow_root(contents: &str) -> Option<String> {
+    parse_cgroup_path_inner(contents, true)
+}
+
+fn parse_cgroup_path_inner(contents: &str, allow_root: bool) -> Option<String> {
     contents
         .lines()
         .filter_map(|line| line.rsplit_once(':').map(|(_, path)| path.trim()))
-        .find(|path| !path.is_empty() && *path != "/")
+        .find(|path| !path.is_empty() && (allow_root || *path != "/"))
         .map(|path| {
             if Path::new(path).is_absolute() {
                 path.to_string()
@@ -607,6 +859,69 @@ fn parse_cgroup_path(contents: &str) -> Option<String> {
                 format!("/{path}")
             }
         })
+}
+
+fn join_cgroup_paths(parent: &str, child: &str) -> String {
+    let parent = parent.trim();
+    let child = child.trim_matches('/');
+    if parent.is_empty() || parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{}/{}", parent.trim_end_matches('/'), child)
+    }
+}
+
+fn cgroup_fs_path(cgroup_path: &str) -> Result<PathBuf> {
+    let root = PathBuf::from("/sys/fs/cgroup");
+    if !root.join("cgroup.controllers").exists() {
+        bail!("cgroup v2 root is not available at {}", root.display());
+    }
+    let relative = cgroup_path.trim_start_matches('/');
+    if relative.is_empty() {
+        return Ok(root);
+    }
+    if relative
+        .split('/')
+        .any(|part| part == ".." || part.is_empty())
+    {
+        bail!("invalid cgroup path {cgroup_path}");
+    }
+    Ok(root.join(relative))
+}
+
+fn sanitize_cgroup_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "service".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn unique_cgroup_suffix() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{now}", std::process::id())
+}
+
+fn remove_service_cgroup_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove service cgroup {}", path.display())),
+    }
 }
 
 fn create_chain_if_missing() -> Result<()> {
@@ -945,6 +1260,10 @@ fn vm_bytes_comment(vm_id: &str) -> String {
     format!("reson-vm-bytes:{vm_id}")
 }
 
+fn service_private_egress_comment(service: &str) -> String {
+    format!("reson-service-private-egress:{service}")
+}
+
 fn install_counter_rule(
     comment: &str,
     pid: u32,
@@ -1001,59 +1320,16 @@ fn install_counter_rule(
         return run_iptables(cgroup_install);
     }
 
-    let pid = pid.to_string();
-    let mut check_rule = vec![
-        "-t",
-        FILTER_TABLE,
-        "-C",
-        ACCOUNT_CHAIN_NAME,
-        "-m",
-        "comment",
-        "--comment",
+    warn!(
         comment,
-        "-m",
-        "owner",
-        "--pid-owner",
-        pid.as_str(),
-    ];
-    if conntrack_new_only {
-        check_rule.extend(["-m", "conntrack", "--ctstate", "NEW"]);
-    }
-    check_rule.extend(["-j", "RETURN"]);
-    if Command::new("iptables")
-        .args(&check_rule)
-        .status()
-        .context("check vm accounting rule")?
-        .success()
-    {
-        return Ok(());
-    }
-
-    let mut install_rule = vec![
-        "-t",
-        FILTER_TABLE,
-        "-I",
-        ACCOUNT_CHAIN_NAME,
-        "1",
-        "-m",
-        "comment",
-        "--comment",
-        comment,
-        "-m",
-        "owner",
-        "--pid-owner",
-        pid.as_str(),
-    ];
-    if conntrack_new_only {
-        install_rule.extend(["-m", "conntrack", "--ctstate", "NEW"]);
-    }
-    install_rule.extend(["-j", "RETURN"]);
-    run_iptables(install_rule)
+        pid, "skipping vm accounting rule because cgroup path is unavailable"
+    );
+    Ok(())
 }
 
 fn remove_counter_rule(
     comment: &str,
-    pid: u32,
+    _pid: u32,
     cgroup_path: Option<&str>,
     conntrack_new_only: bool,
 ) -> Result<()> {
@@ -1082,30 +1358,6 @@ fn remove_counter_rule(
             .context("remove vm accounting cgroup rule")?;
         return Ok(());
     }
-
-    let pid = pid.to_string();
-    let mut pid_rule = vec![
-        "-t",
-        FILTER_TABLE,
-        "-D",
-        ACCOUNT_CHAIN_NAME,
-        "-m",
-        "comment",
-        "--comment",
-        comment,
-        "-m",
-        "owner",
-        "--pid-owner",
-        pid.as_str(),
-    ];
-    if conntrack_new_only {
-        pid_rule.extend(["-m", "conntrack", "--ctstate", "NEW"]);
-    }
-    pid_rule.extend(["-j", "RETURN"]);
-    let _ = Command::new("iptables")
-        .args(&pid_rule)
-        .status()
-        .context("remove vm accounting rule")?;
 
     Ok(())
 }
@@ -1190,6 +1442,49 @@ mod tests {
     }
 
     #[test]
+    fn private_webrtc_udp_carveout_is_disabled_in_ha_mode() {
+        let mut cfg = Config::default();
+        cfg.ha_mode = false;
+        assert!(allow_private_webrtc_udp(&cfg));
+
+        cfg.ha_mode = true;
+        assert!(!allow_private_webrtc_udp(&cfg));
+    }
+
+    #[test]
+    fn service_private_egress_blocks_loopback_and_link_local_ranges() {
+        assert!(RESOLVED_IP_BLOCK_RANGES.contains(&"127.0.0.0/8"));
+        assert!(RESOLVED_IP_BLOCK_RANGES.contains(&"169.254.0.0/16"));
+        assert!(RESOLVED_IP_BLOCK_RANGES.contains(&"10.0.0.0/8"));
+    }
+
+    #[test]
+    fn service_private_egress_rule_targets_service_cgroup() {
+        let cgroup_path = "/kubepods.slice/pod123/reson-services/envoy-1234";
+        let args = service_private_drop_rule_args("-A", "envoy", cgroup_path, "10.0.0.0/8");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--path" && pair[1] == cgroup_path)
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-m" && pair[1] == "cgroup")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-d" && pair[1] == "10.0.0.0/8")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-j" && pair[1] == "DROP")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "reson-service-private-egress:envoy")
+        );
+    }
+
+    #[test]
     fn parse_cgroup_path_prefers_non_root_entry() {
         let parsed = parse_cgroup_path("0::/\n1:name=systemd:/kubepods.slice/pod123/vm.scope\n");
         assert_eq!(parsed.as_deref(), Some("/kubepods.slice/pod123/vm.scope"));
@@ -1198,8 +1493,8 @@ mod tests {
     #[test]
     fn parse_counter_for_comment_extracts_packets_and_bytes() {
         let contents = r#"
-[12:3456] -A RESON_QEMU_ACCOUNT -m comment --comment "reson-vm-conn:vm-1" -m owner --pid-owner 123 -m conntrack --ctstate NEW -j RETURN
-[34:5678] -A RESON_QEMU_ACCOUNT -m comment --comment "reson-vm-bytes:vm-1" -m owner --pid-owner 123 -j RETURN
+[12:3456] -A RESON_QEMU_ACCOUNT -m comment --comment "reson-vm-conn:vm-1" -m cgroup --path /kubepods.slice/pod123/vm.scope -m conntrack --ctstate NEW -j RETURN
+[34:5678] -A RESON_QEMU_ACCOUNT -m comment --comment "reson-vm-bytes:vm-1" -m cgroup --path /kubepods.slice/pod123/vm.scope -j RETURN
 "#;
         assert_eq!(
             parse_counter_for_comment(contents, ACCOUNT_CHAIN_NAME, "reson-vm-conn:vm-1"),

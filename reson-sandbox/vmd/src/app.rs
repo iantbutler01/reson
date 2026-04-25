@@ -62,6 +62,7 @@ pub async fn run_server(config: Config) -> Result<()> {
     let public_ingress_handle = public_ingress::start(&config, Arc::clone(&manager))
         .await
         .context("start public ingress server")?;
+    let registry_handle = start_node_registry(config.node_registry.clone()).await?;
     let partition_handle =
         start_partition_monitor(config.node_registry.as_ref(), config.control_bus.as_ref()).await?;
     let partition_gate = partition_handle.as_ref().map(|handle| handle.gate());
@@ -124,7 +125,6 @@ pub async fn run_server(config: Config) -> Result<()> {
 
     let (reconcile_trigger_tx, reconcile_trigger_rx) = mpsc::unbounded_channel::<()>();
     let _reconcile_trigger_guard = reconcile_trigger_tx.clone();
-    let registry_handle = start_node_registry(config.node_registry.clone()).await?;
     let reconcile_handle = start_reconcile_worker(
         Arc::clone(&manager),
         config.node_registry.clone(),

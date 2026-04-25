@@ -9,6 +9,7 @@ mod child_tracker;
 mod cli;
 mod daemon;
 mod port_forward;
+mod process_group;
 mod services;
 mod system_env;
 
@@ -28,6 +29,7 @@ pub mod pb {
     }
 }
 
+use std::env;
 use std::net::SocketAddr;
 use std::process;
 use std::time::Duration;
@@ -37,19 +39,25 @@ use child_tracker::ChildTracker;
 use clap::Parser;
 use cli::Args;
 use daemon::DaemonRegistry;
-use nix::sys::signal::{Signal as UnixSignal, kill};
+use nix::sys::signal::Signal as UnixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
+use process_group::signal_process_group_or_pid;
 use services::{DaemonManagerService, PortProxyService, ShellExecService};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::sleep;
+use tonic::metadata::MetadataMap;
+use tonic::service::Interceptor;
 use tonic::transport::Server;
+use tonic::{Request, Status};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManagerServer;
 use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxyServer;
 use crate::pb::bracket::portproxy::v1::shell_exec_server::ShellExecServer;
+
+const PORTPROXY_AUTH_TOKEN_ENV: &str = "RESON_PORTPROXY_AUTH_TOKEN";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -110,6 +118,7 @@ async fn serve_grpc(
     let shell_exec = ShellExecService::new(tracker.clone());
     let port_proxy = PortProxyService::new(tracker.clone());
     let daemon_manager = DaemonManagerService::new(daemon_registry);
+    let auth_interceptor = PortproxyAuthInterceptor::from_env();
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
@@ -127,12 +136,87 @@ async fn serve_grpc(
 
     Server::builder()
         .add_service(health_service)
-        .add_service(ShellExecServer::new(shell_exec))
-        .add_service(PortProxyServer::new(port_proxy))
-        .add_service(DaemonManagerServer::new(daemon_manager))
+        .add_service(ShellExecServer::with_interceptor(
+            shell_exec,
+            auth_interceptor.clone(),
+        ))
+        .add_service(PortProxyServer::with_interceptor(
+            port_proxy,
+            auth_interceptor.clone(),
+        ))
+        .add_service(DaemonManagerServer::with_interceptor(
+            daemon_manager,
+            auth_interceptor,
+        ))
         .serve(addr)
         .await
         .context("gRPC server failed")
+}
+
+#[derive(Clone)]
+struct PortproxyAuthInterceptor {
+    token: Option<String>,
+}
+
+impl PortproxyAuthInterceptor {
+    fn from_env() -> Self {
+        let token = env::var(PORTPROXY_AUTH_TOKEN_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if token.is_some() {
+            info!("portproxy RPC auth is enabled");
+        } else {
+            warn!("portproxy RPC auth is disabled because {PORTPROXY_AUTH_TOKEN_ENV} is not set");
+        }
+        Self { token }
+    }
+}
+
+impl Interceptor for PortproxyAuthInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        match self.token.as_deref() {
+            Some(expected) => authorize_portproxy_request(request, expected),
+            None => Ok(request),
+        }
+    }
+}
+
+fn authorize_portproxy_request(
+    request: Request<()>,
+    expected_token: &str,
+) -> Result<Request<()>, Status> {
+    let provided = bearer_token_from_metadata(request.metadata())
+        .ok_or_else(|| Status::unauthenticated("missing portproxy authorization"))?;
+    if token_matches(&provided, expected_token) {
+        Ok(request)
+    } else {
+        Err(Status::unauthenticated("invalid portproxy authorization"))
+    }
+}
+
+fn bearer_token_from_metadata(metadata: &MetadataMap) -> Option<String> {
+    let raw = metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())?
+        .trim();
+    raw.strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn token_matches(provided: &str, expected: &str) -> bool {
+    let provided = provided.as_bytes();
+    let expected = expected.as_bytes();
+    if provided.len() != expected.len() {
+        return false;
+    }
+    let diff = provided
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b));
+    diff == 0
 }
 
 async fn reap_zombies(tracker: ChildTracker) {
@@ -178,7 +262,7 @@ async fn forward_signals(tracker: ChildTracker) -> anyhow::Result<()> {
         if pid <= 0 {
             continue;
         }
-        if let Err(err) = kill(Pid::from_raw(pid), received) {
+        if let Err(err) = signal_process_group_or_pid(pid, received) {
             warn!("failed to send {:?} to pid {}: {}", received, pid, err);
         }
     }
@@ -186,4 +270,53 @@ async fn forward_signals(tracker: ChildTracker) -> anyhow::Result<()> {
     sleep(Duration::from_secs(2)).await;
     info!("Shutting down after signal");
     process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_token_from_metadata_extracts_authorization_value() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer secret-token".parse().unwrap());
+
+        assert_eq!(
+            bearer_token_from_metadata(request.metadata()).as_deref(),
+            Some("secret-token")
+        );
+    }
+
+    #[test]
+    fn authorize_portproxy_request_rejects_missing_or_wrong_token() {
+        assert!(
+            authorize_portproxy_request(Request::new(()), "secret-token")
+                .expect_err("missing token must be rejected")
+                .code()
+                == tonic::Code::Unauthenticated
+        );
+
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer wrong-token".parse().unwrap());
+        assert!(
+            authorize_portproxy_request(request, "secret-token")
+                .expect_err("wrong token must be rejected")
+                .code()
+                == tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn authorize_portproxy_request_accepts_matching_token() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer secret-token".parse().unwrap());
+
+        assert!(authorize_portproxy_request(request, "secret-token").is_ok());
+    }
 }

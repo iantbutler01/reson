@@ -22,13 +22,11 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
-use crate::types::{
-    AssistantResponse, CacheMarker, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall,
-};
+use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, parse_json_value_strict_str,
 };
 
 /// Google Anthropic (Vertex AI with Claude) client
@@ -243,21 +241,37 @@ impl GoogleAnthropicClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<serde_json::Value>, &'a [ConversationMessage])> {
-        if let Some(ConversationMessage::Chat(first)) = messages.first() {
-            if first.role == ChatRole::System {
-                let mut system_dict = serde_json::json!({
-                    "type": "text",
-                    "text": first.content
-                });
+        let mut system_blocks = Vec::new();
+        let mut consumed = 0usize;
 
-                // Add cache control if marked
-                if first.cache_marker == Some(CacheMarker::Ephemeral) {
-                    system_dict["cache_control"] = serde_json::json!({"type": "ephemeral"});
-                }
-
-                return Ok((Some(serde_json::json!([system_dict])), &messages[1..]));
+        for message in messages {
+            let ConversationMessage::Chat(chat) = message else {
+                break;
+            };
+            if chat.role != ChatRole::System {
+                break;
             }
+
+            let mut system_dict = serde_json::json!({
+                "type": "text",
+                "text": chat.content
+            });
+
+            if let Some(marker) = chat.cache_marker.as_ref() {
+                system_dict["cache_control"] = marker.anthropic_cache_control();
+            }
+
+            system_blocks.push(system_dict);
+            consumed += 1;
         }
+
+        if !system_blocks.is_empty() {
+            return Ok((
+                Some(serde_json::json!(system_blocks)),
+                &messages[consumed..],
+            ));
+        }
+
         Ok((None, messages))
     }
 
@@ -445,7 +459,7 @@ impl InferenceClient for GoogleAnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
+        use crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk};
         use crate::utils::parse_sse_stream;
 
         let request_body = self.build_request_body(messages, config, true)?;
@@ -537,7 +551,7 @@ impl InferenceClient for GoogleAnthropicClient {
 #[cfg(all(test, feature = "google-adc"))]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::{CacheMarker, ChatMessage};
 
     #[test]
     fn test_endpoint_url() {
@@ -563,6 +577,34 @@ mod tests {
         .with_thinking_budget(1024);
 
         assert_eq!(client.thinking_budget, Some(1024));
+    }
+
+    #[test]
+    fn test_extract_multiple_system_messages() {
+        let client = GoogleAnthropicClient::from_adc_with_project(
+            "claude-sonnet-4@20250514",
+            "test-project",
+            "us-east5",
+        );
+        let messages = vec![
+            ConversationMessage::Chat(
+                ChatMessage::system("Stable runtime contract")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(
+                ChatMessage::system("<soul>Durable identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(ChatMessage::user("Hello")),
+        ];
+
+        let (system, remaining) = client.extract_system_message(&messages).unwrap();
+        let system_val = system.unwrap();
+        assert_eq!(system_val.as_array().unwrap().len(), 2);
+        assert_eq!(system_val[0]["text"], "Stable runtime contract");
+        assert_eq!(system_val[1]["text"], "<soul>Durable identity</soul>");
+        assert!(system_val[0]["cache_control"].is_object());
+        assert_eq!(remaining.len(), 1);
     }
 
     #[test]

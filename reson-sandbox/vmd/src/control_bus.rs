@@ -2,13 +2,15 @@
 // @dive-rel: Consumes ControlBusConfig from vmd/src/config.rs and enforces bounded in-flight command behavior.
 // @dive-rel: Publishes replay/dead-letter/overload signals consumed by operational gates in scripts/verify_reson_sandbox.sh.
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use async_nats::jetstream;
 use async_nats::jetstream::AckKind;
 use async_nats::jetstream::consumer::{AckPolicy, pull};
-use etcd_client::{Client as EtcdClient, Compare, CompareOp, Txn, TxnOp};
+use etcd_client::{Client as EtcdClient, Compare, CompareOp, PutOptions, Txn, TxnOp};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +18,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
+use tonic::metadata::{Ascii, MetadataValue};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -33,6 +36,9 @@ use crate::state::{Manager, SnapshotParams, UpdateVmParams};
 const META_EXEC_RESTORE_SNAPSHOT_ID: &str = "reson.execution_restore_snapshot_id";
 const META_EXEC_RESTORE_SNAPSHOT_NAME: &str = "reson.execution_restore_snapshot_name";
 const META_TIER_B_ELIGIBLE: &str = "reson.tier_b_eligible";
+const META_PORTPROXY_AUTH_TOKEN: &str = "reson.portproxy_auth_token";
+const MAX_EXEC_RUN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const ETCD_DEDUPE_TTL_SECS: i64 = 24 * 60 * 60;
 
 pub struct CommandConsumerHandle {
     stop_tx: Option<oneshot::Sender<()>>,
@@ -89,6 +95,7 @@ struct ExecRunPayload {
 #[derive(Clone)]
 struct ActiveExecStream {
     request_tx: mpsc::Sender<AttachDaemonRequest>,
+    last_input_seq: std::sync::Arc<Mutex<u64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,11 +145,40 @@ struct ExecRunResult {
     vm_id: String,
     stdout: String,
     stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     exit_code: Option<i32>,
     timed_out: bool,
     error: Option<String>,
     executed_by_node_id: String,
     completed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct BoundedTextOutput {
+    value: String,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl BoundedTextOutput {
+    fn push_lossy(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let remaining = MAX_EXEC_RUN_OUTPUT_BYTES.saturating_sub(self.bytes);
+        if remaining == 0 {
+            self.truncated = true;
+            return;
+        }
+        let take = remaining.min(bytes.len());
+        self.value
+            .push_str(&String::from_utf8_lossy(&bytes[..take]));
+        self.bytes += take;
+        if take < bytes.len() {
+            self.truncated = true;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,7 +236,8 @@ struct EtcdDedupeStore {
 #[derive(Clone)]
 struct EtcdOwnershipFenceStore {
     etcd: std::sync::Arc<Mutex<EtcdClient>>,
-    key_prefix: String,
+    session_fences_prefix: String,
+    session_shard_count: u8,
 }
 
 impl EtcdDedupeStore {
@@ -220,11 +257,47 @@ impl EtcdDedupeStore {
     async fn mark_or_duplicate(&self, idempotency_key: &str) -> Result<bool> {
         let key = format!("{}/{}", self.key_prefix, idempotency_key);
         let mut client = self.etcd.lock().await;
+        let lease = client
+            .lease_grant(ETCD_DEDUPE_TTL_SECS, None)
+            .await
+            .context("grant dedupe key lease")?;
         let txn = Txn::new()
             .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
-            .and_then(vec![TxnOp::put(key, b"1", None)]);
+            .and_then(vec![TxnOp::put(
+                key,
+                b"1",
+                Some(PutOptions::new().with_lease(lease.id())),
+            )]);
         let response = client.txn(txn).await.context("dedupe txn")?;
         Ok(!response.succeeded())
+    }
+
+    async fn is_completed(&self, idempotency_key: &str) -> Result<bool> {
+        let key = self.completed_key(idempotency_key);
+        let mut client = self.etcd.lock().await;
+        let response = client
+            .get(key, None)
+            .await
+            .context("read completed command marker")?;
+        Ok(!response.kvs().is_empty())
+    }
+
+    async fn mark_completed(&self, idempotency_key: &str) -> Result<()> {
+        let key = self.completed_key(idempotency_key);
+        let mut client = self.etcd.lock().await;
+        let lease = client
+            .lease_grant(ETCD_DEDUPE_TTL_SECS, None)
+            .await
+            .context("grant completed command marker lease")?;
+        client
+            .put(key, b"1", Some(PutOptions::new().with_lease(lease.id())))
+            .await
+            .context("write completed command marker")?;
+        Ok(())
+    }
+
+    fn completed_key(&self, idempotency_key: &str) -> String {
+        format!("{}/completed/{}", self.key_prefix, idempotency_key)
     }
 }
 
@@ -236,55 +309,52 @@ impl EtcdOwnershipFenceStore {
         let client = EtcdClient::connect(config.dedupe_etcd_endpoints.clone(), None)
             .await
             .context("connect etcd for ownership fences")?;
+        let etcd_prefix = session_etcd_prefix_from_dedupe_prefix(&config.dedupe_prefix);
         Ok(Some(Self {
             etcd: std::sync::Arc::new(Mutex::new(client)),
-            key_prefix: format!(
-                "{}/ownership-fences",
-                config.dedupe_prefix.trim_end_matches('/')
-            ),
+            session_fences_prefix: format!("{}/session_fences", etcd_prefix.trim_end_matches('/')),
+            session_shard_count: 16,
         }))
     }
 
-    async fn check_and_rotate(
+    async fn check_session_fence(
         &self,
-        ordering_key: &str,
+        session_id: Option<&str>,
         expected_fence: Option<&str>,
-    ) -> Result<String> {
-        let key = format!(
-            "{}/{}",
-            self.key_prefix,
-            sanitize_key_component(ordering_key)
-        );
-        let mut client = self.etcd.lock().await;
-        let current = read_fence_value(&mut client, &key).await?;
-        if !ownership_fence_allows_transition(current.as_deref(), expected_fence) {
-            let current_display = current.as_deref().unwrap_or("<none>");
-            let expected_display = expected_fence.unwrap_or("<none>");
-            return Err(anyhow!(
-                "ownership fence mismatch for ordering_key={ordering_key}: expected={expected_display} current={current_display}"
-            ));
-        }
-
-        let next_fence = Uuid::new_v4().to_string();
-        let compare = match expected_fence {
-            Some(expected) => Compare::value(key.clone(), CompareOp::Equal, expected),
-            None => Compare::version(key.clone(), CompareOp::Equal, 0),
+    ) -> Result<()> {
+        let Some(expected_fence) = expected_fence
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
         };
-        let txn = Txn::new().when(vec![compare]).and_then(vec![TxnOp::put(
-            key.clone(),
-            next_fence.clone(),
-            None,
-        )]);
-        let response = client.txn(txn).await.context("ownership fence txn")?;
-        if !response.succeeded() {
-            let latest = read_fence_value(&mut client, &key).await?;
-            let current_display = latest.as_deref().unwrap_or("<none>");
-            let expected_display = expected_fence.unwrap_or("<none>");
+        let session_id = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("expected ownership fence requires session_id"))?;
+        let key = self.session_fence_key(session_id);
+        let legacy_key = self.legacy_session_fence_key(session_id);
+        let mut client = self.etcd.lock().await;
+        let mut current = read_fence_value(&mut client, &key).await?;
+        if current.is_none() && key != legacy_key {
+            current = read_fence_value(&mut client, &legacy_key).await?;
+        }
+        if current.as_deref() != Some(expected_fence) {
+            let current_display = current.as_deref().unwrap_or("<none>");
             return Err(anyhow!(
-                "ownership fence compare-and-swap failed: expected={expected_display} current={current_display}"
+                "session ownership fence mismatch for session_id={session_id}: expected={expected_fence} current={current_display}"
             ));
         }
-        Ok(next_fence)
+        Ok(())
+    }
+
+    fn session_fence_key(&self, session_id: &str) -> String {
+        let shard = shard_for_key(session_id, self.session_shard_count.max(1));
+        format!("{}/{shard:02}/{session_id}", self.session_fences_prefix)
+    }
+
+    fn legacy_session_fence_key(&self, session_id: &str) -> String {
+        format!("{}/{}", self.session_fences_prefix, session_id)
     }
 }
 
@@ -305,9 +375,12 @@ pub async fn start_with_trigger(
         return Ok(None);
     };
 
-    let nats = async_nats::connect(config.nats_url.clone())
-        .await
-        .context("connect nats for command consumer")?;
+    let nats = connect_nats(
+        &config.nats_url,
+        config.nats_auth_token.as_deref(),
+        "connect nats for command consumer",
+    )
+    .await?;
     let jetstream = jetstream::new(nats);
     ensure_control_stream(&jetstream, &config).await?;
 
@@ -350,6 +423,8 @@ pub async fn start_with_trigger(
     // @dive: Dedupe state is shared across spawned command workers so duplicate suppression remains cluster-node local and bounded by TTL.
     let seen_commands: std::sync::Arc<Mutex<HashMap<String, Instant>>> =
         std::sync::Arc::new(Mutex::new(HashMap::new()));
+    let completed_commands: std::sync::Arc<Mutex<HashMap<String, Instant>>> =
+        std::sync::Arc::new(Mutex::new(HashMap::new()));
     let active_exec_streams: std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>> =
         std::sync::Arc::new(Mutex::new(HashMap::new()));
     // @dive: Enforces a hard bound on in-flight control commands; overload is signaled deterministically via NAK+retry hint.
@@ -385,6 +460,7 @@ pub async fn start_with_trigger(
                             let fence_store = fence_store.clone();
                             let partition_gate = partition_gate.clone();
                             let seen_commands = seen_commands.clone();
+                            let completed_commands = completed_commands.clone();
                             let active_exec_streams = active_exec_streams.clone();
                             let reconcile_trigger = reconcile_trigger.clone();
                             let manager = std::sync::Arc::clone(&manager);
@@ -400,6 +476,7 @@ pub async fn start_with_trigger(
                                     fence_store.as_ref(),
                                     partition_gate.as_ref(),
                                     &seen_commands,
+                                    &completed_commands,
                                     &active_exec_streams,
                                     reconcile_trigger.as_ref(),
                                     &jetstream,
@@ -444,9 +521,12 @@ pub async fn replay_dead_letters(config: ControlBusConfig, limit: usize) -> Resu
         return Ok(0);
     }
 
-    let nats = async_nats::connect(config.nats_url.clone())
-        .await
-        .context("connect nats for dead-letter replay")?;
+    let nats = connect_nats(
+        &config.nats_url,
+        config.nats_auth_token.as_deref(),
+        "connect nats for dead-letter replay",
+    )
+    .await?;
     let jetstream = jetstream::new(nats);
     ensure_control_stream(&jetstream, &config).await?;
 
@@ -563,6 +643,23 @@ pub async fn replay_dead_letters(config: ControlBusConfig, limit: usize) -> Resu
     Ok(replayed)
 }
 
+async fn connect_nats(
+    url: &str,
+    auth_token: Option<&str>,
+    context: &'static str,
+) -> Result<async_nats::Client> {
+    let token = auth_token.map(str::trim).filter(|value| !value.is_empty());
+    match token {
+        Some(token) => {
+            async_nats::ConnectOptions::with_token(token.to_string())
+                .connect(url.to_string())
+                .await
+        }
+        None => async_nats::connect(url.to_string()).await,
+    }
+    .with_context(|| context)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_command_message(
     message: jetstream::Message,
@@ -573,6 +670,7 @@ async fn process_command_message(
     fence_store: Option<&EtcdOwnershipFenceStore>,
     partition_gate: Option<&PartitionGate>,
     seen_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
+    completed_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
     active_exec_streams: &std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>>,
     reconcile_trigger: Option<&mpsc::UnboundedSender<()>>,
     jetstream: &jetstream::Context,
@@ -720,6 +818,39 @@ async fn process_command_message(
             seen.insert(dedupe_key.clone(), now);
         }
     } else {
+        match command_completed(dedupe_store, completed_commands, &dedupe_key, dedupe_ttl).await {
+            Ok(true) => {
+                debug!(
+                    node_id = %node_id,
+                    subject = %message.subject,
+                    command_id = %envelope.command_id,
+                    idempotency_key = %dedupe_key,
+                    delivery_attempt = delivery_attempt,
+                    "dropping completed control command redelivery"
+                );
+                if let Err(err) = message.ack().await {
+                    warn!(
+                        node_id = %node_id,
+                        command_id = %envelope.command_id,
+                        idempotency_key = %dedupe_key,
+                        err = %err,
+                        "failed to ack completed command redelivery"
+                    );
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    node_id = %node_id,
+                    subject = %message.subject,
+                    command_id = %envelope.command_id,
+                    idempotency_key = %dedupe_key,
+                    err = %err,
+                    "completed command marker check failed; processing redelivery"
+                );
+            }
+        }
         // @dive: Broker redeliveries must bypass duplicate suppression so failed commands can exhaust retry budget and reach DLQ.
         debug!(
             node_id = %node_id,
@@ -732,9 +863,11 @@ async fn process_command_message(
     }
 
     if let Some(store) = fence_store {
-        let ordering_key = ownership_scope_key(&envelope);
         if let Err(err) = store
-            .check_and_rotate(&ordering_key, envelope.expected_fence.as_deref())
+            .check_session_fence(
+                command_session_id(&envelope),
+                envelope.expected_fence.as_deref(),
+            )
             .await
         {
             handle_failed_command_message(
@@ -785,6 +918,22 @@ async fn process_command_message(
                 .await
             {
                 Ok(()) => {
+                    if let Err(mark_err) = mark_command_completed(
+                        dedupe_store,
+                        completed_commands,
+                        &dedupe_key,
+                        dedupe_ttl,
+                    )
+                    .await
+                    {
+                        warn!(
+                            node_id = %node_id,
+                            command_id = %envelope.command_id,
+                            idempotency_key = %dedupe_key,
+                            err = %mark_err,
+                            "failed to mark exec.run error result complete before ack"
+                        );
+                    }
                     if let Err(ack_err) = message.ack().await {
                         warn!(
                             node_id = %node_id,
@@ -852,6 +1001,18 @@ async fn process_command_message(
         }
     }
 
+    if let Err(mark_err) =
+        mark_command_completed(dedupe_store, completed_commands, &dedupe_key, dedupe_ttl).await
+    {
+        warn!(
+            node_id = %node_id,
+            command_id = %envelope.command_id,
+            idempotency_key = %dedupe_key,
+            err = %mark_err,
+            "failed to mark control command complete before ack"
+        );
+    }
+
     if let Err(err) = message.ack().await {
         warn!(
             node_id = %node_id,
@@ -860,6 +1021,44 @@ async fn process_command_message(
             "failed to ack control command"
         );
     }
+}
+
+async fn command_completed(
+    dedupe_store: Option<&EtcdDedupeStore>,
+    completed_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
+    dedupe_key: &str,
+    dedupe_ttl: Duration,
+) -> Result<bool> {
+    {
+        let now = Instant::now();
+        let mut completed = completed_commands.lock().await;
+        completed.retain(|_, ts| now.duration_since(*ts) < dedupe_ttl);
+        if completed.contains_key(dedupe_key) {
+            return Ok(true);
+        }
+    }
+    if let Some(store) = dedupe_store {
+        return store.is_completed(dedupe_key).await;
+    }
+    Ok(false)
+}
+
+async fn mark_command_completed(
+    dedupe_store: Option<&EtcdDedupeStore>,
+    completed_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
+    dedupe_key: &str,
+    dedupe_ttl: Duration,
+) -> Result<()> {
+    {
+        let now = Instant::now();
+        let mut completed = completed_commands.lock().await;
+        completed.retain(|_, ts| now.duration_since(*ts) < dedupe_ttl);
+        completed.insert(dedupe_key.to_string(), now);
+    }
+    if let Some(store) = dedupe_store {
+        store.mark_completed(dedupe_key).await?;
+    }
+    Ok(())
 }
 
 async fn handle_exec_run_command(
@@ -889,6 +1088,7 @@ async fn handle_exec_run_command(
             payload.vm_id
         ));
     }
+    let portproxy_auth = portproxy_auth_header_from_metadata(&vm.metadata)?;
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
     let mut client = ShellExecClient::connect(endpoint)
         .await
@@ -910,13 +1110,16 @@ async fn handle_exec_run_command(
     drop(req_tx);
 
     let response = client
-        .exec(Request::new(ReceiverStream::new(req_rx)))
+        .exec(request_with_portproxy_auth(
+            ReceiverStream::new(req_rx),
+            portproxy_auth.as_ref(),
+        ))
         .await
         .context("invoke shell exec stream for exec.run")?;
     let mut stream = response.into_inner();
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    let mut stdout = BoundedTextOutput::default();
+    let mut stderr = BoundedTextOutput::default();
     let mut exit_code = None;
     let mut timed_out = false;
 
@@ -929,12 +1132,12 @@ async fn handle_exec_run_command(
             ExecResponse {
                 response: Some(exec_response::Response::StdoutData(bytes)),
             } => {
-                stdout.push_str(&String::from_utf8_lossy(&bytes));
+                stdout.push_lossy(&bytes);
             }
             ExecResponse {
                 response: Some(exec_response::Response::StderrData(bytes)),
             } => {
-                stderr.push_str(&String::from_utf8_lossy(&bytes));
+                stderr.push_lossy(&bytes);
             }
             ExecResponse {
                 response: Some(exec_response::Response::ExitCode(code)),
@@ -964,8 +1167,10 @@ async fn handle_exec_run_command(
         command_id,
         session_id: payload.session_id,
         vm_id: payload.vm_id,
-        stdout,
-        stderr,
+        stdout: stdout.value,
+        stderr: stderr.value,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
         exit_code,
         timed_out,
         error: None,
@@ -1008,6 +1213,8 @@ async fn publish_exec_run_error_result(
         vm_id: payload.vm_id,
         stdout: String::new(),
         stderr: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
         exit_code: None,
         timed_out: false,
         error: Some(error.to_string()),
@@ -1052,10 +1259,6 @@ async fn handle_exec_stream_start_command(
     if payload.command.trim().is_empty() && !resume_only {
         return Err(anyhow!("exec.stream.start payload missing command"));
     }
-    // @dive: timeout/detach are carried for compatibility with the control payload; daemon attach mode currently enforces lifecycle via stream semantics.
-    let _ignored_timeout_secs = payload.timeout_secs;
-    let _ignored_detach = payload.detach;
-
     let stream_id = logical_stream_id.clone();
     let cluster_id = if payload.cluster_id.trim().is_empty() {
         config.cluster_id.clone()
@@ -1190,6 +1393,7 @@ async fn handle_exec_stream_start_command(
             payload.vm_id
         ));
     }
+    let portproxy_auth = portproxy_auth_header_from_metadata(&vm_metadata)?;
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
     info!(stream_id = %stream_id, endpoint = %endpoint, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T4 before_daemon_connect");
     let mut daemon_client = DaemonManagerClient::connect(endpoint.clone())
@@ -1203,11 +1407,16 @@ async fn handle_exec_stream_start_command(
             .clone()
             .unwrap_or_else(|| "/bin/sh".to_string());
         daemon_client
-            .exec_daemon(Request::new(ExecDaemonRequest {
-                name: daemon_name.clone(),
-                args: vec![shell, "-lc".to_string(), payload.command.clone()],
-                env: payload.env.clone(),
-            }))
+            .exec_daemon(request_with_portproxy_auth(
+                ExecDaemonRequest {
+                    name: daemon_name.clone(),
+                    args: vec![shell, "-lc".to_string(), payload.command.clone()],
+                    env: payload.env.clone(),
+                    timeout: payload.timeout_secs,
+                    detach: payload.detach,
+                },
+                portproxy_auth.as_ref(),
+            ))
             .await
             .context("invoke daemon manager for exec.stream.start")?;
         info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T6 after_exec_daemon_rpc");
@@ -1235,7 +1444,10 @@ async fn handle_exec_stream_start_command(
             .map_err(|_| anyhow!("enqueue exec.stream attach start request"))?;
         info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T9 before_attach_daemon_rpc");
         match attach_client
-            .attach_daemon(Request::new(ReceiverStream::new(req_rx)))
+            .attach_daemon(request_with_portproxy_auth(
+                ReceiverStream::new(req_rx),
+                portproxy_auth.as_ref(),
+            ))
             .await
         {
             Ok(response) => {
@@ -1295,6 +1507,7 @@ async fn handle_exec_stream_start_command(
             stream_id.clone(),
             ActiveExecStream {
                 request_tx: req_tx.clone(),
+                last_input_seq: std::sync::Arc::new(Mutex::new(0)),
             },
         );
     }
@@ -1787,6 +2000,9 @@ async fn handle_exec_stream_input_command(
                     payload.input_seq
                 )
             })?;
+            if !accept_next_input_seq(&active, payload.input_seq).await? {
+                return Ok(());
+            }
             active
                 .request_tx
                 .send(AttachDaemonRequest {
@@ -1808,11 +2024,21 @@ async fn handle_exec_stream_input_command(
                 input_seq = payload.input_seq,
                 "exec.stream.input eof"
             );
-            let removed = {
-                let mut guard = active_exec_streams.lock().await;
-                guard.remove(&payload.stream_id)
+            let active = {
+                let guard = active_exec_streams.lock().await;
+                guard.get(&payload.stream_id).cloned()
             };
-            if let Some(active) = removed {
+            if let Some(active) = active {
+                if !accept_next_input_seq(&active, payload.input_seq).await? {
+                    return Ok(());
+                }
+                let removed = {
+                    let mut guard = active_exec_streams.lock().await;
+                    guard.remove(&payload.stream_id)
+                };
+                let Some(active) = removed else {
+                    return Ok(());
+                };
                 drop(active.request_tx);
             }
         }
@@ -1822,6 +2048,25 @@ async fn handle_exec_stream_input_command(
     }
 
     Ok(())
+}
+
+async fn accept_next_input_seq(active: &ActiveExecStream, input_seq: u64) -> Result<bool> {
+    if input_seq == 0 {
+        return Ok(true);
+    }
+    let mut last_input_seq = active.last_input_seq.lock().await;
+    if input_seq <= *last_input_seq {
+        return Ok(false);
+    }
+    let expected = last_input_seq.saturating_add(1);
+    if input_seq != expected {
+        return Err(anyhow!(
+            "exec.stream.input out of order: got seq={}, expected seq={expected}",
+            input_seq
+        ));
+    }
+    *last_input_seq = input_seq;
+    Ok(true)
 }
 
 async fn publish_exec_stream_event(
@@ -2021,6 +2266,36 @@ fn metadata_tier_b_eligible(metadata: &HashMap<String, String>) -> bool {
     )
 }
 
+fn portproxy_auth_header_from_metadata(
+    metadata: &HashMap<String, String>,
+) -> Result<Option<MetadataValue<Ascii>>> {
+    let Some(token) = metadata
+        .get(META_PORTPROXY_AUTH_TOKEN)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    else {
+        return Ok(None);
+    };
+    let value = format!("Bearer {token}");
+    MetadataValue::try_from(value.as_str())
+        .map(Some)
+        .context("build portproxy authorization metadata")
+}
+
+fn request_with_portproxy_auth<T>(
+    message: T,
+    auth_header: Option<&MetadataValue<Ascii>>,
+) -> Request<T> {
+    let mut request = Request::new(message);
+    if let Some(value) = auth_header {
+        request
+            .metadata_mut()
+            .insert("authorization", value.clone());
+    }
+    request
+}
+
 async fn resolve_execution_restore_snapshot_id(
     manager: &Manager,
     vm_id: &str,
@@ -2149,16 +2424,33 @@ fn dedupe_key(envelope: &CommandEnvelope) -> String {
     format!("anon-{}", Uuid::new_v4())
 }
 
-fn ownership_scope_key(envelope: &CommandEnvelope) -> String {
-    if !envelope.ordering_key.trim().is_empty() {
-        return envelope.ordering_key.trim().to_string();
-    }
-    if !envelope.command_id.trim().is_empty() {
-        return envelope.command_id.trim().to_string();
-    }
-    format!("anon-owner-{}", Uuid::new_v4())
+fn command_session_id(envelope: &CommandEnvelope) -> Option<&str> {
+    envelope
+        .payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
+fn session_etcd_prefix_from_dedupe_prefix(dedupe_prefix: &str) -> String {
+    let trimmed = dedupe_prefix.trim().trim_end_matches('/');
+    trimmed
+        .split("/command-dedupe")
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/reson-sandbox")
+        .to_string()
+}
+
+fn shard_for_key(key: &str, shard_count: u8) -> u8 {
+    let shard_count = shard_count.max(1);
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() % shard_count as u64) as u8
+}
+
+#[cfg(test)]
 fn ownership_fence_allows_transition(current: Option<&str>, expected: Option<&str>) -> bool {
     match expected {
         Some(expected) => current.is_some_and(|value| value == expected),
@@ -2235,7 +2527,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ownership_scope_key_prefers_ordering_key() {
+    fn command_session_id_prefers_payload_session() {
         let envelope = CommandEnvelope {
             command_id: "command-1".to_string(),
             idempotency_key: String::new(),
@@ -2243,9 +2535,9 @@ mod tests {
             ordering_key: "session-1".to_string(),
             expected_fence: None,
             target_node_id: None,
-            payload: Value::Null,
+            payload: json!({ "session_id": "session-from-payload" }),
         };
-        assert_eq!(ownership_scope_key(&envelope), "session-1");
+        assert_eq!(command_session_id(&envelope), Some("session-from-payload"));
     }
 
     #[test]
@@ -2269,6 +2561,37 @@ mod tests {
         assert!(first.starts_with("cluster-alpha-"));
         assert!(second.starts_with("cluster-alpha-"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn portproxy_auth_header_uses_vm_metadata_token() {
+        let metadata = HashMap::from([(
+            META_PORTPROXY_AUTH_TOKEN.to_string(),
+            "guest-token".to_string(),
+        )]);
+        let value = portproxy_auth_header_from_metadata(&metadata)
+            .expect("portproxy auth metadata should compile")
+            .expect("portproxy auth metadata should be present");
+        assert_eq!(value.to_str().expect("ascii header"), "Bearer guest-token");
+    }
+
+    #[test]
+    fn request_with_portproxy_auth_inserts_authorization_metadata() {
+        let metadata = HashMap::from([(
+            META_PORTPROXY_AUTH_TOKEN.to_string(),
+            "guest-token".to_string(),
+        )]);
+        let value = portproxy_auth_header_from_metadata(&metadata)
+            .expect("portproxy auth metadata should compile")
+            .expect("portproxy auth metadata should be present");
+        let request = request_with_portproxy_auth((), Some(&value));
+        assert_eq!(
+            request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer guest-token")
+        );
     }
 
     #[test]

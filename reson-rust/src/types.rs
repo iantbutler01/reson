@@ -123,6 +123,17 @@ pub enum ChatRole {
 pub enum CacheMarker {
     /// Ephemeral cache point
     Ephemeral,
+    /// Ephemeral cache point with a 1 hour TTL
+    Ephemeral1h,
+}
+
+impl CacheMarker {
+    pub fn anthropic_cache_control(&self) -> serde_json::Value {
+        match self {
+            Self::Ephemeral => serde_json::json!({ "type": "ephemeral" }),
+            Self::Ephemeral1h => serde_json::json!({ "type": "ephemeral", "ttl": "1h" }),
+        }
+    }
 }
 
 /// A chat message in the conversation

@@ -8,8 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_nats::jetstream;
+use async_nats::jetstream::AckKind;
 use async_nats::jetstream::consumer::{AckPolicy, pull};
-use etcd_client::{Client as EtcdClient, Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
+use etcd_client::{
+    Client as EtcdClient, Compare, CompareOp, GetOptions, LeaseKeepAliveStream, LeaseKeeper,
+    PutOptions, Txn, TxnOp,
+};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -245,12 +249,9 @@ impl DistributedControlPlane {
             .map_err(|err| {
                 SandboxError::DaemonUnavailable(format!("failed connecting to etcd: {err}"))
             })?;
-        let nats = async_nats::connect(cfg.nats_url.clone())
-            .await
-            .map_err(|err| {
-                SandboxError::DaemonUnavailable(format!("failed connecting to nats: {err}"))
-            })?;
         let normalized = normalize_cfg(cfg);
+        let nats =
+            connect_nats(&normalized.nats_url, normalized.nats_auth_token.as_deref()).await?;
         let jetstream = jetstream::new(nats.clone());
         ensure_control_stream(&jetstream, &normalized).await?;
         let plane = Self {
@@ -1017,18 +1018,20 @@ impl DistributedControlPlane {
                     }
                 };
 
-                let parsed = decode_exec_stream_event_payload(&message.payload);
-                if let Err(err) = message.ack().await {
-                    tracing::warn!(
-                        error = %err,
-                        stream_id = %stream_id,
-                        consumer = %cleanup_consumer_name,
-                        "failed to ack distributed exec stream event"
-                    );
-                }
-                let event = match parsed {
+                let event = match decode_exec_stream_event_payload_for_stream(
+                    &message.payload,
+                    stream_id.as_str(),
+                ) {
                     Ok(event) => event,
                     Err(err) => {
+                        if let Err(ack_err) = message.ack_with(AckKind::Term).await {
+                            tracing::warn!(
+                                error = %ack_err,
+                                stream_id = %stream_id,
+                                consumer = %cleanup_consumer_name,
+                                "failed to terminate invalid distributed exec stream event"
+                            );
+                        }
                         if let Some(tx) = started_tx.take() {
                             let _ = tx.send(Err(SandboxError::DaemonUnavailable(format!("{err}"))));
                         }
@@ -1039,6 +1042,15 @@ impl DistributedControlPlane {
                 let event_seq = event.normalized_event_seq();
                 // @dive: Resume semantics are forward-only; once a consumer checkpoint exists, replayed event_seq frames are dropped.
                 if should_drop_replayed_event(event_seq, resume_after_event_seq) {
+                    if let Err(err) = message.ack().await {
+                        tracing::warn!(
+                            error = %err,
+                            stream_id = %stream_id,
+                            consumer = %cleanup_consumer_name,
+                            event_seq = event_seq,
+                            "failed to ack dropped replayed distributed exec stream event"
+                        );
+                    }
                     continue;
                 }
 
@@ -1069,6 +1081,15 @@ impl DistributedControlPlane {
                 if event_tx.send(Ok(event)).await.is_err() {
                     break;
                 }
+                if let Err(err) = message.ack().await {
+                    tracing::warn!(
+                        error = %err,
+                        stream_id = %stream_id,
+                        consumer = %cleanup_consumer_name,
+                        event_seq = event_seq,
+                        "failed to ack delivered distributed exec stream event"
+                    );
+                }
                 if terminal {
                     break;
                 }
@@ -1098,8 +1119,8 @@ impl DistributedControlPlane {
     ) -> Result<PortAllocationLease> {
         const DEFAULT_LEASE_TTL_SECS: i64 = 30;
         let key = self.port_key(&allocation.vm_id, allocation.host_port);
-        write_port_allocation(
-            &self.cfg.etcd_endpoints,
+        let mut lease_id = put_port_allocation_with_new_lease(
+            &self.etcd,
             &key,
             &allocation,
             DEFAULT_LEASE_TTL_SECS,
@@ -1107,26 +1128,87 @@ impl DistributedControlPlane {
         .await?;
 
         let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-        let endpoints = self.cfg.etcd_endpoints.clone();
+        let etcd = Arc::clone(&self.etcd);
         let key_for_task = key.clone();
         let allocation_for_task = allocation.clone();
         let interval = lease_interval(DEFAULT_LEASE_TTL_SECS);
         let join = tokio::spawn(async move {
+            let mut keepalive_client = {
+                let client = etcd.lock().await;
+                client.clone()
+            };
+            let mut keepalive =
+                match start_port_allocation_keepalive(&mut keepalive_client, lease_id).await {
+                    Ok(keepalive) => Some(keepalive),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            port_key = %key_for_task,
+                            lease_id,
+                            "failed to start port allocation lease keepalive"
+                        );
+                        None
+                    }
+                };
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     _ = tokio::time::sleep(interval) => {
-                        let _ = write_port_allocation(
-                            &endpoints,
-                            &key_for_task,
-                            &allocation_for_task,
-                            DEFAULT_LEASE_TTL_SECS,
-                        ).await;
+                        let keepalive_result = match keepalive.as_mut() {
+                            Some(keepalive) => keep_port_allocation_alive(keepalive).await,
+                            None => Err(SandboxError::DaemonUnavailable(
+                                "port allocation lease keepalive is not active".to_string(),
+                            )),
+                        };
+                        if let Err(err) = keepalive_result {
+                            tracing::warn!(
+                                error = %err,
+                                port_key = %key_for_task,
+                                lease_id,
+                                "failed to keep port allocation lease alive; refreshing allocation"
+                            );
+                            match put_port_allocation_with_new_lease(
+                                &etcd,
+                                &key_for_task,
+                                &allocation_for_task,
+                                DEFAULT_LEASE_TTL_SECS,
+                            ).await {
+                                Ok(next_lease_id) => {
+                                    lease_id = next_lease_id;
+                                    let mut next_keepalive_client = {
+                                        let client = etcd.lock().await;
+                                        client.clone()
+                                    };
+                                    keepalive = match start_port_allocation_keepalive(
+                                        &mut next_keepalive_client,
+                                        lease_id,
+                                    ).await {
+                                        Ok(next_keepalive) => Some(next_keepalive),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                error = %err,
+                                                port_key = %key_for_task,
+                                                lease_id,
+                                                "failed to restart port allocation lease keepalive"
+                                            );
+                                            None
+                                        }
+                                    };
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        port_key = %key_for_task,
+                                        "failed to refresh port allocation lease"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            let _ = delete_etcd_key(&endpoints, &key_for_task).await;
+            let _ = delete_etcd_key(&etcd, &key_for_task).await;
         });
 
         Ok(PortAllocationLease {
@@ -1340,6 +1422,12 @@ fn spawn_outbox_replay_worker(control: DistributedControlPlane) {
 
 fn normalize_cfg(mut cfg: DistributedControlConfig) -> DistributedControlConfig {
     cfg.etcd_prefix = normalize_prefix(&cfg.etcd_prefix);
+    cfg.nats_auth_token = cfg
+        .nats_auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     if cfg.cluster_id.trim().is_empty() {
         cfg.cluster_id = "reson-sandbox-cluster".to_string();
     }
@@ -1377,6 +1465,20 @@ fn normalize_cfg(mut cfg: DistributedControlConfig) -> DistributedControlConfig 
         cfg.admission_retry_after_ms = 2_000;
     }
     cfg
+}
+
+async fn connect_nats(url: &str, auth_token: Option<&str>) -> Result<async_nats::Client> {
+    let token = auth_token.map(str::trim).filter(|value| !value.is_empty());
+    let client = match token {
+        Some(token) => {
+            async_nats::ConnectOptions::with_token(token.to_string())
+                .connect(url.to_string())
+                .await
+        }
+        None => async_nats::connect(url.to_string()).await,
+    }
+    .map_err(|err| SandboxError::DaemonUnavailable(format!("failed connecting to nats: {err}")))?;
+    Ok(client)
 }
 
 async fn ensure_control_stream(
@@ -1756,6 +1858,34 @@ fn decode_exec_stream_event_payload(raw: &[u8]) -> Result<ExecStreamEvent> {
     Ok(parsed)
 }
 
+fn decode_exec_stream_event_payload_for_stream(
+    raw: &[u8],
+    expected_stream_id: &str,
+) -> Result<ExecStreamEvent> {
+    let expected_stream_id = expected_stream_id.trim();
+    if expected_stream_id.is_empty() {
+        return Err(SandboxError::InvalidResponse(
+            "exec stream event validation requires expected stream id".to_string(),
+        ));
+    }
+
+    let parsed = decode_exec_stream_event_payload(raw)?;
+    if parsed.logical_stream_id.trim().is_empty() || parsed.stream_id.trim().is_empty() {
+        return Err(SandboxError::InvalidResponse(
+            "exec stream event missing stream identity".to_string(),
+        ));
+    }
+    if parsed.logical_stream_id.trim() != expected_stream_id
+        || parsed.stream_id.trim() != expected_stream_id
+    {
+        return Err(SandboxError::InvalidResponse(format!(
+            "exec stream event identity mismatch: expected {}, got logical_stream_id={} stream_id={}",
+            expected_stream_id, parsed.logical_stream_id, parsed.stream_id
+        )));
+    }
+    Ok(parsed)
+}
+
 fn sanitize_subject_token(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -1847,18 +1977,19 @@ fn lease_interval(ttl_secs: i64) -> std::time::Duration {
     std::time::Duration::from_secs(interval)
 }
 
-async fn write_port_allocation(
-    endpoints: &[String],
+type PortAllocationKeepAlive = (LeaseKeeper, LeaseKeepAliveStream);
+
+async fn put_port_allocation_with_new_lease(
+    etcd: &Arc<Mutex<EtcdClient>>,
     key: &str,
     allocation: &PortAllocation,
     ttl_secs: i64,
-) -> Result<()> {
-    let mut client = EtcdClient::connect(endpoints.to_vec(), None)
-        .await
-        .map_err(|err| SandboxError::DaemonUnavailable(format!("etcd connect failed: {err}")))?;
+) -> Result<i64> {
+    let mut client = etcd.lock().await;
     let lease = client.lease_grant(ttl_secs, None).await.map_err(|err| {
         SandboxError::DaemonUnavailable(format!("etcd lease grant failed: {err}"))
     })?;
+    let lease_id = lease.id();
     let payload = serde_json::to_vec(&PortAllocationRecord {
         session_id: allocation.session_id.clone(),
         vm_id: allocation.vm_id.clone(),
@@ -1869,16 +2000,51 @@ async fn write_port_allocation(
     })
     .map_err(|err| SandboxError::InvalidResponse(format!("serialize port allocation: {err}")))?;
     client
-        .put(key, payload, Some(PutOptions::new().with_lease(lease.id())))
+        .put(key, payload, Some(PutOptions::new().with_lease(lease_id)))
         .await
         .map_err(|err| SandboxError::DaemonUnavailable(format!("etcd put failed: {err}")))?;
+    Ok(lease_id)
+}
+
+async fn start_port_allocation_keepalive(
+    client: &mut EtcdClient,
+    lease_id: i64,
+) -> Result<PortAllocationKeepAlive> {
+    client.lease_keep_alive(lease_id).await.map_err(|err| {
+        SandboxError::DaemonUnavailable(format!("etcd lease keepalive start failed: {err}"))
+    })
+}
+
+async fn keep_port_allocation_alive(keepalive: &mut PortAllocationKeepAlive) -> Result<()> {
+    const KEEPALIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    keepalive.0.keep_alive().await.map_err(|err| {
+        SandboxError::DaemonUnavailable(format!("etcd lease keepalive failed: {err}"))
+    })?;
+    let response = tokio::time::timeout(KEEPALIVE_RESPONSE_TIMEOUT, keepalive.1.message())
+        .await
+        .map_err(|_| {
+            SandboxError::DaemonUnavailable("etcd lease keepalive response timed out".to_string())
+        })?
+        .map_err(|err| {
+            SandboxError::DaemonUnavailable(format!("etcd lease keepalive response failed: {err}"))
+        })?;
+    let Some(response) = response else {
+        return Err(SandboxError::DaemonUnavailable(
+            "etcd lease keepalive stream closed".to_string(),
+        ));
+    };
+    if response.ttl() <= 0 {
+        return Err(SandboxError::DaemonUnavailable(format!(
+            "etcd lease keepalive returned non-positive ttl for lease {}",
+            response.id()
+        )));
+    }
     Ok(())
 }
 
-async fn delete_etcd_key(endpoints: &[String], key: &str) -> Result<()> {
-    let mut client = EtcdClient::connect(endpoints.to_vec(), None)
-        .await
-        .map_err(|err| SandboxError::DaemonUnavailable(format!("etcd connect failed: {err}")))?;
+async fn delete_etcd_key(etcd: &Arc<Mutex<EtcdClient>>, key: &str) -> Result<()> {
+    let mut client = etcd.lock().await;
     client
         .delete(key, None)
         .await
@@ -2543,6 +2709,44 @@ mod tests {
         assert_eq!(parsed.kind, "exit");
         assert_eq!(parsed.exit_code, Some(0));
         assert_eq!(parsed.normalized_event_seq(), 3);
+    }
+
+    #[test]
+    fn decode_exec_stream_event_payload_for_stream_rejects_wrong_stream() {
+        let raw = json!({
+            "logical_stream_id": "stream-a",
+            "stream_id": "stream-b",
+            "kind": "stdout",
+            "data": [111, 107],
+            "event_seq": 1
+        });
+        let err = decode_exec_stream_event_payload_for_stream(
+            serde_json::to_string(&raw)
+                .expect("serialize stream event")
+                .as_bytes(),
+            "stream-a",
+        )
+        .expect_err("mismatched stream identity should be rejected");
+        assert!(format!("{err}").contains("identity mismatch"));
+    }
+
+    #[test]
+    fn decode_exec_stream_event_payload_for_stream_accepts_legacy_stream_id_only() {
+        let raw = json!({
+            "stream_id": "stream-a",
+            "kind": "exit",
+            "exit_code": 0,
+            "sequence": 1
+        });
+        let parsed = decode_exec_stream_event_payload_for_stream(
+            serde_json::to_string(&raw)
+                .expect("serialize stream event")
+                .as_bytes(),
+            "stream-a",
+        )
+        .expect("legacy stream identity should normalize");
+        assert_eq!(parsed.logical_stream_id, "stream-a");
+        assert_eq!(parsed.stream_id, "stream-a");
     }
 
     #[test]

@@ -11,7 +11,18 @@ use crate::error::Result;
 use crate::utils::ConversationMessage;
 
 // Re-export types for convenience
-pub use crate::types::{AssistantResponse, CostInfo, Provider, TokenUsage};
+pub use crate::types::{AssistantResponse, CacheMarker, CostInfo, Provider, TokenUsage};
+
+#[derive(Debug, Clone)]
+pub struct AnthropicProviderConfig {
+    pub automatic_prompt_caching: Option<CacheMarker>,
+    pub tool_definitions_cache_breakpoint: Option<CacheMarker>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProviderConfig {
+    Anthropic(AnthropicProviderConfig),
+}
 
 // Provider implementations
 pub mod anthropic;
@@ -39,6 +50,22 @@ pub use openai_responses::OpenAIResponsesClient;
 pub use openrouter::OpenRouterClient;
 pub use openrouter_responses::OpenRouterResponsesClient;
 pub use tracing_client::TracingInferenceClient;
+
+/// Configuration for generation requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptCacheRetention {
+    InMemory,
+    H24,
+}
+
+impl PromptCacheRetention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InMemory => "in_memory",
+            Self::H24 => "24h",
+        }
+    }
+}
 
 /// Configuration for generation requests
 #[derive(Debug, Clone)]
@@ -81,6 +108,13 @@ pub struct GenerationConfig {
     /// baseline. LLM-heavy callers should inject their own policy here so
     /// long-running generations don't get killed by the conservative default.
     pub retry_config: Option<crate::retry::RetryConfig>,
+
+    /// Prompt cache retention policy for providers that support request-level
+    /// cache controls (currently OpenAI direct APIs).
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+
+    /// Provider-specific request-shaping options.
+    pub provider_config: Option<ProviderConfig>,
 }
 
 impl Default for GenerationConfig {
@@ -98,6 +132,8 @@ impl Default for GenerationConfig {
             output_type_name: None,
             timeout: None,
             retry_config: None,
+            prompt_cache_retention: None,
+            provider_config: None,
         }
     }
 }
@@ -167,6 +203,18 @@ impl GenerationConfig {
     /// Set retry policy
     pub fn with_retry_config(mut self, retry_config: crate::retry::RetryConfig) -> Self {
         self.retry_config = Some(retry_config);
+        self
+    }
+
+    /// Set prompt cache retention policy
+    pub fn with_prompt_cache_retention(mut self, retention: PromptCacheRetention) -> Self {
+        self.prompt_cache_retention = Some(retention);
+        self
+    }
+
+    /// Set provider-specific request options
+    pub fn with_provider_config(mut self, config: ProviderConfig) -> Self {
+        self.provider_config = Some(config);
         self
     }
 }

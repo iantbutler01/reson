@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use etcd_client::{Client as EtcdClient, GetOptions};
 use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
@@ -216,14 +216,24 @@ async fn probe_once(config: &PartitionPolicyConfig, client: &mut Option<EtcdClie
         .as_mut()
         .expect("partition probe client must be initialized")
         .get(
-            key_prefix,
+            key_prefix.clone(),
             Some(GetOptions::new().with_prefix().with_limit(1)),
         )
         .await;
-    if let Err(err) = probe {
-        // @dive: On RPC failure we drop the client so next tick forces a clean reconnect instead of reusing stale transport.
-        *client = None;
-        return Err(err).context("etcd partition probe get");
+    match probe {
+        Ok(response) => validate_visible_node_registry(&key_prefix, response.kvs().len())?,
+        Err(err) => {
+            // @dive: On RPC failure we drop the client so next tick forces a clean reconnect instead of reusing stale transport.
+            *client = None;
+            return Err(err).context("etcd partition probe get");
+        }
+    }
+    Ok(())
+}
+
+fn validate_visible_node_registry(key_prefix: &str, visible_nodes: usize) -> Result<()> {
+    if visible_nodes == 0 {
+        bail!("etcd partition probe found no node registry keys under {key_prefix}");
     }
     Ok(())
 }
@@ -288,5 +298,11 @@ mod tests {
                 .local_stream_allowed(now - Duration::from_secs(30))
                 .await
         );
+    }
+
+    #[test]
+    fn partition_probe_requires_visible_node_registry_key() {
+        assert!(validate_visible_node_registry("/reson/nodes/", 1).is_ok());
+        assert!(validate_visible_node_registry("/reson/nodes/", 0).is_err());
     }
 }

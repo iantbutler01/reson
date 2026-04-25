@@ -11,16 +11,138 @@ use tokio::sync::RwLock;
 use crate::error::{Error, Result};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient, StreamChunk,
+    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient, PromptCacheRetention,
+    ProviderConfig, StreamChunk,
 };
 use crate::schema::{apply_tool_strict_for_provider, fix_output_schema_for_provider};
 use crate::types::{
-    AssistantResponse, ChatMessage, CreateResult, ReasoningSegment, ResponsePart,
+    AssistantResponse, ChatMessage, CreateResult, Provider, ReasoningSegment, ResponsePart,
     ResponseStreamEvent, TokenUsage, ToolCall,
 };
 use crate::utils::ConversationMessage;
 
 use super::{Accumulators, ToolFunction, ToolSchemaInfo};
+
+fn supports_system_message_blocks(provider: Provider) -> bool {
+    matches!(provider, Provider::Anthropic | Provider::GoogleAnthropic)
+}
+
+fn build_runtime_messages(
+    prompt: Option<&str>,
+    system: Option<&str>,
+    system_messages: Option<Vec<ChatMessage>>,
+    history: Option<Vec<ConversationMessage>>,
+    provider: Option<Provider>,
+) -> Vec<ConversationMessage> {
+    let mut messages = Vec::new();
+
+    if let Some(system_messages) = system_messages.filter(|messages| !messages.is_empty()) {
+        if provider.is_some_and(supports_system_message_blocks) {
+            messages.extend(system_messages.into_iter().map(ConversationMessage::Chat));
+        } else {
+            let joined = system_messages
+                .into_iter()
+                .map(|msg| msg.content)
+                .filter(|content| !content.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !joined.is_empty() {
+                messages.push(ConversationMessage::Chat(ChatMessage::system(joined)));
+            }
+        }
+    } else if let Some(sys) = system {
+        messages.push(ConversationMessage::Chat(ChatMessage::system(sys)));
+    }
+
+    if let Some(hist) = history {
+        messages.extend(hist);
+    }
+
+    if let Some(p) = prompt {
+        messages.push(ConversationMessage::Chat(ChatMessage::user(p)));
+    }
+
+    messages
+}
+
+fn resolve_provider_for_caching(model: &str) -> Option<Provider> {
+    Provider::from_model_string(model)
+        .ok()
+        .map(|(provider, _)| provider)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedModelString {
+    provider: String,
+    model_name: String,
+    reasoning: Option<String>,
+    server_url: Option<String>,
+    inline_api_key: Option<String>,
+    prompt_cache_retention: Option<PromptCacheRetention>,
+}
+
+fn parse_prompt_cache_retention(value: &str) -> Result<PromptCacheRetention> {
+    match value {
+        "in_memory" => Ok(PromptCacheRetention::InMemory),
+        "24h" => Ok(PromptCacheRetention::H24),
+        other => Err(Error::NonRetryable(format!(
+            "Unsupported @cache value '{}'. Expected 'in_memory' or '24h'",
+            other
+        ))),
+    }
+}
+
+fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
+    let parts: Vec<&str> = model_str.split(':').collect();
+    if parts.len() < 2 {
+        return Err(Error::NonRetryable(format!(
+            "Invalid model string format: {}. Expected 'provider:model'",
+            model_str
+        )));
+    }
+
+    let (provider, model_part) = if parts.len() >= 3 && parts[1] == "resp" {
+        (format!("{}-responses", parts[0]), parts[2..].join(":"))
+    } else {
+        (parts[0].to_string(), parts[1..].join(":"))
+    };
+
+    let mut reasoning = None;
+    let mut server_url = None;
+    let mut inline_api_key = None;
+    let mut prompt_cache_retention = None;
+
+    let model_name = if model_part.contains('@') {
+        let model_parts: Vec<&str> = model_part.split('@').collect();
+
+        for param in &model_parts[1..] {
+            if param.starts_with("reasoning=") {
+                reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
+            } else if param.starts_with("server_url=") {
+                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
+            } else if param.starts_with("api_key=") {
+                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
+            } else if param.starts_with("cache=") {
+                prompt_cache_retention = Some(parse_prompt_cache_retention(
+                    param.strip_prefix("cache=").unwrap(),
+                )?);
+            }
+        }
+
+        model_parts[0].to_string()
+    } else {
+        model_part.to_string()
+    };
+
+    Ok(ParsedModelString {
+        provider,
+        model_name,
+        reasoning,
+        server_url,
+        inline_api_key,
+        prompt_cache_retention,
+    })
+}
 
 /// Result from non-streaming LLM call
 pub struct CallResult {
@@ -374,12 +496,14 @@ fn resolve_provider_key(model: &str) -> String {
 ///
 /// Parameters:
 /// - `@reasoning=<value>` - reasoning effort (numeric budget or level like `high`)
+/// - `@cache=<value>` - OpenAI prompt cache retention (`in_memory` or `24h`)
 /// - `@server_url=<url>` - custom API endpoint (required for `custom-openai`, optional for `openai`)
 /// - `@api_key=<key>` - inline API key (overrides env var and `api_key` parameter)
 ///
 /// Examples:
 /// - `anthropic:claude-3-5-sonnet-20241022`
 /// - `openrouter:openai/gpt-4o@reasoning=high`
+/// - `openai:gpt-5.1@cache=24h`
 /// - `openai:gpt-4o`
 /// - `openai:resp:gpt-4o`
 /// - `openrouter:resp:openai/o4-mini`
@@ -389,41 +513,12 @@ pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
-    // Parse model string
-    let parts: Vec<&str> = model_str.split(':').collect();
-    if parts.len() < 2 {
-        return Err(Error::NonRetryable(format!(
-            "Invalid model string format: {}. Expected 'provider:model'",
-            model_str
-        )));
-    }
-    let (provider, model_part) = if parts.len() >= 3 && parts[1] == "resp" {
-        (format!("{}-responses", parts[0]), parts[2..].join(":"))
-    } else {
-        (parts[0].to_string(), parts[1..].join(":"))
-    };
-
-    // Parse parameters (e.g., @reasoning=1024, @server_url=http://localhost:8000/v1, @api_key=sk-...)
-    let mut reasoning = None;
-    let mut server_url = None;
-    let mut inline_api_key = None;
-    let model_name = if model_part.contains('@') {
-        let model_parts: Vec<&str> = model_part.split('@').collect();
-
-        for param in &model_parts[1..] {
-            if param.starts_with("reasoning=") {
-                reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
-            } else if param.starts_with("server_url=") {
-                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
-            } else if param.starts_with("api_key=") {
-                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
-            }
-        }
-
-        model_parts[0].to_string()
-    } else {
-        model_part.to_string()
-    };
+    let parsed = parse_model_string(model_str)?;
+    let provider = parsed.provider;
+    let reasoning = parsed.reasoning;
+    let server_url = parsed.server_url;
+    let inline_api_key = parsed.inline_api_key;
+    let model_name = parsed.model_name;
 
     // Resolve API key: @api_key= > api_key parameter > env var
     let key = if let Some(k) = inline_api_key {
@@ -455,7 +550,7 @@ pub fn create_inference_client(
                 return Err(Error::NonRetryable(format!(
                     "Unknown provider: {}",
                     provider
-                )))
+                )));
             }
         }
     };
@@ -529,7 +624,7 @@ pub fn create_inference_client(
             return Err(Error::NonRetryable(format!(
                 "Unsupported provider: {}",
                 provider
-            )))
+            )));
         }
     };
 
@@ -547,31 +642,24 @@ pub async fn call_llm(
     output_schema: Option<serde_json::Value>,
     api_key: Option<&str>,
     system: Option<&str>,
+    system_messages: Option<Vec<ChatMessage>>,
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
     retry_config: Option<crate::retry::RetryConfig>,
+    provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 ) -> Result<CallResult> {
     // Create client
     let client = create_inference_client(model, api_key)?;
+    let parsed_model = parse_model_string(model)?;
+    let provider_key = resolve_provider_key(model);
+    let message_provider = resolve_provider_for_caching(model);
 
-    // Build messages
-    let mut messages = Vec::new();
-
-    if let Some(sys) = system {
-        messages.push(ConversationMessage::Chat(ChatMessage::system(sys)));
-    }
-
-    if let Some(hist) = history {
-        messages.extend(hist);
-    }
-
-    if let Some(p) = prompt {
-        messages.push(ConversationMessage::Chat(ChatMessage::user(p)));
-    }
+    let messages =
+        build_runtime_messages(prompt, system, system_messages, history, message_provider);
 
     if messages.is_empty() {
         return Err(Error::NonRetryable(
@@ -591,9 +679,8 @@ pub async fn call_llm(
     };
 
     // Fix output schema for provider-specific requirements
-    let provider = resolve_provider_key(model);
     let fixed_output_schema = output_schema.map(|mut schema| {
-        fix_output_schema_for_provider(&mut schema, &provider);
+        fix_output_schema_for_provider(&mut schema, &provider_key);
         schema
     });
 
@@ -611,6 +698,11 @@ pub async fn call_llm(
         output_type_name,
         timeout,
         retry_config,
+        prompt_cache_retention: match provider_key.as_str() {
+            "openai" | "openai-responses" => parsed_model.prompt_cache_retention,
+            _ => None,
+        },
+        provider_config,
     };
 
     // Make API call
@@ -638,32 +730,25 @@ pub async fn call_llm_stream(
     output_schema: Option<serde_json::Value>,
     api_key: Option<&str>,
     system: Option<&str>,
+    system_messages: Option<Vec<ChatMessage>>,
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
     retry_config: Option<crate::retry::RetryConfig>,
+    provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
     accumulators: Arc<RwLock<Accumulators>>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
     let client = create_inference_client(model, api_key)?;
+    let parsed_model = parse_model_string(model)?;
+    let provider_key = resolve_provider_key(model);
+    let message_provider = resolve_provider_for_caching(model);
 
-    // Build messages
-    let mut messages = Vec::new();
-
-    if let Some(sys) = system {
-        messages.push(ConversationMessage::Chat(ChatMessage::system(sys)));
-    }
-
-    if let Some(hist) = history {
-        messages.extend(hist);
-    }
-
-    if let Some(p) = prompt {
-        messages.push(ConversationMessage::Chat(ChatMessage::user(p)));
-    }
+    let messages =
+        build_runtime_messages(prompt, system, system_messages, history, message_provider);
 
     if messages.is_empty() {
         return Err(Error::NonRetryable(
@@ -683,9 +768,8 @@ pub async fn call_llm_stream(
     };
 
     // Fix output schema for provider-specific requirements
-    let provider = resolve_provider_key(model);
     let fixed_output_schema = output_schema.map(|mut schema| {
-        fix_output_schema_for_provider(&mut schema, &provider);
+        fix_output_schema_for_provider(&mut schema, &provider_key);
         schema
     });
 
@@ -703,6 +787,11 @@ pub async fn call_llm_stream(
         output_type_name,
         timeout,
         retry_config,
+        prompt_cache_retention: match provider_key.as_str() {
+            "openai" | "openai-responses" => parsed_model.prompt_cache_retention,
+            _ => None,
+        },
+        provider_config,
     };
 
     // Get streaming response
@@ -747,6 +836,7 @@ pub async fn call_llm_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{CacheMarker, ChatRole};
 
     #[test]
     fn test_create_inference_client_anthropic() {
@@ -781,6 +871,23 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let result = create_inference_client("openai:resp:gpt-4o", None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_model_string_with_openai_cache_retention() {
+        let parsed = parse_model_string("openai:gpt-5.1@cache=24h").unwrap();
+        assert_eq!(parsed.provider, "openai");
+        assert_eq!(parsed.model_name, "gpt-5.1");
+        assert_eq!(
+            parsed.prompt_cache_retention,
+            Some(PromptCacheRetention::H24)
+        );
+    }
+
+    #[test]
+    fn test_parse_model_string_rejects_invalid_cache_retention() {
+        let result = parse_model_string("openai:gpt-5.1@cache=forever");
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -819,6 +926,130 @@ mod tests {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
         let result = create_inference_client("openrouter:resp:openai/o4-mini", None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_runtime_messages_preserves_system_array_for_anthropic_family() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            None,
+            Some(vec![
+                ChatMessage::system("Runtime contract").with_cache_marker(CacheMarker::Ephemeral),
+                ChatMessage::system("<soul>Identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ]),
+            None,
+            Some(Provider::Anthropic),
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: Some(CacheMarker::Ephemeral),
+                ..
+            }) if content == "Runtime contract"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: Some(CacheMarker::Ephemeral),
+                ..
+            }) if content == "<soul>Identity</soul>"
+        ));
+    }
+
+    #[test]
+    fn test_build_runtime_messages_collapses_system_array_for_string_only_providers() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            None,
+            Some(vec![
+                ChatMessage::system("Runtime contract").with_cache_marker(CacheMarker::Ephemeral),
+                ChatMessage::system("<soul>Identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ]),
+            None,
+            Some(Provider::Bedrock),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Runtime contract\n\n<soul>Identity</soul>"
+        ));
+    }
+
+    #[test]
+    fn test_build_runtime_messages_preserves_plain_system_when_structured_system_is_empty() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            Some("Plain system"),
+            Some(Vec::new()),
+            None,
+            Some(Provider::Anthropic),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Plain system"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::User,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Prompt"
+        ));
+    }
+
+    #[test]
+    fn test_build_runtime_messages_does_not_invent_prompt_cache_markers() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            None,
+            None,
+            Some(vec![ConversationMessage::Chat(ChatMessage::user(
+                "Prior user message",
+            ))]),
+            Some(Provider::Anthropic),
+        );
+
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::User,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Prior user message"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::User,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Prompt"
+        ));
     }
 
     #[test]

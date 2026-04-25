@@ -32,6 +32,8 @@ message ExecDaemonRequest {
   string name = 1;
   repeated string args = 2;
   map<string, string> env = 3;
+  optional int32 timeout = 4;
+  bool detach = 5;
 }
 
 message ExecDaemonResponse { bool is_new = 1; }

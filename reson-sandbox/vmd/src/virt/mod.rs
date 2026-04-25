@@ -112,9 +112,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
             .arg("--output")
             .arg(&output_name)
             .arg("--size")
-            .arg(format!("{disk_gb}G"))
-            .arg("--password")
-            .arg("root");
+            .arg(format!("{disk_gb}G"));
         if opts.pull {
             cmd.arg("--pull");
         }
@@ -161,9 +159,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
             .arg("--output")
             .arg(&output_name)
             .arg("--size")
-            .arg(format!("{disk_gb}G"))
-            .arg("--password")
-            .arg("root");
+            .arg(format!("{disk_gb}G"));
 
         if opts.pull {
             cmd.arg("--pull");
