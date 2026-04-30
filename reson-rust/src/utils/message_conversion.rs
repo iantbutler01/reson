@@ -3,7 +3,7 @@
 //! Converts mixed ChatMessage/ToolResult/ToolCall/ReasoningSegment lists to provider-specific formats.
 //! Handles message coalescing for Anthropic/Google providers.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{
     AssistantResponse, CacheMarker, ChatMessage, ChatRole, MediaPart, MediaSource,
     MultimodalMessage, Provider, ReasoningSegment, ResponsePart, ToolCall, ToolResult,
@@ -303,32 +303,30 @@ fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
             "text": text
         }),
 
-        MediaPart::Image { source, .. } => match source {
+        MediaPart::Image { source, detail } => {
+            let mut image = match source {
             MediaSource::Base64 { data, mime_type } => json!({
                 "type": "input_image",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", mime_type, data)
-                }
+                "image_url": format!("data:{};base64,{}", mime_type, data)
             }),
             MediaSource::Url { url } => json!({
                 "type": "input_image",
-                "image_url": {
-                    "url": url
-                }
+                "image_url": url
             }),
             MediaSource::FileId { file_id } => json!({
                 "type": "input_image",
-                "image_file": {
-                    "file_id": file_id
-                }
+                "file_id": file_id
             }),
             MediaSource::FileUri { uri, .. } => json!({
                 "type": "input_image",
-                "image_url": {
-                    "url": uri
-                }
+                "image_url": uri
             }),
-        },
+            };
+            if let Some(detail) = detail {
+                image["detail"] = json!(detail);
+            }
+            image
+        }
 
         MediaPart::Audio { source, format } => match source {
             MediaSource::Base64 { data, .. } => {
@@ -353,6 +351,31 @@ fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
             "text": "[Video/Document not supported by this provider]"
         }),
     }
+}
+
+/// Return true when the conversation contains user-supplied image input.
+pub fn messages_contain_image_input(messages: &[ConversationMessage]) -> bool {
+    messages.iter().any(|message| match message {
+        ConversationMessage::Multimodal(multimodal) => multimodal
+            .parts
+            .iter()
+            .any(|part| matches!(part, MediaPart::Image { .. })),
+        _ => false,
+    })
+}
+
+/// Fail before dispatch when a provider/model cannot carry image input.
+pub fn validate_image_input_supported(
+    messages: &[ConversationMessage],
+    provider: Provider,
+    model: &str,
+) -> Result<()> {
+    if messages_contain_image_input(messages) && !provider.supports_image_input(model) {
+        return Err(Error::Validation(
+            "This Nym's current model cannot inspect images.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Convert a MultimodalMessage to provider-specific format

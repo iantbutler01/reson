@@ -49,7 +49,8 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::runtime::{RunParams, Runtime};
     pub use crate::types::{
-        AssistantResponse, CacheMarker, ChatMessage, ChatRole, CreateResult, Provider,
+        AssistantResponse, CacheMarker, ChatMessage, ChatRole, CreateResult, MediaPart,
+        MediaSource, MediaSourceKind, MultimodalMessage, Provider, ProviderCapabilities,
         ReasoningSegment, ResponsePart, ResponseStreamEvent, TokenUsage, ToolCall, ToolResult,
     };
 }

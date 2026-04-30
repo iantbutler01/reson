@@ -26,7 +26,8 @@ use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
+    convert_messages_to_provider_format, parse_json_value_strict_str,
+    validate_image_input_supported, ConversationMessage,
 };
 
 /// Google Anthropic (Vertex AI with Claude) client
@@ -166,6 +167,9 @@ impl GoogleAnthropicClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::GoogleAnthropic, model)?;
+
         // Extract system message if present
         let (system, messages) = self.extract_system_message(messages)?;
 
@@ -175,13 +179,6 @@ impl GoogleAnthropicClient {
 
         // Wrap string content in proper format
         let formatted_messages = self.wrap_string_content(formatted_messages);
-
-        // Use config.model if provided, otherwise use self.model
-        let _model = if config.model.is_empty() {
-            &self.model
-        } else {
-            &config.model
-        };
 
         let mut request = serde_json::json!({
             // Note: model is NOT included - it's in the URL for Vertex AI

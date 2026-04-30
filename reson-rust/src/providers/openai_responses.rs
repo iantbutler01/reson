@@ -21,7 +21,7 @@ use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
     convert_messages_to_responses_input, parse_json_value_strict_str, parse_sse_stream,
-    ConversationMessage,
+    validate_image_input_supported, ConversationMessage,
 };
 
 use super::openai_responses_streaming::{parse_openai_responses_event, ResponsesToolAccumulator};
@@ -130,11 +130,14 @@ impl OpenAIResponsesClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, self.provider, model)?;
+
         let (instructions, input_items) =
             convert_messages_to_responses_input(messages, self.provider)?;
 
         let mut request = serde_json::json!({
-            "model": if config.model.is_empty() { &self.model } else { &config.model },
+            "model": model,
             "input": input_items,
             "max_output_tokens": config.max_tokens.unwrap_or(4096),
             "temperature": config.temperature.unwrap_or(0.7),

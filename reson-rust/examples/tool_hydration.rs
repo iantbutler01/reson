@@ -38,6 +38,7 @@ fn run_params(
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
+        retry_config: None,
     }
 }
 

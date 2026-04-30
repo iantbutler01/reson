@@ -25,7 +25,9 @@ use crate::schema::fix_tool_schema_for_provider;
 #[cfg(feature = "bedrock")]
 use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
 #[cfg(feature = "bedrock")]
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::utils::{
+    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+};
 
 #[cfg(feature = "bedrock")]
 use {
@@ -104,6 +106,9 @@ impl BedrockClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::Bedrock, model)?;
+
         // Extract system message if present
         let (system, remaining_messages) = self.extract_system_message(messages)?;
 

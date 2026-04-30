@@ -100,6 +100,120 @@ impl Provider {
                 | Provider::OpenRouterResponses
         )
     }
+
+    /// Return model-level provider capabilities using conservative allowlists.
+    pub fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+        let image_input = self.supports_image_input(model);
+        ProviderCapabilities {
+            image_input,
+            image_input_sources: if image_input {
+                match self {
+                    Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                        vec![MediaSourceKind::Base64]
+                    }
+                    Provider::OpenAI | Provider::OpenRouter => {
+                        vec![MediaSourceKind::Base64, MediaSourceKind::Url]
+                    }
+                    Provider::GoogleGenAI => {
+                        vec![MediaSourceKind::Base64, MediaSourceKind::FileUri]
+                    }
+                    Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                        vec![
+                            MediaSourceKind::Base64,
+                            MediaSourceKind::Url,
+                            MediaSourceKind::FileId,
+                        ]
+                    }
+                }
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Check whether this provider/model pair can inspect image inputs.
+    pub fn supports_image_input(&self, model: &str) -> bool {
+        let normalized = normalize_capability_model_name(model);
+
+        match self {
+            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                is_claude_vision_model(&normalized)
+            }
+            Provider::GoogleGenAI => is_gemini_vision_model(&normalized),
+            Provider::OpenAI | Provider::OpenAIResponses => is_openai_vision_model(&normalized),
+            Provider::OpenRouter | Provider::OpenRouterResponses => {
+                is_openrouter_vision_model(&normalized)
+            }
+        }
+    }
+}
+
+/// Provider-normalized capability flags for a concrete model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    /// Whether the provider/model can accept image inputs.
+    pub image_input: bool,
+    /// Source kinds accepted for image input by this provider path.
+    pub image_input_sources: Vec<MediaSourceKind>,
+}
+
+/// Media source families exposed by provider capability checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaSourceKind {
+    /// Base64 inline payload.
+    Base64,
+    /// Public or provider-resolvable URL.
+    Url,
+    /// Provider file ID.
+    FileId,
+    /// Provider file URI.
+    FileUri,
+}
+
+fn normalize_capability_model_name(model: &str) -> String {
+    model
+        .split('@')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_claude_vision_model(model: &str) -> bool {
+    model.contains("claude-3")
+        || model.contains("claude-4")
+        || model.contains("claude-sonnet-4")
+        || model.contains("claude-opus-4")
+        || model.contains("claude-haiku-4")
+}
+
+fn is_gemini_vision_model(model: &str) -> bool {
+    model.contains("gemini")
+}
+
+fn is_openai_vision_model(model: &str) -> bool {
+    model.starts_with("gpt-4o")
+        || model.starts_with("gpt-4.1")
+        || model.starts_with("gpt-4.5")
+        || model.starts_with("gpt-5")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+}
+
+fn is_openrouter_vision_model(model: &str) -> bool {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+    if is_openai_vision_model(model) {
+        return true;
+    }
+
+    let model = model.strip_prefix("anthropic/").unwrap_or(model);
+    if is_claude_vision_model(model) {
+        return true;
+    }
+
+    let model = model.strip_prefix("google/").unwrap_or(model);
+    is_gemini_vision_model(model)
 }
 
 /// Chat message role

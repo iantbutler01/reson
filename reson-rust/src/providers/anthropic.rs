@@ -21,7 +21,9 @@ use crate::providers::{
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::utils::{
+    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+};
 
 /// Anthropic API client
 #[derive(Clone)]
@@ -75,6 +77,9 @@ impl AnthropicClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::Anthropic, model)?;
+
         // Extract system message if present
         let (system, messages) = self.extract_system_message(messages)?;
 
@@ -86,7 +91,7 @@ impl AnthropicClient {
         let formatted_messages = self.wrap_string_content(formatted_messages);
 
         let mut request = serde_json::json!({
-            "model": if config.model.is_empty() { &self.model } else { &config.model },
+            "model": model,
             "max_tokens": config.max_tokens.unwrap_or(4096),
             "messages": formatted_messages,
             "stream": stream,

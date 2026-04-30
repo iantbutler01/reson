@@ -28,7 +28,10 @@ use crate::providers::{
 use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::ChatRole;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
-use crate::utils::{media_part_to_google_format, ConversationMessage, JsonStreamAccumulator};
+use crate::utils::{
+    media_part_to_google_format, validate_image_input_supported, ConversationMessage,
+    JsonStreamAccumulator,
+};
 
 #[cfg(feature = "google-adc")]
 use crate::utils::parse_json_value_strict_str;
@@ -875,6 +878,9 @@ impl GoogleGenAIClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::GoogleGenAI, model)?;
+
         // Extract system instruction if present
         let (system_instruction, messages) = self.extract_system_message(messages)?;
 

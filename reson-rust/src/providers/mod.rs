@@ -147,6 +147,15 @@ impl GenerationConfig {
         }
     }
 
+    /// Return the explicit request model, or the client default when unset.
+    pub fn effective_model<'a>(&'a self, client_model: &'a str) -> &'a str {
+        if self.model.is_empty() {
+            client_model
+        } else {
+            &self.model
+        }
+    }
+
     /// Set max tokens
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
@@ -480,6 +489,18 @@ mod tests {
         assert_eq!(config.max_tokens, Some(2048));
         assert_eq!(config.temperature, Some(0.5));
         assert!(config.native_tools);
+    }
+
+    #[test]
+    fn test_generation_config_effective_model() {
+        assert_eq!(
+            GenerationConfig::default().effective_model("client-model"),
+            "client-model"
+        );
+        assert_eq!(
+            GenerationConfig::new("request-model").effective_model("client-model"),
+            "request-model"
+        );
     }
 
     #[test]
