@@ -9,7 +9,6 @@
 //! Run with: cargo test --test integration_tests -- --ignored
 //! Or specific test: cargo test --test integration_tests test_anthropic_simple -- --ignored
 
-use reson_agentic::Tool;
 use reson_agentic::agentic;
 use reson_agentic::providers::{
     AnthropicClient, AnthropicProviderConfig, GenerationConfig, GoogleGenAIClient, InferenceClient,
@@ -24,6 +23,7 @@ use reson_agentic::types::{
     TokenUsage, ToolCall, ToolResult,
 };
 use reson_agentic::utils::ConversationMessage;
+use reson_agentic::Tool;
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -1185,10 +1185,10 @@ async fn test_anthropic_runtime_system_message_cache_marker_live() {
     let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
     let mut runtime = Runtime::new();
     runtime
-        .set_system_messages(vec![
-            ChatMessage::system(long_cacheable_text("runtime-system-1h"))
-                .with_cache_marker(CacheMarker::Ephemeral1h),
-        ])
+        .set_system_messages(vec![ChatMessage::system(long_cacheable_text(
+            "runtime-system-1h",
+        ))
+        .with_cache_marker(CacheMarker::Ephemeral1h)])
         .await;
 
     let params = RunParams {
@@ -1634,7 +1634,7 @@ async fn test_openrouter_with_tools() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_with_tools_streaming() {
     use futures::StreamExt;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     let mut last_error = None;
 

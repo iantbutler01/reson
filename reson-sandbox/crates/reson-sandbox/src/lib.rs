@@ -1213,7 +1213,10 @@ impl Session {
         }
 
         let endpoint = self.resolve_session_endpoint().await?;
-        let start_wait = self.sandbox.inner.cfg.connect_timeout + Duration::from_secs(15);
+        let start_wait = std::cmp::max(
+            self.sandbox.inner.cfg.connect_timeout,
+            self.sandbox.inner.cfg.portproxy_ready_timeout,
+        ) + Duration::from_secs(30);
         let timeout_secs = opts.timeout_secs.unwrap_or(30).max(1);
         let idle_timeout = Duration::from_secs(timeout_secs as u64 + 90);
         let target_node_id = self
@@ -1232,19 +1235,6 @@ impl Session {
             .await
         {
             Ok(state) => state,
-            Err(SandboxError::DaemonUnavailable(message))
-                if message.contains("distributed exec stream did not become ready") =>
-            {
-                return self
-                    .exec_via_control_plane_run_fallback(
-                        command,
-                        opts,
-                        control,
-                        endpoint,
-                        target_node_id,
-                    )
-                    .await;
-            }
             Err(err) => return Err(err),
         };
 
@@ -1590,99 +1580,6 @@ impl Session {
                         break;
                     }
                     _ => {}
-                }
-            }
-        });
-
-        Ok(ExecHandle {
-            input: input_tx,
-            events: Box::pin(ReceiverStream::new(event_rx)),
-        })
-    }
-
-    #[cfg(feature = "distributed-control")]
-    async fn exec_via_control_plane_run_fallback(
-        &self,
-        command: &str,
-        opts: ExecOptions,
-        control: &distributed::DistributedControlPlane,
-        endpoint: String,
-        target_node_id: String,
-    ) -> Result<ExecHandle> {
-        let timeout_secs = opts.timeout_secs.unwrap_or(30).max(1);
-        let shell = opts
-            .shell
-            .clone()
-            .unwrap_or_else(|| self.sandbox.inner.cfg.default_shell.clone());
-        let expected_fence = self.ownership_fence().await;
-        let command_id = control
-            .publish_command(
-                "exec.run",
-                format!("exec-run:{}", Uuid::new_v4()).as_str(),
-                json!({
-                    "session_id": self.session_id.as_str(),
-                    "vm_id": self.vm_id.as_str(),
-                    "endpoint": endpoint.as_str(),
-                    "target_node_id": target_node_id.as_str(),
-                    "command": command,
-                    "env": opts.env.clone(),
-                    "detach": opts.detach,
-                    "shell": shell,
-                    "timeout_secs": timeout_secs,
-                    "expected_fence": expected_fence.as_deref(),
-                }),
-            )
-            .await?;
-
-        let wait_timeout = self.sandbox.inner.cfg.connect_timeout + Duration::from_secs(15);
-        let control_for_task = control.clone();
-        let (input_tx, mut input_rx) = mpsc::channel(64);
-        let (event_tx, event_rx) = mpsc::channel(128);
-        tokio::spawn(async move {
-            while let Some(input) = input_rx.recv().await {
-                match input {
-                    ExecInput::Eof => break,
-                    ExecInput::Data(_) | ExecInput::Signal(_) | ExecInput::Resize { .. } => {}
-                }
-            }
-
-            match control_for_task
-                .wait_for_exec_result(command_id.as_str(), wait_timeout)
-                .await
-            {
-                Ok(result) => {
-                    if !result.stdout.is_empty() {
-                        let _ = event_tx
-                            .send(Ok(ExecEvent::Stdout(result.stdout.into_bytes())))
-                            .await;
-                    }
-                    if !result.stderr.is_empty() {
-                        let _ = event_tx
-                            .send(Ok(ExecEvent::Stderr(result.stderr.into_bytes())))
-                            .await;
-                    }
-                    if let Some(error) = result.error {
-                        let _ = event_tx
-                            .send(Err(SandboxError::DaemonUnavailable(error)))
-                            .await;
-                        return;
-                    }
-                    if result.timed_out {
-                        let _ = event_tx.send(Ok(ExecEvent::Timeout)).await;
-                        return;
-                    }
-                    if let Some(code) = result.exit_code {
-                        let _ = event_tx.send(Ok(ExecEvent::Exit(code))).await;
-                    } else {
-                        let _ = event_tx
-                            .send(Err(SandboxError::InvalidResponse(
-                                "distributed exec.run result missing exit code".to_string(),
-                            )))
-                            .await;
-                    }
-                }
-                Err(err) => {
-                    let _ = event_tx.send(Err(err)).await;
                 }
             }
         });
@@ -2176,11 +2073,24 @@ impl Sandbox {
             )
             .await?;
 
-            // @dive: Reattach path must boot first, then restore, so memory snapshots are applied with live monitor semantics.
-            let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
-            let _ = self
-                .restore_execution_state_if_needed(&session_id, &vm.id, &node_endpoint, &vm, false)
+            let endpoint_handoff = self
+                .session_attach_is_endpoint_handoff(&session_id, &node_endpoint)
                 .await?;
+            // @dive: Same-endpoint reattach only restores stopped VMs. Cross-endpoint
+            // handoff must restore even if stale metadata says Running; otherwise a
+            // secondary clone can be trusted before its execution snapshot is materialized.
+            if endpoint_handoff || vm.state != proto::vmd::v1::VmState::Running as i32 {
+                let _ = self
+                    .restore_execution_state_if_needed(
+                        &session_id,
+                        &vm.id,
+                        &node_endpoint,
+                        &vm,
+                        endpoint_handoff,
+                    )
+                    .await?;
+            }
+            let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
             self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
                 .await?;
             let next_fence = self
@@ -2384,11 +2294,24 @@ impl Sandbox {
         )
         .await?;
 
-        // @dive: Attach boot-before-restore ordering preserves memory-snapshot fidelity for Tier-B state recovery.
-        let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
-        let _ = self
-            .restore_execution_state_if_needed(session_id, &vm.id, &node_endpoint, &vm, false)
+        let endpoint_handoff = self
+            .session_attach_is_endpoint_handoff(session_id, &node_endpoint)
             .await?;
+        // @dive: Same-endpoint attach only restores stopped VMs. Cross-endpoint handoff
+        // must restore even if stale metadata says Running; otherwise a secondary clone
+        // can be trusted before its execution snapshot is materialized.
+        if endpoint_handoff || vm.state != proto::vmd::v1::VmState::Running as i32 {
+            let _ = self
+                .restore_execution_state_if_needed(
+                    session_id,
+                    &vm.id,
+                    &node_endpoint,
+                    &vm,
+                    endpoint_handoff,
+                )
+                .await?;
+        }
+        let vm = self.ensure_vm_running(&vm.id, &node_endpoint).await?;
         self.maybe_wait_for_session_guest_rpc(&vm.id, &node_endpoint)
             .await?;
         let next_fence = self
@@ -2982,6 +2905,29 @@ impl Sandbox {
         Ok(("default".to_string(), "default".to_string()))
     }
 
+    async fn session_attach_is_endpoint_handoff(
+        &self,
+        session_id: &str,
+        node_endpoint: &str,
+    ) -> Result<bool> {
+        let node_endpoint = normalize_endpoint(node_endpoint)?;
+        #[cfg(feature = "distributed-control")]
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route_endpoint) = control
+                .get_session_route(session_id)
+                .await?
+                .map(|route| route.endpoint)
+                .filter(|endpoint| !endpoint.trim().is_empty())
+            {
+                return Ok(normalize_endpoint(&route_endpoint)? != node_endpoint);
+            }
+        }
+
+        #[cfg(not(feature = "distributed-control"))]
+        let _ = session_id;
+        Ok(normalize_endpoint(&self.inner.cfg.endpoint)? != node_endpoint)
+    }
+
     async fn clear_session_route(
         &self,
         _session_id: Option<&str>,
@@ -3122,13 +3068,10 @@ impl Sandbox {
             if candidate == from_endpoint {
                 continue;
             }
-            if self
-                .find_vm_by_id_on_endpoint(vm_id, &candidate)
-                .await?
-                .is_none()
-            {
+            let Some(candidate_vm) = self.find_vm_by_id_on_endpoint(vm_id, &candidate).await?
+            else {
                 continue;
-            }
+            };
 
             #[cfg(feature = "distributed-control")]
             if let ControlBackend::Distributed(control) = &self.inner.control_backend {
@@ -3148,30 +3091,14 @@ impl Sandbox {
                     .await;
             }
 
-            let running_vm = match self.ensure_vm_running(vm_id, &candidate).await {
-                Ok(vm) => vm,
-                Err(_) => {
-                    #[cfg(feature = "distributed-control")]
-                    if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-                        let _ = control
-                            .publish_event(
-                                "stream.failed",
-                                json!({
-                                    "session_id": session_id,
-                                    "vm_id": vm_id,
-                                    "from_endpoint": from_endpoint,
-                                    "to_endpoint": candidate.clone(),
-                                    "stage": "ensure_vm_running",
-                                    "reason": reason,
-                                }),
-                            )
-                            .await;
-                    }
-                    continue;
-                }
-            };
             let restore_snapshot_id = match self
-                .restore_execution_state_if_needed(session_id, vm_id, &candidate, &running_vm, true)
+                .restore_execution_state_if_needed(
+                    session_id,
+                    vm_id,
+                    &candidate,
+                    &candidate_vm,
+                    true,
+                )
                 .await
             {
                 Ok(snapshot_id) => snapshot_id,
@@ -3192,6 +3119,29 @@ impl Sandbox {
                                     "stage": "execution_state_restore",
                                     "reason": reason,
                                     "error": err.to_string(),
+                                }),
+                            )
+                            .await;
+                    }
+                    continue;
+                }
+            };
+
+            let running_vm = match self.ensure_vm_running(vm_id, &candidate).await {
+                Ok(vm) => vm,
+                Err(_) => {
+                    #[cfg(feature = "distributed-control")]
+                    if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                        let _ = control
+                            .publish_event(
+                                "stream.failed",
+                                json!({
+                                    "session_id": session_id,
+                                    "vm_id": vm_id,
+                                    "from_endpoint": from_endpoint,
+                                    "to_endpoint": candidate.clone(),
+                                    "stage": "ensure_vm_running",
+                                    "reason": reason,
                                 }),
                             )
                             .await;

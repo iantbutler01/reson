@@ -18,10 +18,10 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, ProviderConfig, StreamChunk,
     TraceCallback,
 };
-use crate::retry::{RetryConfig, retry_with_backoff};
+use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
-use crate::utils::{ConversationMessage, convert_messages_to_provider_format};
+use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
 
 /// Anthropic API client
 #[derive(Clone)]
@@ -405,7 +405,7 @@ impl InferenceClient for AnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk};
+        use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
         use crate::utils::parse_sse_stream;
 
         let use_structured_outputs = config.output_schema.is_some();

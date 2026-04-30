@@ -1,7 +1,9 @@
-// @dive-file: Daemon-wide network service lifecycle for guest egress helpers such as the explicit HTTP/HTTPS proxy.
-// @dive-rel: Owned by vmd startup/shutdown so guest bootstrap and QEMU guestfwd have a real pod-local upstream to target.
+// @dive-file: Daemon-wide network service lifecycle for guest egress policy and proxying.
+// @dive-rel: Owned by vmd startup/shutdown so tap-captured guest traffic has pod-local policy services to target.
 // @dive-rel: Generates Envoy/CoreDNS config on disk and supervises both child processes with readiness probing.
+mod envoy_config;
 mod firewall;
+pub mod tap;
 mod vm_counters;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -28,8 +30,6 @@ pub use vm_counters::{VmProxyAccessEvent, VmProxyActivitySnapshot};
 
 const ENVOY_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const ENVOY_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const ENVOY_CLUSTER_NAME: &str = "dynamic_forward_proxy_cluster";
-const ENVOY_DNS_CACHE_NAME: &str = "dynamic_forward_proxy_cache_config";
 const COREDNS_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const COREDNS_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LIMIT_ENFORCER_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -115,6 +115,19 @@ pub struct VmProxyPolicyConfig {
     pub max_connections_per_minute: u32,
 }
 
+impl Default for VmProxyPolicyConfig {
+    fn default() -> Self {
+        Self {
+            nym_id: None,
+            domain_allowlist: None,
+            domain_blocklist: Vec::new(),
+            custom_port_allowlist: Vec::new(),
+            bandwidth_cap_mb_per_hour: 1024,
+            max_connections_per_minute: 1000,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct VmProxyListener {
     listen_addr: SocketAddr,
@@ -195,8 +208,8 @@ pub async fn start(config: &Config) -> Result<Option<NetworkServicesHandle>> {
 }
 
 fn needs_coredns(config: &Config) -> bool {
-    config.guest_network.dns_server.is_some()
-        || config.guest_network.http_proxy_upstream_addr.is_some()
+    let _ = config;
+    true
 }
 
 async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
@@ -497,17 +510,31 @@ async fn wait_for_listener(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<()> {
+    let probe_addr = listener_probe_addr(addr);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().context("poll child readiness")? {
             bail!("{label} exited before becoming ready: {status}");
         }
-        if TcpStream::connect(addr).await.is_ok() {
+        if TcpStream::connect(probe_addr).await.is_ok() {
             return Ok(());
         }
         tokio::time::sleep(poll_interval).await;
     }
     bail!("{label} did not become ready on {addr} within 5s");
+}
+
+fn listener_probe_addr(addr: SocketAddr) -> SocketAddr {
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    SocketAddr::new(
+        match addr {
+            SocketAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            SocketAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        },
+        addr.port(),
+    )
 }
 
 fn envoy_runtime_config(
@@ -532,7 +559,7 @@ fn envoy_runtime_config(
                 .map(|listener| listener.listen_addr)
         })
         .ok_or_else(|| anyhow!("at least one envoy listener is required"))?;
-    let dns_resolver_addr = config
+    let dns_bind_addr = config
         .network_services
         .coredns_bind_addr
         .parse::<SocketAddr>()
@@ -542,6 +569,17 @@ fn envoy_runtime_config(
                 config.network_services.coredns_bind_addr
             )
         })?;
+    let dns_resolver_addr = if dns_bind_addr.ip().is_unspecified() {
+        SocketAddr::new(
+            match dns_bind_addr {
+                SocketAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                SocketAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            },
+            dns_bind_addr.port(),
+        )
+    } else {
+        dns_bind_addr
+    };
     let admin_addr = config
         .network_services
         .envoy_admin_addr
@@ -564,7 +602,7 @@ fn envoy_runtime_config(
 fn envoy_runtime_paths(config: &Config) -> EnvoyRuntimePaths {
     let work_dir = Path::new(&config.data_dir).join("_network").join("envoy");
     EnvoyRuntimePaths {
-        config_path: work_dir.join("envoy.yaml"),
+        config_path: work_dir.join("envoy.json"),
         access_log_path: work_dir.join("access.log"),
         process_log_path: work_dir.join("process.log"),
         work_dir,
@@ -589,7 +627,7 @@ async fn validate_envoy_candidate_config(
         .with_context(|| format!("create envoy work dir {}", paths.work_dir.display()))?;
     let validation_path = paths
         .work_dir
-        .join(format!(".envoy-validate-{}.yaml", Uuid::new_v4()));
+        .join(format!(".envoy-validate-{}.json", Uuid::new_v4()));
 
     let result = async {
         write_envoy_config(
@@ -685,7 +723,7 @@ async fn write_envoy_config(
     dns_resolver_addr: SocketAddr,
     access_log_path: &Path,
 ) -> Result<()> {
-    let contents = render_envoy_config(
+    let contents = envoy_config::render(
         default_listen_addr,
         vm_proxy_policies,
         admin_addr,
@@ -749,377 +787,6 @@ fn render_coredns_config(bind_addr: SocketAddr, threat_hosts_path: &Path) -> Str
         port = bind_addr.port(),
         threat_hosts_path = threat_hosts_path.display(),
     )
-}
-
-fn render_envoy_config(
-    default_listen_addr: Option<SocketAddr>,
-    vm_proxy_policies: &BTreeMap<String, VmProxyListener>,
-    admin_addr: SocketAddr,
-    dns_resolver_addr: SocketAddr,
-    access_log_path: &Path,
-) -> String {
-    let admin_ip = admin_addr.ip();
-    let dns_resolver_ip = dns_resolver_addr.ip();
-    let access_log = access_log_path.display();
-    let mut listeners = String::new();
-    if let Some(listen_addr) = default_listen_addr {
-        listeners.push_str(&render_envoy_listener_block(
-            "listener_http_proxy",
-            listen_addr,
-            None,
-            None,
-            None,
-            dns_resolver_addr,
-            access_log.to_string().as_str(),
-        ));
-    }
-    for (vm_id, listener) in vm_proxy_policies {
-        listeners.push_str(&render_envoy_listener_block(
-            format!("listener_vm_{}", sanitize_listener_name(vm_id)).as_str(),
-            listener.listen_addr,
-            Some(listener.policy.domain_blocklist.as_slice()),
-            Some(&listener.policy),
-            Some(vm_id.as_str()),
-            dns_resolver_addr,
-            access_log.to_string().as_str(),
-        ));
-    }
-    format!(
-        r#"admin:
-  access_log_path: {access_log}
-  address:
-    socket_address:
-      address: {admin_ip}
-      port_value: {admin_port}
-static_resources:
-  listeners:
-{listeners}
-  clusters:
-  - name: {cluster_name}
-    connect_timeout: 10s
-    lb_policy: CLUSTER_PROVIDED
-    cluster_type:
-      name: envoy.clusters.dynamic_forward_proxy
-      typed_config:
-        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
-        dns_cache_config:
-          name: {dns_cache_name}
-          dns_lookup_family: V4_ONLY
-          typed_dns_resolver_config:
-            name: envoy.network.dns_resolver.cares
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
-              resolvers:
-              - socket_address:
-                  address: {dns_resolver_ip}
-                  port_value: {dns_resolver_port}
-              dns_resolver_options:
-                use_tcp_for_dns_lookups: true
-                no_default_search_domain: true
-"#,
-        access_log = access_log,
-        admin_ip = admin_ip,
-        admin_port = admin_addr.port(),
-        dns_resolver_ip = dns_resolver_ip,
-        dns_resolver_port = dns_resolver_addr.port(),
-        listeners = listeners,
-        cluster_name = ENVOY_CLUSTER_NAME,
-        dns_cache_name = ENVOY_DNS_CACHE_NAME,
-    )
-}
-
-fn render_envoy_listener_block(
-    name: &str,
-    listen_addr: SocketAddr,
-    domain_blocklist: Option<&[String]>,
-    policy: Option<&VmProxyPolicyConfig>,
-    vm_id: Option<&str>,
-    dns_resolver_addr: SocketAddr,
-    access_log_path: &str,
-) -> String {
-    let additional_block_regex = domain_blocklist
-        .filter(|entries| !entries.is_empty())
-        .map(|entries| domain_list_regex(entries, None))
-        .unwrap_or_default();
-    let allow_regex = policy.map(|policy| {
-        let mut allowed_ports = vec![80_u16, 443_u16];
-        allowed_ports.extend(policy.custom_port_allowlist.iter().copied());
-        allowed_ports.sort_unstable();
-        allowed_ports.dedup();
-        authority_allow_regex(policy.domain_allowlist.as_deref(), &allowed_ports)
-    });
-    let additional_block_regex = escape_yaml_double_quoted(&additional_block_regex);
-    let allow_regex = allow_regex.as_deref().map(escape_yaml_double_quoted);
-    let system_block_routes = render_envoy_system_block_routes();
-    let allow_routes = if let Some(allow_regex) = allow_regex {
-        format!(
-            r#"              - match:
-                  connect_matcher: {{}}
-                  headers:
-                  - name: ":authority"
-                    string_match:
-                      safe_regex:
-                        regex: "{allow_regex}"
-                route:
-                  cluster: {cluster_name}
-                  upgrade_configs:
-                  - upgrade_type: CONNECT
-                    connect_config: {{}}
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: ":authority"
-                    string_match:
-                      safe_regex:
-                        regex: "{allow_regex}"
-                route:
-                  cluster: {cluster_name}
-                  timeout: 0s
-              - match:
-                  connect_matcher: {{}}
-                direct_response:
-                  status: 403
-              - match:
-                  prefix: "/"
-                direct_response:
-                  status: 403
-"#,
-            allow_regex = allow_regex,
-            cluster_name = ENVOY_CLUSTER_NAME,
-        )
-    } else {
-        format!(
-            r#"              - match:
-                  connect_matcher: {{}}
-                route:
-                  cluster: {cluster_name}
-                  upgrade_configs:
-                  - upgrade_type: CONNECT
-                    connect_config: {{}}
-              - match:
-                  prefix: "/"
-                route:
-                  cluster: {cluster_name}
-                  timeout: 0s
-"#,
-            cluster_name = ENVOY_CLUSTER_NAME,
-        )
-    };
-    let blocklist_routes = if additional_block_regex.is_empty() {
-        String::new()
-    } else {
-        format!(
-            r#"              - match:
-                  connect_matcher: {{}}
-                  headers:
-                  - name: ":authority"
-                    string_match:
-                      safe_regex:
-                        regex: "{additional_block_regex}"
-                direct_response:
-                  status: 403
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: ":authority"
-                    string_match:
-                      safe_regex:
-                        regex: "{additional_block_regex}"
-                direct_response:
-                  status: 403
-"#
-        )
-    };
-    format!(
-        r#"  - name: {name}
-    address:
-      socket_address:
-        address: {listen_ip}
-        port_value: {listen_port}
-    filter_chains:
-    - filters:
-      - name: envoy.filters.network.http_connection_manager
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-          stat_prefix: {name}
-          access_log:
-          - name: envoy.access_loggers.file
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-              path: {access_log_path}
-              log_format:
-                json_format:
-                  timestamp: "%START_TIME(%Y-%m-%dT%H:%M:%S.%3fZ)%"
-                  vm_id: "{vm_id}"
-                  nym_id: "{nym_id}"
-                  listener: "{name}"
-                  authority: "%REQ(:AUTHORITY)%"
-                  method: "%REQ(:METHOD)%"
-                  path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
-                  response_code: "%RESPONSE_CODE%"
-                  response_code_details: "%RESPONSE_CODE_DETAILS%"
-                  bytes_received: "%BYTES_RECEIVED%"
-                  bytes_sent: "%BYTES_SENT%"
-                  requested_server_name: "%REQUESTED_SERVER_NAME%"
-                  upstream_host: "%UPSTREAM_HOST%"
-          route_config:
-            name: {name}_route
-            virtual_hosts:
-            - name: {name}_proxy
-              domains: ["*"]
-              routes:
-{system_block_routes}{blocklist_routes}{allow_routes}          http_filters:
-          - name: envoy.filters.http.dynamic_forward_proxy
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
-              dns_cache_config:
-                name: {dns_cache_name}
-                dns_lookup_family: V4_ONLY
-                typed_dns_resolver_config:
-                  name: envoy.network.dns_resolver.cares
-                  typed_config:
-                    "@type": type.googleapis.com/envoy.extensions.network.dns_resolver.cares.v3.CaresDnsResolverConfig
-                    resolvers:
-                    - socket_address:
-                        address: {dns_resolver_ip}
-                        port_value: {dns_resolver_port}
-                    dns_resolver_options:
-                      use_tcp_for_dns_lookups: true
-                      no_default_search_domain: true
-          - name: envoy.filters.http.router
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-"#,
-        name = name,
-        listen_ip = listen_addr.ip(),
-        listen_port = listen_addr.port(),
-        vm_id = vm_id.unwrap_or_default(),
-        nym_id = policy
-            .and_then(|value| value.nym_id.as_deref())
-            .unwrap_or_default(),
-        access_log_path = access_log_path,
-        system_block_routes = system_block_routes,
-        blocklist_routes = blocklist_routes,
-        allow_routes = allow_routes,
-        dns_cache_name = ENVOY_DNS_CACHE_NAME,
-        dns_resolver_ip = dns_resolver_addr.ip(),
-        dns_resolver_port = dns_resolver_addr.port(),
-    )
-}
-
-fn authority_allow_regex(domain_allowlist: Option<&[String]>, allowed_ports: &[u16]) -> String {
-    let host_regex = match domain_allowlist {
-        Some(domains) => {
-            if domains.is_empty() {
-                String::from("__nym_no_hosts_allowed__")
-            } else {
-                domains
-                    .iter()
-                    .map(|domain| format!(r"(.*\.)?{}", escape_regex_literal(domain)))
-                    .collect::<Vec<_>>()
-                    .join("|")
-            }
-        }
-        _ => String::from(r"[^:]+"),
-    };
-    let ports_regex = allowed_ports
-        .iter()
-        .map(|port| port.to_string())
-        .collect::<Vec<_>>()
-        .join("|");
-    format!(r"(?i)^({host_regex})(?::({ports_regex}))?$")
-}
-
-fn domain_list_regex(domains: &[String], allowed_ports: Option<&[u16]>) -> String {
-    let hosts = domains
-        .iter()
-        .map(|domain| format!(r"(.*\.)?{}", escape_regex_literal(domain)))
-        .collect::<Vec<_>>()
-        .join("|");
-    match allowed_ports {
-        Some(ports) if !ports.is_empty() => {
-            let ports = ports
-                .iter()
-                .map(|port| port.to_string())
-                .collect::<Vec<_>>()
-                .join("|");
-            format!(r"(?i)^({hosts})(?::({ports}))?$")
-        }
-        _ => format!(r"(?i)^({hosts})(?::\d+)?$"),
-    }
-}
-
-fn escape_regex_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
-                escaped.push('\\');
-                escaped.push(ch);
-            }
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn escape_yaml_double_quoted(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn render_envoy_system_block_routes() -> String {
-    [
-        r"(?i)^10\..*",
-        r"(?i)^172\.(1[6-9]|2[0-9]|3[0-1])\..*",
-        r"(?i)^192\.168\..*",
-        r"(?i)^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\..*",
-        r"(?i)^(.*\.)?svc\.cluster\.local(?::\d+)?$",
-        r"(?i)^(dns\.google|cloudflare-dns\.com|dns\.quad9\.net|one\.one\.one\.one)(?::\d+)?$",
-        r"(?i)^.*:(25|465|587|6667|6697)$",
-    ]
-    .into_iter()
-    .map(render_envoy_regex_deny_routes)
-    .collect()
-}
-
-fn render_envoy_regex_deny_routes(regex: &str) -> String {
-    let regex = escape_yaml_double_quoted(regex);
-    format!(
-        r#"              - match:
-                  connect_matcher: {{}}
-                  headers:
-                  - name: ":authority"
-                    string_match:
-                      safe_regex:
-                        regex: "{regex}"
-                direct_response:
-                  status: 403
-              - match:
-                  prefix: "/"
-                  headers:
-                  - name: ":authority"
-                    string_match:
-                      safe_regex:
-                        regex: "{regex}"
-                direct_response:
-                  status: 403
-"#
-    )
-}
-
-fn sanitize_listener_name(vm_id: &str) -> String {
-    vm_id
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
 }
 
 fn spawn_limit_enforcer(controller: Arc<tokio::sync::Mutex<Option<NetworkController>>>) {
@@ -1459,7 +1126,9 @@ pub async fn register_vm_proxy_policy(
             conn_deltas: VecDeque::new(),
             byte_deltas: VecDeque::new(),
         });
-    firewall::allow_proxy_listener(listen_addr)?;
+    if !listen_addr.ip().is_unspecified() {
+        firewall::allow_proxy_listener(listen_addr)?;
+    }
     Ok(())
 }
 
@@ -1539,7 +1208,9 @@ pub async fn unregister_vm_proxy_policy(vm_id: &str) -> Result<()> {
         }
     }
     if let Some(listener) = removed_listener {
-        firewall::revoke_proxy_listener(listener.listen_addr)?;
+        if !listener.listen_addr.ip().is_unspecified() {
+            firewall::revoke_proxy_listener(listener.listen_addr)?;
+        }
     }
     Ok(())
 }
@@ -1702,111 +1373,6 @@ mod tests {
         assert!(rendered.contains("hosts /tmp/threat-domains.hosts"));
         assert!(rendered.contains("forward . 1.1.1.1 8.8.8.8"));
         assert!(rendered.contains("cache 30"));
-    }
-
-    #[test]
-    fn render_envoy_config_includes_listener_admin_and_dns_cache() {
-        let rendered = render_envoy_config(
-            Some("127.0.0.1:3128".parse().expect("listen addr")),
-            &BTreeMap::new(),
-            "127.0.0.1:9901".parse().expect("admin addr"),
-            "127.0.0.53:53".parse().expect("dns resolver addr"),
-            Path::new("/tmp/envoy-access.log"),
-        );
-        assert!(rendered.contains("address: 127.0.0.1"));
-        assert!(rendered.contains("port_value: 3128"));
-        assert!(rendered.contains("port_value: 9901"));
-        assert!(rendered.contains("address: 127.0.0.53"));
-        assert!(rendered.contains("port_value: 53"));
-        assert!(rendered.contains("connect_matcher"));
-        assert!(rendered.contains("envoy.filters.http.dynamic_forward_proxy"));
-        assert!(rendered.contains("envoy.clusters.dynamic_forward_proxy"));
-        assert!(rendered.contains("/tmp/envoy-access.log"));
-        assert!(rendered.contains(r#"svc\\.cluster\\.local"#));
-        assert!(rendered.contains(r#"cloudflare-dns\\.com"#));
-        assert!(rendered.contains("json_format"));
-        assert!(rendered.contains("authority: \"%REQ(:AUTHORITY)%\""));
-    }
-
-    #[test]
-    fn authority_allow_regex_includes_custom_ports_and_domains() {
-        let regex = authority_allow_regex(Some(&["github.com".to_string()]), &[80, 443, 8080]);
-        assert!(regex.contains("github\\.com"));
-        assert!(regex.contains("8080"));
-    }
-
-    #[test]
-    fn render_envoy_config_embeds_vm_listener_identity() {
-        let mut listeners = BTreeMap::new();
-        listeners.insert(
-            "vm-123".to_string(),
-            VmProxyListener {
-                listen_addr: "127.0.0.1:43128".parse().expect("listen addr"),
-                policy: VmProxyPolicyConfig {
-                    nym_id: Some("nym-123".to_string()),
-                    domain_allowlist: Some(vec!["api.github.com".to_string()]),
-                    domain_blocklist: vec!["bad.example".to_string()],
-                    custom_port_allowlist: vec![8080],
-                    bandwidth_cap_mb_per_hour: 1024,
-                    max_connections_per_minute: 1000,
-                },
-            },
-        );
-        let rendered = render_envoy_config(
-            None,
-            &listeners,
-            "127.0.0.1:9901".parse().expect("admin addr"),
-            "127.0.0.53:53".parse().expect("dns resolver addr"),
-            Path::new("/tmp/envoy-access.log"),
-        );
-        assert!(rendered.contains("vm_id: \"vm-123\""));
-        assert!(rendered.contains("nym_id: \"nym-123\""));
-        assert!(rendered.contains(r#"bad\\.example"#));
-        assert!(rendered.contains(r#"api\\.github\\.com"#));
-        assert!(rendered.contains("8080"));
-    }
-
-    #[test]
-    fn render_envoy_config_uses_custom_dns_resolver_for_vm_listener() {
-        let mut listeners = BTreeMap::new();
-        listeners.insert(
-            "vm-123".to_string(),
-            VmProxyListener {
-                listen_addr: "127.0.0.1:43128".parse().expect("listen addr"),
-                policy: VmProxyPolicyConfig {
-                    nym_id: Some("nym-123".to_string()),
-                    domain_allowlist: None,
-                    domain_blocklist: Vec::new(),
-                    custom_port_allowlist: Vec::new(),
-                    bandwidth_cap_mb_per_hour: 1024,
-                    max_connections_per_minute: 1000,
-                },
-            },
-        );
-        let rendered = render_envoy_config(
-            None,
-            &listeners,
-            "127.0.0.1:9901".parse().expect("admin addr"),
-            "127.0.0.77:5301".parse().expect("dns resolver addr"),
-            Path::new("/tmp/envoy-access.log"),
-        );
-        assert!(rendered.contains("address: 127.0.0.77"));
-        assert!(rendered.contains("port_value: 5301"));
-        assert!(!rendered.contains("address: 127.0.0.53"));
-    }
-
-    #[test]
-    fn render_envoy_config_escapes_regexes_for_yaml() {
-        let rendered = render_envoy_config(
-            Some("127.0.0.1:3128".parse().expect("listen addr")),
-            &BTreeMap::new(),
-            "127.0.0.1:9901".parse().expect("admin addr"),
-            "127.0.0.53:53".parse().expect("dns resolver addr"),
-            Path::new("/tmp/envoy-access.log"),
-        );
-        assert!(rendered.contains(r#"svc\\.cluster\\.local"#));
-        assert!(rendered.contains(r#"cloudflare-dns\\.com"#));
-        assert!(rendered.contains(r#"10\\..*"#));
     }
 
     #[test]

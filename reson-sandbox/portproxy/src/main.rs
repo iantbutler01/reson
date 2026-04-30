@@ -35,7 +35,7 @@ use std::process;
 use std::time::Duration;
 
 use anyhow::Context;
-use child_tracker::ChildTracker;
+use child_tracker::{ChildExit, ChildTracker};
 use clap::Parser;
 use cli::Args;
 use daemon::DaemonRegistry;
@@ -219,25 +219,51 @@ fn token_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
+const CHILD_REAPER_FALLBACK_INTERVAL: Duration = Duration::from_millis(250);
+
 async fn reap_zombies(tracker: ChildTracker) {
+    let Ok(mut sigchld) = signal(SignalKind::child()) else {
+        warn!("failed to install SIGCHLD handler; falling back to child reaper polling");
+        loop {
+            reap_available_children(&tracker);
+            sleep(CHILD_REAPER_FALLBACK_INTERVAL).await;
+        }
+    };
+
+    loop {
+        reap_available_children(&tracker);
+        tokio::select! {
+            _ = sigchld.recv() => {}
+            _ = sleep(CHILD_REAPER_FALLBACK_INTERVAL) => {}
+        }
+    }
+}
+
+fn reap_available_children(tracker: &ChildTracker) {
     use nix::errno::Errno;
 
     loop {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => sleep(Duration::from_secs(5)).await,
+            Ok(WaitStatus::StillAlive) => break,
             Ok(WaitStatus::Exited(pid, status)) => {
-                info!("Reaped pid {} with status {}", pid, status);
-                tracker.unregister(pid.as_raw()).await;
+                if tracker.record_exit(pid.as_raw(), ChildExit::Exited(status)) {
+                    info!("Reaped tracked pid {} with status {}", pid, status);
+                } else {
+                    info!("Reaped untracked pid {} with status {}", pid, status);
+                }
             }
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                info!("Reaped pid {} terminated by {:?}", pid, signal);
-                tracker.unregister(pid.as_raw()).await;
+                if tracker.record_exit(pid.as_raw(), ChildExit::Signaled(signal as i32)) {
+                    info!("Reaped tracked pid {} terminated by {:?}", pid, signal);
+                } else {
+                    info!("Reaped untracked pid {} terminated by {:?}", pid, signal);
+                }
             }
-            Ok(_) => sleep(Duration::from_secs(1)).await,
-            Err(Errno::ECHILD) => sleep(Duration::from_secs(5)).await,
+            Ok(_) => continue,
+            Err(Errno::ECHILD) => break,
             Err(err) => {
                 warn!("waitpid failed: {}", err);
-                sleep(Duration::from_secs(1)).await;
+                break;
             }
         }
     }
@@ -257,7 +283,7 @@ async fn forward_signals(tracker: ChildTracker) -> anyhow::Result<()> {
         received
     );
 
-    let pids = tracker.snapshot().await;
+    let pids = tracker.snapshot();
     for pid in pids {
         if pid <= 0 {
             continue;

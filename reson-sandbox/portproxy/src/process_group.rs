@@ -30,3 +30,10 @@ pub fn signal_process_group_or_pid(pid: i32, signal: Signal) -> Result<(), nix::
         Err(err) => Err(err),
     }
 }
+
+pub fn kill_process_group_or_child(pid: i32, child: &mut tokio::process::Child) {
+    if pid > 0 && signal_process_group_or_pid(pid, Signal::SIGKILL).is_ok() {
+        return;
+    }
+    let _ = child.start_kill();
+}

@@ -292,7 +292,10 @@ pub async fn wait_for_running(monitor: &MonitorHandle, timeout: Duration) -> Res
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("timeout waiting for VM to report running state");
+            bail!(
+                "timeout waiting for VM to report running state (last qmp status: {})",
+                status.status
+            );
         }
         sleep(Duration::from_millis(500)).await;
     }

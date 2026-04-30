@@ -252,7 +252,9 @@ pub fn install(config: &Config) -> Result<FirewallHandle> {
         "--dports",
         "80,443",
         "-j",
-        "DROP",
+        "REJECT",
+        "--reject-with",
+        "tcp-reset",
     ])?;
     append_rule(&[
         "-p",
@@ -262,7 +264,9 @@ pub fn install(config: &Config) -> Result<FirewallHandle> {
         "--dports",
         "80,443",
         "-j",
-        "DROP",
+        "REJECT",
+        "--reject-with",
+        "icmp-port-unreachable",
     ])?;
     if dns_addr.is_some() {
         append_rule(&["-p", "udp", "--dport", "53", "-j", "DROP"])?;
@@ -429,11 +433,24 @@ fn allow_private_webrtc_udp(config: &Config) -> bool {
     !config.ha_mode
 }
 
-fn guest_dns_redirect_addr(config: &Config) -> Option<&str> {
+fn guest_dns_redirect_addr(config: &Config) -> Option<String> {
     if config.guest_network.dns_server.is_some()
         || config.guest_network.http_proxy_upstream_addr.is_some()
     {
-        Some(config.network_services.coredns_bind_addr.as_str())
+        match config
+            .network_services
+            .coredns_bind_addr
+            .parse::<SocketAddr>()
+        {
+            Ok(addr) if addr.ip().is_unspecified() => Some(
+                SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    addr.port(),
+                )
+                .to_string(),
+            ),
+            _ => Some(config.network_services.coredns_bind_addr.clone()),
+        }
     } else {
         None
     }
@@ -603,6 +620,7 @@ fn install_service_private_egress_rules(
     cgroup_path: &str,
     dns_resolver_addr: Option<SocketAddr>,
 ) -> Result<()> {
+    ensure_service_established_allow_rule(service, cgroup_path)?;
     if let Some(dns_addr) = dns_resolver_addr {
         for protocol in ["udp", "tcp"] {
             ensure_service_dns_allow_rule(service, cgroup_path, dns_addr, protocol)?;
@@ -633,6 +651,14 @@ fn remove_service_private_egress_rules(
             .status()
             .with_context(|| format!("remove {service} private egress DROP rule"))?;
     }
+    let _ = Command::new("iptables")
+        .args(service_established_allow_rule_args(
+            "-D",
+            service,
+            cgroup_path,
+        ))
+        .status()
+        .with_context(|| format!("remove {service} established egress allow rule"))?;
     if let Some(dns_addr) = dns_resolver_addr {
         for protocol in ["udp", "tcp"] {
             let _ = Command::new("iptables")
@@ -648,6 +674,27 @@ fn remove_service_private_egress_rules(
         }
     }
     Ok(())
+}
+
+fn ensure_service_established_allow_rule(service: &str, cgroup_path: &str) -> Result<()> {
+    let check_args = service_established_allow_rule_args("-C", service, cgroup_path);
+    if Command::new("iptables")
+        .args(&check_args)
+        .status()
+        .with_context(|| format!("check {service} established egress allow rule"))?
+        .success()
+    {
+        return Ok(());
+    }
+
+    // Envoy accepts proxy clients over loopback via QEMU guestfwd. Keep new
+    // private connects blocked, but allow replies for already-accepted clients.
+    run_iptables(service_established_allow_rule_args(
+        "-I",
+        service,
+        cgroup_path,
+    ))
+    .with_context(|| format!("install {service} established egress allow rule"))
 }
 
 fn ensure_service_dns_allow_rule(
@@ -720,6 +767,33 @@ fn service_dns_allow_rule_args(
         dns_addr.ip().to_string(),
         "--dport".to_string(),
         dns_addr.port().to_string(),
+        "-j".to_string(),
+        "ACCEPT".to_string(),
+    ]
+}
+
+fn service_established_allow_rule_args(
+    operation: &'static str,
+    service: &str,
+    cgroup_path: &str,
+) -> Vec<String> {
+    vec![
+        "-t".to_string(),
+        FILTER_TABLE.to_string(),
+        operation.to_string(),
+        "OUTPUT".to_string(),
+        "-m".to_string(),
+        "comment".to_string(),
+        "--comment".to_string(),
+        service_private_egress_comment(service),
+        "-m".to_string(),
+        "cgroup".to_string(),
+        "--path".to_string(),
+        cgroup_path.to_string(),
+        "-m".to_string(),
+        "conntrack".to_string(),
+        "--ctstate".to_string(),
+        "ESTABLISHED,RELATED".to_string(),
         "-j".to_string(),
         "ACCEPT".to_string(),
     ]
@@ -1434,11 +1508,23 @@ mod tests {
         assert_eq!(guest_dns_redirect_addr(&cfg), None);
 
         cfg.guest_network.dns_server = Some("10.0.2.3".to_string());
-        assert_eq!(guest_dns_redirect_addr(&cfg), Some("127.0.0.53:53"));
+        assert_eq!(
+            guest_dns_redirect_addr(&cfg).as_deref(),
+            Some("127.0.0.53:53")
+        );
 
         cfg.guest_network = GuestNetworkConfig::default();
         cfg.guest_network.http_proxy_upstream_addr = Some("127.0.0.1:3128".to_string());
-        assert_eq!(guest_dns_redirect_addr(&cfg), Some("127.0.0.53:53"));
+        assert_eq!(
+            guest_dns_redirect_addr(&cfg).as_deref(),
+            Some("127.0.0.53:53")
+        );
+
+        cfg.network_services.coredns_bind_addr = "0.0.0.0:15053".to_string();
+        assert_eq!(
+            guest_dns_redirect_addr(&cfg).as_deref(),
+            Some("127.0.0.1:15053")
+        );
     }
 
     #[test]
@@ -1482,6 +1568,30 @@ mod tests {
             args.iter()
                 .any(|arg| arg == "reson-service-private-egress:envoy")
         );
+    }
+
+    #[test]
+    fn service_established_allow_rule_preserves_loopback_replies_only() {
+        let cgroup_path = "/kubepods.slice/pod123/reson-services/envoy-1234";
+        let args = service_established_allow_rule_args("-I", "envoy", cgroup_path);
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--path" && pair[1] == cgroup_path)
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-m" && pair[1] == "conntrack")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--ctstate" && pair[1] == "ESTABLISHED,RELATED")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-j" && pair[1] == "ACCEPT")
+        );
+        assert!(!args.windows(2).any(|pair| pair[0] == "-d"));
     }
 
     #[test]

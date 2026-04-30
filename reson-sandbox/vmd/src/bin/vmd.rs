@@ -3,7 +3,7 @@
 // @dive-rel: Must stay aligned with vmd/src/config.rs defaults so CLI overrides preserve policy invariants.
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use vmd_rs::app;
 use vmd_rs::config::{
@@ -398,22 +398,69 @@ async fn main() -> Result<()> {
         tls: security.tls,
     };
 
-    init_tracing(&cfg.log_level)?;
+    let _tracing_guard = init_tracing(&cfg.log_level)?;
     app::run_server(cfg).await
 }
 
-fn init_tracing(level: &str) -> Result<()> {
+struct TracingGuard {
+    tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
+
+impl Drop for TracingGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.tracer_provider.take()
+            && let Err(error) = provider.shutdown()
+        {
+            eprintln!("failed shutting down vmd tracer provider: {error}");
+        }
+    }
+}
+
+fn init_tracing(level: &str) -> Result<TracingGuard> {
     let filter = EnvFilter::try_new(level)
         .or_else(|_| EnvFilter::try_new(format!("vmd_rs={level}")))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
+    let fmt_layer = fmt::layer().with_target(false).compact();
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
-    Ok(())
+    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+
+        let service_name = std::env::var("OTEL_SERVICE_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "reson-vmd".to_string());
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .build()
+            .expect("failed to build OTLP span exporter");
+
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name(service_name.clone())
+                    .build(),
+            )
+            .build();
+
+        let tracer = provider.tracer(service_name.clone());
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        registry.with(otel_layer).init();
+        tracing::info!(%endpoint, service_name = %service_name, "opentelemetry tracing enabled");
+        return Ok(TracingGuard {
+            tracer_provider: Some(provider),
+        });
+    }
+
+    registry.init();
+
+    Ok(TracingGuard {
+        tracer_provider: None,
+    })
 }
 
 fn resolve_secret(inline: Option<String>, file_path: Option<&str>) -> Result<Option<String>> {

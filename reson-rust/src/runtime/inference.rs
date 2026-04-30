@@ -419,7 +419,10 @@ fn generate_tool_schemas(
     // For each tool, generate schema
     let mut schemas = Vec::new();
 
-    for (tool_name, _tool_fn) in tools.iter() {
+    let mut tool_names: Vec<&String> = tools.keys().collect();
+    tool_names.sort();
+
+    for tool_name in tool_names {
         // Check if we have schema info for this tool
         let tool_schema = if let Some(schema_info) = tool_schemas.get(tool_name) {
             // Build properties and required from field descriptions
@@ -1142,6 +1145,32 @@ mod tests {
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn test_generate_tool_schemas_uses_stable_name_order() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "zeta".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("z".to_string()))),
+        );
+        tools.insert(
+            "alpha".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("a".to_string()))),
+        );
+        tools.insert(
+            "beta".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("b".to_string()))),
+        );
+
+        let schemas =
+            generate_tool_schemas(&tools, &HashMap::new(), "anthropic:claude-3").expect("schemas");
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|schema| schema["name"].as_str())
+            .collect();
+
+        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
     }
 
     #[test]

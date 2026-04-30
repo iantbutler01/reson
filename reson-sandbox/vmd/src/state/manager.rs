@@ -219,21 +219,17 @@ impl Manager {
             .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
             .map_err(ManagerError::Other)?;
 
-        match metadata.get(META_NYM_NETWORK_POLICY) {
+        let policy = match metadata.get(META_NYM_NETWORK_POLICY) {
             Some(policy_json) if !policy_json.trim().is_empty() => {
-                let policy = serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
+                serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
                     .with_context(|| format!("parse vm network policy for {vm_id}"))
-                    .map_err(ManagerError::Other)?;
-                network::register_vm_proxy_policy(vm_id, listen_addr, policy)
-                    .await
-                    .map_err(ManagerError::Other)?;
+                    .map_err(ManagerError::Other)?
             }
-            _ => {
-                network::unregister_vm_proxy_policy(vm_id)
-                    .await
-                    .map_err(ManagerError::Other)?;
-            }
-        }
+            _ => network::VmProxyPolicyConfig::default(),
+        };
+        network::register_vm_proxy_policy(vm_id, listen_addr, policy)
+            .await
+            .map_err(ManagerError::Other)?;
 
         Ok(())
     }
@@ -871,7 +867,8 @@ impl Manager {
                         .cloned()
                         .map(map_bootstrap_shared_mount)
                         .collect(),
-                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
+                    network: Some(map_bootstrap_network(&child_meta)),
+                    http_proxy_url: None,
                     portproxy_auth_token: child_meta
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -1019,7 +1016,8 @@ impl Manager {
                         .cloned()
                         .map(map_bootstrap_shared_mount)
                         .collect(),
-                    http_proxy_url: self.cfg.guest_network.http_proxy_url(),
+                    network: Some(map_bootstrap_network(&child_meta)),
+                    http_proxy_url: None,
                     portproxy_auth_token: child_meta
                         .metadata
                         .get(META_PORTPROXY_AUTH_TOKEN)
@@ -1136,6 +1134,7 @@ impl Manager {
             .ok_or(ManagerError::SnapshotNotFound)
     }
 
+    #[instrument(skip(self, params), fields(vm_id = %vm_id))]
     pub async fn create_snapshot(
         &self,
         vm_id: &str,
@@ -1285,16 +1284,42 @@ impl Manager {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn start_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
+        let cfg = self.cfg.clone();
+        let host_arch = self.host_arch.clone();
+        let id = id.to_string();
 
-        let (binary, meta_snapshot, vm_dir, qmp_path, pid_path, log_path) = {
+        // @dive: Launch has external side effects (FUSE mounts, virtiofsd, qemu). Run it
+        //        in an owned task so caller cancellation/timeouts don't drop the launch
+        //        future halfway through and leave untracked local runtime behind.
+        match tokio::spawn(async move { Self::start_vm_inner(cfg, host_arch, vm, id).await }).await
+        {
+            Ok(result) => result,
+            Err(err) => Err(ManagerError::Other(anyhow!(
+                "start_vm launch task failed: {err}"
+            ))),
+        }
+    }
+
+    async fn start_vm_inner(
+        cfg: Config,
+        host_arch: String,
+        vm: Arc<Vm>,
+        id: String,
+    ) -> ManagerResult<VmMetadata> {
+        let id = id.as_str();
+
+        let (binary, meta_snapshot, vm_dir, qmp_path, pid_path, log_path, cleanup_stale_sidecars) = {
             let mut inner = vm.lock().await;
             if matches!(inner.runtime.state, VmState::Running) {
                 return Ok(inner.metadata.clone());
             }
+            let starting_from_state = inner.runtime.state;
 
-            let binary = self.qemu_binary_for_arch(&inner.metadata.architecture)?;
+            let binary =
+                Self::qemu_binary_for_arch_from(&cfg, &host_arch, &inner.metadata.architecture)?;
 
             let vm_dir = vm.dir.clone();
             let qmp_path = inner.runtime.qmp_path.clone();
@@ -1358,39 +1383,80 @@ impl Manager {
             let snapshot = inner.metadata.clone();
             save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
 
-            (binary, snapshot, vm_dir, qmp_path, pid_path, log_path)
+            (
+                binary,
+                snapshot,
+                vm_dir,
+                qmp_path,
+                pid_path,
+                log_path,
+                reclaimed_stale_runtime
+                    || matches!(
+                        starting_from_state,
+                        VmState::Creating | VmState::Stopped | VmState::Error
+                    ),
+            )
         };
         let mut meta_snapshot = meta_snapshot;
+        if cleanup_stale_sidecars {
+            cleanup_stale_runtime_sidecars(id, vm_dir.as_path()).await;
+        }
 
-        let mut port_map = HashMap::new();
-        port_map.insert(meta_snapshot.network.proxy_port, 13337);
-        port_map.insert(meta_snapshot.network.rpc_port, 13338);
-        let vm_proxy_upstream_addr =
-            if let Some(policy_json) = meta_snapshot.metadata.get(META_NYM_NETWORK_POLICY) {
-                let policy = serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
-                    .with_context(|| format!("parse vm network policy for {id}"))
-                    .map_err(ManagerError::Other)?;
-                let mut reserved_proxy_ports = port_map.keys().copied().collect::<HashSet<_>>();
-                let upstream_port = allocate_host_port(0, &mut reserved_proxy_ports)?;
-                let upstream_addr = format!("127.0.0.1:{upstream_port}");
-                network::register_vm_proxy_policy(
-                    id,
-                    upstream_addr
-                        .parse()
-                        .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
-                        .map_err(ManagerError::Other)?,
-                    policy,
-                )
-                .await
-                .map_err(ManagerError::Other)?;
-                meta_snapshot.metadata.insert(
-                    META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
-                    upstream_addr.clone(),
-                );
-                Some(upstream_addr)
-            } else {
-                None
-            };
+        let mut reserved_proxy_ports = HashSet::from([
+            meta_snapshot.network.proxy_port,
+            meta_snapshot.network.rpc_port,
+        ]);
+        let upstream_port = allocate_host_port(0, &mut reserved_proxy_ports)?;
+        let upstream_addr = format!("0.0.0.0:{upstream_port}");
+        let proxy_policy =
+            vm_proxy_policy_from_metadata(&meta_snapshot).map_err(ManagerError::Other)?;
+        network::register_vm_proxy_policy(
+            id,
+            upstream_addr
+                .parse()
+                .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
+                .map_err(ManagerError::Other)?,
+            proxy_policy,
+        )
+        .await
+        .map_err(ManagerError::Other)?;
+        meta_snapshot.metadata.insert(
+            META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+            upstream_addr.clone(),
+        );
+        let tap_spec = network::tap::spec_for_vm(
+            id,
+            port_forward_bind_address().as_str(),
+            meta_snapshot.network.proxy_port,
+            meta_snapshot.network.rpc_port,
+            upstream_port as u16,
+        )
+        .map_err(ManagerError::Other)?;
+        let vm_proxy_upstream_addr = Some(upstream_addr);
+        if let Err(err) = bootstrap::create_iso(
+            vm_dir.join("bootstrap.iso"),
+            bootstrap::Config {
+                instance_id: meta_snapshot.id.clone(),
+                hostname: meta_snapshot.name.clone(),
+                arch: meta_snapshot.architecture.clone(),
+                shared_mounts: meta_snapshot
+                    .shared_mounts
+                    .iter()
+                    .cloned()
+                    .map(map_bootstrap_shared_mount)
+                    .collect(),
+                network: Some(map_bootstrap_network(&meta_snapshot)),
+                http_proxy_url: None,
+                portproxy_auth_token: meta_snapshot
+                    .metadata
+                    .get(META_PORTPROXY_AUTH_TOKEN)
+                    .cloned(),
+            },
+        ) {
+            let _ = network::unregister_vm_proxy_policy(id).await;
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::Other(err));
+        }
 
         // @dive: Spawn one virtiofsd subprocess per shared mount BEFORE launching
         //        qemu. Each daemon creates its own vhost-user socket under <vm_dir>/,
@@ -1406,8 +1472,7 @@ impl Manager {
         let mut fuse_handles: Vec<fuse::FuseHandle> = Vec::new();
         for mount in &mut meta_snapshot.shared_mounts {
             if mount.is_fuse_backed() {
-                let handle = match fuse::mount_nymfs_fuse(&self.cfg, mount, vm_dir.as_path()).await
-                {
+                let handle = match fuse::mount_nymfs_fuse(&cfg, mount, vm_dir.as_path()).await {
                     Ok(handle) => handle,
                     Err(err) => {
                         if vm_proxy_upstream_addr.is_some() {
@@ -1427,8 +1492,8 @@ impl Manager {
 
         let mut virtiofsd_handles: Vec<virt::VirtiofsdHandle> = Vec::new();
         let can_use_virtiofsd = cfg!(target_os = "linux")
-            && !self.cfg.virtiofsd_bin.is_empty()
-            && Path::new(&self.cfg.virtiofsd_bin).exists();
+            && !cfg.virtiofsd_bin.is_empty()
+            && Path::new(&cfg.virtiofsd_bin).exists();
         if can_use_virtiofsd {
             for (index, mount) in meta_snapshot.shared_mounts.iter().enumerate() {
                 let socket_path = vm_dir.join(format!("virtiofsd-{index}.sock"));
@@ -1439,9 +1504,7 @@ impl Manager {
                     tag: mount.mount_tag.clone(),
                     read_only: mount.read_only,
                 };
-                match virt::spawn_virtiofsd(&self.cfg.virtiofsd_bin, &spawn, log_path.as_path())
-                    .await
-                {
+                match virt::spawn_virtiofsd(&cfg.virtiofsd_bin, &spawn, log_path.as_path()).await {
                     Ok(handle) => virtiofsd_handles.push(handle),
                     Err(err) => {
                         if vm_proxy_upstream_addr.is_some() {
@@ -1461,7 +1524,7 @@ impl Manager {
         } else if !meta_snapshot.shared_mounts.is_empty() {
             debug!(
                 vm_id = %id,
-                virtiofsd_bin = %self.cfg.virtiofsd_bin,
+                virtiofsd_bin = %cfg.virtiofsd_bin,
                 "virtiofsd unavailable; falling back to legacy -virtfs shared mounts (dev path)"
             );
         }
@@ -1471,10 +1534,8 @@ impl Manager {
             vm_dir.as_path(),
             qmp_path.as_path(),
             pid_path.as_path(),
-            &self.host_arch,
-            &self.cfg.guest_network,
-            vm_proxy_upstream_addr.as_deref(),
-            &port_map,
+            &host_arch,
+            &tap_spec,
             &virtiofsd_handles,
         ) {
             Ok(args) => args,
@@ -1482,6 +1543,30 @@ impl Manager {
                 if vm_proxy_upstream_addr.is_some() {
                     let _ = network::unregister_vm_proxy_policy(id).await;
                 }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err));
+            }
+        };
+        let mut tap_network_handle = match network::tap::start_vm_tap_network(&cfg, &tap_spec).await
+        {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
+                mark_vm_state(&vm, VmState::Error).await;
                 return Err(ManagerError::Other(err));
             }
         };
@@ -1497,19 +1582,69 @@ impl Manager {
         cmd.args(&args);
         cmd.current_dir(&vm_dir);
         cmd.stdin(std::process::Stdio::null());
-        configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), &self.cfg)
-            .map_err(ManagerError::Other)?;
+        if let Err(err) = configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), &cfg) {
+            if let Some(handle) = tap_network_handle.take() {
+                handle.shutdown().await;
+            }
+            if vm_proxy_upstream_addr.is_some() {
+                let _ = network::unregister_vm_proxy_policy(id).await;
+            }
+            for handle in &virtiofsd_handles {
+                virt::terminate_virtiofsd(handle);
+            }
+            for handle in &fuse_handles {
+                let _ = fuse::unmount_fuse(handle).await;
+            }
+            mark_vm_state(&vm, VmState::Error).await;
+            return Err(ManagerError::Other(err));
+        }
 
-        let log_file = OpenOptions::new()
+        let log_file = match OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
             .with_context(|| format!("open qemu log {}", log_path.display()))
-            .map_err(ManagerError::Other)?;
-        let stderr_file = log_file
+        {
+            Ok(file) => file,
+            Err(err) => {
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err));
+            }
+        };
+        let stderr_file = match log_file
             .try_clone()
             .with_context(|| format!("clone qemu log {}", log_path.display()))
-            .map_err(ManagerError::Other)?;
+        {
+            Ok(file) => file,
+            Err(err) => {
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err));
+            }
+        };
 
         cmd.stdout(std::process::Stdio::from(log_file));
         cmd.stderr(std::process::Stdio::from(stderr_file));
@@ -1520,6 +1655,9 @@ impl Manager {
         {
             Ok(child) => child,
             Err(err) => {
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
                 if vm_proxy_upstream_addr.is_some() {
                     let _ = network::unregister_vm_proxy_policy(id).await;
                 }
@@ -1538,6 +1676,9 @@ impl Manager {
             match virt::wait_for_monitor(qmp_path.as_path(), Duration::from_secs(20)).await {
                 Ok(handle) => handle,
                 Err(err) => {
+                    if let Some(handle) = tap_network_handle.take() {
+                        handle.shutdown().await;
+                    }
                     if vm_proxy_upstream_addr.is_some() {
                         let _ = network::unregister_vm_proxy_policy(id).await;
                     }
@@ -1550,7 +1691,13 @@ impl Manager {
                     return Err(abort_launch(vm.clone(), child, &log_path, err).await);
                 }
             };
-        if let Err(err) = virt::wait_for_running(&monitor, Duration::from_secs(20)).await {
+        // Cooled/restarted VMs can spend longer in QMP pre-running states while
+        // restoring disk/memory and reconnecting shared mounts. Keep monitor
+        // discovery tight, but allow the actual running transition more room.
+        if let Err(err) = virt::wait_for_running(&monitor, Duration::from_secs(60)).await {
+            if let Some(handle) = tap_network_handle.take() {
+                handle.shutdown().await;
+            }
             if vm_proxy_upstream_addr.is_some() {
                 let _ = network::unregister_vm_proxy_policy(id).await;
             }
@@ -1571,6 +1718,7 @@ impl Manager {
             inner.runtime.command_pid = child.id();
             inner.runtime.virtiofsd_handles = virtiofsd_handles;
             inner.runtime.fuse_handles = fuse_handles;
+            inner.runtime.tap_network = tap_network_handle.take();
             {
                 let mut exit = inner
                     .runtime
@@ -1599,9 +1747,12 @@ impl Manager {
         match child.id() {
             Some(pid) => {
                 if let Err(err) = network::register_vm_process(id, pid).await {
-                    if self.cfg.ha_mode {
+                    if cfg.ha_mode {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
+                        if let Some(handle) = tap_network_handle.take() {
+                            handle.shutdown().await;
+                        }
                         if vm_proxy_upstream_addr.is_some() {
                             let _ = network::unregister_vm_proxy_policy(id).await;
                         }
@@ -1614,9 +1765,12 @@ impl Manager {
                     warn!(vm_id = %id, pid, error = %err, "failed to register vm process for network guardrails");
                 }
             }
-            None if self.cfg.ha_mode => {
+            None if cfg.ha_mode => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
                 if vm_proxy_upstream_addr.is_some() {
                     let _ = network::unregister_vm_proxy_policy(id).await;
                 }
@@ -1635,6 +1789,7 @@ impl Manager {
         Ok(meta)
     }
 
+    #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn stop_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(id).await?;
         let (state, monitor) =
@@ -1663,6 +1818,7 @@ impl Manager {
         Ok(meta)
     }
 
+    #[instrument(skip(self), fields(vm_id = %id))]
     pub async fn restart_vm(&self, id: &str) -> ManagerResult<VmMetadata> {
         self.stop_vm(id).await?;
         self.start_vm(id).await
@@ -1766,10 +1922,16 @@ impl Manager {
             .map_err(ManagerError::Other)?;
             if reclaimed {
                 let _ = network::unregister_vm_proxy_policy(id).await;
-                let fuse_handles = {
+                let (fuse_handles, tap_network) = {
                     let mut inner = vm.lock().await;
-                    std::mem::take(&mut inner.runtime.fuse_handles)
+                    (
+                        std::mem::take(&mut inner.runtime.fuse_handles),
+                        inner.runtime.tap_network.take(),
+                    )
                 };
+                if let Some(handle) = tap_network {
+                    handle.shutdown().await;
+                }
                 for handle in &fuse_handles {
                     let _ = fuse::unmount_fuse(handle).await;
                 }
@@ -1782,6 +1944,7 @@ impl Manager {
         Ok(meta)
     }
 
+    #[instrument(skip(self), fields(vm_id = %vm_id, snapshot_id = %snapshot_id))]
     pub async fn restore_snapshot(
         &self,
         vm_id: &str,
@@ -1835,20 +1998,35 @@ impl Manager {
             }
         }
 
-        // Relaunch qemu; `-incoming file:<path>` consumes the RAM file and brings the
-        // guest back to the running state of the snapshot moment.
-        let result = self.start_vm(vm_id).await;
+        let cfg = self.cfg.clone();
+        let host_arch = self.host_arch.clone();
+        let start_vm = vm.clone();
+        let clear_vm = vm.clone();
+        let launch_vm_id = vm_id.to_string();
+        let clear_vm_id = vm_id.to_string();
 
-        // Clear the one-shot incoming pointer so future restarts of this VM don't loop
-        // back to the same RAM file. The RAM file itself stays on disk as a valid future
-        // restore target until explicitly deleted via `delete_snapshot`.
-        {
-            let mut inner = vm.lock().await;
-            inner.metadata.boot_incoming_ram_path.clear();
-            if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
-                warn!(vm_id = %vm_id, error = %err, "clear boot_incoming_ram_path failed");
+        // Relaunch qemu; `-incoming file:<path>` consumes the RAM file and brings the
+        // guest back to the running state of the snapshot moment. Keep the one-shot
+        // incoming-pointer cleanup in the same owned task as launch so RPC cancellation
+        // cannot leave future restarts pinned to this RAM file.
+        let result = match tokio::spawn(async move {
+            let result = Self::start_vm_inner(cfg, host_arch, start_vm, launch_vm_id).await;
+            {
+                let mut inner = clear_vm.lock().await;
+                inner.metadata.boot_incoming_ram_path.clear();
+                if let Err(err) = save_metadata(&clear_vm.dir, &mut inner.metadata) {
+                    warn!(vm_id = %clear_vm_id, error = %err, "clear boot_incoming_ram_path failed");
+                }
             }
-        }
+            result
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => Err(ManagerError::Other(anyhow!(
+                "restore_snapshot launch task failed: {err}"
+            ))),
+        };
 
         result
     }
@@ -2083,7 +2261,8 @@ impl Manager {
                 .cloned()
                 .map(map_bootstrap_shared_mount)
                 .collect(),
-            http_proxy_url: self.cfg.guest_network.http_proxy_url(),
+            network: Some(map_bootstrap_network(&guard.metadata)),
+            http_proxy_url: None,
             portproxy_auth_token: guard
                 .metadata
                 .metadata
@@ -2164,15 +2343,19 @@ impl Manager {
         Ok(guard)
     }
 
-    fn qemu_binary_for_arch(&self, arch: &str) -> ManagerResult<String> {
+    fn qemu_binary_for_arch_from(
+        cfg: &Config,
+        host_arch: &str,
+        arch: &str,
+    ) -> ManagerResult<String> {
         let normalized = if arch.trim().is_empty() {
-            self.host_arch.clone()
+            host_arch.to_string()
         } else {
             normalize_arch(arch)?
         };
         match normalized.as_str() {
-            ARCH_AMD64 => Ok(self.cfg.qemu_bin.clone()),
-            ARCH_ARM64 => Ok(self.cfg.qemu_arm64_bin.clone()),
+            ARCH_AMD64 => Ok(cfg.qemu_bin.clone()),
+            ARCH_ARM64 => Ok(cfg.qemu_arm64_bin.clone()),
             other => Err(ManagerError::Other(anyhow!(
                 "unsupported architecture: {other}"
             ))),
@@ -2351,9 +2534,7 @@ fn build_qemu_args(
     qmp_path: &Path,
     pid_path: &Path,
     host_arch: &str,
-    guest_network: &config::GuestNetworkConfig,
-    guest_http_proxy_upstream_override: Option<&str>,
-    port_map: &HashMap<i32, i32>,
+    tap_network: &network::tap::VmTapNetworkSpec,
     virtiofsd_handles: &[virt::VirtiofsdHandle],
 ) -> Result<Vec<String>> {
     let guest_arch = if meta.architecture.trim().is_empty() {
@@ -2420,25 +2601,10 @@ fn build_qemu_args(
     };
 
     let disk_path = vm_dir.join("disk.qcow2");
-    let port_forward_bind = port_forward_bind_address();
-    let mut netdev = String::from("user,id=net0");
-    if let Some(dns_server) = guest_network.dns_server.as_deref() {
-        netdev.push_str(&format!(",dns={dns_server}"));
-    }
-    if let (Some(guest_addr), Some(upstream_addr)) = (
-        guest_network.http_proxy_guest_addr.as_deref(),
-        guest_http_proxy_upstream_override.or(guest_network.http_proxy_upstream_addr.as_deref()),
-    ) {
-        netdev.push_str(&format!(",guestfwd=tcp:{guest_addr}-tcp:{upstream_addr}"));
-    }
-    for (host_port, guest_port) in port_map {
-        // @dive: Distributed in-cluster callers need guest RPC and stream forwards reachable on the
-        // pod interface, while local dev keeps the same loopback-only default unless explicitly widened.
-        netdev.push_str(&format!(
-            ",hostfwd=tcp:{bind_addr}:{host_port}-:{guest_port}",
-            bind_addr = port_forward_bind,
-        ));
-    }
+    let netdev = format!(
+        "tap,id=net0,ifname={},script=no,downscript=no",
+        tap_network.tap_name
+    );
 
     let mut args = Vec::new();
     args.push("-machine".to_string());
@@ -2561,6 +2727,26 @@ fn map_bootstrap_shared_mount(mount: SharedMountSpec) -> bootstrap::SharedMount 
         guest_path: mount.guest_path,
         mount_tag: mount.mount_tag,
         read_only: mount.read_only,
+    }
+}
+
+fn map_bootstrap_network(meta: &VmMetadata) -> bootstrap::NetworkConfig {
+    let addressing = network::tap::addressing_for_vm(&meta.id);
+    bootstrap::NetworkConfig {
+        mac_address: meta.network.mac.clone(),
+        address_cidr: format!("{}/{}", addressing.guest_ip, addressing.prefix_len),
+        gateway: addressing.gateway_ip.to_string(),
+        dns: addressing.gateway_ip.to_string(),
+    }
+}
+
+fn vm_proxy_policy_from_metadata(meta: &VmMetadata) -> Result<network::VmProxyPolicyConfig> {
+    match meta.metadata.get(META_NYM_NETWORK_POLICY) {
+        Some(policy_json) if !policy_json.trim().is_empty() => {
+            serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
+                .with_context(|| format!("parse vm network policy for {}", meta.id))
+        }
+        _ => Ok(network::VmProxyPolicyConfig::default()),
     }
 }
 
@@ -2749,13 +2935,17 @@ async fn mark_vm_state(vm: &Arc<Vm>, state: VmState) {
 }
 
 async fn cleanup_runtime_mounts(vm: &Arc<Vm>) {
-    let (virtiofsd_handles, fuse_handles) = {
+    let (virtiofsd_handles, fuse_handles, tap_network) = {
         let mut inner = vm.lock().await;
         (
             std::mem::take(&mut inner.runtime.virtiofsd_handles),
             std::mem::take(&mut inner.runtime.fuse_handles),
+            inner.runtime.tap_network.take(),
         )
     };
+    if let Some(handle) = tap_network {
+        handle.shutdown().await;
+    }
     for handle in &virtiofsd_handles {
         virt::terminate_virtiofsd(handle);
     }
@@ -2902,6 +3092,9 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
         let fuse_handles = std::mem::take(&mut inner.runtime.fuse_handles);
         for handle in &fuse_handles {
             let _ = fuse::unmount_fuse(handle).await;
+        }
+        if let Some(handle) = inner.runtime.tap_network.take() {
+            handle.shutdown().await;
         }
 
         {
@@ -3152,6 +3345,78 @@ async fn reclaim_local_runtime_ownership(
     Ok(reclaimed)
 }
 
+async fn cleanup_stale_runtime_sidecars(vm_id: &str, vm_dir: &Path) {
+    for pid in list_local_virtiofsd_pids_for_vm(vm_dir) {
+        if !pid_exists(pid) {
+            continue;
+        }
+        match kill_process(pid) {
+            Ok(()) => {
+                let _ = wait_for_pid_exit(pid, Duration::from_secs(3)).await;
+                warn!(
+                    vm_id = %vm_id,
+                    pid,
+                    "killed stale virtiofsd process after reclaiming VM runtime ownership"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    vm_id = %vm_id,
+                    pid,
+                    error = %err,
+                    "failed killing stale virtiofsd process after reclaiming VM runtime ownership"
+                );
+            }
+        }
+    }
+
+    lazy_unmount_stale_fuse_mounts(vm_id, vm_dir);
+}
+
+fn lazy_unmount_stale_fuse_mounts(vm_id: &str, vm_dir: &Path) {
+    let fuse_dir = vm_dir.join("fuse-mounts");
+    let Ok(entries) = fs::read_dir(&fuse_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let mountpoint = entry.path();
+        if !mountpoint.is_dir() {
+            continue;
+        }
+
+        match StdCommand::new("umount")
+            .arg("-l")
+            .arg(&mountpoint)
+            .status()
+        {
+            Ok(status) if status.success() => {
+                warn!(
+                    vm_id = %vm_id,
+                    mountpoint = %mountpoint.display(),
+                    "lazy-unmounted stale FUSE mount after reclaiming VM runtime ownership"
+                );
+            }
+            Ok(status) => {
+                debug!(
+                    vm_id = %vm_id,
+                    mountpoint = %mountpoint.display(),
+                    status = %status,
+                    "stale FUSE lazy-unmount did not detach mountpoint"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    vm_id = %vm_id,
+                    mountpoint = %mountpoint.display(),
+                    error = %err,
+                    "failed running lazy unmount for stale FUSE mountpoint"
+                );
+            }
+        }
+    }
+}
+
 async fn wait_for_runtime_release(qmp_path: &Path, pid_path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -3247,6 +3512,49 @@ fn list_local_qemu_pids_for_vm(vm_dir: &Path, qmp_path: &Path) -> Vec<u32> {
             continue;
         }
         if pid_command_matches_vm(command, vm_dir, qmp_path) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+fn list_local_virtiofsd_pids_for_vm(vm_dir: &Path) -> Vec<u32> {
+    let output = StdCommand::new("ps")
+        .arg("-Ao")
+        .arg("pid=,command=")
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+
+    let vm_dir_str = vm_dir.to_string_lossy();
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut iter = trimmed.split_whitespace();
+        let Some(pid_token) = iter.next() else {
+            continue;
+        };
+        let command = trimmed[pid_token.len()..].trim_start();
+        if command.is_empty() {
+            continue;
+        }
+        let Ok(pid) = pid_token.parse::<u32>() else {
+            continue;
+        };
+        if pid == 0 {
+            continue;
+        }
+        if command.contains("virtiofsd") && command.contains(vm_dir_str.as_ref()) {
             out.push(pid);
         }
     }
@@ -3456,6 +3764,17 @@ mod tests {
             }
         }
         None
+    }
+
+    fn test_tap_spec(vm_id: &str) -> network::tap::VmTapNetworkSpec {
+        network::tap::spec_for_vm(
+            vm_id,
+            "127.0.0.1",
+            3000,
+            3001,
+            network::tap::POLICY_ENVOY_PORT,
+        )
+        .expect("test tap spec")
     }
 
     #[tokio::test]
@@ -4223,18 +4542,13 @@ mod tests {
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
-        let mut port_map = HashMap::new();
-        port_map.insert(3000, 13337);
-
         let args = build_qemu_args(
             &meta,
             Path::new("/tmp/vm-9p"),
             Path::new("/tmp/vm-9p/qmp.sock"),
             Path::new("/tmp/vm-9p/qemu.pid"),
             ARCH_AMD64,
-            &config::GuestNetworkConfig::default(),
-            None,
-            &port_map,
+            &test_tap_spec(&meta.id),
             &[],
         )
         .expect("build qemu args");
@@ -4292,18 +4606,13 @@ mod tests {
             boot_incoming_ram_path: "/srv/reson/vms/vm-incoming/snapshots/snap-abc.ram".to_string(),
             started_at: None,
         };
-        let mut port_map = HashMap::new();
-        port_map.insert(3000, 13337);
-
         let args = build_qemu_args(
             &meta,
             Path::new("/tmp/vm-incoming"),
             Path::new("/tmp/vm-incoming/qmp.sock"),
             Path::new("/tmp/vm-incoming/qemu.pid"),
             ARCH_AMD64,
-            &config::GuestNetworkConfig::default(),
-            None,
-            &port_map,
+            &test_tap_spec(&meta.id),
             &[],
         )
         .expect("build qemu args");
@@ -4323,7 +4632,7 @@ mod tests {
     }
 
     #[test]
-    fn build_qemu_args_emits_guest_dns_and_proxy_forwarding_when_configured() {
+    fn build_qemu_args_emits_tap_networking() {
         let meta = VmMetadata {
             id: "vm-guest-network".to_string(),
             name: "guest-network".to_string(),
@@ -4351,13 +4660,7 @@ mod tests {
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
-        let guest_network = config::GuestNetworkConfig {
-            dns_server: Some("10.0.2.3".to_string()),
-            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
-            http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
-        };
-        let mut port_map = HashMap::new();
-        port_map.insert(3000, 13337);
+        let tap_spec = test_tap_spec(&meta.id);
 
         let args = build_qemu_args(
             &meta,
@@ -4365,9 +4668,7 @@ mod tests {
             Path::new("/tmp/vm-guest-network/qmp.sock"),
             Path::new("/tmp/vm-guest-network/qemu.pid"),
             ARCH_AMD64,
-            &guest_network,
-            None,
-            &port_map,
+            &tap_spec,
             &[],
         )
         .expect("build qemu args");
@@ -4378,15 +4679,16 @@ mod tests {
             .expect("missing -netdev arg");
         let netdev = args
             .get(netdev_idx + 1)
-            .expect("missing user netdev value after -netdev");
-        assert!(netdev.starts_with("user,id=net0"));
-        assert!(netdev.contains("dns=10.0.2.3"));
-        assert!(netdev.contains("guestfwd=tcp:10.0.2.100:3128-tcp:127.0.0.1:3128"));
-        assert!(netdev.contains("hostfwd=tcp:"));
+            .expect("missing tap netdev value after -netdev");
+        assert!(netdev.starts_with("tap,id=net0"));
+        assert!(netdev.contains(format!("ifname={}", tap_spec.tap_name).as_str()));
+        assert!(netdev.contains("script=no"));
+        assert!(!netdev.contains("guestfwd="));
+        assert!(!netdev.contains("hostfwd="));
     }
 
     #[test]
-    fn build_qemu_args_prefers_vm_proxy_upstream_override_when_present() {
+    fn build_qemu_args_does_not_emit_qemu_user_networking() {
         let meta = VmMetadata {
             id: "vm-guest-network-override".to_string(),
             name: "guest-network-override".to_string(),
@@ -4414,23 +4716,13 @@ mod tests {
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
-        let guest_network = config::GuestNetworkConfig {
-            dns_server: Some("10.0.2.3".to_string()),
-            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
-            http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
-        };
-        let mut port_map = HashMap::new();
-        port_map.insert(3000, 13337);
-
         let args = build_qemu_args(
             &meta,
             Path::new("/tmp/vm-guest-network-override"),
             Path::new("/tmp/vm-guest-network-override/qmp.sock"),
             Path::new("/tmp/vm-guest-network-override/qemu.pid"),
             ARCH_AMD64,
-            &guest_network,
-            Some("127.0.0.1:43128"),
-            &port_map,
+            &test_tap_spec(&meta.id),
             &[],
         )
         .expect("build qemu args");
@@ -4441,9 +4733,10 @@ mod tests {
             .expect("missing -netdev arg");
         let netdev = args
             .get(netdev_idx + 1)
-            .expect("missing user netdev value after -netdev");
-        assert!(netdev.contains("guestfwd=tcp:10.0.2.100:3128-tcp:127.0.0.1:43128"));
-        assert!(!netdev.contains("guestfwd=tcp:10.0.2.100:3128-tcp:127.0.0.1:3128"));
+            .expect("missing tap netdev value after -netdev");
+        assert!(!netdev.starts_with("user,"));
+        assert!(!netdev.contains("guestfwd="));
+        assert!(!netdev.contains("hostfwd="));
     }
 
     #[test]
@@ -4555,8 +4848,6 @@ mod tests {
             boot_incoming_ram_path: String::new(),
             started_at: None,
         };
-        let mut port_map = HashMap::new();
-        port_map.insert(3000, 13337);
         let virtiofsd_handles = vec![virt::VirtiofsdHandle {
             pid: 0,
             socket_path: PathBuf::from("/tmp/vm-shared/virtiofsd-0.sock"),
@@ -4571,9 +4862,7 @@ mod tests {
             Path::new("/tmp/vm-shared/qmp.sock"),
             Path::new("/tmp/vm-shared/qemu.pid"),
             ARCH_AMD64,
-            &config::GuestNetworkConfig::default(),
-            None,
-            &port_map,
+            &test_tap_spec(&meta.id),
             &virtiofsd_handles,
         )
         .expect("build qemu args");

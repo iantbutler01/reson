@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
-use crate::child_tracker::ChildTracker;
+use crate::child_tracker::{ChildExit, ChildTracker};
 use crate::daemon::{DaemonError, DaemonRegistry, OutputKind, build_command_builder};
 use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManager;
 use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxy;
@@ -29,7 +29,9 @@ use crate::pb::bracket::portproxy::v1::{
 };
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
 use crate::pb::google::protobuf::Empty;
-use crate::process_group::{configure_child_process_group, signal_process_group_or_pid};
+use crate::process_group::{
+    configure_child_process_group, kill_process_group_or_child, signal_process_group_or_pid,
+};
 use crate::system_env::build_exec_env;
 use nix::sys::signal::Signal;
 
@@ -123,23 +125,35 @@ impl ShellExec for ShellExecService {
             .spawn()
             .map_err(|err| Status::internal(format!("failed to start command: {err}")))?;
 
-        let pid = child.id().unwrap_or(0) as i32;
-        if pid > 0 {
-            self.tracker.register(pid).await;
-        }
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Status::internal("missing stdin handle"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Status::internal("missing stdout handle"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Status::internal("missing stderr handle"))?;
+        let pid = match child.id() {
+            Some(pid) => pid as i32,
+            None => {
+                let _ = child.start_kill();
+                return Err(Status::internal("spawned command without pid"));
+            }
+        };
+        let mut stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                kill_process_group_or_child(pid, &mut child);
+                return Err(Status::internal("missing stdin handle"));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                kill_process_group_or_child(pid, &mut child);
+                return Err(Status::internal("missing stdout handle"));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                kill_process_group_or_child(pid, &mut child);
+                return Err(Status::internal("missing stderr handle"));
+            }
+        };
+        let mut child_exit = self.tracker.register(pid);
 
         let timeout = start.timeout.map(|secs| Duration::from_secs(secs as u64));
 
@@ -183,60 +197,33 @@ impl ShellExec for ShellExecService {
             let _ = stdin.shutdown().await;
         });
 
-        let tracker = self.tracker.clone();
         tokio::spawn(async move {
-            let status_result = if let Some(duration) = timeout {
-                tokio::time::timeout(duration, child.wait()).await
-            } else {
-                match child.wait().await {
-                    Ok(status) => return finalize_exec(status, pid, tracker, tx).await,
-                    Err(err) => {
-                        error!("failed waiting for child: {err}");
-                        if pid > 0 {
-                            tracker.unregister(pid).await;
-                        }
-                        return;
-                    }
-                }
-            };
-
-            match status_result {
-                Ok(Ok(status)) => finalize_exec(status, pid, tracker, tx).await,
-                Ok(Err(err)) => {
-                    error!("failed waiting for child: {err}");
-                    if pid > 0 {
-                        tracker.unregister(pid).await;
-                    }
-                }
-                Err(_) => {
-                    debug!("command timed out, killing process group for pid {pid}");
-                    if let Err(err) = signal_process_group_or_pid(pid, Signal::SIGKILL) {
-                        debug!("failed to kill timed out process group: {err}");
-                        if let Err(err) = child.start_kill() {
-                            debug!("failed to kill timed out process: {err}");
-                        }
-                    }
-                    let _ = tx
-                        .send(Ok(ExecResponse {
-                            response: Some(
-                                crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(
-                                    b"\n(Command timed out)".to_vec(),
+            if let Some(duration) = timeout {
+                match tokio::time::timeout(duration, child_exit.wait()).await {
+                    Ok(Ok(exit)) => finalize_exec_exit(pid, tx, exit).await,
+                    Ok(Err(err)) => finalize_exec_wait_error(pid, tx, err).await,
+                    Err(_) => {
+                        debug!("command timed out, killing process group for pid {pid}");
+                        kill_process_group_or_child(pid, &mut child);
+                        let _ = tx
+                            .send(Ok(ExecResponse {
+                                response: Some(
+                                    crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(
+                                        b"\n(Command timed out)".to_vec(),
+                                    ),
                                 ),
-                            ),
-                        }))
-                        .await;
+                            }))
+                            .await;
 
-                    match child.wait().await {
-                        Ok(_) => {
-                            finalize_exec_with_code(pid, tracker, tx, 124).await;
-                        }
-                        Err(err) => {
-                            error!("failed waiting after timeout: {err}");
-                            if pid > 0 {
-                                tracker.unregister(pid).await;
-                            }
-                        }
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), child_exit.wait()).await;
+                        finalize_exec_with_code(pid, tx, 124).await;
                     }
+                }
+            } else {
+                match child_exit.wait().await {
+                    Ok(exit) => finalize_exec_exit(pid, tx, exit).await,
+                    Err(err) => finalize_exec_wait_error(pid, tx, err).await,
                 }
             }
         });
@@ -285,27 +272,39 @@ impl ShellExec for ShellExecService {
             }
         });
 
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(builder)
             .map_err(|err| Status::internal(format!("failed to spawn interactive shell: {err}")))?;
 
-        let killer = child.clone_killer();
-        let killer = Arc::new(StdMutex::new(Some(killer)));
-
+        let mut killer = child.clone_killer();
         let pid = child.process_id().unwrap_or(0) as i32;
-        if pid > 0 {
-            self.tracker.register(pid).await;
+        if pid <= 0 {
+            let _ = killer.kill();
+            return Err(Status::internal("spawned interactive shell without pid"));
         }
 
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|err| Status::internal(format!("failed to clone pty reader: {err}")))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|err| Status::internal(format!("failed to take pty writer: {err}")))?;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                let _ = killer.kill();
+                return Err(Status::internal(format!(
+                    "failed to clone pty reader: {err}"
+                )));
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(err) => {
+                let _ = killer.kill();
+                return Err(Status::internal(format!(
+                    "failed to take pty writer: {err}"
+                )));
+            }
+        };
+
+        let killer = Arc::new(StdMutex::new(Some(killer)));
+        let mut child_exit = self.tracker.register(pid);
 
         let (tx, rx) = mpsc::channel(32);
 
@@ -388,30 +387,17 @@ impl ShellExec for ShellExecService {
             });
         }
 
-        let tracker = self.tracker.clone();
         let killer_for_wait = killer.clone();
         tokio::spawn(async move {
-            let status = match tokio::task::spawn_blocking(move || child.wait()).await {
-                Ok(res) => res,
-                Err(err) => Err(std::io::Error::other(err)),
-            };
-
-            if pid > 0 {
-                tracker.unregister(pid).await;
-            }
+            let status = child_exit.wait().await;
+            drop(child);
 
             if let Ok(mut guard) = killer_for_wait.lock() {
                 guard.take();
             }
 
             let exit_code = match status {
-                Ok(exit_status) => {
-                    if exit_status.signal().is_some() {
-                        -1
-                    } else {
-                        exit_status.exit_code() as i32
-                    }
-                }
+                Ok(exit_status) => exit_status.interactive_code(),
                 Err(err) => {
                     error!("interactive shell wait failed: {err}");
                     -1
@@ -445,7 +431,7 @@ impl PortProxyService {
 #[tonic::async_trait]
 impl PortProxy for PortProxyService {
     async fn prepare_shutdown(&self, _request: Request<Empty>) -> Result<Response<Empty>, Status> {
-        let pids = self.tracker.snapshot().await;
+        let pids = self.tracker.snapshot();
         for pid in &pids {
             if *pid <= 0 {
                 continue;
@@ -829,24 +815,37 @@ where
     });
 }
 
-async fn finalize_exec(
-    status: std::process::ExitStatus,
+async fn finalize_exec_exit(
     pid: i32,
-    tracker: ChildTracker,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
+    exit: ChildExit,
 ) {
-    finalize_exec_with_code(pid, tracker, tx, exit_code_from_status(&status)).await;
+    finalize_exec_with_code(pid, tx, exit.protocol_code()).await;
+}
+
+async fn finalize_exec_wait_error(
+    pid: i32,
+    tx: mpsc::Sender<Result<ExecResponse, Status>>,
+    err: impl std::fmt::Display,
+) {
+    error!("failed waiting for child pid {pid}: {err}");
+    let _ = tx
+        .send(Ok(ExecResponse {
+            response: Some(
+                crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(
+                    format!("\n(Command exit status unavailable: {err})").into_bytes(),
+                ),
+            ),
+        }))
+        .await;
+    finalize_exec_with_code(pid, tx, -1).await;
 }
 
 async fn finalize_exec_with_code(
     pid: i32,
-    tracker: ChildTracker,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
     code: i32,
 ) {
-    if pid > 0 {
-        tracker.unregister(pid).await;
-    }
     if tx
         .send(Ok(ExecResponse {
             response: Some(
@@ -857,14 +856,5 @@ async fn finalize_exec_with_code(
         .is_err()
     {
         debug!("failed to send exit code for pid {}", pid);
-    }
-}
-
-fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(code) = status.code() {
-        code
-    } else {
-        status.signal().unwrap_or(-1)
     }
 }

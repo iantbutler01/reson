@@ -9,6 +9,7 @@ use anyhow::Error;
 use chrono::{DateTime, Utc};
 
 use crate::fuse::FuseHandle;
+use crate::network::tap::VmTapNetworkHandle;
 use crate::state::types::VmState;
 use crate::virt::{MonitorHandle, VirtiofsdHandle};
 
@@ -27,6 +28,7 @@ pub struct VmRuntime {
     /// its vhost-user socket during a normal shutdown.
     pub virtiofsd_handles: Vec<VirtiofsdHandle>,
     pub fuse_handles: Vec<FuseHandle>,
+    pub tap_network: Option<VmTapNetworkHandle>,
 }
 
 impl VmRuntime {
@@ -42,6 +44,7 @@ impl VmRuntime {
             suspending: false,
             virtiofsd_handles: Vec::new(),
             fuse_handles: Vec::new(),
+            tap_network: None,
         }
     }
 }

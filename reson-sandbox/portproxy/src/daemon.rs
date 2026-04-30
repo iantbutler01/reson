@@ -14,9 +14,8 @@ use tracing::{error, info, warn};
 
 use crate::child_tracker::ChildTracker;
 use crate::pb::bracket::portproxy::v1::{ExecDaemonRequest, ExecDaemonResponse};
-use crate::process_group::{configure_child_process_group, signal_process_group_or_pid};
+use crate::process_group::{configure_child_process_group, kill_process_group_or_child};
 use crate::system_env::build_exec_env;
-use nix::sys::signal::Signal;
 
 const CHANNEL_CAPACITY: usize = 100;
 const BACKLOG_MAX_FRAMES: usize = 512;
@@ -83,27 +82,39 @@ impl DaemonRegistry {
         let pid = match child.id() {
             Some(id) => id as i32,
             None => {
-                warn!("daemon {}: spawned process without pid", req.name);
-                -1
+                let _ = child.start_kill();
+                return Err(DaemonError::Spawn(std::io::Error::other(
+                    "spawned daemon without pid",
+                )));
             }
         };
-
-        if pid > 0 {
-            self.tracker.register(pid).await;
-        }
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| DaemonError::InvalidRequest("failed to capture stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| DaemonError::InvalidRequest("failed to capture stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| DaemonError::InvalidRequest("failed to capture stderr".into()))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                kill_process_group_or_child(pid, &mut child);
+                return Err(DaemonError::InvalidRequest(
+                    "failed to capture stdin".into(),
+                ));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                kill_process_group_or_child(pid, &mut child);
+                return Err(DaemonError::InvalidRequest(
+                    "failed to capture stdout".into(),
+                ));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                kill_process_group_or_child(pid, &mut child);
+                return Err(DaemonError::InvalidRequest(
+                    "failed to capture stderr".into(),
+                ));
+            }
+        };
 
         let (stdout_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (stderr_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
@@ -123,10 +134,12 @@ impl DaemonRegistry {
         {
             let mut daemons = self.daemons.write().await;
             if daemons.contains_key(&req.name) {
+                kill_process_group_or_child(pid, &mut child);
                 return Err(DaemonError::AlreadyRunning);
             }
             daemons.insert(req.name.clone(), entry.clone());
         }
+        let mut child_exit = self.tracker.register(pid);
 
         spawn_reader(
             stdout,
@@ -144,19 +157,15 @@ impl DaemonRegistry {
         );
 
         let daemons = self.daemons.clone();
-        let tracker = self.tracker.clone();
         let timeout = req
             .timeout
             .filter(|secs| *secs > 0)
             .map(|secs| std::time::Duration::from_secs(secs as u64));
         tokio::spawn(async move {
             let exit_code = match timeout {
-                Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
-                    Ok(Ok(status)) => status.code(),
-                    Ok(Err(err)) => {
-                        error!("daemon {} wait failed: {}", req.name, err);
-                        return;
-                    }
+                Some(timeout) => match tokio::time::timeout(timeout, child_exit.wait()).await {
+                    Ok(Ok(exit)) => Some(exit.protocol_code()),
+                    Ok(Err(err)) => Some(daemon_wait_error_code(&req.name, err)),
                     Err(_) => {
                         let timeout_message = b"\n(Command timed out)".to_vec();
                         {
@@ -164,31 +173,21 @@ impl DaemonRegistry {
                             guard.push(OutputKind::Stderr, timeout_message.clone());
                         }
                         let _ = stderr_tx.send(timeout_message);
-                        if let Err(err) = signal_process_group_or_pid(pid, Signal::SIGKILL) {
-                            warn!("daemon {} timeout kill failed: {}", req.name, err);
-                            let _ = child.start_kill();
-                        }
-                        match child.wait().await {
-                            Ok(_) => Some(124),
-                            Err(err) => {
-                                error!("daemon {} wait after timeout failed: {}", req.name, err);
-                                return;
-                            }
-                        }
+                        kill_process_group_or_child(pid, &mut child);
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            child_exit.wait(),
+                        )
+                        .await;
+                        Some(124)
                     }
                 },
-                None => match child.wait().await {
-                    Ok(status) => status.code(),
-                    Err(err) => {
-                        error!("daemon {} wait failed: {}", req.name, err);
-                        return;
-                    }
+                None => match child_exit.wait().await {
+                    Ok(exit) => Some(exit.protocol_code()),
+                    Err(err) => Some(daemon_wait_error_code(&req.name, err)),
                 },
             };
             let _ = exit_tx.send(exit_code);
-            if pid > 0 {
-                tracker.unregister(pid).await;
-            }
 
             {
                 let mut guard = daemons.write().await;
@@ -251,6 +250,11 @@ impl DaemonEntry {
         let mut guard = self.output_backlog.lock().await;
         guard.drain()
     }
+}
+
+fn daemon_wait_error_code(name: &str, err: impl std::fmt::Display) -> i32 {
+    error!("daemon {name} wait failed: {err}");
+    -1
 }
 
 fn spawn_reader<R>(

@@ -39,6 +39,8 @@ const META_TIER_B_ELIGIBLE: &str = "reson.tier_b_eligible";
 const META_PORTPROXY_AUTH_TOKEN: &str = "reson.portproxy_auth_token";
 const MAX_EXEC_RUN_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const ETCD_DEDUPE_TTL_SECS: i64 = 24 * 60 * 60;
+const GUEST_EXEC_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const GUEST_EXEC_READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct CommandConsumerHandle {
     stop_tx: Option<oneshot::Sender<()>>,
@@ -1061,6 +1063,10 @@ async fn mark_command_completed(
     Ok(())
 }
 
+#[tracing::instrument(
+    skip(envelope, config, manager, jetstream),
+    fields(command_id = %envelope.command_id, command_type = %envelope.command_type, node_id = %node_id)
+)]
 async fn handle_exec_run_command(
     envelope: &CommandEnvelope,
     config: &ControlBusConfig,
@@ -1090,6 +1096,13 @@ async fn handle_exec_run_command(
     }
     let portproxy_auth = portproxy_auth_header_from_metadata(&vm.metadata)?;
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
+    wait_for_guest_exec_ready(
+        endpoint.as_str(),
+        portproxy_auth.as_ref(),
+        GUEST_EXEC_READY_TIMEOUT,
+    )
+    .await
+    .context("wait for guest exec readiness before exec.run")?;
     let mut client = ShellExecClient::connect(endpoint)
         .await
         .context("connect shell exec client for exec.run")?;
@@ -1232,6 +1245,10 @@ async fn publish_exec_run_error_result(
     Ok(())
 }
 
+#[tracing::instrument(
+    skip(envelope, config, manager, active_exec_streams, jetstream),
+    fields(command_id = %envelope.command_id, command_type = %envelope.command_type, node_id = %node_id)
+)]
 async fn handle_exec_stream_start_command(
     envelope: &CommandEnvelope,
     config: &ControlBusConfig,
@@ -1395,6 +1412,13 @@ async fn handle_exec_stream_start_command(
     }
     let portproxy_auth = portproxy_auth_header_from_metadata(&vm_metadata)?;
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
+    wait_for_guest_exec_ready(
+        endpoint.as_str(),
+        portproxy_auth.as_ref(),
+        GUEST_EXEC_READY_TIMEOUT,
+    )
+    .await
+    .context("wait for guest exec readiness before exec.stream.start")?;
     info!(stream_id = %stream_id, endpoint = %endpoint, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T4 before_daemon_connect");
     let mut daemon_client = DaemonManagerClient::connect(endpoint.clone())
         .await
@@ -2294,6 +2318,95 @@ fn request_with_portproxy_auth<T>(
             .insert("authorization", value.clone());
     }
     request
+}
+
+async fn wait_for_guest_exec_ready(
+    endpoint: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut last_error: Option<String> = None;
+
+    while start.elapsed() < timeout {
+        match tokio::time::timeout(
+            GUEST_EXEC_READY_ATTEMPT_TIMEOUT,
+            probe_guest_exec_ready(endpoint, auth_header),
+        )
+        .await
+        {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                last_error = Some(err.to_string());
+            }
+            Err(_) => {
+                last_error = Some("guest exec readiness probe timed out".to_string());
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let suffix = last_error
+        .map(|error| format!("; last error: {error}"))
+        .unwrap_or_default();
+    Err(anyhow!(
+        "guest exec RPC did not become ready on {endpoint} within {}s{suffix}",
+        timeout.as_secs()
+    ))
+}
+
+async fn probe_guest_exec_ready(
+    endpoint: &str,
+    auth_header: Option<&MetadataValue<Ascii>>,
+) -> Result<()> {
+    let mut client = ShellExecClient::connect(endpoint.to_string())
+        .await
+        .context("connect shell exec readiness probe")?;
+    let (req_tx, req_rx) = mpsc::channel(2);
+    req_tx
+        .send(ExecRequest {
+            request: Some(exec_request::Request::Start(ExecStart {
+                args: vec!["/bin/sh".to_string(), "-lc".to_string(), "true".to_string()],
+                env: HashMap::new(),
+                detach: false,
+                timeout: Some(5),
+            })),
+        })
+        .await
+        .map_err(|_| anyhow!("enqueue shell exec readiness probe"))?;
+    drop(req_tx);
+
+    let response = client
+        .exec(request_with_portproxy_auth(
+            ReceiverStream::new(req_rx),
+            auth_header,
+        ))
+        .await
+        .context("invoke shell exec readiness probe")?;
+    let mut stream = response.into_inner();
+
+    while let Some(frame) = stream
+        .message()
+        .await
+        .context("read shell exec readiness probe frame")?
+    {
+        if let ExecResponse {
+            response: Some(exec_response::Response::ExitCode(code)),
+        } = frame
+        {
+            if code == 0 {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "shell exec readiness probe exited with status {code}"
+            ));
+        }
+    }
+
+    Err(anyhow!(
+        "shell exec readiness probe stream ended before exit code"
+    ))
 }
 
 async fn resolve_execution_restore_snapshot_id(

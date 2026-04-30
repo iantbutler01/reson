@@ -208,14 +208,11 @@ impl NetworkServicesConfig {
             self.envoy_log_level = "info".to_string();
         }
         self.envoy_admin_addr = normalize_socket_addr(&self.envoy_admin_addr, "envoy admin addr")?;
-        if guest_network.http_proxy_upstream_addr.is_some() {
-            self.envoy_bin = resolve_binary(&self.envoy_bin, "envoy")?;
-        }
-        if guest_network.http_proxy_upstream_addr.is_some() || guest_network.dns_server.is_some() {
-            self.coredns_bin = resolve_binary(&self.coredns_bin, "coredns")?;
-            self.coredns_bind_addr =
-                normalize_socket_addr(&self.coredns_bind_addr, "coredns bind addr")?;
-        }
+        let _ = guest_network;
+        self.envoy_bin = resolve_binary(&self.envoy_bin, "envoy")?;
+        self.coredns_bin = resolve_binary(&self.coredns_bin, "coredns")?;
+        self.coredns_bind_addr =
+            normalize_socket_addr(&self.coredns_bind_addr, "coredns bind addr")?;
         self.coredns_threat_hosts_path = self.coredns_threat_hosts_path.trim().to_string();
         if self.coredns_threat_hosts_path.is_empty() {
             self.coredns_threat_hosts_path = "/opt/reson/network/threat-domains.hosts".to_string();
@@ -1034,7 +1031,7 @@ fn default_coredns_bind_addr_from_env() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "127.0.0.53:53".to_string())
+        .unwrap_or_else(|| "0.0.0.0:15053".to_string())
 }
 
 fn default_coredns_threat_hosts_path_from_env() -> String {

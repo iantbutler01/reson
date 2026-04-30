@@ -31,14 +31,20 @@ Reson is a **Rust core** with **Python bindings**:
 
 ```
 reson/
+├── reson-durable/ # Durable execution primitives
 ├── reson-rust/     # Rust library (reson-agentic crate)
+├── reson-mcp/      # MCP client/server/apps library
+├── reson-sandbox/  # Sandbox/VFS/runtime surface library
 ├── reson-py/       # Python bindings via PyO3
 └── docs/           # Provider documentation
 ```
 
 | Component | Package | Install | Use Case |
 |-----------|---------|---------|----------|
+| **Durable** | `reson-durable` | `cargo add reson-durable` | Durable run, step, state, effect, wait, and event primitives |
 | **Rust** | `reson-agentic` | `cargo add reson-agentic` | Full feature set, maximum performance, production services |
+| **MCP** | `reson-mcp` | `cargo add reson-mcp` | MCP client/server/apps support |
+| **Sandbox** | `reson-sandbox` | `cargo add reson-sandbox` | VM/sandbox and runtime surface integration |
 | **Python** | `reson` | `pip install reson` | Rapid development, prototyping (subset of Rust features) |
 
 The Python package is a compiled Rust extension via PyO3. Rust is the primary implementation; Python bindings expose core functionality for convenience.

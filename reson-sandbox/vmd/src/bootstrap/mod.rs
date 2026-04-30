@@ -23,8 +23,17 @@ pub struct Config {
     pub hostname: String,
     pub arch: String,
     pub shared_mounts: Vec<SharedMount>,
+    pub network: Option<NetworkConfig>,
     pub http_proxy_url: Option<String>,
     pub portproxy_auth_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkConfig {
+    pub mac_address: String,
+    pub address_cidr: String,
+    pub gateway: String,
+    pub dns: String,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +57,7 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
         .with_context(|| "bootstrap iso: locate portproxy binary")?;
     let init = build_init_script(
         &hostname,
+        cfg.network.as_ref(),
         cfg.http_proxy_url.as_deref(),
         cfg.portproxy_auth_token.as_deref(),
     );
@@ -70,10 +80,12 @@ pub fn create_iso<P: AsRef<Path>>(path: P, cfg: Config) -> Result<()> {
 
 fn build_init_script(
     hostname: &str,
+    network: Option<&NetworkConfig>,
     http_proxy_url: Option<&str>,
     portproxy_auth_token: Option<&str>,
 ) -> String {
     let host_value = shell_escape(hostname);
+    let network_setup = build_network_setup_script(network);
     let proxy_setup = build_proxy_setup_script(http_proxy_url);
     let portproxy_auth_setup = build_portproxy_auth_setup_script(portproxy_auth_token);
     format!(
@@ -121,6 +133,8 @@ if [ -n "$HOSTNAME" ]; then
     fi
   fi
 fi
+
+{network_setup}
 
 log "searching bootstrap payload files"
 SRC=""
@@ -403,7 +417,88 @@ journalctl --no-pager -u portproxy.service -n 100 || true
 log "bootstrap init complete"
 "#,
         host_value = host_value,
+        network_setup = network_setup,
         proxy_setup = proxy_setup,
+    )
+}
+
+fn build_network_setup_script(network: Option<&NetworkConfig>) -> String {
+    let Some(network) = network else {
+        return r#"log "managed tap network disabled""#.to_string();
+    };
+    let mac = shell_escape(&network.mac_address.to_ascii_lowercase());
+    let address_cidr = shell_escape(&network.address_cidr);
+    let gateway = shell_escape(&network.gateway);
+    let dns = shell_escape(&network.dns);
+    format!(
+        r#"log "configuring managed tap network"
+TAP_MAC={mac}
+TAP_ADDRESS_CIDR={address_cidr}
+TAP_GATEWAY={gateway}
+TAP_DNS={dns}
+
+if command -v sysctl >/dev/null 2>&1; then
+  sysctl -w net.ipv6.conf.all.disable_ipv6=1 || true
+  sysctl -w net.ipv6.conf.default.disable_ipv6=1 || true
+fi
+
+TAP_IFACE=""
+for path in /sys/class/net/*; do
+  [ -e "$path/address" ] || continue
+  if [ "$(tr '[:upper:]' '[:lower:]' < "$path/address")" = "$TAP_MAC" ]; then
+    TAP_IFACE="$(basename "$path")"
+    break
+  fi
+done
+if [ -z "$TAP_IFACE" ]; then
+  log "managed tap interface not found for mac=$TAP_MAC"
+  ip link || true
+  exit 55
+fi
+
+mkdir -p /etc/reson
+cat <<EOF >/etc/reson/tap-network.env
+TAP_IFACE=$TAP_IFACE
+TAP_MAC=$TAP_MAC
+TAP_ADDRESS_CIDR=$TAP_ADDRESS_CIDR
+TAP_GATEWAY=$TAP_GATEWAY
+TAP_DNS=$TAP_DNS
+EOF
+chmod 0644 /etc/reson/tap-network.env
+
+if command -v netplan >/dev/null 2>&1; then
+  mkdir -p /etc/netplan
+  cat <<EOF >/etc/netplan/90-reson-tap.yaml
+network:
+  version: 2
+  ethernets:
+    nym0:
+      match:
+        macaddress: "$TAP_MAC"
+      set-name: nym0
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - "$TAP_ADDRESS_CIDR"
+      routes:
+        - to: default
+          via: "$TAP_GATEWAY"
+      nameservers:
+        addresses:
+          - "$TAP_DNS"
+EOF
+  chmod 0644 /etc/netplan/90-reson-tap.yaml
+  netplan apply || true
+fi
+
+if ip link show nym0 >/dev/null 2>&1; then
+  TAP_IFACE=nym0
+fi
+ip link set "$TAP_IFACE" up || true
+ip addr flush dev "$TAP_IFACE" || true
+ip addr add "$TAP_ADDRESS_CIDR" dev "$TAP_IFACE"
+ip route replace default via "$TAP_GATEWAY" dev "$TAP_IFACE"
+printf 'nameserver %s\noptions edns0 trust-ad\n' "$TAP_DNS" >/etc/resolv.conf || true"#
     )
 }
 
@@ -903,6 +998,7 @@ mod tests {
                 mount_tag: "nymfs".to_string(),
                 read_only: false,
             }],
+            network: None,
             http_proxy_url: None,
             portproxy_auth_token: Some("test-token".to_string()),
         };
@@ -947,7 +1043,7 @@ mod tests {
 
     #[test]
     fn init_script_precreates_guest_paths_before_mount_phase() {
-        let script = build_init_script("vm-test", None, None);
+        let script = build_init_script("vm-test", None, None, None);
         let precreate = script
             .find("mkdir -p \"$GUEST\"")
             .expect("precreate loop present");
@@ -963,7 +1059,7 @@ mod tests {
 
     #[test]
     fn init_script_configures_managed_proxy_files_when_proxy_url_present() {
-        let script = build_init_script("vm-test", Some("http://10.0.2.100:3128"), None);
+        let script = build_init_script("vm-test", None, Some("http://10.0.2.100:3128"), None);
         assert!(script.contains("log \"configuring managed guest proxy environment\""));
         assert!(script.contains("HTTP_PROXY_URL='http://10.0.2.100:3128'"));
         assert!(script.contains("cat <<EOF >/etc/reson/proxy.env"));
@@ -973,7 +1069,7 @@ mod tests {
 
     #[test]
     fn init_script_removes_managed_proxy_files_when_proxy_url_absent() {
-        let script = build_init_script("vm-test", None, None);
+        let script = build_init_script("vm-test", None, None, None);
         assert!(script.contains("managed guest proxy disabled; removing managed proxy files"));
         assert!(script.contains("rm -f /etc/reson/proxy.env"));
         assert!(script.contains("rm -f /etc/profile.d/reson-proxy.sh"));
@@ -982,8 +1078,23 @@ mod tests {
     }
 
     #[test]
+    fn init_script_configures_static_tap_network_when_present() {
+        let network = NetworkConfig {
+            mac_address: "02:00:00:00:00:10".to_string(),
+            address_cidr: "198.18.0.2/30".to_string(),
+            gateway: "198.18.0.1".to_string(),
+            dns: "198.18.0.1".to_string(),
+        };
+        let script = build_init_script("vm-test", Some(&network), None, None);
+        assert!(script.contains("log \"configuring managed tap network\""));
+        assert!(script.contains("TAP_ADDRESS_CIDR='198.18.0.2/30'"));
+        assert!(script.contains("ip route replace default via \"$TAP_GATEWAY\""));
+        assert!(script.contains("net.ipv6.conf.all.disable_ipv6=1"));
+    }
+
+    #[test]
     fn init_script_configures_portproxy_auth_env_file_when_token_present() {
-        let script = build_init_script("vm-test", None, Some("guest-token"));
+        let script = build_init_script("vm-test", None, None, Some("guest-token"));
         assert!(script.contains("log \"configuring managed portproxy auth\""));
         assert!(script.contains("RESON_PORTPROXY_AUTH_TOKEN=%s"));
         assert!(script.contains("'guest-token' >/etc/reson/portproxy.env"));
@@ -993,7 +1104,7 @@ mod tests {
 
     #[test]
     fn init_script_removes_portproxy_auth_env_file_when_token_absent() {
-        let script = build_init_script("vm-test", None, None);
+        let script = build_init_script("vm-test", None, None, None);
         assert!(script.contains("managed portproxy auth disabled; removing managed auth file"));
         assert!(script.contains("rm -f /etc/reson/portproxy.env"));
         assert!(script.contains("EnvironmentFile=-/etc/reson/portproxy.env"));
