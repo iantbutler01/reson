@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde_json::json;
 use tokio::process::{Child, Command};
@@ -63,6 +63,9 @@ const FORK_COMPACTION_QUEUE_DIR_NAME: &str = "fork_compaction_queue";
 const MAX_VM_VCPU: i32 = 8;
 const MAX_VM_MEMORY_MB: i32 = 16 * 1024;
 const MAX_VM_DISK_GB: i32 = 100;
+const VM_RUNNING_TIMEOUT: Duration = Duration::from_secs(60);
+const INCOMING_RESTORE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const INCOMING_RESTORE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 const ARM64_BIOS_CANDIDATES: [&str; 3] = [
     "/usr/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
@@ -115,10 +118,31 @@ pub enum ManagerError {
 
 pub type ManagerResult<T> = Result<T, ManagerError>;
 
+#[derive(Clone, Debug)]
+pub struct VmHealthProbeTarget {
+    pub vm_id: String,
+    pub rpc_port: i32,
+    pub portproxy_auth_token: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct SnapshotParams {
     pub label: String,
     pub description: String,
+}
+
+/// Handle returned by `Manager::create_snapshot_qemu_phase` describing where
+/// qemu wrote the live RAM image (`staging_ram_path` if a staging dir is
+/// configured, otherwise None) and where it must end up on durable shared
+/// storage (`canonical_ram_path`). Pass to `Manager::promote_staged_snapshot`
+/// to finish the snapshot — the second call performs the slow Filestore copy
+/// and persists snapshot metadata, and is safe to run without holding any
+/// per-vm wait-gate.
+pub struct PendingSnapshot {
+    pub meta: SnapshotMetadata,
+    pub staging_ram_path: Option<std::path::PathBuf>,
+    pub canonical_ram_path: std::path::PathBuf,
 }
 
 pub struct Manager {
@@ -350,6 +374,106 @@ impl Manager {
             self.metadata_with_runtime_network_snapshot(metadata).await,
             runtime,
         ))
+    }
+
+    pub async fn running_vm_health_probe_targets(
+        &self,
+        now: DateTime<Utc>,
+        now_instant: Instant,
+        start_grace: Duration,
+        min_probe_interval: Duration,
+    ) -> Vec<VmHealthProbeTarget> {
+        let vms: Vec<Arc<Vm>> = {
+            let guard = self.vms.read().await;
+            guard.values().cloned().collect()
+        };
+
+        let mut targets = Vec::new();
+        for vm in vms {
+            let mut inner = vm.lock().await;
+            if inner.runtime.state != VmState::Running {
+                continue;
+            }
+            let Some(started_at) = inner.runtime.started_at else {
+                continue;
+            };
+            let age = now
+                .signed_duration_since(started_at)
+                .to_std()
+                .unwrap_or_default();
+            if age < start_grace {
+                continue;
+            }
+            if let Some(last_probe_at) = inner.runtime.last_health_probe_at {
+                if now_instant
+                    .checked_duration_since(last_probe_at)
+                    .is_some_and(|elapsed| elapsed < min_probe_interval)
+                {
+                    continue;
+                }
+            }
+            inner.runtime.last_health_probe_at = Some(now_instant);
+            targets.push(VmHealthProbeTarget {
+                vm_id: inner.metadata.id.clone(),
+                rpc_port: inner.metadata.network.rpc_port,
+                portproxy_auth_token: inner
+                    .metadata
+                    .metadata
+                    .get(META_PORTPROXY_AUTH_TOKEN)
+                    .cloned(),
+                started_at,
+            });
+        }
+        targets
+    }
+
+    pub async fn record_vm_health_probe_success(
+        &self,
+        id: &str,
+        expected_started_at: DateTime<Utc>,
+    ) -> ManagerResult<bool> {
+        let vm = self.vm_by_id(id).await?;
+        let mut inner = vm.lock().await;
+        if inner.runtime.state != VmState::Running
+            || inner.runtime.started_at != Some(expected_started_at)
+        {
+            return Ok(false);
+        }
+        let had_failures = inner.runtime.consecutive_health_failures > 0;
+        inner.runtime.clear_health_failures();
+        Ok(had_failures)
+    }
+
+    pub async fn record_vm_health_probe_failure(
+        &self,
+        id: &str,
+        expected_started_at: DateTime<Utc>,
+        failure_threshold: u32,
+        permanent: bool,
+    ) -> ManagerResult<Option<u32>> {
+        let vm = self.vm_by_id(id).await?;
+        let mut inner = vm.lock().await;
+        if inner.runtime.state != VmState::Running
+            || inner.runtime.started_at != Some(expected_started_at)
+        {
+            return Ok(None);
+        }
+        let failure_threshold = failure_threshold.max(1);
+        if permanent {
+            inner.runtime.consecutive_health_failures = inner
+                .runtime
+                .consecutive_health_failures
+                .max(failure_threshold);
+        } else {
+            inner.runtime.consecutive_health_failures =
+                inner.runtime.consecutive_health_failures.saturating_add(1);
+        }
+        let failures = inner.runtime.consecutive_health_failures;
+        if failures >= failure_threshold {
+            Ok(Some(failures))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn active_vm_count(&self) -> usize {
@@ -1140,6 +1264,21 @@ impl Manager {
         vm_id: &str,
         params: SnapshotParams,
     ) -> ManagerResult<SnapshotMetadata> {
+        let pending = self.create_snapshot_qemu_phase(vm_id, params).await?;
+        self.promote_staged_snapshot(vm_id, pending).await
+    }
+
+    /// First phase of snapshot creation: validate state, run the qemu
+    /// background migrate, return the in-flight handle. Holds the userfaultfd-WP
+    /// write window — callers that want to serialize against attach_daemon
+    /// should hold their per-vm wait-gate Mutex around this call only, then
+    /// drop it before invoking `promote_staged_snapshot` so the slow Filestore
+    /// copy does not block subsequent exec.stream.start handlers.
+    pub async fn create_snapshot_qemu_phase(
+        &self,
+        vm_id: &str,
+        params: SnapshotParams,
+    ) -> ManagerResult<PendingSnapshot> {
         let vm = self.vm_by_id(vm_id).await?;
         let (state, monitor, disk_path, vm_dir) = {
             let inner = vm.lock().await;
@@ -1170,14 +1309,44 @@ impl Manager {
         ensure_qemu_writable_snapshot_dir(snapshots_dir.as_path(), &self.cfg)
             .with_context(|| format!("prepare snapshots dir {}", snapshots_dir.display()))
             .map_err(ManagerError::Other)?;
-        let ram_path = snapshots_dir.join(&meta.ram_file_name);
+        let canonical_ram_path = snapshots_dir.join(&meta.ram_file_name);
+
+        // @dive: When a fast-local staging dir is configured, qemu writes the RAM
+        //        file there first so the userfaultfd-WP storm completes at local
+        //        SSD speed (the in-guest network-facing services stay responsive)
+        //        and we then dump the snapshot onto durable shared storage. Without
+        //        staging, qemu writes directly to the canonical (durable) path —
+        //        which on slow shared storage causes the migration thread to block
+        //        on writes, leaving WP faults un-drained and wedging guest network
+        //        I/O for the duration of the snapshot.
+        let staging_ram_path = self.cfg.snapshot_staging_dir.as_ref().map(|staging| {
+            std::path::PathBuf::from(staging)
+                .join(vm_id)
+                .join(&meta.ram_file_name)
+        });
+        let qemu_ram_path = staging_ram_path
+            .clone()
+            .unwrap_or_else(|| canonical_ram_path.clone());
+        if let Some(staging_path) = staging_ram_path.as_ref() {
+            if let Some(parent) = staging_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .with_context(|| {
+                        format!("ensure snapshot staging dir {}", parent.display())
+                    })
+                    .map_err(ManagerError::Other)?;
+                ensure_qemu_writable_snapshot_dir(parent, &self.cfg)
+                    .with_context(|| format!("prepare snapshot staging dir {}", parent.display()))
+                    .map_err(ManagerError::Other)?;
+            }
+        }
 
         let opts = virt::BackgroundSnapshotOptions::default();
         let status = virt::save_vm_background(
             &monitor,
             disk_path.as_path(),
             &meta.name,
-            ram_path.as_path(),
+            qemu_ram_path.as_path(),
             &opts,
         )
         .await
@@ -1187,9 +1356,63 @@ impl Manager {
             snapshot = %meta.name,
             ram_bytes = ?status.bytes_transferred,
             total_ms = ?status.total_time_ms,
-            "background snapshot completed"
+            staged = staging_ram_path.is_some(),
+            "background snapshot qemu phase completed"
         );
 
+        Ok(PendingSnapshot {
+            meta,
+            staging_ram_path,
+            canonical_ram_path,
+        })
+    }
+
+    /// Second phase of snapshot creation: copy the staged RAM file onto durable
+    /// shared storage and persist the snapshot metadata. Safe to run without
+    /// any per-vm lock — qemu has already released userfaultfd-WP, so the slow
+    /// Filestore IO does not interfere with guest network I/O or with the next
+    /// exec's attach_daemon RPC.
+    pub async fn promote_staged_snapshot(
+        &self,
+        vm_id: &str,
+        pending: PendingSnapshot,
+    ) -> ManagerResult<SnapshotMetadata> {
+        let PendingSnapshot {
+            meta,
+            staging_ram_path,
+            canonical_ram_path,
+        } = pending;
+
+        if let Some(staging_path) = staging_ram_path.as_ref() {
+            let copy_start = std::time::Instant::now();
+            tokio::fs::copy(staging_path, &canonical_ram_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "copy staged snapshot {} → durable {}",
+                        staging_path.display(),
+                        canonical_ram_path.display()
+                    )
+                })
+                .map_err(ManagerError::Other)?;
+            if let Err(err) = tokio::fs::remove_file(staging_path).await {
+                tracing::warn!(
+                    vm_id = %vm_id,
+                    snapshot = %meta.name,
+                    staging = %staging_path.display(),
+                    error = %err,
+                    "failed removing staged snapshot file after durable copy; orphan will accumulate"
+                );
+            }
+            debug!(
+                vm_id = %vm_id,
+                snapshot = %meta.name,
+                copy_ms = copy_start.elapsed().as_millis() as u64,
+                "promoted staged snapshot to durable storage"
+            );
+        }
+
+        let vm = self.vm_by_id(vm_id).await?;
         {
             let mut inner = vm.lock().await;
             inner.metadata.snapshots.push(meta.clone());
@@ -1692,9 +1915,22 @@ impl Manager {
                 }
             };
         // Cooled/restarted VMs can spend longer in QMP pre-running states while
-        // restoring disk/memory and reconnecting shared mounts. Keep monitor
-        // discovery tight, but allow the actual running transition more room.
-        if let Err(err) = virt::wait_for_running(&monitor, Duration::from_secs(60)).await {
+        // restoring disk/memory and reconnecting shared mounts. When booting from a
+        // live RAM snapshot, QEMU sits in `inmigrate`; supervise migration progress
+        // instead of treating a healthy-but-slow restore like a stuck launch.
+        let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
+        let running_result = if booting_from_incoming {
+            virt::wait_for_running_or_incoming_restore(
+                &monitor,
+                VM_RUNNING_TIMEOUT,
+                INCOMING_RESTORE_TOTAL_TIMEOUT,
+                INCOMING_RESTORE_STALL_TIMEOUT,
+            )
+            .await
+        } else {
+            virt::wait_for_running(&monitor, VM_RUNNING_TIMEOUT).await
+        };
+        if let Err(err) = running_result {
             if let Some(handle) = tap_network_handle.take() {
                 handle.shutdown().await;
             }
@@ -1710,12 +1946,15 @@ impl Manager {
             return Err(abort_launch(vm.clone(), child, &log_path, err).await);
         }
 
+        let child_pid = child.id();
+        cleanup_runtime_mounts(&vm).await;
         {
             let mut inner = vm.lock().await;
             inner.runtime.monitor = Some(monitor.clone());
             inner.runtime.state = VmState::Running;
             inner.runtime.started_at = Some(Utc::now());
-            inner.runtime.command_pid = child.id();
+            inner.runtime.reset_health_tracking();
+            inner.runtime.command_pid = child_pid;
             inner.runtime.virtiofsd_handles = virtiofsd_handles;
             inner.runtime.fuse_handles = fuse_handles;
             inner.runtime.tap_network = tap_network_handle.take();
@@ -1744,7 +1983,7 @@ impl Manager {
                 warn!(vm_id = %id, error = %err, "failed to persist metadata after start");
             }
         }
-        match child.id() {
+        match child_pid {
             Some(pid) => {
                 if let Err(err) = network::register_vm_process(id, pid).await {
                     if cfg.ha_mode {
@@ -1783,7 +2022,7 @@ impl Manager {
             None => {}
         }
 
-        spawn_exit_task(vm.clone(), child, log_path);
+        spawn_exit_task(vm.clone(), child, log_path, child_pid);
         info!(vm_id = %id, "VM started");
         let meta = vm.lock().await.metadata.clone();
         Ok(meta)
@@ -1872,6 +2111,7 @@ impl Manager {
             let mut inner = vm.lock().await;
             inner.runtime.state = VmState::Running;
             inner.runtime.started_at = Some(Utc::now());
+            inner.runtime.reset_health_tracking();
             inner.metadata.state = VmState::Running;
             inner.metadata.started_at = inner.runtime.started_at;
             if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
@@ -1922,19 +2162,7 @@ impl Manager {
             .map_err(ManagerError::Other)?;
             if reclaimed {
                 let _ = network::unregister_vm_proxy_policy(id).await;
-                let (fuse_handles, tap_network) = {
-                    let mut inner = vm.lock().await;
-                    (
-                        std::mem::take(&mut inner.runtime.fuse_handles),
-                        inner.runtime.tap_network.take(),
-                    )
-                };
-                if let Some(handle) = tap_network {
-                    handle.shutdown().await;
-                }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
+                cleanup_runtime_mounts(&vm).await;
                 // @dive: Attach/failover paths can invoke force-stop without local runtime bookkeeping; persist stopped state after reclaim.
                 mark_vm_state(&vm, VmState::Stopped).await;
             }
@@ -1942,6 +2170,55 @@ impl Manager {
 
         let meta = vm.lock().await.metadata.clone();
         Ok(meta)
+    }
+
+    pub async fn mark_vm_error(&self, id: &str, reason: &str) -> ManagerResult<VmMetadata> {
+        {
+            let vm = self.vm_by_id(id).await?;
+            let inner = vm.lock().await;
+            if inner.runtime.state == VmState::Error && inner.metadata.state == VmState::Error {
+                return Ok(inner.metadata.clone());
+            }
+        }
+
+        if let Err(err) = self.force_stop_vm(id).await {
+            warn!(
+                vm_id = %id,
+                error = %err,
+                reason = %reason,
+                "failed force-stopping vm before marking error"
+            );
+        }
+        if let Err(err) = network::unregister_vm_proxy_policy(id).await {
+            warn!(
+                vm_id = %id,
+                error = %err,
+                reason = %reason,
+                "failed unregistering vm proxy policy before marking error"
+            );
+        }
+        let vm = self.vm_by_id(id).await?;
+        cleanup_runtime_mounts(&vm).await;
+        {
+            let mut inner = vm.lock().await;
+            inner.runtime.state = VmState::Error;
+            inner.runtime.started_at = None;
+            inner.runtime.reset_health_tracking();
+            inner.metadata.state = VmState::Error;
+            inner.metadata.started_at = None;
+            {
+                let mut exit = inner
+                    .runtime
+                    .exit_status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *exit = Some(anyhow!(reason.to_string()));
+            }
+            if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
+                warn!(vm_id = %id, error = %err, "persist metadata after marking vm error failed");
+            }
+        }
+        Ok(vm.lock().await.metadata.clone())
     }
 
     #[instrument(skip(self), fields(vm_id = %vm_id, snapshot_id = %snapshot_id))]
@@ -2926,6 +3203,7 @@ async fn mark_vm_state(vm: &Arc<Vm>, state: VmState) {
     inner.runtime.state = state;
     if state != VmState::Running {
         inner.runtime.started_at = None;
+        inner.runtime.reset_health_tracking();
     }
     inner.metadata.state = state;
     inner.metadata.started_at = inner.runtime.started_at;
@@ -3056,7 +3334,7 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
+fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf, expected_pid: Option<u32>) {
     tokio::spawn(async move {
         let wait_result = child.wait().await;
         let tail = read_log_tail(&log_path, 8192);
@@ -3078,9 +3356,20 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
         let mut inner = vm.lock().await;
         let vm_id = inner.metadata.id.clone();
         let vm_id_for_proxy_cleanup = vm_id.clone();
+        let current_pid = inner.runtime.command_pid;
+        if current_pid != expected_pid {
+            warn!(
+                vm_id = %vm_id,
+                expected_pid = ?expected_pid,
+                current_pid = ?current_pid,
+                "stale VM exit task observed; preserving newer runtime state"
+            );
+            return;
+        }
         inner.runtime.monitor = None;
         inner.runtime.command_pid = None;
         inner.runtime.started_at = None;
+        inner.runtime.reset_health_tracking();
 
         // @dive: virtiofsd normally self-exits when qemu drops the vhost-user socket,
         //        but we still SIGTERM any straggler to make cleanup deterministic and
@@ -3097,17 +3386,27 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf) {
             handle.shutdown().await;
         }
 
-        {
+        let preserve_existing_error_reason = {
             let mut exit_guard = inner
                 .runtime
                 .exit_status
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            *exit_guard = exit_error.take();
-        }
+            if inner.runtime.state == VmState::Error && exit_guard.is_some() {
+                true
+            } else {
+                *exit_guard = exit_error.take();
+                false
+            }
+        };
 
-        inner.runtime.state = new_state;
-        inner.metadata.state = new_state;
+        let final_state = if preserve_existing_error_reason {
+            VmState::Error
+        } else {
+            new_state
+        };
+        inner.runtime.state = final_state;
+        inner.metadata.state = final_state;
         inner.metadata.started_at = inner.runtime.started_at;
 
         if let Some(msg) = log_message {
@@ -3818,6 +4117,7 @@ mod tests {
             guest_network: Default::default(),
             network_services: Default::default(),
             security: Default::default(),
+            snapshot_staging_dir: None,
         };
 
         let manager = Manager {
@@ -4059,6 +4359,7 @@ mod tests {
             guest_network: Default::default(),
             network_services: Default::default(),
             security: Default::default(),
+            snapshot_staging_dir: None,
         };
 
         let manager = Manager {
@@ -4108,6 +4409,7 @@ mod tests {
             guest_network: Default::default(),
             network_services: Default::default(),
             security: Default::default(),
+            snapshot_staging_dir: None,
         };
 
         let manager = Manager {
@@ -4201,6 +4503,7 @@ mod tests {
             guest_network: Default::default(),
             network_services: Default::default(),
             security: Default::default(),
+            snapshot_staging_dir: None,
         };
 
         let manager = Manager {
@@ -4309,6 +4612,7 @@ mod tests {
             guest_network: Default::default(),
             network_services: Default::default(),
             security: Default::default(),
+            snapshot_staging_dir: None,
         };
 
         let manager = Manager {
@@ -4401,6 +4705,7 @@ mod tests {
             guest_network: Default::default(),
             network_services: Default::default(),
             security: Default::default(),
+            snapshot_staging_dir: None,
         };
 
         let manager = Manager {
@@ -5042,6 +5347,7 @@ mod tests {
                 guest_network: Default::default(),
                 network_services: Default::default(),
                 security: Default::default(),
+            snapshot_staging_dir: None,
             },
             host_arch: ARCH_ARM64.to_string(),
             vms: RwLock::new(HashMap::new()),
