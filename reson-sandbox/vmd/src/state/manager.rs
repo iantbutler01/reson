@@ -67,6 +67,7 @@ const MAX_VM_DISK_GB: i32 = 100;
 const VM_RUNNING_TIMEOUT: Duration = Duration::from_secs(60);
 const INCOMING_RESTORE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INCOMING_RESTORE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
+const AMD64_QEMU_RUNTIME_FINGERPRINT: &str = "qemu-amd64-apic-vapic-off-v1";
 const ARM64_BIOS_CANDIDATES: [&str; 3] = [
     "/usr/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
@@ -1305,8 +1306,7 @@ impl Manager {
             monitor.ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
 
         let mut meta = new_snapshot_metadata(params.label, params.description);
-        meta.guest_runtime_fingerprint =
-            Some(portproxy::guest_runtime_fingerprint(arch.as_str()).map_err(ManagerError::Other)?);
+        meta.guest_runtime_fingerprint = Some(current_guest_runtime_fingerprint(arch.as_str())?);
         let snapshots_dir = vm_dir.join("snapshots");
         tokio::fs::create_dir_all(&snapshots_dir)
             .await
@@ -2946,6 +2946,15 @@ fn build_qemu_args(
     args.push(machine);
     args.push("-cpu".to_string());
     args.push(cpu);
+    if guest_arch == ARCH_AMD64 {
+        // @dive: The KVM VAPIC/TPR option ROM is a legacy optimization for old
+        //        32-bit Windows guests. Our Linux guests do not need it, and its
+        //        `kvm-tpr-opt` migration post-load hook can fail RAM restore with
+        //        EPERM under the nested/Kubernetes KVM environment. Keep KVM on,
+        //        but remove this migration-toxic APIC subfeature.
+        args.push("-global".to_string());
+        args.push("apic.vapic=off".to_string());
+    }
     args.push("-smp".to_string());
     args.push(meta.resources.vcpu.to_string());
     args.push("-m".to_string());
@@ -3077,7 +3086,12 @@ fn map_bootstrap_network(meta: &VmMetadata) -> bootstrap::NetworkConfig {
 }
 
 fn current_guest_runtime_fingerprint(arch: &str) -> ManagerResult<String> {
-    portproxy::guest_runtime_fingerprint(arch).map_err(ManagerError::Other)
+    let guest_runtime = portproxy::guest_runtime_fingerprint(arch).map_err(ManagerError::Other)?;
+    if arch == ARCH_AMD64 {
+        Ok(format!("{guest_runtime}:{AMD64_QEMU_RUNTIME_FINGERPRINT}"))
+    } else {
+        Ok(guest_runtime)
+    }
 }
 
 fn snapshot_guest_runtime_matches_current(
@@ -5042,6 +5056,66 @@ mod tests {
             .get(incoming_idx + 1)
             .expect("`-incoming` missing its value arg");
         assert_eq!(next, "defer", "unexpected -incoming value");
+    }
+
+    #[test]
+    fn build_qemu_args_disables_amd64_vapic_for_ram_restore_compatibility() {
+        let meta = VmMetadata {
+            id: "vm-vapic-off".to_string(),
+            name: "vapic-off".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            state: VmState::Stopped,
+            architecture: ARCH_AMD64.to_string(),
+            source: VmSource {
+                source_type: VmSourceType::Docker,
+                reference: "mock/image:latest".to_string(),
+            },
+            resources: crate::state::ResourceSpec {
+                vcpu: 1,
+                memory_mb: 512,
+                disk_gb: 10,
+            },
+            network: NetworkSpec {
+                mac: "02:00:00:00:00:12".to_string(),
+                proxy_port: 3000,
+                rpc_port: 3001,
+            },
+            metadata: HashMap::new(),
+            snapshots: Vec::new(),
+            shared_mounts: Vec::new(),
+            boot_incoming_ram_path: String::new(),
+            started_at: None,
+        };
+        let args = build_qemu_args(
+            &meta,
+            Path::new("/tmp/vm-vapic-off"),
+            Path::new("/tmp/vm-vapic-off/qmp.sock"),
+            Path::new("/tmp/vm-vapic-off/qemu.pid"),
+            ARCH_AMD64,
+            &test_tap_spec(&meta.id),
+            &[],
+        )
+        .expect("build qemu args");
+
+        let global_idx = args
+            .iter()
+            .position(|arg| arg == "-global")
+            .expect("missing -global");
+        assert_eq!(
+            args.get(global_idx + 1).map(String::as_str),
+            Some("apic.vapic=off")
+        );
+    }
+
+    #[test]
+    fn amd64_runtime_fingerprint_includes_qemu_migration_shape() {
+        let fingerprint =
+            current_guest_runtime_fingerprint(ARCH_AMD64).expect("fingerprint should build");
+        assert!(
+            fingerprint.contains(AMD64_QEMU_RUNTIME_FINGERPRINT),
+            "amd64 RAM snapshots must be invalidated when migration-sensitive QEMU args change"
+        );
     }
 
     #[test]
