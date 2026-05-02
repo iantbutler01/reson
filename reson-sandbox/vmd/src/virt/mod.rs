@@ -18,6 +18,9 @@ use tokio::task;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
+pub const RAM_SNAPSHOT_FORMAT_LEGACY: &str = "legacy";
+pub const RAM_SNAPSHOT_FORMAT_MAPPED: &str = "mapped-ram";
+
 #[derive(Clone, Debug)]
 pub struct MonitorHandle {
     path: PathBuf,
@@ -301,6 +304,106 @@ pub async fn wait_for_running(monitor: &MonitorHandle, timeout: Duration) -> Res
     }
 }
 
+pub async fn wait_for_running_or_incoming_restore(
+    monitor: &MonitorHandle,
+    running_timeout: Duration,
+    incoming_total_timeout: Duration,
+    incoming_stall_timeout: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    let running_deadline = started + running_timeout;
+    let incoming_deadline = started + incoming_total_timeout;
+    let mut incoming_seen = false;
+    let mut last_progress_at = started;
+    let mut last_bytes_transferred = None;
+    let mut last_migrate_status: Option<String> = None;
+
+    loop {
+        let status = monitor.query_status().await?;
+        if status.running {
+            return Ok(());
+        }
+
+        if status.status == "inmigrate" {
+            incoming_seen = true;
+            match query_migrate(monitor).await {
+                Ok(migrate) => {
+                    let status_changed =
+                        last_migrate_status.as_deref() != Some(migrate.status.as_str());
+                    let bytes_progressed = match (last_bytes_transferred, migrate.bytes_transferred)
+                    {
+                        (Some(previous), Some(current)) => current > previous,
+                        (None, Some(current)) => current > 0,
+                        _ => false,
+                    };
+                    if status_changed || bytes_progressed {
+                        last_progress_at = Instant::now();
+                        last_migrate_status = Some(migrate.status.clone());
+                        last_bytes_transferred = migrate.bytes_transferred;
+                        debug!(
+                            status = %migrate.status,
+                            bytes = ?migrate.bytes_transferred,
+                            total_ms = ?migrate.total_time_ms,
+                            "incoming migration restore made progress"
+                        );
+                    }
+
+                    match migrate.status.as_str() {
+                        "failed" | "cancelled" | "cancelling" => {
+                            bail!(
+                                "incoming migration restore ended in status {}: {}",
+                                migrate.status,
+                                migrate.error_desc.as_deref().unwrap_or("<no detail>")
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "failed querying incoming migration progress"
+                    );
+                }
+            }
+
+            let now = Instant::now();
+            if now >= incoming_deadline {
+                bail!(
+                    "timeout waiting for incoming VM restore to finish after {}s (last qmp status: {}, last migrate status: {}, bytes: {:?})",
+                    incoming_total_timeout.as_secs(),
+                    status.status,
+                    last_migrate_status.as_deref().unwrap_or("<unknown>"),
+                    last_bytes_transferred
+                );
+            }
+            if now.duration_since(last_progress_at) >= incoming_stall_timeout {
+                bail!(
+                    "incoming VM restore stalled for {}s (last qmp status: {}, last migrate status: {}, bytes: {:?})",
+                    incoming_stall_timeout.as_secs(),
+                    status.status,
+                    last_migrate_status.as_deref().unwrap_or("<unknown>"),
+                    last_bytes_transferred
+                );
+            }
+        } else if incoming_seen {
+            if Instant::now() >= incoming_deadline {
+                bail!(
+                    "timeout waiting for VM to report running after incoming restore (last qmp status: {})",
+                    status.status
+                );
+            }
+        } else if Instant::now() >= running_deadline {
+            bail!(
+                "timeout waiting for VM to report running state (last qmp status: {})",
+                status.status
+            );
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub async fn system_powerdown(monitor: &MonitorHandle) -> Result<()> {
     monitor.execute("system_powerdown", None).await.map(|_| ())
 }
@@ -323,21 +426,15 @@ pub async fn cont(monitor: &MonitorHandle) -> Result<()> {
 /// is 32 MiB/s which would cap our snapshot throughput absurdly low. We set this to a
 /// large value so the snapshot writes at the underlying storage's full speed.
 ///
-/// **qemu 6.2 compatibility notes (empirically confirmed via direct QMP probing):**
-/// - `background-snapshot` capability requires `userfaultfd-WP` support (Linux ≥ 5.7).
-/// - `background-snapshot` is **incompatible with `compress`**:
-///   `"Background-snapshot is not compatible with compress"` — the legacy compress thread
-///   pool conflicts with the UFFD-WP migration worker.
-/// - `background-snapshot` is **incompatible with `multifd`**:
-///   `"Background-snapshot is not compatible with multifd"` — multifd requires the main
-///   migration thread to iterate, but background-snapshot runs the copy in a UFFD-WP
-///   worker thread that isn't multifd-aware.
-/// - So the only throughput knob we have is `max-bandwidth`, which we uncap. Guest is
-///   not frozen during the copy, so `max-bandwidth` only affects the wall-clock completion
-///   time of the background migration, not user-perceived latency.
+/// QEMU 9+ supports the `mapped-ram` file migration format, which pairs with `direct-io`
+/// so RAM pages are written to stable offsets rather than a single sequential stream.
+/// vmd prefers that format for new snapshots and falls back to the legacy
+/// background-snapshot stream when the running qemu/kernel cannot support it.
 #[derive(Clone, Debug)]
 pub struct BackgroundSnapshotOptions {
     pub max_bandwidth_bytes_per_sec: u64,
+    pub prefer_mapped_ram: bool,
+    pub direct_io: bool,
 }
 
 impl Default for BackgroundSnapshotOptions {
@@ -345,6 +442,8 @@ impl Default for BackgroundSnapshotOptions {
         Self {
             // 10 GiB/s — effectively uncapped; qemu clamps to real disk throughput anyway.
             max_bandwidth_bytes_per_sec: 10u64 * 1024 * 1024 * 1024,
+            prefer_mapped_ram: true,
+            direct_io: true,
         }
     }
 }
@@ -411,16 +510,10 @@ pub async fn blockdev_snapshot_delete_internal_sync(
         .map(|_| ())
 }
 
-/// Enable the `background-snapshot` migration capability.
-///
-/// `background-snapshot` is the qemu ≥5.2 feature that lets the guest keep running during
-/// a RAM migration. It uses `userfaultfd-WP` to copy-on-write guest pages as the migration
-/// thread walks them, so there's no stop-the-world pause; the VM only briefly barriers on
-/// pages that the guest writes faster than the background thread can drain them.
-///
-/// No other capabilities are set here — qemu 6.2 rejects combining background-snapshot
-/// with either `compress` or `multifd`, which we confirmed empirically via QMP probing.
-async fn enable_background_snapshot_capabilities(monitor: &MonitorHandle) -> Result<()> {
+async fn configure_legacy_background_snapshot(
+    monitor: &MonitorHandle,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
     let args = json!({
         "capabilities": [
             { "capability": "background-snapshot", "state": true }
@@ -428,22 +521,75 @@ async fn enable_background_snapshot_capabilities(monitor: &MonitorHandle) -> Res
     });
     monitor
         .execute("migrate-set-capabilities", Some(args))
-        .await
-        .map(|_| ())
+        .await?;
+    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_LEGACY).await
+}
+
+async fn configure_mapped_background_snapshot(
+    monitor: &MonitorHandle,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
+    let args = json!({
+        "capabilities": [
+            { "capability": "background-snapshot", "state": true },
+            { "capability": "mapped-ram", "state": true }
+        ]
+    });
+    monitor
+        .execute("migrate-set-capabilities", Some(args))
+        .await?;
+    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_MAPPED).await
 }
 
 /// Configure migration runtime parameters for a background-snapshot save.
 async fn configure_background_snapshot_parameters(
     monitor: &MonitorHandle,
     opts: &BackgroundSnapshotOptions,
+    ram_format: &str,
 ) -> Result<()> {
-    // Only the bandwidth cap is tunable; compress-threads/level have no effect without
-    // the `compress` capability which we cannot enable alongside background-snapshot.
-    let params = json!({ "max-bandwidth": opts.max_bandwidth_bytes_per_sec });
+    let mut params = json!({ "max-bandwidth": opts.max_bandwidth_bytes_per_sec });
+    if ram_format == RAM_SNAPSHOT_FORMAT_MAPPED {
+        if let Some(object) = params.as_object_mut() {
+            object.insert("direct-io".to_string(), json!(opts.direct_io));
+        }
+    }
     monitor
         .execute("migrate-set-parameters", Some(params))
         .await
         .map(|_| ())
+}
+
+pub async fn start_incoming_migration_from_file(
+    monitor: &MonitorHandle,
+    ram_path: &Path,
+    ram_format: &str,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
+    match ram_format {
+        RAM_SNAPSHOT_FORMAT_MAPPED => configure_mapped_incoming_restore(monitor, opts).await?,
+        _ => {}
+    }
+
+    let migrate_uri = format!("file:{}", ram_path.display());
+    monitor
+        .execute("migrate-incoming", Some(json!({ "uri": migrate_uri })))
+        .await
+        .map(|_| ())
+}
+
+async fn configure_mapped_incoming_restore(
+    monitor: &MonitorHandle,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
+    let args = json!({
+        "capabilities": [
+            { "capability": "mapped-ram", "state": true }
+        ]
+    });
+    monitor
+        .execute("migrate-set-capabilities", Some(args))
+        .await?;
+    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_MAPPED).await
 }
 
 /// Status snapshot of an in-progress migration, as returned by QMP `query-migrate`.
@@ -454,6 +600,7 @@ pub struct MigrationStatus {
     pub bytes_transferred: Option<u64>,
     pub expected_downtime_ms: Option<u64>,
     pub error_desc: Option<String>,
+    pub ram_format: String,
 }
 
 /// Query the current migration state.
@@ -480,6 +627,7 @@ pub async fn query_migrate(monitor: &MonitorHandle) -> Result<MigrationStatus> {
         bytes_transferred,
         expected_downtime_ms,
         error_desc,
+        ram_format: String::new(),
     })
 }
 
@@ -496,10 +644,10 @@ pub async fn query_migrate(monitor: &MonitorHandle) -> Result<MigrationStatus> {
 /// Ordering inside this function:
 ///   1. Discover the block device name via `query-block`.
 ///   2. Take an internal disk snapshot pinning the point-in-time disk state.
-///   3. Enable `background-snapshot` on the migration channel (alone — qemu 6.2 rejects
-///      combining it with `compress` or `multifd`).
-///   4. Configure `max-bandwidth` to an effectively-uncapped value so the snapshot writes
-///      at the storage's real throughput instead of qemu's 32 MiB/s default.
+///   3. Prefer `background-snapshot` + `mapped-ram`; fall back to legacy
+///      `background-snapshot` when the running qemu/kernel cannot support mapped RAM.
+///   4. Configure `max-bandwidth` to an effectively-uncapped value and, for mapped RAM,
+///      enable direct I/O.
 ///   5. Issue `migrate file:<ram_path>` — qemu installs UFFD-WP and begins the async copy.
 ///   6. Poll `query-migrate` until the migration finishes or fails.
 ///
@@ -523,14 +671,36 @@ pub async fn save_vm_background(
         .await
         .with_context(|| "blockdev-snapshot-internal-sync for background save")?;
 
-    if let Err(err) = enable_background_snapshot_capabilities(monitor).await {
-        let _ = blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
-        return Err(err.context("enable background-snapshot capabilities"));
-    }
-    if let Err(err) = configure_background_snapshot_parameters(monitor, opts).await {
-        let _ = blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
-        return Err(err.context("configure migrate parameters"));
-    }
+    let ram_format = if opts.prefer_mapped_ram {
+        match configure_mapped_background_snapshot(monitor, opts).await {
+            Ok(()) => RAM_SNAPSHOT_FORMAT_MAPPED,
+            Err(mapped_err) => {
+                warn!(
+                    error = %mapped_err,
+                    "mapped-ram background snapshot setup failed; falling back to legacy migration stream"
+                );
+                if let Err(err) = configure_legacy_background_snapshot(monitor, opts).await {
+                    let _ = blockdev_snapshot_delete_internal_sync(
+                        monitor,
+                        &device,
+                        disk_snapshot_name,
+                    )
+                    .await;
+                    return Err(err.context(format!(
+                        "configure legacy background snapshot after mapped-ram setup failed: {mapped_err}"
+                    )));
+                }
+                RAM_SNAPSHOT_FORMAT_LEGACY
+            }
+        }
+    } else {
+        if let Err(err) = configure_legacy_background_snapshot(monitor, opts).await {
+            let _ =
+                blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
+            return Err(err.context("configure legacy background snapshot"));
+        }
+        RAM_SNAPSHOT_FORMAT_LEGACY
+    };
 
     if let Some(parent) = ram_path.parent() {
         if let Err(err) = tokio::fs::create_dir_all(parent).await {
@@ -567,7 +737,11 @@ pub async fn save_vm_background(
             "background-snapshot migrate poll"
         );
         match status.status.as_str() {
-            "completed" => return Ok(status),
+            "completed" => {
+                let mut status = status;
+                status.ram_format = ram_format.to_string();
+                return Ok(status);
+            }
             "failed" | "cancelled" | "cancelling" => {
                 let _ =
                     blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name)

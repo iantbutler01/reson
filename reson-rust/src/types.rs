@@ -133,6 +133,10 @@ impl Provider {
 
     /// Check whether this provider/model pair can inspect image inputs.
     pub fn supports_image_input(&self, model: &str) -> bool {
+        if let Some(image_input) = model_image_input_override(model) {
+            return image_input;
+        }
+
         let normalized = normalize_capability_model_name(model);
 
         match self {
@@ -146,6 +150,24 @@ impl Provider {
             }
         }
     }
+}
+
+fn model_image_input_override(model: &str) -> Option<bool> {
+    model
+        .split('@')
+        .skip(1)
+        .filter_map(|param| param.split_once('='))
+        .find_map(|(key, value)| {
+            if key != "vision" {
+                return None;
+            }
+
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Some(true),
+                "0" | "false" | "no" => Some(false),
+                _ => None,
+            }
+        })
 }
 
 /// Provider-normalized capability flags for a concrete model.
@@ -1543,6 +1565,26 @@ mod tests {
         assert_eq!(model, "openai/o4-mini");
 
         assert!(Provider::from_model_string("invalid").is_err());
+    }
+
+    #[test]
+    fn test_provider_image_input_override() {
+        assert!(
+            Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=true")
+        );
+        assert!(
+            !Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=maybe")
+        );
+        assert!(!Provider::OpenAI.supports_image_input("gpt-4o@vision=false"));
+        assert!(!Provider::OpenRouter
+            .supports_image_input("qwen/qwen2.5-vl-72b-instruct@image_input=true"));
+
+        let capabilities = Provider::OpenRouter.capabilities_for_model("custom/model@vision=true");
+        assert!(capabilities.image_input);
+        assert_eq!(
+            capabilities.image_input_sources,
+            vec![MediaSourceKind::Base64, MediaSourceKind::Url]
+        );
     }
 
     #[test]

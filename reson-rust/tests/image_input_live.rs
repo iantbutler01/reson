@@ -20,12 +20,14 @@ fn live_image_tests_enabled() -> bool {
 }
 
 fn letter_l_message() -> Vec<ConversationMessage> {
-    vec![ConversationMessage::Multimodal(MultimodalMessage::user(vec![
-        MediaPart::text(
-            "What uppercase letter is drawn in the image? Answer with the single letter only.",
-        ),
-        MediaPart::image(MediaSource::base64(LETTER_L_PNG, "image/png")),
-    ]))]
+    vec![ConversationMessage::Multimodal(MultimodalMessage::user(
+        vec![
+            MediaPart::text(
+                "What uppercase letter is drawn in the image? Answer with the single letter only.",
+            ),
+            MediaPart::image(MediaSource::base64(LETTER_L_PNG, "image/png")),
+        ],
+    ))]
 }
 
 fn assert_reads_letter_l(provider: &str, model: &str, text: &str) {

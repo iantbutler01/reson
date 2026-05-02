@@ -500,12 +500,14 @@ fn resolve_provider_key(model: &str) -> String {
 /// Parameters:
 /// - `@reasoning=<value>` - reasoning effort (numeric budget or level like `high`)
 /// - `@cache=<value>` - OpenAI prompt cache retention (`in_memory` or `24h`)
+/// - `@vision=<true|false>` - image-input capability override consumed by `Provider::supports_image_input`
 /// - `@server_url=<url>` - custom API endpoint (required for `custom-openai`, optional for `openai`)
 /// - `@api_key=<key>` - inline API key (overrides env var and `api_key` parameter)
 ///
 /// Examples:
 /// - `anthropic:claude-3-5-sonnet-20241022`
 /// - `openrouter:openai/gpt-4o@reasoning=high`
+/// - `openrouter:qwen/qwen2.5-vl-72b-instruct@vision=true`
 /// - `openai:gpt-5.1@cache=24h`
 /// - `openai:gpt-4o`
 /// - `openai:resp:gpt-4o`
@@ -885,6 +887,18 @@ mod tests {
             parsed.prompt_cache_retention,
             Some(PromptCacheRetention::H24)
         );
+    }
+
+    #[test]
+    fn test_parse_model_string_strips_capability_overrides_from_provider_model() {
+        let parsed =
+            parse_model_string("openrouter:qwen/qwen2.5-vl-72b-instruct@vision=true").unwrap();
+        assert_eq!(parsed.provider, "openrouter");
+        assert_eq!(parsed.model_name, "qwen/qwen2.5-vl-72b-instruct");
+
+        let parsed = parse_model_string("openai:resp:gpt-4o@vision=false").unwrap();
+        assert_eq!(parsed.provider, "openai-responses");
+        assert_eq!(parsed.model_name, "gpt-4o");
     }
 
     #[test]

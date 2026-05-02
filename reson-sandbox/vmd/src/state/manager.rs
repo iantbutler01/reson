@@ -27,6 +27,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::assets::portproxy;
 use crate::bootstrap;
 use crate::config::{self, Config};
 use crate::fuse;
@@ -813,6 +814,8 @@ impl Manager {
             description: snapshot.description.clone(),
             created_at: snapshot.created_at,
             ram_file_name: snapshot.ram_file_name.clone(),
+            ram_format: snapshot.ram_format.clone(),
+            guest_runtime_fingerprint: snapshot.guest_runtime_fingerprint.clone(),
         });
 
         let (
@@ -1280,13 +1283,14 @@ impl Manager {
         params: SnapshotParams,
     ) -> ManagerResult<PendingSnapshot> {
         let vm = self.vm_by_id(vm_id).await?;
-        let (state, monitor, disk_path, vm_dir) = {
+        let (state, monitor, disk_path, vm_dir, arch) = {
             let inner = vm.lock().await;
             (
                 inner.runtime.state,
                 inner.runtime.monitor.clone(),
                 vm.disk_path(),
                 vm.dir.clone(),
+                inner.metadata.architecture.clone(),
             )
         };
 
@@ -1300,7 +1304,9 @@ impl Manager {
         let monitor =
             monitor.ok_or_else(|| ManagerError::Other(anyhow!("vm monitor unavailable")))?;
 
-        let meta = new_snapshot_metadata(params.label, params.description);
+        let mut meta = new_snapshot_metadata(params.label, params.description);
+        meta.guest_runtime_fingerprint =
+            Some(portproxy::guest_runtime_fingerprint(arch.as_str()).map_err(ManagerError::Other)?);
         let snapshots_dir = vm_dir.join("snapshots");
         tokio::fs::create_dir_all(&snapshots_dir)
             .await
@@ -1331,9 +1337,7 @@ impl Manager {
             if let Some(parent) = staging_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
-                    .with_context(|| {
-                        format!("ensure snapshot staging dir {}", parent.display())
-                    })
+                    .with_context(|| format!("ensure snapshot staging dir {}", parent.display()))
                     .map_err(ManagerError::Other)?;
                 ensure_qemu_writable_snapshot_dir(parent, &self.cfg)
                     .with_context(|| format!("prepare snapshot staging dir {}", parent.display()))
@@ -1351,10 +1355,12 @@ impl Manager {
         )
         .await
         .map_err(ManagerError::Other)?;
+        meta.ram_format = status.ram_format.clone();
         debug!(
             vm_id = %vm_id,
             snapshot = %meta.name,
             ram_bytes = ?status.bytes_transferred,
+            ram_format = %meta.ram_format,
             total_ms = ?status.total_time_ms,
             staged = staging_ram_path.is_some(),
             "background snapshot qemu phase completed"
@@ -1602,6 +1608,14 @@ impl Manager {
             }
             inner.runtime.state = VmState::Creating;
             inner.metadata.state = VmState::Creating;
+            if !boot_incoming_guest_runtime_matches(&inner.metadata)? {
+                warn!(
+                    vm_id = %id,
+                    incoming = %inner.metadata.boot_incoming_ram_path,
+                    "clearing incompatible boot_incoming_ram_path before cold starting VM disk"
+                );
+                inner.metadata.boot_incoming_ram_path.clear();
+            }
 
             let snapshot = inner.metadata.clone();
             save_metadata(&vm.dir, &mut inner.metadata).map_err(ManagerError::Other)?;
@@ -1914,11 +1928,28 @@ impl Manager {
                     return Err(abort_launch(vm.clone(), child, &log_path, err).await);
                 }
             };
+        let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
+        if booting_from_incoming {
+            let ram_format = boot_incoming_ram_format(&meta_snapshot);
+            virt::start_incoming_migration_from_file(
+                &monitor,
+                Path::new(&meta_snapshot.boot_incoming_ram_path),
+                ram_format,
+                &virt::BackgroundSnapshotOptions::default(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "start incoming VM restore from {}",
+                    meta_snapshot.boot_incoming_ram_path
+                )
+            })
+            .map_err(ManagerError::Other)?;
+        }
         // Cooled/restarted VMs can spend longer in QMP pre-running states while
         // restoring disk/memory and reconnecting shared mounts. When booting from a
         // live RAM snapshot, QEMU sits in `inmigrate`; supervise migration progress
         // instead of treating a healthy-but-slow restore like a stuck launch.
-        let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
         let running_result = if booting_from_incoming {
             virt::wait_for_running_or_incoming_restore(
                 &monitor,
@@ -2228,7 +2259,7 @@ impl Manager {
         snapshot_id: &str,
     ) -> ManagerResult<VmMetadata> {
         let vm = self.vm_by_id(vm_id).await?;
-        let (state, snapshot, disk_path, vm_dir) = {
+        let (state, snapshot, disk_path, vm_dir, arch) = {
             let inner = vm.lock().await;
             let state = inner.runtime.state;
             let snapshot = inner
@@ -2239,8 +2270,29 @@ impl Manager {
                 .cloned()
                 .ok_or(ManagerError::SnapshotNotFound)?;
             let disk_path = vm.disk_path();
-            (state, snapshot, disk_path, vm.dir.clone())
+            (
+                state,
+                snapshot,
+                disk_path,
+                vm.dir.clone(),
+                inner.metadata.architecture.clone(),
+            )
         };
+
+        let current_runtime_fingerprint = current_guest_runtime_fingerprint(arch.as_str())?;
+        if snapshot.guest_runtime_fingerprint.as_deref()
+            != Some(current_runtime_fingerprint.as_str())
+        {
+            return Err(ManagerError::Other(anyhow!(
+                "snapshot {} guest runtime fingerprint incompatible: snapshot={} current={}",
+                snapshot.name,
+                snapshot
+                    .guest_runtime_fingerprint
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+                current_runtime_fingerprint
+            )));
+        }
 
         let ram_path = vm_dir.join("snapshots").join(&snapshot.ram_file_name);
         if !ram_path.exists() {
@@ -2248,6 +2300,12 @@ impl Manager {
                 "snapshot {} missing ram file at {}",
                 snapshot.name,
                 ram_path.display()
+            )));
+        }
+        if snapshot.ram_format.trim().is_empty() {
+            return Err(ManagerError::Other(anyhow!(
+                "snapshot {} is missing RAM snapshot format metadata; skipping restore because the VM runtime was upgraded",
+                snapshot.name
             )));
         }
 
@@ -2966,12 +3024,13 @@ fn build_qemu_args(
         args.push(bios);
     }
 
-    // @dive: `-incoming file:<path>` restores the VM from a background-snapshot RAM
-    //        file (paired with an already-reverted qcow2 disk snapshot). This is the
-    //        only restore mechanism — there is no legacy `-loadvm` path.
+    // @dive: Defer incoming restore until after QMP is available. Fast mapped-ram
+    //        restore requires migration capabilities/parameters to be set before
+    //        qemu consumes the file, so `start_vm_inner` issues `migrate-incoming`
+    //        after monitor setup.
     if !meta.boot_incoming_ram_path.is_empty() {
         args.push("-incoming".to_string());
-        args.push(format!("file:{}", meta.boot_incoming_ram_path));
+        args.push("defer".to_string());
     }
 
     let bootstrap_iso = vm_dir.join("bootstrap.iso");
@@ -3015,6 +3074,57 @@ fn map_bootstrap_network(meta: &VmMetadata) -> bootstrap::NetworkConfig {
         gateway: addressing.gateway_ip.to_string(),
         dns: addressing.gateway_ip.to_string(),
     }
+}
+
+fn current_guest_runtime_fingerprint(arch: &str) -> ManagerResult<String> {
+    portproxy::guest_runtime_fingerprint(arch).map_err(ManagerError::Other)
+}
+
+fn snapshot_guest_runtime_matches_current(
+    snapshot: &SnapshotMetadata,
+    arch: &str,
+) -> ManagerResult<bool> {
+    let current = current_guest_runtime_fingerprint(arch)?;
+    Ok(snapshot.guest_runtime_fingerprint.as_deref() == Some(current.as_str()))
+}
+
+fn boot_incoming_guest_runtime_matches(meta: &VmMetadata) -> ManagerResult<bool> {
+    if meta.boot_incoming_ram_path.is_empty() {
+        return Ok(true);
+    }
+
+    let Some(incoming_file_name) = Path::new(&meta.boot_incoming_ram_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return Ok(false);
+    };
+
+    let Some(snapshot) = meta
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.ram_file_name == incoming_file_name)
+    else {
+        return Ok(false);
+    };
+
+    snapshot_guest_runtime_matches_current(snapshot, meta.architecture.as_str())
+}
+
+fn boot_incoming_ram_format(meta: &VmMetadata) -> &str {
+    let Some(incoming_file_name) = Path::new(&meta.boot_incoming_ram_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return virt::RAM_SNAPSHOT_FORMAT_LEGACY;
+    };
+
+    meta.snapshots
+        .iter()
+        .find(|snapshot| snapshot.ram_file_name == incoming_file_name)
+        .map(|snapshot| snapshot.ram_format.as_str())
+        .filter(|format| !format.trim().is_empty())
+        .unwrap_or(virt::RAM_SNAPSHOT_FORMAT_LEGACY)
 }
 
 fn vm_proxy_policy_from_metadata(meta: &VmMetadata) -> Result<network::VmProxyPolicyConfig> {
@@ -4881,9 +4991,10 @@ mod tests {
 
     #[test]
     fn build_qemu_args_emits_incoming_when_boot_incoming_ram_path_set() {
-        // @dive: Verifies the one-shot -incoming restore path. When boot_incoming_ram_path
-        //        is populated, build_qemu_args must emit -incoming file:<path> so qemu
-        //        consumes the background-snapshot RAM file on launch.
+        // @dive: Verifies the one-shot incoming restore path. When
+        //        boot_incoming_ram_path is populated, qemu must start with
+        //        `-incoming defer` so vmd can configure mapped-ram/direct-io
+        //        over QMP before issuing `migrate-incoming file:<path>`.
         let meta = VmMetadata {
             id: "vm-incoming".to_string(),
             name: "incoming".to_string(),
@@ -4922,7 +5033,7 @@ mod tests {
         )
         .expect("build qemu args");
 
-        // `-incoming` must be present, followed by `file:<path>`.
+        // `-incoming` must be present and deferred until QMP config is applied.
         let incoming_idx = args
             .iter()
             .position(|a| a == "-incoming")
@@ -4930,10 +5041,7 @@ mod tests {
         let next = args
             .get(incoming_idx + 1)
             .expect("`-incoming` missing its value arg");
-        assert_eq!(
-            next, "file:/srv/reson/vms/vm-incoming/snapshots/snap-abc.ram",
-            "unexpected -incoming value"
-        );
+        assert_eq!(next, "defer", "unexpected -incoming value");
     }
 
     #[test]
@@ -5347,7 +5455,7 @@ mod tests {
                 guest_network: Default::default(),
                 network_services: Default::default(),
                 security: Default::default(),
-            snapshot_staging_dir: None,
+                snapshot_staging_dir: None,
             },
             host_arch: ARCH_ARM64.to_string(),
             vms: RwLock::new(HashMap::new()),

@@ -46,7 +46,7 @@ use crate::state::{
 };
 use crate::{
     config::{ControlBusConfig, NodeRegistryConfig},
-    control_bus, public_ingress, reconcile, registry, virt,
+    control_bus, health_reconciler, public_ingress, reconcile, registry, virt,
 };
 
 pub async fn run_server(config: Config) -> Result<()> {
@@ -62,6 +62,9 @@ pub async fn run_server(config: Config) -> Result<()> {
     let public_ingress_handle = public_ingress::start(&config, Arc::clone(&manager))
         .await
         .context("start public ingress server")?;
+    let vm_health_reconciler_handle = health_reconciler::start(Arc::clone(&manager))
+        .await
+        .context("start vm health reconciler")?;
     let registry_handle = start_node_registry(config.node_registry.clone()).await?;
     let partition_handle =
         start_partition_monitor(config.node_registry.as_ref(), config.control_bus.as_ref()).await?;
@@ -160,6 +163,9 @@ pub async fn run_server(config: Config) -> Result<()> {
         handle.shutdown().await;
     }
     if let Some(handle) = reconcile_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = vm_health_reconciler_handle {
         handle.shutdown().await;
     }
     if let Some(handle) = partition_handle {

@@ -305,22 +305,22 @@ fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
 
         MediaPart::Image { source, detail } => {
             let mut image = match source {
-            MediaSource::Base64 { data, mime_type } => json!({
-                "type": "input_image",
-                "image_url": format!("data:{};base64,{}", mime_type, data)
-            }),
-            MediaSource::Url { url } => json!({
-                "type": "input_image",
-                "image_url": url
-            }),
-            MediaSource::FileId { file_id } => json!({
-                "type": "input_image",
-                "file_id": file_id
-            }),
-            MediaSource::FileUri { uri, .. } => json!({
-                "type": "input_image",
-                "image_url": uri
-            }),
+                MediaSource::Base64 { data, mime_type } => json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{}", mime_type, data)
+                }),
+                MediaSource::Url { url } => json!({
+                    "type": "input_image",
+                    "image_url": url
+                }),
+                MediaSource::FileId { file_id } => json!({
+                    "type": "input_image",
+                    "file_id": file_id
+                }),
+                MediaSource::FileUri { uri, .. } => json!({
+                    "type": "input_image",
+                    "image_url": uri
+                }),
             };
             if let Some(detail) = detail {
                 image["detail"] = json!(detail);

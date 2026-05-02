@@ -17,6 +17,8 @@ pub mod bootstrap;
 pub mod config;
 pub mod control_bus;
 pub mod fuse;
+pub mod guest_exec_probe;
+pub mod health_reconciler;
 pub mod image;
 pub mod network;
 pub mod partition;

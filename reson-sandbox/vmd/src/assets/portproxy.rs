@@ -6,11 +6,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 const ENV_PROXY_BIN: &str = "PROXY_BIN";
 const DEFAULT_PROXY_BIN_DIR: &str = "../portproxy/bin";
 const PORTPROXY_LINUX_AMD64: &str = "portproxy-linux-amd64";
 const PORTPROXY_LINUX_ARM64: &str = "portproxy-linux-arm64";
+const GUEST_RUNTIME_FINGERPRINT_VERSION: &str = "bootstrap-v1";
 
 pub fn binary(arch: &str) -> Result<Vec<u8>> {
     let filename = match arch {
@@ -42,6 +44,29 @@ pub fn binary(arch: &str) -> Result<Vec<u8>> {
     bail!(
         "portproxy: read binary {filename} failed; searched: {searched}; set {ENV_PROXY_BIN} to override"
     );
+}
+
+pub fn guest_runtime_fingerprint(arch: &str) -> Result<String> {
+    let bin = binary(arch)?;
+    let digest = Sha256::digest(&bin);
+    Ok(format!(
+        "{GUEST_RUNTIME_FINGERPRINT_VERSION}:portproxy-sha256:{}",
+        hex_lower(&digest)
+    ))
+}
+
+pub fn binary_sha256_hex(arch: &str) -> Result<String> {
+    let bin = binary(arch)?;
+    Ok(hex_lower(&Sha256::digest(&bin)))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn default_candidate_dirs() -> Vec<PathBuf> {

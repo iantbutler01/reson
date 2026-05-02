@@ -38,7 +38,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN cargo install --locked --version 1.13.0 virtiofsd
 
-FROM ubuntu:24.04 AS threat-feed-builder
+FROM ubuntu:26.04 AS threat-feed-builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -62,13 +62,11 @@ FROM --platform=linux/amd64 ${D2VM_SOURCE_IMAGE} AS d2vm
 FROM --platform=linux/amd64 ${ENVOY_IMAGE} AS envoy-bin
 FROM --platform=linux/amd64 ${COREDNS_IMAGE} AS coredns-bin
 
-# @dive-rel: Ubuntu 24.04 (noble) ships qemu 8.2.2 + Rust virtiofsd 1.7.x.
-# @dive-rel: qemu 8.x is required for vhost-user-fs migration cooperation, which vmd
-# @dive-rel: needs for background-snapshot live migration. qemu 6.2 (Ubuntu 22.04)
-# @dive-rel: had `vhost-user-fs` marked `.unmigratable = 1` and would refuse any
-# @dive-rel: migrate call with a virtio-fs device attached. See immutable-munching-pearl.md
-# @dive-rel: for the full rationale.
-FROM ubuntu:24.04
+# @dive-rel: Ubuntu 26.04 ships QEMU 10.x, which includes mapped-ram file
+# @dive-rel: migration. vmd uses mapped-ram + direct-io for new RAM
+# @dive-rel: snapshots so warm restores do not get stuck on the old sequential
+# @dive-rel: `-incoming file:` path.
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

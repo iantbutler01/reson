@@ -167,8 +167,7 @@ fi
 cat <<'EOF' >/etc/systemd/system/portproxy.service
 [Unit]
 Description=Bracket PortProxy
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
@@ -468,6 +467,18 @@ chmod 0644 /etc/reson/tap-network.env
 
 if command -v netplan >/dev/null 2>&1; then
   mkdir -p /etc/netplan
+  mkdir -p /etc/reson/disabled-netplan
+  for existing in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+    [ -e "$existing" ] || continue
+    case "$(basename "$existing")" in
+      90-reson-tap.yaml)
+        continue
+        ;;
+    esac
+    disabled="/etc/reson/disabled-netplan/$(basename "$existing").disabled"
+    log "disabling inherited netplan config src=$existing dest=$disabled"
+    mv "$existing" "$disabled" || true
+  done
   cat <<EOF >/etc/netplan/90-reson-tap.yaml
 network:
   version: 2
@@ -487,7 +498,7 @@ network:
         addresses:
           - "$TAP_DNS"
 EOF
-  chmod 0644 /etc/netplan/90-reson-tap.yaml
+  chmod 0600 /etc/netplan/90-reson-tap.yaml
   netplan apply || true
 fi
 
@@ -1090,6 +1101,15 @@ mod tests {
         assert!(script.contains("TAP_ADDRESS_CIDR='198.18.0.2/30'"));
         assert!(script.contains("ip route replace default via \"$TAP_GATEWAY\""));
         assert!(script.contains("net.ipv6.conf.all.disable_ipv6=1"));
+        assert!(script.contains("disabling inherited netplan config"));
+        assert!(script.contains("chmod 0600 /etc/netplan/90-reson-tap.yaml"));
+    }
+
+    #[test]
+    fn init_script_does_not_block_portproxy_on_network_online() {
+        let script = build_init_script("vm-test", None, None, None);
+        assert!(script.contains("After=network.target"));
+        assert!(!script.contains("network-online.target"));
     }
 
     #[test]

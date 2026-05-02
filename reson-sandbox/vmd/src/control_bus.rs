@@ -10,19 +10,22 @@ use anyhow::{Context, Result, anyhow};
 use async_nats::jetstream;
 use async_nats::jetstream::AckKind;
 use async_nats::jetstream::consumer::{AckPolicy, pull};
+use chrono::Utc;
 use etcd_client::{Client as EtcdClient, Compare, CompareOp, PutOptions, Txn, TxnOp};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::assets::portproxy;
 use crate::config::ControlBusConfig;
 use crate::guest_exec_probe::{
-    portproxy_auth_header_from_metadata, probe_guest_exec_ready_anyhow, request_with_portproxy_auth,
+    META_PORTPROXY_AUTH_TOKEN, ensure_guest_portproxy_binary, portproxy_auth_header_from_metadata,
+    probe_guest_exec_ready_anyhow, request_with_portproxy_auth,
 };
 use crate::partition::PartitionGate;
 use crate::proto::bracket::portproxy::v1::daemon_manager_client::DaemonManagerClient;
@@ -46,11 +49,13 @@ const COMMAND_ACK_PROGRESS_MAX_INTERVAL_MS: u64 = 15_000;
 // mark the bad VM and publish a terminal error before the caller gives up locally.
 const GUEST_EXEC_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const WARM_GUEST_EXEC_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const RUNNING_VM_COLD_GUEST_EXEC_GRACE: Duration = Duration::from_secs(90);
 const GUEST_EXEC_READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 // @dive: Skip refreshing the execution-restore marker if we already refreshed within
 // this window. Bounds tier-B snapshot IOPS on shared RWX storage when an agent fires
 // many small commands in close succession; older marker remains valid as resume target.
 const EXEC_RESTORE_REFRESH_THROTTLE: Duration = Duration::from_secs(30);
+const EXEC_RESTORE_REFRESH_QUIET_PERIOD: Duration = Duration::from_secs(15);
 const VM_SNAPSHOT_STATE_GC_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub struct CommandConsumerHandle {
@@ -312,6 +317,56 @@ impl EtcdDedupeStore {
     fn completed_key(&self, idempotency_key: &str) -> String {
         format!("{}/completed/{}", self.key_prefix, idempotency_key)
     }
+
+    async fn acquire_inflight(
+        &self,
+        idempotency_key: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Option<DistributedCommandInFlightGuard>> {
+        let key = self.inflight_key(idempotency_key);
+        let ttl_secs = i64::try_from(ttl.as_secs().max(1)).unwrap_or(i64::MAX);
+        let mut client = self.etcd.lock().await;
+        let lease = client
+            .lease_grant(ttl_secs, None)
+            .await
+            .context("grant in-flight command lease")?;
+        let txn = Txn::new()
+            .when(vec![Compare::version(key.clone(), CompareOp::Equal, 0)])
+            .and_then(vec![TxnOp::put(
+                key.clone(),
+                owner.as_bytes(),
+                Some(PutOptions::new().with_lease(lease.id())),
+            )]);
+        let response = client
+            .txn(txn)
+            .await
+            .context("in-flight command acquire txn")?;
+        if !response.succeeded() {
+            return Ok(None);
+        }
+        Ok(Some(DistributedCommandInFlightGuard {
+            store: self.clone(),
+            key: Some(key),
+            owner: owner.to_string(),
+        }))
+    }
+
+    async fn release_inflight(&self, key: &str, owner: &str) -> Result<()> {
+        let mut client = self.etcd.lock().await;
+        let txn = Txn::new()
+            .when(vec![Compare::value(key, CompareOp::Equal, owner)])
+            .and_then(vec![TxnOp::delete(key, None)]);
+        client
+            .txn(txn)
+            .await
+            .context("in-flight command release txn")?;
+        Ok(())
+    }
+
+    fn inflight_key(&self, idempotency_key: &str) -> String {
+        format!("{}/inflight/{}", self.key_prefix, idempotency_key)
+    }
 }
 
 impl EtcdOwnershipFenceStore {
@@ -380,6 +435,110 @@ struct CommandInFlightGuard {
     key: Option<String>,
 }
 
+struct DistributedCommandInFlightGuard {
+    store: EtcdDedupeStore,
+    key: Option<String>,
+    owner: String,
+}
+
+#[derive(Clone, Debug)]
+struct VmReadinessState {
+    locks: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>>,
+}
+
+#[derive(Clone, Debug)]
+struct VmExecActivityState {
+    active_counts: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+#[derive(Debug)]
+struct VmExecActivityLease {
+    state: VmExecActivityState,
+    vm_id: String,
+}
+
+impl VmReadinessState {
+    fn new() -> Self {
+        Self {
+            locks: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn lock(&self, vm_id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut guard = self.locks.lock().await;
+            guard
+                .entry(vm_id.to_string())
+                .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn lock_with_timeout(
+        &self,
+        vm_id: &str,
+        timeout: Duration,
+    ) -> Result<OwnedMutexGuard<()>> {
+        tokio::time::timeout(timeout, self.lock(vm_id))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "timed out after {}s waiting for vm {vm_id} guest exec readiness gate",
+                    timeout.as_secs()
+                )
+            })
+    }
+}
+
+impl VmExecActivityState {
+    fn new() -> Self {
+        Self {
+            active_counts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn begin(&self, vm_id: &str) -> VmExecActivityLease {
+        let mut guard = self
+            .active_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard.entry(vm_id.to_string()).or_insert(0) += 1;
+        VmExecActivityLease {
+            state: self.clone(),
+            vm_id: vm_id.to_string(),
+        }
+    }
+
+    fn end(&self, vm_id: &str) {
+        let mut guard = self
+            .active_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = guard.get_mut(vm_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            guard.remove(vm_id);
+        }
+    }
+
+    fn is_active(&self, vm_id: &str) -> bool {
+        let guard = self
+            .active_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(vm_id).copied().unwrap_or(0) > 0
+    }
+}
+
+impl Drop for VmExecActivityLease {
+    fn drop(&mut self) {
+        self.state.end(&self.vm_id);
+    }
+}
+
 impl CommandInFlightGuard {
     async fn acquire(
         in_flight: std::sync::Arc<Mutex<HashMap<String, Instant>>>,
@@ -409,6 +568,25 @@ impl Drop for CommandInFlightGuard {
         let in_flight = std::sync::Arc::clone(&self.in_flight);
         tokio::spawn(async move {
             in_flight.lock().await.remove(&key);
+        });
+    }
+}
+
+impl Drop for DistributedCommandInFlightGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let owner = self.owner.clone();
+        tokio::spawn(async move {
+            if let Err(err) = store.release_inflight(key.as_str(), owner.as_str()).await {
+                warn!(
+                    key = %key,
+                    error = %err,
+                    "failed releasing distributed in-flight command guard"
+                );
+            }
         });
     }
 }
@@ -482,45 +660,77 @@ fn command_needs_single_owner(command_type: &str) -> bool {
     matches!(command_type, "exec.run" | "exec.stream.start")
 }
 
+fn readiness_gate_wait_timeout(ready_timeout: Duration) -> Duration {
+    ready_timeout
+        .checked_add(Duration::from_secs(5))
+        .unwrap_or(ready_timeout)
+}
+
 async fn guest_exec_ready_timeout_for_start(manager: &Manager, vm_id: &str) -> Duration {
     match manager.get_with_runtime(vm_id).await {
-        Ok((_, runtime)) if runtime.state == VmState::Running => WARM_GUEST_EXEC_READY_TIMEOUT,
+        Ok((_, runtime)) if runtime.state == VmState::Running => {
+            if runtime
+                .started_at
+                .and_then(|started_at| Utc::now().signed_duration_since(started_at).to_std().ok())
+                .is_some_and(|age| age >= RUNNING_VM_COLD_GUEST_EXEC_GRACE)
+            {
+                WARM_GUEST_EXEC_READY_TIMEOUT
+            } else {
+                // @dive: QMP Running means the VM process is live, not that guest userspace
+                //        has finished booting portproxy/shell-exec. Recently-started VMs
+                //        still need the cold budget or deploy-induced cold starts get marked
+                //        Error while booting normally.
+                GUEST_EXEC_READY_TIMEOUT
+            }
+        }
         Ok(_) | Err(_) => GUEST_EXEC_READY_TIMEOUT,
     }
 }
 
-// @dive: Throttle state for the post-exit snapshot worker. Skips re-running
-//        the snapshot if we already refreshed within EXEC_RESTORE_REFRESH_THROTTLE
-//        for the same VM, bounding RAM-write IOPS when many short commands fire
-//        in succession. The older marker remains a valid resume target.
+async fn fail_if_vm_already_error(manager: &Manager, vm_id: &str, context: &str) -> Result<()> {
+    match manager.get_with_runtime(vm_id).await {
+        Ok((metadata, runtime))
+            if metadata.state == VmState::Error || runtime.state == VmState::Error =>
+        {
+            Err(anyhow!(
+                "{context} target vm {vm_id} is marked Error; recover/rebind before exec"
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(err) => Err(anyhow!("{context} target vm {vm_id} unavailable: {err}")),
+    }
+}
+
+// @dive: Throttle state for the post-exit snapshot worker. Claims refresh
+//        eligibility before QMP work starts, not after it completes, so multiple
+//        fast exec exits cannot all launch background migrations against the
+//        same VM. The older marker remains a valid resume target.
 //
 //        Owner_fence + RWX storage already guarantee single-writer per VM across
 //        nodes, so this state is process-local and does not need cross-node sync.
 #[derive(Clone, Debug)]
 struct VmSnapshotState {
-    last_refresh: std::sync::Arc<Mutex<HashMap<String, Instant>>>,
+    last_refresh_attempt: std::sync::Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl VmSnapshotState {
     fn new() -> Self {
         Self {
-            last_refresh: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            last_refresh_attempt: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn should_refresh(&self, vm_id: &str, throttle: Duration) -> bool {
+    async fn try_begin_refresh(&self, vm_id: &str, throttle: Duration) -> bool {
         let now = Instant::now();
-        let mut guard = self.last_refresh.lock().await;
+        let mut guard = self.last_refresh_attempt.lock().await;
         guard.retain(|_, ts| now.duration_since(*ts) < VM_SNAPSHOT_STATE_GC_TTL);
         match guard.get(vm_id) {
             Some(last) if now.duration_since(*last) < throttle => false,
-            _ => true,
+            _ => {
+                guard.insert(vm_id.to_string(), now);
+                true
+            }
         }
-    }
-
-    async fn mark_refreshed(&self, vm_id: &str) {
-        let mut guard = self.last_refresh.lock().await;
-        guard.insert(vm_id.to_string(), Instant::now());
     }
 }
 
@@ -595,6 +805,8 @@ pub async fn start_with_trigger(
         std::sync::Arc::new(Mutex::new(HashMap::new()));
     let active_exec_streams: std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>> =
         std::sync::Arc::new(Mutex::new(HashMap::new()));
+    let vm_readiness_state = VmReadinessState::new();
+    let vm_exec_activity_state = VmExecActivityState::new();
     let vm_snapshot_state = VmSnapshotState::new();
     // @dive: Enforces a hard bound on in-flight control commands; overload is signaled deterministically via NAK+retry hint.
     let inflight_limit = std::sync::Arc::new(Semaphore::new(config.max_inflight_commands));
@@ -632,6 +844,8 @@ pub async fn start_with_trigger(
                             let active_commands = active_commands.clone();
                             let completed_commands = completed_commands.clone();
                             let active_exec_streams = active_exec_streams.clone();
+                            let vm_readiness_state = vm_readiness_state.clone();
+                            let vm_exec_activity_state = vm_exec_activity_state.clone();
                             let vm_snapshot_state = vm_snapshot_state.clone();
                             let reconcile_trigger = reconcile_trigger.clone();
                             let manager = std::sync::Arc::clone(&manager);
@@ -650,6 +864,8 @@ pub async fn start_with_trigger(
                                     &active_commands,
                                     &completed_commands,
                                     &active_exec_streams,
+                                    &vm_readiness_state,
+                                    &vm_exec_activity_state,
                                     &vm_snapshot_state,
                                     reconcile_trigger.as_ref(),
                                     &jetstream,
@@ -846,6 +1062,8 @@ async fn process_command_message(
     active_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
     completed_commands: &std::sync::Arc<Mutex<HashMap<String, Instant>>>,
     active_exec_streams: &std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>>,
+    vm_readiness_state: &VmReadinessState,
+    vm_exec_activity_state: &VmExecActivityState,
     vm_snapshot_state: &VmSnapshotState,
     reconcile_trigger: Option<&mpsc::UnboundedSender<()>>,
     jetstream: &jetstream::Context,
@@ -1037,7 +1255,60 @@ async fn process_command_message(
         );
     }
 
-    let _command_in_flight = if command_needs_single_owner(envelope.command_type.as_str()) {
+    let needs_single_owner = command_needs_single_owner(envelope.command_type.as_str());
+    let _distributed_command_in_flight = if needs_single_owner {
+        if let Some(store) = dedupe_store {
+            let owner = format!(
+                "{}:{}:{}",
+                node_id,
+                envelope.command_id.trim(),
+                Uuid::new_v4()
+            );
+            match store
+                .acquire_inflight(dedupe_key.as_str(), owner.as_str(), dedupe_ttl)
+                .await
+            {
+                Ok(Some(guard)) => Some(guard),
+                Ok(None) => {
+                    warn!(
+                        node_id = %node_id,
+                        subject = %message.subject,
+                        command_id = %envelope.command_id,
+                        idempotency_key = %dedupe_key,
+                        delivery_attempt = delivery_attempt,
+                        "control command already owned by another in-flight handler"
+                    );
+                    if let Err(err) = message.ack_with(AckKind::Progress).await {
+                        warn!(
+                            node_id = %node_id,
+                            command_id = %envelope.command_id,
+                            idempotency_key = %dedupe_key,
+                            err = %err,
+                            "failed to progress-ack distributed in-flight command"
+                        );
+                    }
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        node_id = %node_id,
+                        subject = %message.subject,
+                        command_id = %envelope.command_id,
+                        idempotency_key = %dedupe_key,
+                        err = %err,
+                        "distributed in-flight command acquire failed; falling back to local guard"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let _command_in_flight = if needs_single_owner {
         match CommandInFlightGuard::acquire(
             std::sync::Arc::clone(active_commands),
             &dedupe_key,
@@ -1130,8 +1401,15 @@ async fn process_command_message(
             }
         }
     } else if envelope.command_type == "exec.run" {
-        if let Err(err) =
-            handle_exec_run_command(&envelope, config, node_id, manager.as_ref(), jetstream).await
+        if let Err(err) = handle_exec_run_command(
+            &envelope,
+            config,
+            node_id,
+            manager.as_ref(),
+            vm_readiness_state,
+            jetstream,
+        )
+        .await
         {
             let error_text = err.to_string();
             match publish_exec_run_error_result(&envelope, config, node_id, jetstream, &error_text)
@@ -1191,6 +1469,8 @@ async fn process_command_message(
             node_id,
             manager,
             active_exec_streams,
+            vm_readiness_state,
+            vm_exec_activity_state,
             vm_snapshot_state,
             jetstream,
         )
@@ -1313,6 +1593,7 @@ async fn handle_exec_run_command(
     config: &ControlBusConfig,
     node_id: &str,
     manager: &Manager,
+    vm_readiness_state: &VmReadinessState,
     jetstream: &jetstream::Context,
 ) -> Result<()> {
     let payload: ExecRunPayload = serde_json::from_value(envelope.payload.clone())
@@ -1325,6 +1606,13 @@ async fn handle_exec_run_command(
     }
 
     let ready_timeout = guest_exec_ready_timeout_for_start(manager, payload.vm_id.as_str()).await;
+    let _vm_readiness_guard = vm_readiness_state
+        .lock_with_timeout(
+            payload.vm_id.as_str(),
+            readiness_gate_wait_timeout(ready_timeout),
+        )
+        .await?;
+    fail_if_vm_already_error(manager, payload.vm_id.as_str(), "exec.run").await?;
     let vm = manager
         .start_vm(payload.vm_id.as_str())
         .await
@@ -1350,6 +1638,7 @@ async fn handle_exec_run_command(
     {
         return Err(error);
     }
+    drop(_vm_readiness_guard);
     let mut client = ShellExecClient::connect(endpoint)
         .await
         .context("connect shell exec client for exec.run")?;
@@ -1502,6 +1791,8 @@ async fn handle_exec_stream_start_command(
     node_id: &str,
     manager: &std::sync::Arc<Manager>,
     active_exec_streams: &std::sync::Arc<Mutex<HashMap<String, ActiveExecStream>>>,
+    vm_readiness_state: &VmReadinessState,
+    vm_exec_activity_state: &VmExecActivityState,
     vm_snapshot_state: &VmSnapshotState,
     jetstream: &jetstream::Context,
 ) -> Result<()> {
@@ -1558,8 +1849,93 @@ async fn handle_exec_stream_start_command(
     }
     info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T2 after_active_streams_check");
 
+    // Track exec intent before taking the readiness gate. Background
+    // execution-restore refreshes use this to yield to back-to-back tool calls,
+    // including calls that are still waiting for guest readiness and are not yet
+    // present in `active_exec_streams`.
+    let exec_activity_lease = vm_exec_activity_state.begin(vm_id.as_str());
     let mut ready_timeout =
         guest_exec_ready_timeout_for_start(manager.as_ref(), payload.vm_id.as_str()).await;
+    let vm_readiness_guard = match vm_readiness_state
+        .lock_with_timeout(
+            payload.vm_id.as_str(),
+            readiness_gate_wait_timeout(ready_timeout),
+        )
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            let error_text = error.to_string();
+            spawn_mark_vm_guest_exec_unhealthy(
+                std::sync::Arc::clone(manager),
+                payload.vm_id.clone(),
+                error_text.clone(),
+            );
+            sequence = sequence.saturating_add(1);
+            publish_exec_stream_event(
+                config,
+                jetstream,
+                ExecStreamEvent {
+                    cluster_id: cluster_id.clone(),
+                    logical_stream_id: logical_stream_id.clone(),
+                    stream_id: stream_id.clone(),
+                    event_seq: sequence,
+                    event_id: next_stream_event_id(cluster_id.as_str()),
+                    producer_epoch,
+                    command_id: command_id.clone(),
+                    session_id: session_id.clone(),
+                    vm_id: vm_id.clone(),
+                    kind: "error".to_string(),
+                    data: Vec::new(),
+                    exit_code: None,
+                    timed_out: false,
+                    error: Some(error_text),
+                    sequence,
+                    emitted_by_node_id: node_id.to_string(),
+                    emitted_at_unix_ms: unix_millis(),
+                },
+            )
+            .await?;
+            drop(exec_activity_lease);
+            return Ok(());
+        }
+    };
+    if let Err(error) = fail_if_vm_already_error(
+        manager.as_ref(),
+        payload.vm_id.as_str(),
+        "exec.stream.start",
+    )
+    .await
+    {
+        let error_text = error.to_string();
+        sequence = sequence.saturating_add(1);
+        publish_exec_stream_event(
+            config,
+            jetstream,
+            ExecStreamEvent {
+                cluster_id: cluster_id.clone(),
+                logical_stream_id: logical_stream_id.clone(),
+                stream_id: stream_id.clone(),
+                event_seq: sequence,
+                event_id: next_stream_event_id(cluster_id.as_str()),
+                producer_epoch,
+                command_id: command_id.clone(),
+                session_id: session_id.clone(),
+                vm_id: vm_id.clone(),
+                kind: "error".to_string(),
+                data: Vec::new(),
+                exit_code: None,
+                timed_out: false,
+                error: Some(error_text),
+                sequence,
+                emitted_by_node_id: node_id.to_string(),
+                emitted_at_unix_ms: unix_millis(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
     let mut vm = manager
         .start_vm(payload.vm_id.as_str())
         .await
@@ -1701,6 +2077,30 @@ async fn handle_exec_stream_start_command(
         .await?;
         return Ok(());
     }
+    let expected_portproxy_sha =
+        portproxy::binary_sha256_hex(vm.architecture.as_str()).context("hash bundled portproxy")?;
+    let bundled_portproxy =
+        portproxy::binary(vm.architecture.as_str()).context("load bundled portproxy")?;
+    let upgraded_portproxy = ensure_guest_portproxy_binary(
+        endpoint.as_str(),
+        portproxy_auth.as_ref(),
+        vm_metadata
+            .get(META_PORTPROXY_AUTH_TOKEN)
+            .map(String::as_str),
+        expected_portproxy_sha.as_str(),
+        bundled_portproxy.as_slice(),
+    )
+    .await
+    .context("ensure guest portproxy binary matches bundled runtime")?;
+    if upgraded_portproxy {
+        info!(
+            stream_id = %stream_id,
+            vm_id = %vm_id,
+            expected_sha256 = %expected_portproxy_sha,
+            "upgraded guest portproxy binary before exec stream"
+        );
+    }
+    drop(vm_readiness_guard);
     info!(stream_id = %stream_id, endpoint = %endpoint, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T4 before_daemon_connect");
     let mut daemon_client = DaemonManagerClient::connect(endpoint.clone())
         .await
@@ -1853,7 +2253,7 @@ async fn handle_exec_stream_start_command(
 
     sequence = sequence.saturating_add(1);
     info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T13 before_publish_started_event");
-    publish_exec_stream_event(
+    if let Err(err) = publish_exec_stream_event(
         config,
         jetstream,
         ExecStreamEvent {
@@ -1876,7 +2276,14 @@ async fn handle_exec_stream_start_command(
             emitted_at_unix_ms: unix_millis(),
         },
     )
-    .await?;
+    .await
+    {
+        {
+            let mut guard = active_exec_streams.lock().await;
+            guard.remove(&stream_id);
+        }
+        return Err(err);
+    }
     info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T14 after_publish_started_event_handler_done");
 
     let config = config.clone();
@@ -1887,10 +2294,30 @@ async fn handle_exec_stream_start_command(
     let snapshot_vm_metadata = vm_metadata.clone();
     let snapshot_tier_b_eligible = tier_b_eligible;
     let snapshot_state_for_loop = vm_snapshot_state.clone();
+    let vm_exec_activity_for_loop = vm_exec_activity_state.clone();
+    // @dive: Carry the attach context into the spawn loop so we can re-issue
+    //        attach_daemon when the response stream closes without an
+    //        ExitCode frame. The portproxy in older guest images races
+    //        between three forwarder tasks (stdout/stderr/exit) and can drop
+    //        the response stream before the exit forwarder sends ExitCode for
+    //        fast back-to-back commands. Re-attaching hits the post-exit
+    //        cached_exit fast path on the same daemon name and recovers the
+    //        terminal frame deterministically — no guest-image rebuild
+    //        required.
+    let reattach_endpoint = endpoint.clone();
+    let reattach_daemon_name = daemon_name.clone();
+    let reattach_portproxy_auth = portproxy_auth.clone();
+    let stream_response_idle_timeout =
+        Duration::from_secs(payload.timeout_secs.unwrap_or(30).max(1) as u64 + 15);
+    const REATTACH_MAX_ATTEMPTS: u32 = 3;
+    const REATTACH_BACKOFF: Duration = Duration::from_millis(150);
     tokio::spawn(async move {
+        let _exec_activity_lease = exec_activity_lease;
         let mut terminal_emitted = false;
         let mut pending_exit_code: Option<i32> = None;
+        let mut refresh_execution_restore_snapshot = false;
         const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(150);
+        let mut reattach_attempts: u32 = 0;
         loop {
             let next_message = if let Some(code) = pending_exit_code {
                 match tokio::time::timeout(EXIT_FLUSH_GRACE, stream.message()).await {
@@ -1937,19 +2364,61 @@ async fn handle_exec_stream_start_command(
                         }
                         terminal_emitted = true;
                         if snapshot_tier_b_eligible {
-                            spawn_execution_restore_snapshot_refresh(
-                                std::sync::Arc::clone(&snapshot_manager),
-                                vm_id.clone(),
-                                stream_id.clone(),
-                                snapshot_vm_metadata.clone(),
-                                snapshot_state_for_loop.clone(),
-                            );
+                            refresh_execution_restore_snapshot = true;
                         }
                         break;
                     }
                 }
             } else {
-                stream.message().await
+                match tokio::time::timeout(stream_response_idle_timeout, stream.message()).await {
+                    Ok(message) => message,
+                    Err(_) => {
+                        sequence = sequence.saturating_add(1);
+                        warn!(
+                            stream_id = %stream_id,
+                            sequence = sequence,
+                            idle_timeout_ms = stream_response_idle_timeout.as_millis() as u64,
+                            "exec.stream attach_daemon response idle timeout"
+                        );
+                        if let Err(err) = publish_exec_stream_event(
+                            &config,
+                            &jetstream,
+                            ExecStreamEvent {
+                                cluster_id: cluster_id.clone(),
+                                logical_stream_id: logical_stream_id.clone(),
+                                stream_id: stream_id.clone(),
+                                event_seq: sequence,
+                                event_id: next_stream_event_id(cluster_id.as_str()),
+                                producer_epoch,
+                                command_id: command_id.clone(),
+                                session_id: session_id.clone(),
+                                vm_id: vm_id.clone(),
+                                kind: "timeout".to_string(),
+                                data: Vec::new(),
+                                exit_code: None,
+                                timed_out: true,
+                                error: Some(
+                                    "exec stream timed out waiting for guest terminal event"
+                                        .to_string(),
+                                ),
+                                sequence,
+                                emitted_by_node_id: node_id.clone(),
+                                emitted_at_unix_ms: unix_millis(),
+                            },
+                        )
+                        .await
+                        {
+                            warn!(
+                                stream_id = %stream_id,
+                                sequence = sequence,
+                                err = %err,
+                                "failed publishing exec.stream idle timeout event"
+                            );
+                        }
+                        terminal_emitted = true;
+                        break;
+                    }
+                }
             };
             match next_message {
                 Ok(Some(AttachDaemonResponse {
@@ -2086,6 +2555,50 @@ async fn handle_exec_stream_start_command(
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
+                    info!(
+                        stream_id = %stream_id,
+                        pending_exit_code = ?pending_exit_code,
+                        sequence = sequence,
+                        reattach_attempts = reattach_attempts,
+                        "exec.stream attach_daemon response stream closed (Ok(None))"
+                    );
+                    if pending_exit_code.is_none() && reattach_attempts < REATTACH_MAX_ATTEMPTS {
+                        reattach_attempts = reattach_attempts.saturating_add(1);
+                        tokio::time::sleep(REATTACH_BACKOFF).await;
+                        match reattach_daemon_for_exit(
+                            reattach_endpoint.as_str(),
+                            reattach_daemon_name.as_str(),
+                            reattach_portproxy_auth.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(Some(new_stream)) => {
+                                info!(
+                                    stream_id = %stream_id,
+                                    reattach_attempts = reattach_attempts,
+                                    "exec.stream re-attached to recover missing ExitCode"
+                                );
+                                stream = new_stream;
+                                continue;
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    stream_id = %stream_id,
+                                    reattach_attempts = reattach_attempts,
+                                    "exec.stream re-attach succeeded but daemon entry gone (will fall through to synthetic error)"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    stream_id = %stream_id,
+                                    reattach_attempts = reattach_attempts,
+                                    err = %err,
+                                    "exec.stream re-attach RPC failed (will retry or give up)"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(code) = pending_exit_code {
                         sequence = sequence.saturating_add(1);
                         debug!(
@@ -2128,13 +2641,7 @@ async fn handle_exec_stream_start_command(
                         }
                         terminal_emitted = true;
                         if snapshot_tier_b_eligible {
-                            spawn_execution_restore_snapshot_refresh(
-                                std::sync::Arc::clone(&snapshot_manager),
-                                vm_id.clone(),
-                                stream_id.clone(),
-                                snapshot_vm_metadata.clone(),
-                                snapshot_state_for_loop.clone(),
-                            );
+                            refresh_execution_restore_snapshot = true;
                         }
                     }
                     debug!(
@@ -2187,13 +2694,7 @@ async fn handle_exec_stream_start_command(
                         }
                         terminal_emitted = true;
                         if snapshot_tier_b_eligible {
-                            spawn_execution_restore_snapshot_refresh(
-                                std::sync::Arc::clone(&snapshot_manager),
-                                vm_id.clone(),
-                                stream_id.clone(),
-                                snapshot_vm_metadata.clone(),
-                                snapshot_state_for_loop.clone(),
-                            );
+                            refresh_execution_restore_snapshot = true;
                         }
                         break;
                     }
@@ -2243,6 +2744,13 @@ async fn handle_exec_stream_start_command(
         }
 
         if !terminal_emitted {
+            warn!(
+                stream_id = %stream_id,
+                vm_id = %vm_id,
+                pending_exit_code = ?pending_exit_code,
+                last_sequence = sequence,
+                "exec.stream spawn loop ended without terminal event; publishing synthetic error to NATS"
+            );
             sequence = sequence.saturating_add(1);
             if let Err(err) = publish_exec_stream_event(
                 &config,
@@ -2278,11 +2786,63 @@ async fn handle_exec_stream_start_command(
             }
         }
 
-        let mut guard = active_exec_streams.lock().await;
-        guard.remove(&stream_id);
+        {
+            let mut guard = active_exec_streams.lock().await;
+            guard.remove(&stream_id);
+        }
+        if refresh_execution_restore_snapshot {
+            spawn_execution_restore_snapshot_refresh(
+                std::sync::Arc::clone(&snapshot_manager),
+                vm_id.clone(),
+                stream_id.clone(),
+                snapshot_vm_metadata.clone(),
+                snapshot_state_for_loop.clone(),
+                vm_exec_activity_for_loop.clone(),
+            );
+        }
     });
 
     Ok(())
+}
+
+/// Re-issues an attach_daemon RPC for a daemon that has already exited so the
+/// portproxy `cached_exit` fast path can deliver the missing ExitCode frame.
+/// Returns:
+/// - `Ok(Some(stream))` — fresh response stream that will deliver the exit
+///   code; caller continues the spawn loop reading from it.
+/// - `Ok(None)` — daemon entry was reaped (NotFound). Caller should fall
+///   through to the synthetic-error path.
+/// - `Err` — transport failure. Caller should retry or give up per its own
+///   policy.
+async fn reattach_daemon_for_exit(
+    endpoint: &str,
+    daemon_name: &str,
+    portproxy_auth: Option<&tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+) -> Result<Option<tonic::Streaming<AttachDaemonResponse>>> {
+    let mut client = DaemonManagerClient::connect(endpoint.to_string())
+        .await
+        .with_context(|| format!("reattach: connect daemon manager at {endpoint}"))?;
+    let (req_tx, req_rx) = mpsc::channel(2);
+    req_tx
+        .send(AttachDaemonRequest {
+            request: Some(attach_daemon_request::Request::Start(AttachDaemonStart {
+                name: daemon_name.to_string(),
+            })),
+        })
+        .await
+        .map_err(|_| anyhow!("reattach: enqueue start request"))?;
+    drop(req_tx);
+    match client
+        .attach_daemon(request_with_portproxy_auth(
+            ReceiverStream::new(req_rx),
+            portproxy_auth,
+        ))
+        .await
+    {
+        Ok(response) => Ok(Some(response.into_inner())),
+        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        Err(status) => Err(anyhow!("reattach attach_daemon RPC: {status}")),
+    }
 }
 
 async fn handle_exec_stream_input_command(
@@ -2701,10 +3261,32 @@ async fn wait_for_guest_exec_ready_or_mark_vm_error(
         Ok(()) => Ok(()),
         Err(error) => {
             let error_text = error.to_string();
-            mark_vm_guest_exec_unhealthy(manager, vm_id, error_text.as_str()).await;
+            if tokio::time::timeout(
+                Duration::from_secs(10),
+                mark_vm_guest_exec_unhealthy(manager, vm_id, error_text.as_str()),
+            )
+            .await
+            .is_err()
+            {
+                warn!(
+                    vm_id = %vm_id,
+                    error = %error_text,
+                    "timed out marking vm error after guest exec readiness failure"
+                );
+            }
             Err(error)
         }
     }
+}
+
+fn spawn_mark_vm_guest_exec_unhealthy(
+    manager: std::sync::Arc<Manager>,
+    vm_id: String,
+    error: String,
+) {
+    tokio::spawn(async move {
+        mark_vm_guest_exec_unhealthy(manager.as_ref(), vm_id.as_str(), error.as_str()).await;
+    });
 }
 
 async fn mark_vm_guest_exec_unhealthy(manager: &Manager, vm_id: &str, error: &str) {
@@ -2764,22 +3346,20 @@ async fn resolve_execution_restore_snapshot_id(
 //        the command instead of replaying it. Throttles per-VM to bound IOPS
 //        on shared RWX storage when many small commands fire in succession.
 //
-//        Runs entirely in the background — no per-vm wait-gate. The qemu
-//        userfaultfd-WP migration drains page faults concurrently with guest
-//        execution; with a local-SSD staging dir the migration thread never
-//        blocks on slow Filestore IO; the post-qemu Filestore copy is plain
-//        file IO that doesn't touch the live VM. Concurrent exec.stream.start
-//        handlers are not affected.
+//        Runs in the background and deliberately stays off the per-VM readiness
+//        gate. Foreground exec startup owns that gate; this refresh only runs
+//        after an idle quiet period and yields if another exec arrives.
 fn spawn_execution_restore_snapshot_refresh(
     manager: std::sync::Arc<Manager>,
     vm_id: String,
     stream_id: String,
     vm_metadata: HashMap<String, String>,
     state: VmSnapshotState,
+    vm_exec_activity_state: VmExecActivityState,
 ) {
     tokio::spawn(async move {
         if !state
-            .should_refresh(vm_id.as_str(), EXEC_RESTORE_REFRESH_THROTTLE)
+            .try_begin_refresh(vm_id.as_str(), EXEC_RESTORE_REFRESH_THROTTLE)
             .await
         {
             debug!(
@@ -2791,50 +3371,72 @@ fn spawn_execution_restore_snapshot_refresh(
             return;
         }
 
-        let pending = match manager
-            .create_snapshot_qemu_phase(
-                vm_id.as_str(),
-                SnapshotParams {
-                    label: "execution-restore".to_string(),
-                    description: "control-bus exec stream restore marker".to_string(),
-                },
-            )
-            .await
-        {
-            Ok(pending) => pending,
-            Err(err) if background_snapshot_unsupported(&err) => {
-                if let Err(persist_err) = disable_tier_b_after_unsupported(
-                    manager.as_ref(),
-                    vm_id.as_str(),
-                    &vm_metadata,
-                )
-                .await
-                {
-                    warn!(
-                        vm_id = %vm_id,
-                        stream_id = %stream_id,
-                        error = %persist_err,
-                        underlying = %err,
-                        "failed disabling tier-b eligibility after unsupported background snapshot"
-                    );
-                } else {
-                    warn!(
-                        vm_id = %vm_id,
-                        stream_id = %stream_id,
-                        underlying = %err,
-                        "background snapshot unsupported on host; disabled tier-b restore-marker enforcement for this vm"
-                    );
-                }
-                return;
-            }
-            Err(err) => {
-                warn!(
+        tokio::time::sleep(EXEC_RESTORE_REFRESH_QUIET_PERIOD).await;
+        if vm_exec_activity_state.is_active(vm_id.as_str()) {
+            debug!(
+                vm_id = %vm_id,
+                stream_id = %stream_id,
+                quiet_ms = EXEC_RESTORE_REFRESH_QUIET_PERIOD.as_millis() as u64,
+                "skipping execution restore snapshot refresh; VM accepted another exec during quiet window"
+            );
+            return;
+        }
+
+        let pending = {
+            if vm_exec_activity_state.is_active(vm_id.as_str()) {
+                debug!(
                     vm_id = %vm_id,
                     stream_id = %stream_id,
-                    error = %err,
-                    "failed qemu phase of execution restore snapshot refresh"
+                    "skipping execution restore snapshot refresh; VM accepted another exec before snapshot phase"
                 );
                 return;
+            }
+
+            match manager
+                .create_snapshot_qemu_phase(
+                    vm_id.as_str(),
+                    SnapshotParams {
+                        label: "execution-restore".to_string(),
+                        description: "control-bus exec stream restore marker".to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(pending) => pending,
+                Err(err) if background_snapshot_unsupported(&err) => {
+                    if let Err(persist_err) = disable_tier_b_after_unsupported(
+                        manager.as_ref(),
+                        vm_id.as_str(),
+                        &vm_metadata,
+                    )
+                    .await
+                    {
+                        warn!(
+                            vm_id = %vm_id,
+                            stream_id = %stream_id,
+                            error = %persist_err,
+                            underlying = %err,
+                            "failed disabling tier-b eligibility after unsupported background snapshot"
+                        );
+                    } else {
+                        warn!(
+                            vm_id = %vm_id,
+                            stream_id = %stream_id,
+                            underlying = %err,
+                            "background snapshot unsupported on host; disabled tier-b restore-marker enforcement for this vm"
+                        );
+                    }
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        vm_id = %vm_id,
+                        stream_id = %stream_id,
+                        error = %err,
+                        "failed qemu phase of execution restore snapshot refresh"
+                    );
+                    return;
+                }
             }
         };
 
@@ -2847,7 +3449,6 @@ fn spawn_execution_restore_snapshot_refresh(
         .await
         {
             Ok((snapshot_id, snapshot_name)) => {
-                state.mark_refreshed(vm_id.as_str()).await;
                 info!(
                     vm_id = %vm_id,
                     stream_id = %stream_id,

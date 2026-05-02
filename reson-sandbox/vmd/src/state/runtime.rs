@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Error;
 use chrono::{DateTime, Utc};
@@ -29,6 +30,8 @@ pub struct VmRuntime {
     pub virtiofsd_handles: Vec<VirtiofsdHandle>,
     pub fuse_handles: Vec<FuseHandle>,
     pub tap_network: Option<VmTapNetworkHandle>,
+    pub consecutive_health_failures: u32,
+    pub last_health_probe_at: Option<Instant>,
 }
 
 impl VmRuntime {
@@ -45,6 +48,17 @@ impl VmRuntime {
             virtiofsd_handles: Vec::new(),
             fuse_handles: Vec::new(),
             tap_network: None,
+            consecutive_health_failures: 0,
+            last_health_probe_at: None,
         }
+    }
+
+    pub fn reset_health_tracking(&mut self) {
+        self.consecutive_health_failures = 0;
+        self.last_health_probe_at = None;
+    }
+
+    pub fn clear_health_failures(&mut self) {
+        self.consecutive_health_failures = 0;
     }
 }

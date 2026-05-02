@@ -157,6 +157,14 @@ pub struct SnapshotMetadata {
     pub created_at: DateTime<Utc>,
     /// Filename of the external RAM state file under `<vm_dir>/snapshots/`. Required.
     pub ram_file_name: String,
+    /// QEMU RAM migration file format. Empty/missing means the legacy sequential
+    /// `file:` migration stream used before mapped-ram support.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ram_format: String,
+    /// Fingerprint of the guest runtime/bootstrap payload active when the RAM
+    /// image was captured. Missing/mismatched values must not RAM-restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_runtime_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +332,8 @@ pub fn new_snapshot_metadata(label: String, description: String) -> SnapshotMeta
         description,
         created_at: Utc::now(),
         ram_file_name,
+        ram_format: String::new(),
+        guest_runtime_fingerprint: None,
     }
 }
 

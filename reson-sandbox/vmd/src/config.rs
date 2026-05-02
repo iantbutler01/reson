@@ -281,6 +281,15 @@ impl GuestNetworkConfig {
 pub struct Config {
     pub listen_address: String,
     pub data_dir: String,
+    /// Optional fast-local directory for staging snapshot RAM files before they're
+    /// copied to durable shared storage. When set, `migrate file:` writes here so
+    /// qemu's userfaultfd-WP storm completes quickly (local SSD write speed) and
+    /// guest network-facing services stay responsive throughout the snapshot. The
+    /// staged file is then copied to the canonical `<vm_dir>/snapshots/<name>` path
+    /// on durable storage (Filestore for HA, persistent for single-node) before the
+    /// snapshot metadata is recorded. When unset, snapshots write directly to the
+    /// canonical path.
+    pub snapshot_staging_dir: Option<String>,
     pub qemu_bin: String,
     pub qemu_arm64_bin: String,
     pub qemu_img_bin: String,
@@ -316,6 +325,7 @@ impl Default for Config {
         Self {
             listen_address: "127.0.0.1:8052".to_string(),
             data_dir: data_dir.to_string_lossy().to_string(),
+            snapshot_staging_dir: default_snapshot_staging_dir_from_env(),
             qemu_bin: "qemu-system-x86_64".to_string(),
             qemu_arm64_bin: "qemu-system-aarch64".to_string(),
             qemu_img_bin: "qemu-img".to_string(),
@@ -360,6 +370,21 @@ impl Config {
         fs::create_dir_all(&base_dir)
             .with_context(|| format!("create base image dir {}", base_dir.to_string_lossy()))?;
         self.data_dir = canonical_string(&data_dir)?;
+
+        if let Some(ref staging) = self.snapshot_staging_dir {
+            if !staging.trim().is_empty() {
+                let staging_dir = expand_home(staging)?;
+                fs::create_dir_all(&staging_dir).with_context(|| {
+                    format!(
+                        "create snapshot staging dir {}",
+                        staging_dir.to_string_lossy()
+                    )
+                })?;
+                self.snapshot_staging_dir = Some(canonical_string(&staging_dir)?);
+            } else {
+                self.snapshot_staging_dir = None;
+            }
+        }
 
         self.qemu_bin = resolve_binary(&self.qemu_bin, "qemu-system-x86_64")?;
         self.qemu_arm64_bin = resolve_binary(&self.qemu_arm64_bin, "qemu-system-aarch64")?;
@@ -833,6 +858,13 @@ fn default_max_active_vms_from_env() -> Option<usize> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn default_snapshot_staging_dir_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_SNAPSHOT_STAGING_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn default_max_fork_chain_depth_from_env() -> usize {

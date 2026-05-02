@@ -137,6 +137,7 @@ impl DaemonRegistry {
             stderr_tx: std::sync::Mutex::new(Some(stderr_tx)),
             output_backlog: output_backlog.clone(),
             attach_lock: Arc::new(Mutex::new(())),
+            exit_code: std::sync::Mutex::new(None),
             exit_tx: exit_tx.clone(),
         });
 
@@ -197,6 +198,7 @@ impl DaemonRegistry {
                     Err(err) => Some(daemon_wait_error_code(&req.name, err)),
                 },
             };
+            post_exit_entry.set_exit_code(exit_code);
             let _ = exit_tx.send(exit_code);
             info!("daemon {} exited with {:?}", req.name, exit_code);
 
@@ -257,6 +259,10 @@ pub struct DaemonEntry {
     pub stderr_tx: std::sync::Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     pub output_backlog: Arc<Mutex<OutputBacklog>>,
     pub attach_lock: Arc<Mutex<()>>,
+    /// Retained terminal state for late attach. watch::Sender::send returns
+    /// Err without storing the value when no receivers exist, which is common
+    /// for fast commands that exit before vmd has attached.
+    exit_code: std::sync::Mutex<Option<i32>>,
     pub exit_tx: watch::Sender<Option<i32>>,
 }
 
@@ -294,6 +300,16 @@ impl DaemonEntry {
     pub async fn drain_output_backlog(&self) -> Vec<OutputFrame> {
         let mut guard = self.output_backlog.lock().await;
         guard.drain()
+    }
+
+    pub fn cached_exit_code(&self) -> Option<i32> {
+        self.exit_code.lock().ok().and_then(|guard| *guard)
+    }
+
+    fn set_exit_code(&self, code: Option<i32>) {
+        if let Ok(mut guard) = self.exit_code.lock() {
+            *guard = code;
+        }
     }
 }
 

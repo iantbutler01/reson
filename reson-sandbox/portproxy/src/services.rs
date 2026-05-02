@@ -618,7 +618,7 @@ impl DaemonManager for DaemonManagerService {
 
         let (tx, rx) = mpsc::channel(32);
         let mut exit_rx = entry.exit_tx.subscribe();
-        let cached_exit = *exit_rx.borrow_and_update();
+        let cached_exit = entry.cached_exit_code();
         let replay_frames = entry.drain_output_backlog().await;
 
         // @dive: Replay any buffered output the child wrote before this attach
@@ -689,7 +689,7 @@ impl DaemonManager for DaemonManagerService {
         if stdout_rx.is_none() || stderr_rx.is_none() {
             // Entry was post-exit cleaned between our cached_exit check and
             // here. Deliver whatever exit code is cached now and end.
-            let final_exit = *exit_rx.borrow_and_update();
+            let final_exit = entry.cached_exit_code();
             if let Some(exit_code) = final_exit {
                 let _ = tx
                     .send(Ok(AttachDaemonResponse {
@@ -706,11 +706,35 @@ impl DaemonManager for DaemonManagerService {
         let mut stdout_rx = stdout_rx.unwrap();
         let mut stderr_rx = stderr_rx.unwrap();
 
-        tokio::spawn({
-            let tx = tx.clone();
-            async move {
-                loop {
-                    match stdout_rx.recv().await {
+        // @dive: One coordinator task instead of three concurrent forwarders.
+        //        The previous design raced: stdout/stderr forwarders could drop
+        //        their tx clones (broadcast Closed, observed when both
+        //        spawn_reader and the entry's broadcast Sender had been
+        //        dropped) before the exit forwarder ever scheduled, leaving
+        //        the response stream to close without an ExitCode frame and
+        //        forcing vmd's spawn loop into the terminal_emitted=false
+        //        branch. Centralizing the lifecycle in one task lets us hold
+        //        tx until we have either sent ExitCode or proven none will
+        //        ever arrive.
+        let entry_for_coord = entry.clone();
+        tokio::spawn(async move {
+            let mut stdout_done = false;
+            let mut stderr_done = false;
+            let mut exit_code: Option<i32> = None;
+            // Initial check: post_exit may have fired exit_tx.send already
+            // even though we got past the cached_exit fast-path check above.
+            if let Some(code) = entry_for_coord.cached_exit_code() {
+                exit_code = Some(code);
+            }
+
+            loop {
+                if exit_code.is_some() {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+                    stdout_event = stdout_rx.recv(), if !stdout_done => match stdout_event {
                         Ok(data) => {
                             if tx
                                 .send(Ok(AttachDaemonResponse {
@@ -721,21 +745,13 @@ impl DaemonManager for DaemonManagerService {
                                 .await
                                 .is_err()
                             {
-                                break;
+                                return;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    }
-                }
-            }
-        });
-
-        tokio::spawn({
-            let tx = tx.clone();
-            async move {
-                loop {
-                    match stderr_rx.recv().await {
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_done = true,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    },
+                    stderr_event = stderr_rx.recv(), if !stderr_done => match stderr_event {
                         Ok(data) => {
                             if tx
                                 .send(Ok(AttachDaemonResponse {
@@ -746,35 +762,99 @@ impl DaemonManager for DaemonManagerService {
                                 .await
                                 .is_err()
                             {
-                                break;
+                                return;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => stderr_done = true,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    },
+                    changed = exit_rx.changed(), if exit_code.is_none() => match changed {
+                        Ok(()) => {
+                            if let Some(code) = entry_for_coord.cached_exit_code() {
+                                exit_code = Some(code);
+                            }
+                        }
+                        Err(_) => {
+                            // All Senders dropped without setting Some(code).
+                            // Break out — nothing more to do.
+                            break;
+                        }
+                    },
+                }
+            }
+
+            // Final guarantee: if either output stream is still open but we
+            // already have an exit code, give the producer a brief window to
+            // flush its last frames, then close. Without this, fast commands
+            // that emit stdout right before exit could lose the trailing line
+            // because select! might pick the changed() branch first.
+            if exit_code.is_some() && (!stdout_done || !stderr_done) {
+                let drain_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(50);
+                while !stdout_done || !stderr_done {
+                    let remaining =
+                        drain_deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        stdout_event = stdout_rx.recv(), if !stdout_done => match stdout_event {
+                            Ok(data) => {
+                                if tx
+                                    .send(Ok(AttachDaemonResponse {
+                                        response: Some(
+                                            crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StdoutData(data),
+                                        ),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => stdout_done = true,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        },
+                        stderr_event = stderr_rx.recv(), if !stderr_done => match stderr_event {
+                            Ok(data) => {
+                                if tx
+                                    .send(Ok(AttachDaemonResponse {
+                                        response: Some(
+                                            crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::StderrData(data),
+                                        ),
+                                    }))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => stderr_done = true,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        },
+                        _ = tokio::time::sleep(remaining) => break,
                     }
                 }
             }
-        });
 
-        tokio::spawn({
-            let tx = tx.clone();
-            async move {
-                loop {
-                    let exit_code = *exit_rx.borrow_and_update();
-                    if let Some(exit_code) = exit_code {
-                        let _ = tx
-                            .send(Ok(AttachDaemonResponse {
-                                response: Some(
-                                    crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::ExitCode(exit_code),
-                                ),
-                            }))
-                            .await;
-                        break;
-                    }
-                    if exit_rx.changed().await.is_err() {
-                        break;
-                    }
+            // If the exit_rx changed() returned Err without ever setting a code
+            // (all Senders dropped before child exit propagated), make one
+            // last attempt to read the entry's retained terminal state.
+            if exit_code.is_none() {
+                if let Some(code) = entry_for_coord.cached_exit_code() {
+                    exit_code = Some(code);
                 }
+            }
+
+            if let Some(code) = exit_code {
+                let _ = tx
+                    .send(Ok(AttachDaemonResponse {
+                        response: Some(
+                            crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::ExitCode(code),
+                        ),
+                    }))
+                    .await;
             }
         });
 
@@ -923,5 +1003,216 @@ async fn finalize_exec_with_code(
         .is_err()
     {
         debug!("failed to send exit code for pid {}", pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use futures::stream;
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
+    use tokio::net::TcpListener;
+    use tonic::Request;
+    use tonic::transport::Server;
+
+    use super::*;
+    use crate::child_tracker::{ChildExit, ChildTracker};
+    use crate::daemon::DaemonRegistry;
+    use crate::pb::bracket::portproxy::v1::daemon_manager_client::DaemonManagerClient;
+    use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManagerServer;
+    use crate::pb::bracket::portproxy::v1::{
+        AttachDaemonStart, attach_daemon_request, attach_daemon_response,
+    };
+
+    #[tokio::test]
+    async fn attach_daemon_fast_command_returns_exit_code_after_late_attach() {
+        let tracker = ChildTracker::new();
+        spawn_test_child_reaper(tracker.clone());
+        let registry = DaemonRegistry::new(tracker);
+        let service = DaemonManagerService::new(registry);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(DaemonManagerServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test daemon manager server should run");
+        });
+
+        let mut client = DaemonManagerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time should be monotonic")
+            .as_nanos();
+        let daemon_name = format!("late-attach-{nonce}");
+        client
+            .exec_daemon(Request::new(ExecDaemonRequest {
+                name: daemon_name.clone(),
+                args: vec![
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "echo fast-attach-ok".to_string(),
+                ],
+                env: HashMap::new(),
+                timeout: Some(5),
+                detach: false,
+            }))
+            .await
+            .expect("exec_daemon should start process");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(AttachDaemonRequest {
+            request: Some(attach_daemon_request::Request::Start(AttachDaemonStart {
+                name: daemon_name,
+            })),
+        })
+        .await
+        .expect("start frame should enqueue");
+        drop(tx);
+        let mut stream = client
+            .attach_daemon(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect("attach_daemon should resolve retained daemon")
+            .into_inner();
+
+        let mut saw_stdout = false;
+        let mut exit_code = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(2), stream.message())
+                .await
+                .expect("attach stream should not hang")
+                .expect("attach stream should not error");
+            let Some(frame) = next else { break };
+            match frame.response {
+                Some(attach_daemon_response::Response::StdoutData(bytes)) => {
+                    saw_stdout |= String::from_utf8_lossy(&bytes).contains("fast-attach-ok");
+                }
+                Some(attach_daemon_response::Response::ExitCode(code)) => {
+                    exit_code = Some(code);
+                }
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(saw_stdout, "expected stdout backlog to replay before exit");
+        assert_eq!(exit_code, Some(0), "late attach must include terminal exit");
+    }
+
+    #[tokio::test]
+    async fn attach_daemon_live_command_returns_exit_code_after_client_eof() {
+        let tracker = ChildTracker::new();
+        spawn_test_child_reaper(tracker.clone());
+        let registry = DaemonRegistry::new(tracker);
+        let service = DaemonManagerService::new(registry);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(DaemonManagerServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test daemon manager server should run");
+        });
+
+        let mut client = DaemonManagerClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time should be monotonic")
+            .as_nanos();
+        let daemon_name = format!("live-attach-{nonce}");
+        client
+            .exec_daemon(Request::new(ExecDaemonRequest {
+                name: daemon_name.clone(),
+                args: vec![
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "echo live-attach-ok".to_string(),
+                ],
+                env: HashMap::new(),
+                timeout: Some(5),
+                detach: false,
+            }))
+            .await
+            .expect("exec_daemon should start process");
+
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(AttachDaemonRequest {
+            request: Some(attach_daemon_request::Request::Start(AttachDaemonStart {
+                name: daemon_name,
+            })),
+        })
+        .await
+        .expect("start frame should enqueue");
+        drop(tx);
+        let mut stream = client
+            .attach_daemon(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect("attach_daemon should resolve running daemon")
+            .into_inner();
+
+        let mut saw_stdout = false;
+        let mut exit_code = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(2), stream.message())
+                .await
+                .expect("attach stream should not hang")
+                .expect("attach stream should not error");
+            let Some(frame) = next else { break };
+            match frame.response {
+                Some(attach_daemon_response::Response::StdoutData(bytes)) => {
+                    saw_stdout |= String::from_utf8_lossy(&bytes).contains("live-attach-ok");
+                }
+                Some(attach_daemon_response::Response::ExitCode(code)) => {
+                    exit_code = Some(code);
+                }
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(saw_stdout, "expected stdout from live attach");
+        assert_eq!(exit_code, Some(0), "live attach must include terminal exit");
+    }
+
+    fn spawn_test_child_reaper(tracker: ChildTracker) {
+        tokio::spawn(async move {
+            loop {
+                for pid in tracker.snapshot() {
+                    match waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::Exited(_, status)) => {
+                            tracker.record_exit(pid, ChildExit::Exited(status));
+                        }
+                        Ok(WaitStatus::Signaled(_, signal, _)) => {
+                            tracker.record_exit(pid, ChildExit::Signaled(signal as i32));
+                        }
+                        Ok(WaitStatus::StillAlive) => {}
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
     }
 }

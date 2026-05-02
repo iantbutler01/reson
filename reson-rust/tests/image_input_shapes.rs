@@ -1,18 +1,19 @@
-use reson_agentic::types::{
-    MediaPart, MediaSource, MediaSourceKind, MultimodalMessage, Provider,
-};
+use reson_agentic::types::{MediaPart, MediaSource, MediaSourceKind, MultimodalMessage, Provider};
 use reson_agentic::utils::{
     convert_messages_to_provider_format, convert_messages_to_responses_input,
     validate_image_input_supported, ConversationMessage,
 };
 
-const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+const TINY_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 
 fn image_message() -> Vec<ConversationMessage> {
-    vec![ConversationMessage::Multimodal(MultimodalMessage::user(vec![
-        MediaPart::text("What color is this image?"),
-        MediaPart::image(MediaSource::base64(TINY_PNG, "image/png")),
-    ]))]
+    vec![ConversationMessage::Multimodal(MultimodalMessage::user(
+        vec![
+            MediaPart::text("What color is this image?"),
+            MediaPart::image(MediaSource::base64(TINY_PNG, "image/png")),
+        ],
+    ))]
 }
 
 #[test]
@@ -22,7 +23,10 @@ fn openai_chat_image_input_uses_content_parts() {
 
     assert_eq!(formatted[0]["role"], "user");
     assert_eq!(formatted[0]["content"][0]["type"], "text");
-    assert_eq!(formatted[0]["content"][0]["text"], "What color is this image?");
+    assert_eq!(
+        formatted[0]["content"][0]["text"],
+        "What color is this image?"
+    );
     assert_eq!(formatted[0]["content"][1]["type"], "image_url");
     assert_eq!(
         formatted[0]["content"][1]["image_url"]["url"],
@@ -84,7 +88,10 @@ fn anthropic_image_input_uses_base64_image_blocks() {
     assert_eq!(formatted[0]["content"][0]["type"], "text");
     assert_eq!(formatted[0]["content"][1]["type"], "image");
     assert_eq!(formatted[0]["content"][1]["source"]["type"], "base64");
-    assert_eq!(formatted[0]["content"][1]["source"]["media_type"], "image/png");
+    assert_eq!(
+        formatted[0]["content"][1]["source"]["media_type"],
+        "image/png"
+    );
     assert_eq!(formatted[0]["content"][1]["source"]["data"], TINY_PNG);
 }
 
@@ -96,7 +103,10 @@ fn bedrock_claude_image_input_uses_anthropic_image_blocks() {
     assert_eq!(formatted[0]["role"], "user");
     assert_eq!(formatted[0]["content"][1]["type"], "image");
     assert_eq!(formatted[0]["content"][1]["source"]["type"], "base64");
-    assert_eq!(formatted[0]["content"][1]["source"]["media_type"], "image/png");
+    assert_eq!(
+        formatted[0]["content"][1]["source"]["media_type"],
+        "image/png"
+    );
     assert_eq!(formatted[0]["content"][1]["source"]["data"], TINY_PNG);
 }
 
@@ -109,7 +119,10 @@ fn google_anthropic_image_input_uses_anthropic_image_blocks() {
     assert_eq!(formatted[0]["role"], "user");
     assert_eq!(formatted[0]["content"][1]["type"], "image");
     assert_eq!(formatted[0]["content"][1]["source"]["type"], "base64");
-    assert_eq!(formatted[0]["content"][1]["source"]["media_type"], "image/png");
+    assert_eq!(
+        formatted[0]["content"][1]["source"]["media_type"],
+        "image/png"
+    );
     assert_eq!(formatted[0]["content"][1]["source"]["data"], TINY_PNG);
 }
 
@@ -119,7 +132,10 @@ fn google_gemini_image_input_uses_inline_data() {
         .expect("conversion should succeed");
 
     assert_eq!(formatted[0]["role"], "user");
-    assert_eq!(formatted[0]["parts"][0]["text"], "What color is this image?");
+    assert_eq!(
+        formatted[0]["parts"][0]["text"],
+        "What color is this image?"
+    );
     assert_eq!(
         formatted[0]["parts"][1]["inline_data"]["mime_type"],
         "image/png"
@@ -134,9 +150,7 @@ fn provider_capability_reports_known_vision_models() {
     assert!(Provider::Anthropic.supports_image_input("claude-haiku-4-5-20251001"));
     assert!(Provider::GoogleGenAI.supports_image_input("gemini-2.5-flash"));
     assert!(Provider::GoogleAnthropic.supports_image_input("claude-3-5-sonnet-v2@20241022"));
-    assert!(Provider::Bedrock.supports_image_input(
-        "anthropic.claude-3-5-sonnet-20241022-v2:0"
-    ));
+    assert!(Provider::Bedrock.supports_image_input("anthropic.claude-3-5-sonnet-20241022-v2:0"));
     assert!(Provider::OpenRouter.supports_image_input("openai/gpt-4o-mini"));
     assert!(Provider::OpenRouterResponses.supports_image_input("openai/gpt-5.2"));
 }
@@ -176,9 +190,8 @@ fn provider_capability_rejects_unknown_models() {
 
 #[test]
 fn image_input_validation_fails_before_provider_dispatch_for_unsupported_models() {
-    let error =
-        validate_image_input_supported(&image_message(), Provider::OpenAI, "gpt-3.5-turbo")
-            .expect_err("image validation should reject non-vision models");
+    let error = validate_image_input_supported(&image_message(), Provider::OpenAI, "gpt-3.5-turbo")
+        .expect_err("image validation should reject non-vision models");
 
     assert_eq!(
         error.to_string(),
