@@ -21,6 +21,12 @@ const CHANNEL_CAPACITY: usize = 100;
 const BACKLOG_MAX_FRAMES: usize = 512;
 const DEFAULT_EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const DEFAULT_EXEC_HOME: &str = "/root";
+/// Grace window for keeping an exited daemon's entry around so a slightly-
+/// late `attach_daemon` (or one delayed by guest-network jitter) can still
+/// resolve it and replay backlog + final exit code. 5 minutes is more than
+/// enough to cover the longest plausible api → vmd → portproxy roundtrip
+/// while still bounding the registry size on a chatty session.
+const DAEMON_POST_EXIT_RETENTION: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Error, Debug)]
 pub enum DaemonError {
@@ -121,11 +127,14 @@ impl DaemonRegistry {
         let (exit_tx, _) = watch::channel(None::<i32>);
         let output_backlog = Arc::new(Mutex::new(OutputBacklog::default()));
 
+        let stdout_tx_for_reader = stdout_tx.clone();
+        let stderr_tx_for_reader = stderr_tx.clone();
+        let stderr_tx_for_timeout = stderr_tx.clone();
         let entry = Arc::new(DaemonEntry {
             _name: req.name.clone(),
-            stdin: Mutex::new(stdin),
-            stdout_tx: stdout_tx.clone(),
-            stderr_tx: stderr_tx.clone(),
+            stdin: Mutex::new(Some(stdin)),
+            stdout_tx: std::sync::Mutex::new(Some(stdout_tx)),
+            stderr_tx: std::sync::Mutex::new(Some(stderr_tx)),
             output_backlog: output_backlog.clone(),
             attach_lock: Arc::new(Mutex::new(())),
             exit_tx: exit_tx.clone(),
@@ -143,14 +152,14 @@ impl DaemonRegistry {
 
         spawn_reader(
             stdout,
-            stdout_tx,
+            stdout_tx_for_reader,
             output_backlog.clone(),
             OutputKind::Stdout,
             format!("stdout({})", req.name),
         );
         spawn_reader(
             stderr,
-            stderr_tx.clone(),
+            stderr_tx_for_reader,
             output_backlog.clone(),
             OutputKind::Stderr,
             format!("stderr({})", req.name),
@@ -161,6 +170,7 @@ impl DaemonRegistry {
             .timeout
             .filter(|secs| *secs > 0)
             .map(|secs| std::time::Duration::from_secs(secs as u64));
+        let post_exit_entry = entry.clone();
         tokio::spawn(async move {
             let exit_code = match timeout {
                 Some(timeout) => match tokio::time::timeout(timeout, child_exit.wait()).await {
@@ -172,7 +182,7 @@ impl DaemonRegistry {
                             let mut guard = output_backlog.lock().await;
                             guard.push(OutputKind::Stderr, timeout_message.clone());
                         }
-                        let _ = stderr_tx.send(timeout_message);
+                        let _ = stderr_tx_for_timeout.send(timeout_message);
                         kill_process_group_or_child(pid, &mut child);
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
@@ -188,12 +198,40 @@ impl DaemonRegistry {
                 },
             };
             let _ = exit_tx.send(exit_code);
+            info!("daemon {} exited with {:?}", req.name, exit_code);
 
+            // @dive: Drop the broadcast Senders held by the entry so that any
+            //        in-flight attach_daemon's stdout/stderr forwarders observe
+            //        Closed (once spawn_reader's own clone hits EOF and drops)
+            //        and break. Without this, the entry's Sender keeps the
+            //        broadcast alive for the entire DAEMON_POST_EXIT_RETENTION
+            //        window, starving the attach response stream from closing
+            //        and producing an api-side hang up to that grace duration.
+            //        Stdin is dropped here too — child stdin is closed on exit
+            //        anyway, but explicitly dropping the handle releases the
+            //        async Mutex so the stdin-forwarder task's next write
+            //        fails fast.
+            if let Ok(mut guard) = post_exit_entry.stdout_tx.lock() {
+                *guard = None;
+            }
+            if let Ok(mut guard) = post_exit_entry.stderr_tx.lock() {
+                *guard = None;
+            }
+            *post_exit_entry.stdin.lock().await = None;
+
+            // @dive: Keep the entry in the registry past child exit so a
+            //        slightly-late attach_daemon (e.g. for a fast `echo` that
+            //        finishes in microseconds before the api's RPC fan-out
+            //        completes) can still resolve the name. The fast path in
+            //        attach_daemon picks up the cached exit_code from
+            //        exit_tx (watch channels keep the last value after the
+            //        Sender is dropped) and the buffered output from the
+            //        backlog, so this lookup remains useful.
+            tokio::time::sleep(DAEMON_POST_EXIT_RETENTION).await;
             {
                 let mut guard = daemons.write().await;
                 guard.remove(&req.name);
             }
-            info!("daemon {} exited with {:?}", req.name, exit_code);
         });
 
         Ok(ExecDaemonResponse { is_new: true })
@@ -207,9 +245,16 @@ impl DaemonRegistry {
 
 pub struct DaemonEntry {
     pub(crate) _name: String,
-    pub stdin: Mutex<tokio::process::ChildStdin>,
-    pub stdout_tx: broadcast::Sender<Vec<u8>>,
-    pub stderr_tx: broadcast::Sender<Vec<u8>>,
+    /// Set to `None` after the daemon's child exits so the stdin-forwarder in
+    /// attach_daemon can detect the post-exit state and stop trying to write
+    /// into a broken pipe.
+    pub stdin: Mutex<Option<tokio::process::ChildStdin>>,
+    /// `Some` while the daemon's child is running, `None` after exit. Held in
+    /// a `std::sync::Mutex` (not async) so the post-exit cleanup task can
+    /// drop the Sender without yielding, ensuring downstream broadcast
+    /// receivers observe `Closed` promptly.
+    pub stdout_tx: std::sync::Mutex<Option<broadcast::Sender<Vec<u8>>>>,
+    pub stderr_tx: std::sync::Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     pub output_backlog: Arc<Mutex<OutputBacklog>>,
     pub attach_lock: Arc<Mutex<()>>,
     pub exit_tx: watch::Sender<Option<i32>>,

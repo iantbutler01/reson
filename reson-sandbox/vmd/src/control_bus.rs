@@ -1809,6 +1809,14 @@ async fn handle_exec_stream_start_command(
                     .await?;
                     return Ok(());
                 }
+                warn!(
+                    stream_id = %stream_id,
+                    vm_id = %vm_id,
+                    elapsed_ms = handler_start.elapsed().as_millis() as u64,
+                    grpc_code = ?status.code(),
+                    grpc_message = %status.message(),
+                    "STREAMSTART attach_daemon RPC failed"
+                );
                 return Err(anyhow!(
                     "invoke daemon attach for exec.stream.start: {status}"
                 ));
@@ -2806,12 +2814,14 @@ fn spawn_execution_restore_snapshot_refresh(
                         vm_id = %vm_id,
                         stream_id = %stream_id,
                         error = %persist_err,
+                        underlying = %err,
                         "failed disabling tier-b eligibility after unsupported background snapshot"
                     );
                 } else {
                     warn!(
                         vm_id = %vm_id,
                         stream_id = %stream_id,
+                        underlying = %err,
                         "background snapshot unsupported on host; disabled tier-b restore-marker enforcement for this vm"
                     );
                 }
@@ -2947,11 +2957,20 @@ async fn finalize_execution_restore_snapshot_marker(
     Ok((snapshot.id, snapshot.name))
 }
 
+/// Classify an error from `create_snapshot_qemu_phase` as a true "host kernel
+/// can't do background-snapshot" so the caller can disable tier-b for the VM
+/// instead of silently retrying forever. Only match on substrings that
+/// actually indicate the kernel/qemu lacks the feature — NOT on the wrapping
+/// anyhow context string `enable background-snapshot capabilities`, which is
+/// emitted for *any* error during that step (including transient QMP errors,
+/// PII state mismatches, etc.) and was producing false positives that
+/// permanently disabled tier-b on a healthy host.
 fn background_snapshot_unsupported(err: &crate::state::ManagerError) -> bool {
     let message = err.to_string().to_ascii_lowercase();
     message.contains("background-snapshot is not supported by host kernel")
-        || message.contains("enable background-snapshot capabilities")
-        || message.contains("userfaultfd")
+        || message.contains("userfaultfd is not available")
+        || message.contains("uffd-wp")
+        || message.contains("the kernel does not support background snapshot")
 }
 
 fn dedupe_key(envelope: &CommandEnvelope) -> String {

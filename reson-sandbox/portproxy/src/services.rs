@@ -617,11 +617,14 @@ impl DaemonManager for DaemonManagerService {
         let guard = entry.attach_lock.clone().lock_owned().await;
 
         let (tx, rx) = mpsc::channel(32);
-        let mut stdout_rx = entry.stdout_tx.subscribe();
-        let mut stderr_rx = entry.stderr_tx.subscribe();
         let mut exit_rx = entry.exit_tx.subscribe();
+        let cached_exit = *exit_rx.borrow_and_update();
         let replay_frames = entry.drain_output_backlog().await;
 
+        // @dive: Replay any buffered output the child wrote before this attach
+        //        arrived. We send these synchronously so the post-exit fast
+        //        path below can rely on the backlog being delivered first,
+        //        ahead of the ExitCode frame.
         for frame in replay_frames {
             let response = match frame.kind {
                 OutputKind::Stdout => {
@@ -645,6 +648,63 @@ impl DaemonManager for DaemonManagerService {
                 break;
             }
         }
+
+        // @dive: Post-exit fast path. When attach arrives after the daemon's
+        //        child has already exited (common for fast `echo`-class
+        //        commands plus the post-exit registry retention window), the
+        //        broadcast::Senders held by `entry` outlive the spawn_reader
+        //        tasks that produced into them, so subscribing here would
+        //        block on `recv()` forever (Sender alive, no producers).
+        //        Instead, deliver only the cached output backlog + final
+        //        exit code, then drop tx so the response stream completes
+        //        cleanly. No stdin task either — child stdin is closed.
+        if let Some(exit_code) = cached_exit {
+            let _ = tx
+                .send(Ok(AttachDaemonResponse {
+                    response: Some(
+                        crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::ExitCode(exit_code),
+                    ),
+                }))
+                .await;
+            drop(tx);
+            let stream = GuardedStream::new(guard, ReceiverStream::new(rx));
+            return Ok(Response::new(stream));
+        }
+
+        // Subscribe while child is still running. If the entry's broadcast
+        // Sender has already been dropped (race with child exit between the
+        // cached_exit check above and this point), fall through to the
+        // post-exit ExitCode delivery below.
+        let stdout_rx = entry
+            .stdout_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|tx| tx.subscribe()));
+        let stderr_rx = entry
+            .stderr_tx
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|tx| tx.subscribe()));
+
+        if stdout_rx.is_none() || stderr_rx.is_none() {
+            // Entry was post-exit cleaned between our cached_exit check and
+            // here. Deliver whatever exit code is cached now and end.
+            let final_exit = *exit_rx.borrow_and_update();
+            if let Some(exit_code) = final_exit {
+                let _ = tx
+                    .send(Ok(AttachDaemonResponse {
+                        response: Some(
+                            crate::pb::bracket::portproxy::v1::attach_daemon_response::Response::ExitCode(exit_code),
+                        ),
+                    }))
+                    .await;
+            }
+            drop(tx);
+            let stream = GuardedStream::new(guard, ReceiverStream::new(rx));
+            return Ok(Response::new(stream));
+        }
+        let mut stdout_rx = stdout_rx.unwrap();
+        let mut stderr_rx = stderr_rx.unwrap();
 
         tokio::spawn({
             let tx = tx.clone();
@@ -731,7 +791,14 @@ impl DaemonManager for DaemonManagerService {
                                     ),
                                 ),
                         })) => {
-                            if let Err(err) = entry.stdin.lock().await.write_all(&data).await {
+                            let mut stdin_guard = entry.stdin.lock().await;
+                            let Some(stdin) = stdin_guard.as_mut() else {
+                                // Child has exited and the post-exit cleanup
+                                // task replaced stdin with None — nothing to
+                                // write to.
+                                break;
+                            };
+                            if let Err(err) = stdin.write_all(&data).await {
                                 debug!("daemon stdin write failed: {err}");
                                 break;
                             }
