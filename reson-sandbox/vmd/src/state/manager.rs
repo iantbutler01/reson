@@ -46,6 +46,9 @@ const ARCH_AMD64: &str = "amd64";
 const ARCH_ARM64: &str = "arm64";
 const FORK_BASES_DIR_NAME: &str = "_fork_bases";
 const META_FORK_ID: &str = "reson.fork_id";
+const META_SESSION_ID: &str = "reson.session_id";
+const META_BRANCH_ID: &str = "reson.branch_id";
+const META_PARENT_SESSION_ID: &str = "reson.parent_session_id";
 const META_FORK_BASE_PATH: &str = "reson.fork_base_path";
 const META_PARENT_VM_ID: &str = "reson.parent_vm_id";
 const META_FORK_SNAPSHOT: &str = "reson.fork_snapshot";
@@ -55,6 +58,10 @@ const META_FORK_DEPTH: &str = "reson.fork_depth";
 const META_STORAGE_PROFILE: &str = "reson.storage_profile";
 const META_FORK_DURABILITY_CLASS: &str = "reson.fork_durability_class";
 const META_FORK_RESTORE_SCOPE: &str = "reson.fork_restore_scope";
+const META_TIER_B_ELIGIBLE: &str = "reson.tier_b_eligible";
+const META_EXECUTION_FIDELITY_REQUIREMENT: &str = "reson.execution_fidelity_requirement";
+const META_TENANT_ID: &str = "tenant_id";
+const META_WORKSPACE_ID: &str = "workspace_id";
 const META_NYM_NETWORK_POLICY: &str = "nym_network_policy";
 const META_NYM_NETWORK_POLICY_PROXY_UPSTREAM: &str = "nym_network_policy_proxy_upstream";
 const META_NETWORK_EGRESS_SNAPSHOT: &str = "reson.network_egress";
@@ -215,6 +222,28 @@ impl Manager {
         existing: &std::collections::HashMap<String, String>,
         updated: &mut std::collections::HashMap<String, String>,
     ) {
+        for key in [
+            META_SESSION_ID,
+            META_BRANCH_ID,
+            META_PARENT_SESSION_ID,
+            META_PARENT_VM_ID,
+            META_FORK_ID,
+            META_FORK_SNAPSHOT,
+            META_FORK_DEPTH,
+            META_STORAGE_PROFILE,
+            META_FORK_DURABILITY_CLASS,
+            META_FORK_RESTORE_SCOPE,
+            META_TIER_B_ELIGIBLE,
+            META_EXECUTION_FIDELITY_REQUIREMENT,
+            META_TENANT_ID,
+            META_WORKSPACE_ID,
+        ] {
+            if !updated.contains_key(key) {
+                if let Some(value) = existing.get(key) {
+                    updated.insert(key.to_string(), value.clone());
+                }
+            }
+        }
         updated.remove(META_PORTPROXY_AUTH_TOKEN);
         if let Some(value) = existing.get(META_PORTPROXY_AUTH_TOKEN) {
             updated.insert(META_PORTPROXY_AUTH_TOKEN.to_string(), value.clone());
@@ -4866,6 +4895,23 @@ mod tests {
             },
             metadata: HashMap::from([
                 (
+                    META_SESSION_ID.to_string(),
+                    "nym-session-existing".to_string(),
+                ),
+                (
+                    META_BRANCH_ID.to_string(),
+                    "nym-session-existing".to_string(),
+                ),
+                (META_TENANT_ID.to_string(), "tenant-existing".to_string()),
+                (
+                    META_WORKSPACE_ID.to_string(),
+                    "workspace-existing".to_string(),
+                ),
+                (
+                    META_TIER_B_ELIGIBLE.to_string(),
+                    "true".to_string(),
+                ),
+                (
                     META_NYM_NETWORK_POLICY.to_string(),
                     "{\"domain_allowlist\":[\"github.com\"],\"domain_blocklist\":[],\"custom_port_allowlist\":[],\"bandwidth_cap_mb_per_hour\":1024,\"max_connections_per_minute\":1000}".to_string(),
                 ),
@@ -4919,6 +4965,29 @@ mod tests {
                 .get(META_PORTPROXY_AUTH_TOKEN)
                 .map(String::as_str),
             Some("existing-portproxy-token")
+        );
+        assert_eq!(
+            updated.metadata.get(META_SESSION_ID).map(String::as_str),
+            Some("nym-session-existing")
+        );
+        assert_eq!(
+            updated.metadata.get(META_BRANCH_ID).map(String::as_str),
+            Some("nym-session-existing")
+        );
+        assert_eq!(
+            updated.metadata.get(META_TENANT_ID).map(String::as_str),
+            Some("tenant-existing")
+        );
+        assert_eq!(
+            updated.metadata.get(META_WORKSPACE_ID).map(String::as_str),
+            Some("workspace-existing")
+        );
+        assert_eq!(
+            updated
+                .metadata
+                .get(META_TIER_B_ELIGIBLE)
+                .map(String::as_str),
+            Some("true")
         );
         assert!(
             updated
