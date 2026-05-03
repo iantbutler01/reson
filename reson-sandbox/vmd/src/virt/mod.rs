@@ -20,6 +20,7 @@ use tracing::{debug, trace, warn};
 
 pub const RAM_SNAPSHOT_FORMAT_LEGACY: &str = "legacy";
 pub const RAM_SNAPSHOT_FORMAT_MAPPED: &str = "mapped-ram";
+pub const BACKGROUND_SNAPSHOT_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone, Debug)]
 pub struct MonitorHandle {
@@ -728,7 +729,7 @@ pub async fn save_vm_background(
     // Poll until the migration converges. background-snapshot does not iterate (no dirty
     // re-tracking after the initial WP pass), so once qemu reports `completed` the RAM file
     // is fully written. If qemu fails or the user cancels, surface the error.
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + Duration::from_secs(BACKGROUND_SNAPSHOT_TIMEOUT_SECS);
     loop {
         let status = query_migrate(monitor).await?;
         trace!(
@@ -760,7 +761,10 @@ pub async fn save_vm_background(
             let _ =
                 blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
             let _ = tokio::fs::remove_file(ram_path).await;
-            bail!("background-snapshot migrate timed out after 600s");
+            bail!(
+                "background-snapshot migrate timed out after {}s",
+                BACKGROUND_SNAPSHOT_TIMEOUT_SECS
+            );
         }
         sleep(Duration::from_millis(250)).await;
     }

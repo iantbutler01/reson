@@ -32,6 +32,7 @@ pub struct VmRuntime {
     pub tap_network: Option<VmTapNetworkHandle>,
     pub consecutive_health_failures: u32,
     pub last_health_probe_at: Option<Instant>,
+    pub health_probe_suppressed_until: Option<Instant>,
 }
 
 impl VmRuntime {
@@ -50,12 +51,14 @@ impl VmRuntime {
             tap_network: None,
             consecutive_health_failures: 0,
             last_health_probe_at: None,
+            health_probe_suppressed_until: None,
         }
     }
 
     pub fn reset_health_tracking(&mut self) {
         self.consecutive_health_failures = 0;
         self.last_health_probe_at = None;
+        self.health_probe_suppressed_until = None;
     }
 
     pub fn clear_health_failures(&mut self) {

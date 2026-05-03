@@ -245,14 +245,23 @@ while IFS=$'\t' read -r TAG GUEST MODE; do
     continue
   fi
 
-  VFS_OPTS="default_permissions,allow_other"
+  # virtiofs rejects the FUSE-only default_permissions/allow_other options on
+  # current guest kernels. Preserve mount policy with `ro` only when requested;
+  # otherwise omit -o entirely and let virtiofs mount read-write by default.
+  VFS_OPTS=""
   NINEP_OPTS="trans=virtio,version=9p2000.L,msize=104857600"
   if [ "${{MODE:-rw}}" = "ro" ]; then
-    VFS_OPTS="$VFS_OPTS,ro"
+    VFS_OPTS="ro"
     NINEP_OPTS="$NINEP_OPTS,ro"
   fi
 
-  if mount -t virtiofs -o "$VFS_OPTS" "$TAG" "$GUEST" 2>/dev/null; then
+  if {{
+    if [ -n "$VFS_OPTS" ]; then
+      mount -t virtiofs -o "$VFS_OPTS" "$TAG" "$GUEST" 2>/dev/null
+    else
+      mount -t virtiofs "$TAG" "$GUEST" 2>/dev/null
+    fi
+  }}; then
     log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=virtiofs"
   elif mount -t 9p -o "$NINEP_OPTS" "$TAG" "$GUEST"; then
     log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=9p"
@@ -1032,11 +1041,16 @@ mod tests {
     }
 
     #[test]
-    fn build_shared_mounts_file_orders_parent_before_nested_child() {
+    fn build_shared_mounts_file_orders_parent_before_nested_writable_children() {
         let mounts = vec![
             SharedMount {
-                guest_path: "/nym/task-overlays".to_string(),
-                mount_tag: "nymfs-task-overlays".to_string(),
+                guest_path: "/nym/conversations/conv-a/0007_assistant/mount".to_string(),
+                mount_tag: "nymfs-task-conv-a-0007".to_string(),
+                read_only: false,
+            },
+            SharedMount {
+                guest_path: "/nym/conversations/conv-a/shared".to_string(),
+                mount_tag: "nymfs-shared-conv-a".to_string(),
                 read_only: false,
             },
             SharedMount {
@@ -1049,7 +1063,14 @@ mod tests {
         let file = build_shared_mounts_file(&mounts);
         let lines: Vec<&str> = file.lines().collect();
         assert_eq!(lines[0], "nymfs\t/nym\tro");
-        assert_eq!(lines[1], "nymfs-task-overlays\t/nym/task-overlays\trw");
+        assert_eq!(
+            lines[1],
+            "nymfs-shared-conv-a\t/nym/conversations/conv-a/shared\trw"
+        );
+        assert_eq!(
+            lines[2],
+            "nymfs-task-conv-a-0007\t/nym/conversations/conv-a/0007_assistant/mount\trw"
+        );
     }
 
     #[test]
@@ -1065,6 +1086,28 @@ mod tests {
         assert!(
             precreate < mount_phase,
             "expected guest-path precreate pass before mount phase"
+        );
+    }
+
+    #[test]
+    fn init_script_uses_guest_safe_virtiofs_options() {
+        let script = build_init_script("vm-test", None, None, None);
+        assert!(script.contains("VFS_OPTS=\"\""));
+        assert!(script.contains("VFS_OPTS=\"ro\""));
+        assert!(script.contains("if [ -n \"$VFS_OPTS\" ]; then"));
+        assert!(script.contains("mount -t virtiofs -o \"$VFS_OPTS\""));
+        assert!(script.contains("mount -t virtiofs \"$TAG\" \"$GUEST\""));
+        assert!(
+            !script.contains("VFS_RC=$?"),
+            "mount failures must stay inside an if condition so set -e does not skip 9p fallback"
+        );
+        assert!(
+            !script.contains("VFS_OPTS=\"default_permissions"),
+            "default_permissions is valid on the host FUSE mount but rejected by guest virtiofs"
+        );
+        assert!(
+            !script.contains("VFS_OPTS=\"allow_other"),
+            "allow_other is also rejected by the guest virtiofs mount"
         );
     }
 

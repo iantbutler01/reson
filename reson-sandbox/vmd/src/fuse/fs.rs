@@ -6,9 +6,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
-    KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
@@ -415,6 +415,61 @@ impl NymFuseFs {
         Ok(())
     }
 
+    fn resize_handle(&self, fh: u64, size: u64) -> FuseResult<(String, u64)> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        self.ensure_handle_loaded(fh)?;
+        let mut handles = self.lock_handles()?;
+        let state = handles.files.get_mut(&fh).ok_or(Errno::ENOENT)?;
+        state.buffer.resize(size as usize, 0);
+        state.dirty = true;
+        state.loaded = true;
+        state.revision = state.revision.saturating_add(1);
+        Ok((state.path.clone(), size))
+    }
+
+    fn resize_path_immediate(&self, path: &str, size: u64) -> FuseResult<FileAttr> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        self.stat_path(path)?.ok_or(Errno::ENOENT)?;
+        let mut bytes = self
+            .tokio
+            .block_on(self.client.read_file_raw(path))
+            .map_err(|_| Errno::EIO)?;
+        bytes.resize(size as usize, 0);
+        let lease = self
+            .tokio
+            .block_on(
+                self.client
+                    .acquire_lease(path, 1, "resize nymfs fuse file"),
+            )
+            .map_err(|_| Errno::EIO)?;
+        let surface = if path.contains("/shared") {
+            "vm_conversation_shared_fuse"
+        } else {
+            "vm_task_overlay_fuse"
+        };
+        let write_result = self.tokio.block_on(self.client.write_file(
+            path,
+            &bytes,
+            &lease,
+            surface,
+            "fuse_setattr_size",
+        ));
+        let _ = self.tokio.block_on(self.client.release_lease(&lease));
+        write_result.map_err(|_| Errno::EIO)?;
+        self.cache.invalidate(path);
+        let metadata = RemoteMetadata {
+            kind: "file".to_string(),
+            size_bytes: size,
+            content_hash: Some(content_hash_for_bytes(&bytes)),
+            updated_at: None,
+        };
+        Ok(self.attr_for_path(path, &metadata))
+    }
+
     fn mutate_namespace<F>(&self, path: &str, op: F) -> FuseResult<()>
     where
         F: FnOnce(&LeaseGrant, &'static str) -> Result<()>,
@@ -624,6 +679,77 @@ impl Filesystem for NymFuseFs {
             return;
         }
         let result: FuseResult<FileAttr> = (|| {
+            let path = self.path_for_ino(ino)?;
+            let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
+            Ok(self.attr_for_path(&path, &metadata))
+        })();
+        match result {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(err) => reply.error(err),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let result: FuseResult<FileAttr> = (|| {
+            if ino == ROOT_INO {
+                if size.is_some() {
+                    return Err(Errno::EISDIR);
+                }
+                return Ok(self.root_attr());
+            }
+
+            if let Some(size) = size {
+                if let Some(fh) = fh {
+                    let (path, size_bytes) = self.resize_handle(fh.0, size)?;
+                    return Ok(self.attr_for_path(
+                        &path,
+                        &RemoteMetadata {
+                            kind: "file".to_string(),
+                            size_bytes,
+                            content_hash: None,
+                            updated_at: None,
+                        },
+                    ));
+                }
+                let path = self.path_for_ino(ino)?;
+                return self.resize_path_immediate(&path, size);
+            }
+
+            if let Some(fh) = fh {
+                if let Some(state) = self.lock_handles()?.files.get(&fh.0).cloned() {
+                    if state.loaded || state.dirty {
+                        return Ok(self.attr_for_path(
+                            &state.path,
+                            &RemoteMetadata {
+                                kind: "file".to_string(),
+                                size_bytes: state.buffer.len() as u64,
+                                content_hash: state.base_content_hash,
+                                updated_at: None,
+                            },
+                        ));
+                    }
+                    let metadata = self.stat_path(&state.path)?.ok_or(Errno::ENOENT)?;
+                    return Ok(self.attr_for_path(&state.path, &metadata));
+                }
+            }
+
             let path = self.path_for_ino(ino)?;
             let metadata = self.stat_path(&path)?.ok_or(Errno::ENOENT)?;
             Ok(self.attr_for_path(&path, &metadata))

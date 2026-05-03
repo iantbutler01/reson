@@ -435,6 +435,13 @@ impl Manager {
             if age < start_grace {
                 continue;
             }
+            if inner
+                .runtime
+                .health_probe_suppressed_until
+                .is_some_and(|until| now_instant < until)
+            {
+                continue;
+            }
             if let Some(last_probe_at) = inner.runtime.last_health_probe_at {
                 if now_instant
                     .checked_duration_since(last_probe_at)
@@ -489,6 +496,14 @@ impl Manager {
         {
             return Ok(None);
         }
+        if inner
+            .runtime
+            .health_probe_suppressed_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            inner.runtime.clear_health_failures();
+            return Ok(None);
+        }
         let failure_threshold = failure_threshold.max(1);
         if permanent {
             inner.runtime.consecutive_health_failures = inner
@@ -505,6 +520,30 @@ impl Manager {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn suppress_vm_health_probes_for(
+        &self,
+        vm_id: &str,
+        duration: std::time::Duration,
+    ) -> ManagerResult<()> {
+        let vm = self.vm_by_id(vm_id).await?;
+        let mut inner = vm.lock().await;
+        if inner.runtime.state != VmState::Running {
+            return Ok(());
+        }
+        inner.runtime.consecutive_health_failures = 0;
+        inner.runtime.last_health_probe_at = None;
+        inner.runtime.health_probe_suppressed_until = Some(Instant::now() + duration);
+        Ok(())
+    }
+
+    pub async fn clear_vm_health_probe_suppression(&self, vm_id: &str) -> ManagerResult<()> {
+        let vm = self.vm_by_id(vm_id).await?;
+        let mut inner = vm.lock().await;
+        inner.runtime.health_probe_suppressed_until = None;
+        inner.runtime.clear_health_failures();
+        Ok(())
     }
 
     async fn active_vm_count(&self) -> usize {
@@ -1374,16 +1413,26 @@ impl Manager {
             }
         }
 
+        // @dive: QEMU background-snapshot can transiently stall guest exec while
+        //        userfaultfd-WP drains pages. That does not mean the VM is wedged;
+        //        suppress the background health reconciler during the QMP phase so
+        //        our own snapshot maintenance does not kill an otherwise healthy VM.
+        self.suppress_vm_health_probes_for(
+            vm_id,
+            Duration::from_secs(virt::BACKGROUND_SNAPSHOT_TIMEOUT_SECS + 30),
+        )
+        .await?;
         let opts = virt::BackgroundSnapshotOptions::default();
-        let status = virt::save_vm_background(
+        let save_result = virt::save_vm_background(
             &monitor,
             disk_path.as_path(),
             &meta.name,
             qemu_ram_path.as_path(),
             &opts,
         )
-        .await
-        .map_err(ManagerError::Other)?;
+        .await;
+        let _ = self.clear_vm_health_probe_suppression(vm_id).await;
+        let status = save_result.map_err(ManagerError::Other)?;
         meta.ram_format = status.ram_format.clone();
         debug!(
             vm_id = %vm_id,
