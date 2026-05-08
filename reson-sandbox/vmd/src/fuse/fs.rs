@@ -441,10 +441,7 @@ impl NymFuseFs {
         bytes.resize(size as usize, 0);
         let lease = self
             .tokio
-            .block_on(
-                self.client
-                    .acquire_lease(path, 1, "resize nymfs fuse file"),
-            )
+            .block_on(self.client.acquire_lease(path, 1, "resize nymfs fuse file"))
             .map_err(|_| Errno::EIO)?;
         let surface = if path.contains("/shared") {
             "vm_conversation_shared_fuse"
