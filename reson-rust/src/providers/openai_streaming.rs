@@ -116,6 +116,21 @@ pub fn parse_openai_chunk(
     has_tools: bool,
 ) -> Vec<StreamChunk> {
     let mut chunks = Vec::new();
+    let mut metadata = serde_json::Map::new();
+    for key in [
+        "provider_metadata",
+        "generated_token_ids",
+        "completion_token_ids",
+        "token_ids",
+        "request_id",
+    ] {
+        if let Some(value) = chunk_json.get(key) {
+            metadata.insert(key.to_string(), value.clone());
+        }
+    }
+    if !metadata.is_empty() {
+        chunks.push(StreamChunk::Metadata(Value::Object(metadata)));
+    }
 
     // Extract delta from choices[0]
     let delta = match chunk_json
@@ -123,7 +138,28 @@ pub fn parse_openai_chunk(
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("delta"))
     {
-        Some(d) => d,
+        Some(d) => {
+            let choice = chunk_json
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .unwrap_or(&Value::Null);
+            let mut choice_metadata = serde_json::Map::new();
+            for key in [
+                "provider_metadata",
+                "generated_token_ids",
+                "completion_token_ids",
+                "token_ids",
+                "request_id",
+            ] {
+                if let Some(value) = choice.get(key).or_else(|| d.get(key)) {
+                    choice_metadata.insert(key.to_string(), value.clone());
+                }
+            }
+            if !choice_metadata.is_empty() {
+                chunks.push(StreamChunk::Metadata(Value::Object(choice_metadata)));
+            }
+            d
+        }
         None => {
             // Check for usage in final chunk
             if let Some(usage) = chunk_json.get("usage") {

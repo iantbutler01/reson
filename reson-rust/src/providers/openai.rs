@@ -65,6 +65,31 @@ impl std::fmt::Debug for OAIClient {
 }
 
 impl OAIClient {
+    fn extract_provider_metadata_from_body(
+        &self,
+        body: &serde_json::Value,
+        choice: &serde_json::Value,
+        message: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let mut metadata = serde_json::Map::new();
+        for key in [
+            "provider_metadata",
+            "generated_token_ids",
+            "completion_token_ids",
+            "token_ids",
+            "request_id",
+        ] {
+            if let Some(value) = body
+                .get(key)
+                .or_else(|| choice.get(key))
+                .or_else(|| message.get(key))
+            {
+                metadata.insert(key.to_string(), value.clone());
+            }
+        }
+        (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata))
+    }
+
     fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
         let provider = match self.provider {
             Provider::OpenRouter => "openrouter",
@@ -368,7 +393,10 @@ impl InferenceClient for OAIClient {
         // Extract message and content
         let choice = &body["choices"][0];
         let message = &choice["message"];
-        let response = self.extract_response(message)?;
+        let mut response = self.extract_response(message)?;
+        if let Some(metadata) = self.extract_provider_metadata_from_body(&body, choice, message) {
+            response.merge_provider_metadata(metadata);
+        }
 
         // If tools were provided, return full response for tool extraction
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();

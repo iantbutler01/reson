@@ -340,18 +340,28 @@ impl ChatMessage {
 pub struct AssistantResponse {
     /// Ordered output emitted by the assistant.
     pub output: Vec<ResponsePart>,
+
+    /// Provider-specific metadata that is not assistant-visible text or tool
+    /// content. Compatible providers may use this for token ids, request ids,
+    /// or other transport details needed by higher-level runtimes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<serde_json::Value>,
 }
 
 impl AssistantResponse {
     /// Create a new response from ordered output items.
     pub fn new(output: Vec<ResponsePart>) -> Self {
-        Self { output }
+        Self {
+            output,
+            provider_metadata: None,
+        }
     }
 
     /// Create a text-only assistant response.
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
             output: vec![ResponsePart::Text { text: text.into() }],
+            provider_metadata: None,
         }
     }
 
@@ -429,6 +439,27 @@ impl AssistantResponse {
                 ResponsePart::Signature { value },
             ) => existing.push_str(value),
             _ => self.output.push(part),
+        }
+    }
+
+    /// Merge provider metadata into the response without changing assistant
+    /// output ordering.
+    pub fn merge_provider_metadata(&mut self, metadata: serde_json::Value) {
+        let Some(incoming) = metadata.as_object() else {
+            self.provider_metadata = Some(metadata);
+            return;
+        };
+        match self.provider_metadata.as_mut() {
+            Some(existing) => {
+                if let Some(existing_map) = existing.as_object_mut() {
+                    for (key, value) in incoming {
+                        existing_map.insert(key.clone(), value.clone());
+                    }
+                } else {
+                    self.provider_metadata = Some(serde_json::Value::Object(incoming.clone()));
+                }
+            }
+            None => self.provider_metadata = Some(serde_json::Value::Object(incoming.clone())),
         }
     }
 }

@@ -363,6 +363,10 @@ pub enum StreamChunk {
     /// Complete tool call
     ToolCallComplete(serde_json::Value),
 
+    /// Provider-specific metadata that should be attached to the final
+    /// AssistantResponse but is not assistant-visible output.
+    Metadata(serde_json::Value),
+
     /// Token usage statistics (final message)
     Usage {
         input_tokens: u64,

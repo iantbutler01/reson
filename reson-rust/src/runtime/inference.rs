@@ -230,6 +230,11 @@ async fn stream_chunk_to_runtime_events(
             Ok(events)
         }
         StreamChunk::ToolCallPartial(tool) => Ok(vec![ResponseStreamEvent::ToolPartial(tool)]),
+        StreamChunk::Metadata(metadata) => {
+            let mut response = response.write().await;
+            response.merge_provider_metadata(metadata);
+            Ok(Vec::new())
+        }
         StreamChunk::Usage {
             input_tokens,
             output_tokens,
