@@ -24,6 +24,8 @@ jobs:
             ~/.cargo/git/db/
             reson-rust/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('reson-rust/**/Cargo.lock') }}
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run tests
         working-directory: reson-rust
         run: cargo test --all-features
@@ -47,6 +49,8 @@ jobs:
             ~/.cargo/git/db/
             reson-rust/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('reson-rust/**/Cargo.lock') }}
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run clippy
         working-directory: reson-rust
         run: cargo clippy --all-features -- -D warnings
@@ -77,6 +81,8 @@ jobs:
           python-version: "3.12"
       - name: Install maturin
         run: pip install "maturin[patchelf]"
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build Python package
         working-directory: reson-py
         run: maturin build --release
@@ -102,6 +108,7 @@ jobs:
         working-directory: reson-py
         run: |
           source ../.venv/bin/activate
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
           maturin develop --release
       - name: Run integration tests
         env:
