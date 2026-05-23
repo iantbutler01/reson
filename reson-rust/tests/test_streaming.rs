@@ -180,12 +180,9 @@ async fn test_openrouter_basic_streaming() {
         match chunk_result {
             Ok(chunk) => {
                 chunk_count += 1;
-                match chunk {
-                    StreamChunk::Content(text) => {
-                        print!("{}", text);
-                        full_content.push_str(&text);
-                    }
-                    _ => {}
+                if let StreamChunk::Content(text) = chunk {
+                    print!("{}", text);
+                    full_content.push_str(&text);
                 }
             }
             Err(e) => {

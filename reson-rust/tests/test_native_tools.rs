@@ -10,6 +10,7 @@ use reson_agentic::parsers::Deserializable;
 use reson_agentic::types::ToolResult;
 use serde::{Deserialize, Serialize};
 
+#[allow(clippy::too_many_arguments)]
 fn run_params(
     prompt: Option<&str>,
     system: Option<&str>,

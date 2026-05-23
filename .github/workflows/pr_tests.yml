@@ -76,7 +76,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install maturin
-        run: pip install maturin
+        run: pip install "maturin[patchelf]"
       - name: Build Python package
         working-directory: reson-py
         run: maturin build --release
@@ -97,7 +97,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest
+          pip install "maturin[patchelf]" pytest
       - name: Build and install package
         working-directory: reson-py
         run: |

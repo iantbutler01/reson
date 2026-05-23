@@ -318,8 +318,8 @@ async fn test_cross_provider_tool_call_format() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => match chunk {
-                StreamChunk::ToolCallComplete(tool_call) => {
+            Ok(chunk) => {
+                if let StreamChunk::ToolCallComplete(tool_call) = chunk {
                     println!("Tool call: {:?}", tool_call);
 
                     // Streaming emits OpenAI format {id, function: {name, arguments}}
@@ -329,8 +329,7 @@ async fn test_cross_provider_tool_call_format() {
 
                     tool_calls.push(tool_call);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;
@@ -362,8 +361,8 @@ async fn test_google_tool_call_format() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => match chunk {
-                StreamChunk::ToolCallComplete(tool_call) => {
+            Ok(chunk) => {
+                if let StreamChunk::ToolCallComplete(tool_call) = chunk {
                     println!("Google tool call: {:?}", tool_call);
 
                     // Google format should have functionCall or be normalized
@@ -376,8 +375,7 @@ async fn test_google_tool_call_format() {
                     assert!(name.is_some(), "Google tool call should have name");
                     tool_calls.push(tool_call);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;
@@ -419,8 +417,8 @@ async fn test_mixed_tool_registration_formats() {
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok(chunk) => match chunk {
-                StreamChunk::ToolCallComplete(tool_call) => {
+            Ok(chunk) => {
+                if let StreamChunk::ToolCallComplete(tool_call) = chunk {
                     // Streaming emits OpenAI format {id, function: {name, arguments}}
                     let tc = ToolCall::from_provider_format(tool_call.clone(), Provider::OpenAI)
                         .expect("Tool call should parse");
@@ -428,8 +426,7 @@ async fn test_mixed_tool_registration_formats() {
                     tool_names.push(tc.tool_name);
                     tool_calls.push(tool_call);
                 }
-                _ => {}
-            },
+            }
             Err(e) => {
                 eprintln!("Stream error: {}", e);
                 break;
