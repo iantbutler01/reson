@@ -12,8 +12,45 @@ use crate::errors::to_py_err;
 use crate::types::{ChatMessage, ReasoningSegment, ToolResult};
 
 type ChunkStream = Pin<
-    Box<dyn Stream<Item = Result<(String, serde_json::Value), reson_agentic::error::Error>> + Send>,
+    Box<
+        dyn Stream<
+                Item = Result<reson_agentic::types::ResponseStreamEvent, reson_agentic::error::Error>,
+            > + Send,
+    >,
 >;
+
+fn response_stream_event_to_chunk(
+    event: reson_agentic::types::ResponseStreamEvent,
+) -> (String, serde_json::Value) {
+    match event {
+        reson_agentic::types::ResponseStreamEvent::Output(part) => match part {
+            reson_agentic::types::ResponsePart::Text { text } => {
+                ("content".to_string(), serde_json::Value::String(text))
+            }
+            reson_agentic::types::ResponsePart::Reasoning { text } => {
+                ("reasoning".to_string(), serde_json::Value::String(text))
+            }
+            reson_agentic::types::ResponsePart::Tool { call } => (
+                "tool_call".to_string(),
+                serde_json::to_value(call).unwrap_or(serde_json::Value::Null),
+            ),
+            reson_agentic::types::ResponsePart::Signature { value } => {
+                ("signature".to_string(), serde_json::Value::String(value))
+            }
+        },
+        reson_agentic::types::ResponseStreamEvent::ToolPartial(payload) => {
+            ("tool_call_partial".to_string(), payload)
+        }
+        reson_agentic::types::ResponseStreamEvent::Usage(usage) => (
+            "usage".to_string(),
+            serde_json::to_value(usage).unwrap_or(serde_json::Value::Null),
+        ),
+        reson_agentic::types::ResponseStreamEvent::Complete(response) => (
+            "complete".to_string(),
+            serde_json::to_value(response).unwrap_or(serde_json::Value::Null),
+        ),
+    }
+}
 
 /// Generate JSON schema from a Python type (Pydantic model, dataclass, Deserializable, etc.)
 /// Note: Provider-specific schema fixes are applied in the Rust inference layer
@@ -303,10 +340,13 @@ impl StreamIterator {
                         p.output_schema,
                         p.api_key.as_deref(),
                         p.system.as_deref(),
+                        None,
                         p.history,
                         p.temperature,
                         p.top_p,
                         p.max_tokens,
+                        None,
+                        None,
                         None,
                         call_context,
                         accumulators,
@@ -326,7 +366,8 @@ impl StreamIterator {
             match stream_ref {
                 Some(s) => {
                     match s.next().await {
-                        Some(Ok((chunk_type, chunk_value))) => {
+                        Some(Ok(event)) => {
+                            let (chunk_type, chunk_value) = response_stream_event_to_chunk(event);
                             // Update accumulators based on chunk type
                             match chunk_type.as_str() {
                                 "content" => {
@@ -807,27 +848,41 @@ impl Runtime {
                 output_schema,
                 effective_api_key.as_deref(),
                 system_clone.as_deref(),
+                None,
                 rust_history,
                 temperature,
                 top_p,
                 max_tokens,
+                None,
+                None,
                 None,
                 call_context,
             )
             .await
             .map_err(to_py_err)?;
 
+            let response = result.response;
+
             // Update accumulators
-            if let Some(raw) = &result.raw_response {
-                raw_response_acc.write().await.push(raw.clone());
+            let raw = response.text();
+            if !raw.is_empty() {
+                raw_response_acc.write().await.push(raw);
             }
-            if let Some(reasoning) = &result.reasoning {
-                reasoning_acc.write().await.push(reasoning.clone());
+            let reasoning = response.reasoning();
+            if !reasoning.is_empty() {
+                reasoning_acc.write().await.push(reasoning);
             }
 
             // Convert result to Python, hydrating into output_type if provided
             Python::with_gil(|py| -> PyResult<PyObject> {
-                let py_value = pythonize::pythonize(py, &result.parsed_value)
+                let parsed_value = if let Some(text) = response.as_str() {
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+                } else {
+                    serde_json::to_value(&response).unwrap_or(serde_json::Value::Null)
+                };
+
+                let py_value = pythonize::pythonize(py, &parsed_value)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
                 // If output_type was provided, hydrate the response into the typed instance
