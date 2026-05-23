@@ -22,6 +22,15 @@ type ChunkStream = Pin<
 fn response_stream_event_to_chunk(
     event: reson_agentic::types::ResponseStreamEvent,
 ) -> (String, serde_json::Value) {
+    fn serialize_or_error<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        match serde_json::to_value(value) {
+            Ok(v) => v,
+            Err(err) => serde_json::json!({
+                "_serialization_error": err.to_string(),
+            }),
+        }
+    }
+
     match event {
         reson_agentic::types::ResponseStreamEvent::Output(part) => match part {
             reson_agentic::types::ResponsePart::Text { text } => {
@@ -32,7 +41,7 @@ fn response_stream_event_to_chunk(
             }
             reson_agentic::types::ResponsePart::Tool { call } => (
                 "tool_call".to_string(),
-                serde_json::to_value(call).unwrap_or(serde_json::Value::Null),
+                serialize_or_error(&call),
             ),
             reson_agentic::types::ResponsePart::Signature { value } => {
                 ("signature".to_string(), serde_json::Value::String(value))
@@ -43,11 +52,11 @@ fn response_stream_event_to_chunk(
         }
         reson_agentic::types::ResponseStreamEvent::Usage(usage) => (
             "usage".to_string(),
-            serde_json::to_value(usage).unwrap_or(serde_json::Value::Null),
+            serialize_or_error(&usage),
         ),
         reson_agentic::types::ResponseStreamEvent::Complete(response) => (
             "complete".to_string(),
-            serde_json::to_value(response).unwrap_or(serde_json::Value::Null),
+            serialize_or_error(&response),
         ),
     }
 }
@@ -876,10 +885,23 @@ impl Runtime {
             // Convert result to Python, hydrating into output_type if provided
             Python::with_gil(|py| -> PyResult<PyObject> {
                 let parsed_value = if let Some(text) = response.as_str() {
-                    serde_json::from_str::<serde_json::Value>(text)
-                        .unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+                    match serde_json::from_str::<serde_json::Value>(text) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            eprintln!(
+                                "reson-py: failed to parse assistant text as JSON, returning string: {}",
+                                err
+                            );
+                            serde_json::Value::String(text.to_string())
+                        }
+                    }
                 } else {
-                    serde_json::to_value(&response).unwrap_or(serde_json::Value::Null)
+                    match serde_json::to_value(&response) {
+                        Ok(value) => value,
+                        Err(err) => serde_json::json!({
+                            "_serialization_error": err.to_string(),
+                        }),
+                    }
                 };
 
                 let py_value = pythonize::pythonize(py, &parsed_value)
