@@ -544,38 +544,41 @@ Never claim completion without tool evidence."#;
         }
 
         for call_response in &tool_call_responses {
-            let Some(tool_call) = call_response.tool_calls().first().copied().cloned() else {
-                continue;
-            };
-            history.push(ConversationMessage::ToolCall(tool_call.clone()));
+            if let Some(tool_call) = call_response
+                .tool_calls()
+                .first()
+                .map(|tool_call| (*tool_call).clone())
+            {
+                history.push(ConversationMessage::ToolCall(tool_call.clone()));
 
-            let execution_result = runtime.execute_tool(call_response).await;
-            let tool_result = match execution_result {
-                Ok(content) => {
-                    println!(
-                        "[tool:{}] {}",
-                        tool_call.tool_name,
-                        tool_output_json(&tool_call.tool_name, &content)
-                    );
-                    ToolResult::success_with_name(
-                        tool_call.tool_use_id.clone(),
-                        tool_call.tool_name.clone(),
-                        content,
-                    )
-                    .with_tool_obj(tool_call.args.clone())
-                }
-                Err(err) => {
-                    eprintln!("[tool:{}] execution failed: {}", tool_call.tool_name, err);
-                    ToolResult::error(
-                        tool_call.tool_use_id.clone(),
-                        format!("Tool execution failed: {}", err),
-                    )
-                    .with_tool_name(tool_call.tool_name.clone())
-                    .with_tool_obj(tool_call.args.clone())
-                }
-            };
+                let execution_result = runtime.execute_tool(call_response).await;
+                let tool_result = match execution_result {
+                    Ok(content) => {
+                        println!(
+                            "[tool:{}] {}",
+                            tool_call.tool_name,
+                            tool_output_json(&tool_call.tool_name, &content)
+                        );
+                        ToolResult::success_with_name(
+                            tool_call.tool_use_id.clone(),
+                            tool_call.tool_name.clone(),
+                            content,
+                        )
+                        .with_tool_obj(tool_call.args.clone())
+                    }
+                    Err(err) => {
+                        eprintln!("[tool:{}] execution failed: {}", tool_call.tool_name, err);
+                        ToolResult::error(
+                            tool_call.tool_use_id.clone(),
+                            format!("Tool execution failed: {}", err),
+                        )
+                        .with_tool_name(tool_call.tool_name.clone())
+                        .with_tool_obj(tool_call.args.clone())
+                    }
+                };
 
-            history.push(ConversationMessage::ToolResult(tool_result));
+                history.push(ConversationMessage::ToolResult(tool_result));
+            }
         }
     }
 
