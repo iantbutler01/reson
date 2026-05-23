@@ -349,14 +349,14 @@ impl StreamIterator {
                         p.output_schema,
                         p.api_key.as_deref(),
                         p.system.as_deref(),
-                        None,
+                        None, // system_messages
                         p.history,
                         p.temperature,
                         p.top_p,
                         p.max_tokens,
-                        None,
-                        None,
-                        None,
+                        None, // timeout
+                        None, // retry_config
+                        None, // provider_config
                         call_context,
                         accumulators,
                     )
@@ -857,14 +857,14 @@ impl Runtime {
                 output_schema,
                 effective_api_key.as_deref(),
                 system_clone.as_deref(),
-                None,
+                None, // system_messages
                 rust_history,
                 temperature,
                 top_p,
                 max_tokens,
-                None,
-                None,
-                None,
+                None, // timeout
+                None, // retry_config
+                None, // provider_config
                 call_context,
             )
             .await
