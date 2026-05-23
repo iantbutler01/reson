@@ -14,8 +14,8 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
-use crate::schema::ToolParametersSchema;
 use crate::providers::ProviderConfig;
+use crate::schema::ToolParametersSchema;
 use crate::types::{AssistantResponse, ReasoningSegment, ResponseStreamEvent, ToolCall};
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;

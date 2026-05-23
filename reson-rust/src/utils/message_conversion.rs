@@ -783,23 +783,21 @@ pub fn convert_messages_to_provider_format(
                          anthropic_blocks: &mut Vec<Value>,
                          google_parts: &mut Vec<Value>| {
         match provider {
-            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
-                if !anthropic_blocks.is_empty() {
-                    converted.push(json!({
-                        "role": "user",
-                        "content": anthropic_blocks.clone()
-                    }));
-                    anthropic_blocks.clear();
-                }
+            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic
+                if !anthropic_blocks.is_empty() =>
+            {
+                converted.push(json!({
+                    "role": "user",
+                    "content": anthropic_blocks.clone()
+                }));
+                anthropic_blocks.clear();
             }
-            Provider::GoogleGenAI => {
-                if !google_parts.is_empty() {
-                    converted.push(json!({
-                        "role": "user",
-                        "content": google_parts.clone()
-                    }));
-                    google_parts.clear();
-                }
+            Provider::GoogleGenAI if !google_parts.is_empty() => {
+                converted.push(json!({
+                    "role": "user",
+                    "content": google_parts.clone()
+                }));
+                google_parts.clear();
             }
             _ => {}
         }

@@ -226,13 +226,12 @@ mod agentic_macro_tests {
     use reson_agentic::agentic;
     use reson_agentic::error::Result;
 
-    type AgentFuture =
-        std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<reson_agentic::types::AssistantResponse>>
-                    + Send,
-            >,
-        >;
+    type AgentFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<reson_agentic::types::AssistantResponse>>
+                + Send,
+        >,
+    >;
 
     #[allow(clippy::too_many_arguments)]
     fn run_params(

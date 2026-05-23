@@ -225,10 +225,8 @@ fn close_json_fragment(input: &str) -> String {
             '"' => in_string = true,
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']' => {
-                if stack.last().copied() == Some(ch) {
-                    stack.pop();
-                }
+            '}' | ']' if stack.last().copied() == Some(ch) => {
+                stack.pop();
             }
             _ => {}
         }
@@ -323,12 +321,10 @@ pub fn parse_anthropic_chunk(
             }
         }
 
-        "content_block_stop" => {
-            if has_tools {
-                let index = chunk_json["index"].as_u64().unwrap_or(0) as usize;
-                if let Some(complete_tool) = accumulator.complete_tool(index) {
-                    results.push(StreamChunk::ToolCallComplete(complete_tool));
-                }
+        "content_block_stop" if has_tools => {
+            let index = chunk_json["index"].as_u64().unwrap_or(0) as usize;
+            if let Some(complete_tool) = accumulator.complete_tool(index) {
+                results.push(StreamChunk::ToolCallComplete(complete_tool));
             }
         }
 
@@ -373,10 +369,8 @@ pub fn parse_anthropic_chunk(
             }
         }
 
-        "message_stop" => {
-            if has_tools {
-                flush_pending_tools(&mut results, accumulator, "message_stop");
-            }
+        "message_stop" if has_tools => {
+            flush_pending_tools(&mut results, accumulator, "message_stop");
         }
 
         _ => {}
