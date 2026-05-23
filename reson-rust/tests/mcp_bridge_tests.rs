@@ -7,11 +7,22 @@
 use reson_agentic::agentic;
 use reson_agentic::mcp::{McpServer, ServerTransport};
 use reson_agentic::runtime::{RunParams, Runtime};
-use reson_agentic::types::{ChatMessage, ToolCall, ToolResult};
+use reson_agentic::types::{
+    AssistantResponse, ChatMessage, CreateResult, ResponsePart, ToolCall, ToolResult,
+};
 use reson_agentic::utils::ConversationMessage;
 use reson_mcp::{CallToolResult, Content};
 use serde_json::json;
 use std::env;
+
+fn assistant_tool_response(tool_call: serde_json::Value) -> AssistantResponse {
+    let call = match ToolCall::create(tool_call).expect("tool call payload should parse") {
+        CreateResult::Single(call) => call,
+        CreateResult::Multiple(_) => panic!("expected a single tool call"),
+        CreateResult::Empty => panic!("expected a tool call"),
+    };
+    AssistantResponse::new(vec![ResponsePart::Tool { call }])
+}
 
 /// Start a test MCP server on the given WebSocket port
 fn build_calculator_server() -> reson_mcp::server::McpServer {
@@ -114,22 +125,22 @@ async fn test_mcp_client_tool_execution() {
         .expect("Failed to connect to MCP server");
 
     // Execute tool through the runtime
-    let tool_call = json!({
+    let tool_call = assistant_tool_response(json!({
         "_tool_name": "add",
         "a": 7,
         "b": 3
-    });
+    }));
     let result = runtime
         .execute_tool(&tool_call)
         .await
         .expect("Tool execution failed");
     assert_eq!(result, "10");
 
-    let tool_call = json!({
+    let tool_call = assistant_tool_response(json!({
         "_tool_name": "multiply",
         "a": 6,
         "b": 4
-    });
+    }));
     let result = runtime
         .execute_tool(&tool_call)
         .await
@@ -168,13 +179,17 @@ async fn test_mcp_client_mixed_with_local_tools() {
 
     // Both local and MCP tools should work
     let local_result = runtime
-        .execute_tool(&json!({"_tool_name": "local_echo", "message": "hello"}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "local_echo", "message": "hello"}),
+        ))
         .await
         .unwrap();
     assert_eq!(local_result, "echo: hello");
 
     let mcp_result = runtime
-        .execute_tool(&json!({"_tool_name": "add", "a": 1, "b": 2}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "add", "a": 1, "b": 2}),
+        ))
         .await
         .unwrap();
     assert_eq!(mcp_result, "3");
@@ -333,7 +348,9 @@ async fn test_end_to_end_agent_server_to_runtime() {
 
     // Execute through runtime
     let result = runtime
-        .execute_tool(&json!({"_tool_name": "reverse", "input": "hello"}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "reverse", "input": "hello"}),
+        ))
         .await
         .unwrap();
     assert_eq!(result, "olleh");
@@ -360,7 +377,9 @@ async fn test_mcp_as_prefixes_tool_names() {
 
     // Prefixed name works for execution (calls remote "add" under the hood)
     let result = runtime
-        .execute_tool(&json!({"_tool_name": "calc_add", "a": 10, "b": 5}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "calc_add", "a": 10, "b": 5}),
+        ))
         .await
         .unwrap();
     assert_eq!(result, "15");
@@ -382,11 +401,15 @@ async fn test_mcp_as_avoids_conflicts() {
 
     // Both work independently
     let r1 = runtime
-        .execute_tool(&json!({"_tool_name": "s1_add", "a": 1, "b": 2}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "s1_add", "a": 1, "b": 2}),
+        ))
         .await
         .unwrap();
     let r2 = runtime
-        .execute_tool(&json!({"_tool_name": "s2_add", "a": 10, "b": 20}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "s2_add", "a": 10, "b": 20}),
+        ))
         .await
         .unwrap();
     assert_eq!(r1, "3");
@@ -703,7 +726,7 @@ async fn test_tool_returning_error_content() {
 
     // The tool should still execute and return the text (error content is still text)
     let result = runtime
-        .execute_tool(&json!({"_tool_name": "fail"}))
+        .execute_tool(&assistant_tool_response(json!({"_tool_name": "fail"})))
         .await
         .unwrap();
     assert_eq!(result, "something went wrong");
@@ -741,7 +764,7 @@ async fn test_tool_with_no_parameters() {
     assert_eq!(schemas["ping"].fields.len(), 0);
 
     let result = runtime
-        .execute_tool(&json!({"_tool_name": "ping"}))
+        .execute_tool(&assistant_tool_response(json!({"_tool_name": "ping"})))
         .await
         .unwrap();
     assert_eq!(result, "pong");
@@ -780,7 +803,7 @@ async fn test_tool_returning_multiple_content_blocks() {
 
     // Multiple content blocks should be joined with newlines
     let result = runtime
-        .execute_tool(&json!({"_tool_name": "multi"}))
+        .execute_tool(&assistant_tool_response(json!({"_tool_name": "multi"})))
         .await
         .unwrap();
     assert_eq!(result, "line one\nline two\nline three");
@@ -829,7 +852,9 @@ async fn test_mcp_as_with_agent_server_e2e() {
 
     // Execution works via namespaced name
     let result = runtime
-        .execute_tool(&json!({"_tool_name": "math_square", "n": 7}))
+        .execute_tool(&assistant_tool_response(
+            json!({"_tool_name": "math_square", "n": 7}),
+        ))
         .await
         .unwrap();
     assert_eq!(result, "49");
@@ -888,11 +913,11 @@ async fn test_multiple_servers_without_namespace() {
     assert!(schemas.contains_key("tool_b"));
 
     let ra = runtime
-        .execute_tool(&json!({"_tool_name": "tool_a"}))
+        .execute_tool(&assistant_tool_response(json!({"_tool_name": "tool_a"})))
         .await
         .unwrap();
     let rb = runtime
-        .execute_tool(&json!({"_tool_name": "tool_b"}))
+        .execute_tool(&assistant_tool_response(json!({"_tool_name": "tool_b"})))
         .await
         .unwrap();
     assert_eq!(ra, "from A");
@@ -911,9 +936,22 @@ fn get_google_key() -> Option<String> {
     env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
-fn require_tool_call_id(tool_call: &serde_json::Value) -> reson_agentic::error::Result<String> {
+fn require_first_tool_call(
+    response: &AssistantResponse,
+) -> reson_agentic::error::Result<&ToolCall> {
+    response
+        .tool_calls()
+        .into_iter()
+        .next()
+        .ok_or_else(|| reson_agentic::error::Error::NonRetryable("Missing tool call".to_string()))
+}
+
+fn require_tool_call_id(response: &AssistantResponse) -> reson_agentic::error::Result<String> {
+    let tool_call = require_first_tool_call(response)?;
     tool_call
-        .get("id")
+        .tool_obj
+        .as_ref()
+        .and_then(|obj| obj.get("id"))
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
         .map(|s| s.to_string())
@@ -930,7 +968,11 @@ fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::error::Result<i64> {
+fn require_i64_field(
+    response: &AssistantResponse,
+    field: &str,
+) -> reson_agentic::error::Result<i64> {
+    let value = &require_first_tool_call(response)?.args;
     // Try top-level (args are flattened by call_llm)
     if let Some(raw) = value.get(field) {
         if let Some(v) = parse_i64_value(raw) {

@@ -938,7 +938,9 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "get_weather");
         assert!(schemas[0]["input_schema"].is_object());
-        assert_eq!(schemas[0]["input_schema"]["additionalProperties"], false);
+        assert!(schemas[0]["input_schema"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["location"]["type"],
             "string"
@@ -987,10 +989,9 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["type"], "function");
         assert_eq!(schemas[0]["function"]["name"], "calculate");
-        assert_eq!(
-            schemas[0]["function"]["parameters"]["additionalProperties"],
-            false
-        );
+        assert!(schemas[0]["function"]["parameters"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
@@ -1089,7 +1090,9 @@ mod tests {
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "search");
-        assert_eq!(schemas[0]["input_schema"]["additionalProperties"], false);
+        assert!(schemas[0]["input_schema"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["ids"]["items"]["type"],
             "integer"

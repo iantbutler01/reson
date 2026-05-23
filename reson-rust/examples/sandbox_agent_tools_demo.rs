@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use reson_agentic::error::{Error as ResonError, Result as ResonResult};
 use reson_agentic::runtime::{RunParams, Runtime, ToolFunction};
-use reson_agentic::types::{ChatMessage, CreateResult, ToolCall, ToolResult};
+use reson_agentic::types::{AssistantResponse, ChatMessage, ResponsePart, ToolResult};
 use reson_agentic::utils::ConversationMessage;
 use reson_sandbox::{
     DistributedControlConfig, ExecEvent, ExecHandle, ExecInput, ExecOptions, Sandbox,
@@ -153,7 +153,7 @@ fn tool_output_json(tool_name: &str, raw: &str) -> Value {
     }
 }
 
-fn response_to_assistant_text(response: &Value) -> String {
+fn response_to_assistant_text(response: &AssistantResponse) -> String {
     response.as_str().map(ToOwned::to_owned).unwrap_or_else(|| {
         serde_json::to_string_pretty(response).unwrap_or_else(|_| response.to_string())
     })
@@ -374,22 +374,13 @@ async fn discard_with_retry(
     }
 }
 
-fn collect_tool_call_values(runtime: &Runtime, response: &Value) -> Vec<Value> {
-    let response_is_tool_array = response
-        .as_array()
-        .map(|arr| arr.iter().all(|value| runtime.is_tool_call(value)))
-        .unwrap_or(false);
-
-    let mut tool_call_values = Vec::new();
-    if runtime.is_tool_call(response) {
-        tool_call_values.push(response.clone());
-    } else if response_is_tool_array {
-        if let Some(arr) = response.as_array() {
-            tool_call_values.extend(arr.iter().cloned());
-        }
-    }
-
-    tool_call_values
+fn collect_tool_call_responses(response: &AssistantResponse) -> Vec<AssistantResponse> {
+    response
+        .tool_calls()
+        .into_iter()
+        .cloned()
+        .map(|call| AssistantResponse::new(vec![ResponsePart::Tool { call }]))
+        .collect()
 }
 
 #[tokio::main]
@@ -540,9 +531,9 @@ Never claim completion without tool evidence."#;
             })
             .await?;
 
-        let tool_call_values = collect_tool_call_values(&runtime, &response);
+        let tool_call_responses = collect_tool_call_responses(&response);
 
-        if tool_call_values.is_empty() {
+        if tool_call_responses.is_empty() {
             let assistant_text = response_to_assistant_text(&response);
             println!("[agent] final response:\n{}", assistant_text);
             history.push(ConversationMessage::Chat(ChatMessage::assistant(
@@ -552,75 +543,39 @@ Never claim completion without tool evidence."#;
             break;
         }
 
-        for call_value in &tool_call_values {
-            match ToolCall::create(call_value.clone()) {
-                Ok(CreateResult::Single(tool_call)) => {
-                    history.push(ConversationMessage::ToolCall(tool_call.clone()));
+        for call_response in &tool_call_responses {
+            let Some(tool_call) = call_response.tool_calls().first().copied().cloned() else {
+                continue;
+            };
+            history.push(ConversationMessage::ToolCall(tool_call.clone()));
 
-                    let execution_result = runtime.execute_tool(call_value).await;
-                    let tool_result = match execution_result {
-                        Ok(content) => {
-                            println!(
-                                "[tool:{}] {}",
-                                tool_call.tool_name,
-                                tool_output_json(&tool_call.tool_name, &content)
-                            );
-                            ToolResult::success_with_name(
-                                tool_call.tool_use_id.clone(),
-                                tool_call.tool_name.clone(),
-                                content,
-                            )
-                            .with_tool_obj(tool_call.args.clone())
-                        }
-                        Err(err) => {
-                            eprintln!("[tool:{}] execution failed: {}", tool_call.tool_name, err);
-                            ToolResult::error(
-                                tool_call.tool_use_id.clone(),
-                                format!("Tool execution failed: {}", err),
-                            )
-                            .with_tool_name(tool_call.tool_name.clone())
-                            .with_tool_obj(tool_call.args.clone())
-                        }
-                    };
-
-                    history.push(ConversationMessage::ToolResult(tool_result));
+            let execution_result = runtime.execute_tool(call_response).await;
+            let tool_result = match execution_result {
+                Ok(content) => {
+                    println!(
+                        "[tool:{}] {}",
+                        tool_call.tool_name,
+                        tool_output_json(&tool_call.tool_name, &content)
+                    );
+                    ToolResult::success_with_name(
+                        tool_call.tool_use_id.clone(),
+                        tool_call.tool_name.clone(),
+                        content,
+                    )
+                    .with_tool_obj(tool_call.args.clone())
                 }
-                Ok(CreateResult::Multiple(tool_calls)) => {
-                    for tool_call in tool_calls {
-                        history.push(ConversationMessage::ToolCall(tool_call.clone()));
-
-                        let payload = json!({
-                            "_tool_name": tool_call.tool_name,
-                            "function": {
-                                "arguments": serde_json::to_string(&tool_call.args)
-                                    .unwrap_or_else(|_| "{}".to_string())
-                            }
-                        });
-
-                        let execution_result = runtime.execute_tool(&payload).await;
-                        let tool_result = match execution_result {
-                            Ok(content) => ToolResult::success_with_name(
-                                tool_call.tool_use_id.clone(),
-                                tool_call.tool_name.clone(),
-                                content,
-                            )
-                            .with_tool_obj(tool_call.args.clone()),
-                            Err(err) => ToolResult::error(
-                                tool_call.tool_use_id.clone(),
-                                format!("Tool execution failed: {}", err),
-                            )
-                            .with_tool_name(tool_call.tool_name.clone())
-                            .with_tool_obj(tool_call.args.clone()),
-                        };
-
-                        history.push(ConversationMessage::ToolResult(tool_result));
-                    }
-                }
-                Ok(CreateResult::Empty) => {}
                 Err(err) => {
-                    eprintln!("[agent] failed to parse tool call payload: {err}");
+                    eprintln!("[tool:{}] execution failed: {}", tool_call.tool_name, err);
+                    ToolResult::error(
+                        tool_call.tool_use_id.clone(),
+                        format!("Tool execution failed: {}", err),
+                    )
+                    .with_tool_name(tool_call.tool_name.clone())
+                    .with_tool_obj(tool_call.args.clone())
                 }
-            }
+            };
+
+            history.push(ConversationMessage::ToolResult(tool_result));
         }
     }
 
