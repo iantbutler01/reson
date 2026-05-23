@@ -468,9 +468,9 @@ async fn test_toolcall_in_conversation_history() {
         ConversationMessage::Chat(ChatMessage::user("Thanks! Now what about San Francisco?")),
     ];
 
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![weather_tool])
         .with_native_tools(true);
@@ -542,9 +542,9 @@ async fn test_toolcall_hydration_workflow() {
         ConversationMessage::Chat(ChatMessage::user("Great! Now multiply that result by 2")),
     ];
 
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![add_tool])
         .with_native_tools(true);

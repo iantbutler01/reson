@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reson.sandbox.integration.artifact_bundle.v1",
+  "title": "Reson Sandbox Integration Artifact Bundle v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "generated_at_utc",
+    "profile",
+    "reason",
+    "project",
+    "compose_file",
+    "control_plane",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "reson.sandbox.integration.artifact_bundle.v1"
+    },
+    "generated_at_utc": {
+      "type": "string"
+    },
+    "profile": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "project": {
+      "type": "string"
+    },
+    "compose_file": {
+      "type": "string"
+    },
+    "control_plane": {
+      "type": "object",
+      "required": ["etcd_endpoints", "nats_url"],
+      "properties": {
+        "etcd_endpoints": { "type": "string" },
+        "nats_url": { "type": "string" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "compose_ps",
+        "compose_logs",
+        "docker_ps",
+        "process_snapshot",
+        "profile_env",
+        "container_inspect_dir"
+      ],
+      "properties": {
+        "compose_ps": { "type": "string" },
+        "compose_logs": { "type": "string" },
+        "docker_ps": { "type": "string" },
+        "process_snapshot": { "type": "string" },
+        "profile_env": { "type": "string" },
+        "container_inspect_dir": { "type": "string" }
+      }
+    }
+  }
+}

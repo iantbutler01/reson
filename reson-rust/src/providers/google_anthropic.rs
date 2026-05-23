@@ -13,6 +13,7 @@
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -22,9 +23,11 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{CacheMarker, ChatRole, Provider, TokenUsage};
+use crate::schema::fix_tool_schema_for_provider;
+use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
+    convert_messages_to_provider_format, parse_json_value_strict_str,
+    validate_image_input_supported, ConversationMessage,
 };
 
 /// Google Anthropic (Vertex AI with Claude) client
@@ -44,6 +47,17 @@ pub struct GoogleAnthropicClient {
 
 #[cfg(feature = "google-adc")]
 impl GoogleAnthropicClient {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, "google-anthropic");
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new Google Anthropic client with Application Default Credentials (ADC)
     ///
     /// The project ID is automatically extracted from the service account JSON file
@@ -153,6 +167,9 @@ impl GoogleAnthropicClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::GoogleAnthropic, model)?;
+
         // Extract system message if present
         let (system, messages) = self.extract_system_message(messages)?;
 
@@ -162,13 +179,6 @@ impl GoogleAnthropicClient {
 
         // Wrap string content in proper format
         let formatted_messages = self.wrap_string_content(formatted_messages);
-
-        // Use config.model if provided, otherwise use self.model
-        let _model = if config.model.is_empty() {
-            &self.model
-        } else {
-            &config.model
-        };
 
         let mut request = serde_json::json!({
             // Note: model is NOT included - it's in the URL for Vertex AI
@@ -196,7 +206,7 @@ impl GoogleAnthropicClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -228,21 +238,37 @@ impl GoogleAnthropicClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<serde_json::Value>, &'a [ConversationMessage])> {
-        if let Some(ConversationMessage::Chat(first)) = messages.first() {
-            if first.role == ChatRole::System {
-                let mut system_dict = serde_json::json!({
-                    "type": "text",
-                    "text": first.content
-                });
+        let mut system_blocks = Vec::new();
+        let mut consumed = 0usize;
 
-                // Add cache control if marked
-                if first.cache_marker == Some(CacheMarker::Ephemeral) {
-                    system_dict["cache_control"] = serde_json::json!({"type": "ephemeral"});
-                }
-
-                return Ok((Some(serde_json::json!([system_dict])), &messages[1..]));
+        for message in messages {
+            let ConversationMessage::Chat(chat) = message else {
+                break;
+            };
+            if chat.role != ChatRole::System {
+                break;
             }
+
+            let mut system_dict = serde_json::json!({
+                "type": "text",
+                "text": chat.content
+            });
+
+            if let Some(marker) = chat.cache_marker.as_ref() {
+                system_dict["cache_control"] = marker.anthropic_cache_control();
+            }
+
+            system_blocks.push(system_dict);
+            consumed += 1;
         }
+
+        if !system_blocks.is_empty() {
+            return Ok((
+                Some(serde_json::json!(system_blocks)),
+                &messages[consumed..],
+            ));
+        }
+
         Ok((None, messages))
     }
 
@@ -266,31 +292,53 @@ impl GoogleAnthropicClient {
         messages
     }
 
-    /// Extract text content from response
-    fn extract_text_content(&self, content: &serde_json::Value) -> String {
+    /// Extract canonical assistant response from content blocks.
+    fn extract_response(&self, content: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
         if let Some(blocks) = content.as_array() {
             for block in blocks {
-                if block["type"] == "text" {
-                    if let Some(text) = block["text"].as_str() {
-                        return text.to_string();
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
                     }
+                    Some("thinking") => {
+                        if let Some(text) = block["thinking"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    }
+                    Some("tool_use") => {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(
+                                block.clone(),
+                                Provider::GoogleAnthropic,
+                            )?,
+                        });
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        String::new()
-    }
-
-    /// Extract tool calls from response content
-    fn extract_tool_calls(&self, content: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut tool_calls = Vec::new();
-        if let Some(blocks) = content.as_array() {
-            for block in blocks {
-                if block["type"] == "tool_use" {
-                    tool_calls.push(block.clone());
-                }
-            }
-        }
-        tool_calls
+        Ok(response)
     }
 
     /// Parse token usage from response
@@ -348,8 +396,9 @@ impl GoogleAnthropicClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<serde_json::Value> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), timeout).await?;
@@ -376,7 +425,7 @@ impl InferenceClient for GoogleAnthropicClient {
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
         let body = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         // Parse usage statistics
@@ -384,26 +433,22 @@ impl InferenceClient for GoogleAnthropicClient {
 
         // Extract content
         let content_value = &body["content"];
-        let text_content = self.extract_text_content(content_value);
-        let tool_calls = self.extract_tool_calls(content_value);
+        let response = self.extract_response(content_value)?;
 
         // If tools were provided, return full response for tool extraction
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content: text_content,
-            reasoning: None,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
-            provider_cost_dollars: None,
-            raw: if has_tools || has_tool_calls {
+            None,
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -418,7 +463,7 @@ impl InferenceClient for GoogleAnthropicClient {
         let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();
@@ -434,26 +479,61 @@ impl InferenceClient for GoogleAnthropicClient {
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
 
-        // Parse SSE stream - reuse Anthropic's SSE parsing since format is identical
         let sse_stream = parse_sse_stream(response);
+        let chunk_stream = futures::stream::unfold(
+            (
+                sse_stream,
+                ToolCallAccumulator::new(),
+                VecDeque::<Result<StreamChunk>>::new(),
+                false,
+            ),
+            move |(mut sse_stream, mut accumulator, mut pending, eof_flushed)| async move {
+                loop {
+                    if let Some(item) = pending.pop_front() {
+                        return Some((item, (sse_stream, accumulator, pending, eof_flushed)));
+                    }
 
-        // Process chunks with tool accumulator
-        let chunk_stream = sse_stream.scan(
-            ToolCallAccumulator::new(),
-            move |accumulator, sse_result| {
-                let sse_json = match sse_result {
-                    Ok(json) => json,
-                    Err(e) => return futures::future::ready(Some(vec![Err(e)])),
-                };
+                    if eof_flushed {
+                        return None;
+                    }
 
-                // Parse chunk and emit StreamChunks
-                let chunks = parse_anthropic_chunk(&sse_json, accumulator, has_tools);
-                futures::future::ready(Some(chunks.into_iter().map(Ok).collect()))
+                    match sse_stream.next().await {
+                        Some(Ok(sse_json)) => {
+                            pending.extend(
+                                parse_anthropic_chunk(&sse_json, &mut accumulator, has_tools)
+                                    .into_iter()
+                                    .map(Ok),
+                            );
+                        }
+                        Some(Err(e)) => {
+                            return Some((Err(e), (sse_stream, accumulator, pending, true)));
+                        }
+                        None => {
+                            let flushed = accumulator.drain_all_tools();
+                            if flushed.is_empty() {
+                                return None;
+                            }
+
+                            tracing::warn!(
+                                pending_tool_calls = flushed.len(),
+                                "google-anthropic SSE stream ended with unfinished tool calls; flushing pending tools at EOF"
+                            );
+                            pending.extend(
+                                flushed
+                                    .into_iter()
+                                    .map(StreamChunk::ToolCallComplete)
+                                    .map(Ok),
+                            );
+                            return pending
+                                .pop_front()
+                                .map(|item| (item, (sse_stream, accumulator, pending, true)));
+                        }
+                    }
+                }
             },
         );
 
-        // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(chunk_stream.flat_map(futures::stream::iter)))
+        Ok(Box::pin(chunk_stream))
     }
 
     fn provider(&self) -> Provider {
@@ -468,6 +548,7 @@ impl InferenceClient for GoogleAnthropicClient {
 #[cfg(all(test, feature = "google-adc"))]
 mod tests {
     use super::*;
+    use crate::types::{CacheMarker, ChatMessage};
 
     #[test]
     fn test_endpoint_url() {
@@ -493,5 +574,53 @@ mod tests {
         .with_thinking_budget(1024);
 
         assert_eq!(client.thinking_budget, Some(1024));
+    }
+
+    #[test]
+    fn test_extract_multiple_system_messages() {
+        let client = GoogleAnthropicClient::from_adc_with_project(
+            "claude-sonnet-4@20250514",
+            "test-project",
+            "us-east5",
+        );
+        let messages = vec![
+            ConversationMessage::Chat(
+                ChatMessage::system("Stable runtime contract")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(
+                ChatMessage::system("<soul>Durable identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(ChatMessage::user("Hello")),
+        ];
+
+        let (system, remaining) = client.extract_system_message(&messages).unwrap();
+        let system_val = system.unwrap();
+        assert_eq!(system_val.as_array().unwrap().len(), 2);
+        assert_eq!(system_val[0]["text"], "Stable runtime contract");
+        assert_eq!(system_val[1]["text"], "<soul>Durable identity</soul>");
+        assert!(system_val[0]["cache_control"].is_object());
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn test_build_request_with_tools_defaults_to_strict() {
+        let client = GoogleAnthropicClient::from_adc_with_project(
+            "claude-3-5-sonnet-v2@20241022",
+            "my-project",
+            "us-east5",
+        );
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![serde_json::json!({"name": "get_weather"})];
+        let config = GenerationConfig::new("claude-3-5-sonnet-v2@20241022").with_tools(tools);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }
 }

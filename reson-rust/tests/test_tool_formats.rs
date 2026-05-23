@@ -298,13 +298,13 @@ fn test_toolcall_to_provider_format_google() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_cross_provider_tool_call_format() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 5 + 3 using calculate_function",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![tool_schema_for(
             "openrouter",
@@ -394,7 +394,7 @@ async fn test_google_tool_call_format() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_mixed_tool_registration_formats() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 8 + 12 using calculate_function, then process the result message \
@@ -402,7 +402,7 @@ async fn test_mixed_tool_registration_formats() {
     ))];
 
     // Mix of tools
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &calculate_tool_schema()),
@@ -519,13 +519,13 @@ async fn test_multi_turn_toolresult_conversation() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
 
     // Turn 1: Initial request
-    let client1 = OpenRouterClient::new(api_key.clone(), "anthropic/claude-3-5-sonnet", None, None);
+    let client1 = OpenRouterClient::new(api_key.clone(), "anthropic/claude-sonnet-4", None, None);
 
     let messages1 = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 25 + 17 using calculate_function",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![calculate_tool_schema()])
         .with_native_tools(true);
@@ -570,7 +570,7 @@ async fn test_multi_turn_toolresult_conversation() {
         "Great! Now double that result.",
     )));
 
-    let client2 = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client2 = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
     let result2 = client2
         .get_generation(&conversation, &config)
         .await
@@ -593,13 +593,13 @@ async fn test_multi_turn_toolresult_conversation() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_streaming_tool_call_deltas() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Search for 'artificial intelligence' with max_results 8",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![tool_schema_for("openrouter", &search_tool_schema())])
         .with_native_tools(true);

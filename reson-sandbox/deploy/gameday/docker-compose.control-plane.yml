@@ -1,0 +1,54 @@
+services:
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=reson-sandbox-gameday
+    ports:
+      - "${RESON_SANDBOX_GAMEDAY_ETCD_PORT:-32379}:2379"
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=reson-sandbox-gameday
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=reson-sandbox-gameday
+
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - --jetstream
+      - --http_port
+      - "8222"
+    ports:
+      - "${RESON_SANDBOX_GAMEDAY_NATS_PORT:-14222}:4222"
+      - "${RESON_SANDBOX_GAMEDAY_NATS_MONITOR_PORT:-18222}:8222"

@@ -35,6 +35,7 @@ fn run_params(
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
+        ..Default::default()
     }
 }
 
@@ -234,30 +235,25 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
 
     while runtime.is_tool_call(&result) && turn_count < max_turns {
         turn_count += 1;
-        let tool_name = runtime
-            .get_tool_name(&result)
-            .ok_or_else(|| reson_agentic::error::Error::NonRetryable("No tool name".to_string()))?;
+        let tool_calls = result.tool_calls();
+        if tool_calls.is_empty() {
+            return Err(reson_agentic::error::Error::NonRetryable(
+                "Expected tool calls in assistant response".to_string(),
+            ));
+        }
 
-        println!("🔧 Native turn {}: {}", turn_count, tool_name);
+        history.push(reson_agentic::utils::ConversationMessage::AssistantResponse(result.clone()));
 
-        // Execute tool
-        let tool_result_str = runtime.execute_tool(&result).await?;
-        println!("🔧 Native tool result {}: {}", turn_count, tool_result_str);
+        for tool_call in tool_calls {
+            println!("🔧 Native turn {}: {}", turn_count, tool_call.tool_name);
+            let tool_result_str = runtime.execute_tool_call(tool_call).await?;
+            println!("🔧 Native tool result {}: {}", turn_count, tool_result_str);
 
-        // Create ToolResult message
-        let tool_result = ToolResult {
-            tool_use_id: runtime.get_tool_name(&result).unwrap_or_default(),
-            tool_name: None,
-            content: tool_result_str,
-            is_error: false,
-            signature: None,
-            tool_obj: None,
-        };
-
-        // Add to history
-        history.push(reson_agentic::utils::ConversationMessage::ToolResult(
-            tool_result,
-        ));
+            history.push(reson_agentic::utils::ConversationMessage::ToolResult(
+                ToolResult::success(&tool_call.tool_use_id, &tool_result_str)
+                    .with_tool_name(&tool_call.tool_name),
+            ));
+        }
 
         // Continue conversation
         result = runtime

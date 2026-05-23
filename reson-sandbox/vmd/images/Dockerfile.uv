@@ -1,0 +1,270 @@
+FROM ubuntu:22.04
+
+# Set timezone to avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    autoconf \
+    build-essential \
+    clang \
+    ca-certificates \
+    cmake \
+    curl \
+    make \
+    git \
+    pkg-config \
+    wget \
+    gnupg \
+    software-properties-common \
+    chromium-browser \
+    xvfb \
+    x11vnc \
+    x11-utils \
+    websockify \
+    lxqt-core \
+    lxqt-config \
+    qterminal \
+    openbox \
+    arc-theme \
+    papirus-icon-theme \
+    fonts-noto \
+    lxappearance \
+    nitrogen \
+    feh \
+    imagemagick \
+    plank \
+    rofi \
+    gedit \
+    featherpad \
+    unzip \
+    python3-dev \
+    libmemcached-dev \
+    libffi-dev \
+    libjpeg-dev \
+    zlib1g-dev \
+    snapd \
+    squashfuse \
+    fuse \
+    systemd \
+    && update-ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Firefox from Mozilla's official APT repository (not snap)
+RUN add-apt-repository -y ppa:mozillateam/ppa \
+    && echo 'Package: *' > /etc/apt/preferences.d/mozilla-firefox \
+    && echo 'Pin: release o=LP-PPA-mozillateam' >> /etc/apt/preferences.d/mozilla-firefox \
+    && echo 'Pin-Priority: 1001' >> /etc/apt/preferences.d/mozilla-firefox \
+    && apt-get update \
+    && apt-get install -y firefox \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# VNC/Xvfb + WebSocket bridge starter for use with shell service
+RUN cat <<'EOF' > /usr/local/bin/start-vnc.sh
+#!/usr/bin/env bash
+set -e
+
+# Initialize snap support if possible
+# Note: This requires the container to be run with appropriate privileges
+# e.g., --privileged or with specific security options
+if [ -d /var/lib/snapd ]; then
+    # Start snapd service if systemd is available
+    if command -v systemctl &> /dev/null; then
+        systemctl start snapd.socket 2>/dev/null || true
+        systemctl start snapd 2>/dev/null || true
+    else
+        # Fallback: try to start snapd directly
+        /usr/lib/snapd/snapd &> /dev/null &
+    fi
+    
+    # Wait for snapd to be ready
+    sleep 2
+    
+    # Initialize snap paths
+    export PATH="/snap/bin:$PATH"
+fi
+
+Xvfb :0 -screen 0 1920x1080x24 +extension RANDR -dpi 96 &
+
+export DISPLAY=:0
+
+# Force software rendering/headless-safe paths
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+export QT_XCB_GL_INTEGRATION=none
+export QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-software-rasterizer"
+
+
+# Pre-configure LXQt to avoid first-run dialog
+mkdir -p ~/.config/lxqt
+
+# Set window manager to Openbox
+cat > ~/.config/lxqt/session.conf << 'SESSION_EOF'
+[General]
+window_manager=openbox
+SESSION_EOF
+
+# Configure LXQt theme
+cat > ~/.config/lxqt/lxqt.conf << 'LXQT_EOF'
+[General]
+theme=dark
+icon_theme=Papirus-Dark
+LXQT_EOF
+
+# Use the custom background image
+mkdir -p ~/Pictures
+cp /usr/share/backgrounds/bg.jpg ~/Pictures/wallpaper.jpg
+
+# Configure nitrogen for wallpaper
+mkdir -p ~/.config/nitrogen
+cat > ~/.config/nitrogen/bg-saved.cfg << 'NITROGEN_EOF'
+[xin_-1]
+file=/home/Pictures/wallpaper.jpg
+mode=0
+bgcolor=#000000
+NITROGEN_EOF
+
+# Configure Plank dock theme
+mkdir -p ~/.local/share/plank/themes
+cp -r /usr/share/plank/themes/Transparent ~/.local/share/plank/themes/ 2>/dev/null || true
+
+# Configure Plank dock settings
+mkdir -p ~/.config/plank/dock1
+cat > ~/.config/plank/dock1/settings << 'PLANK_EOF'
+[PlankDockPreferences]
+Icon-Size=16
+Theme=Transparent
+Position=Bottom
+Alignment=Center
+ItemsAlignment=Center
+HideMode=Intelligent
+Zoom=True
+PLANK_EOF
+
+# Configure Rofi launcher with dark theme
+mkdir -p ~/.config/rofi
+cat > ~/.config/rofi/config.rasi << 'ROFI_EOF'
+configuration {
+    modi: "drun,run,window";
+    font: "Noto Sans 12";
+    show-icons: true;
+    icon-theme: "Papirus-Dark";
+    display-drun: "Applications";
+    display-run: "Run";
+    display-window: "Windows";
+    drun-display-format: "{name}";
+}
+
+@theme "Arc-Dark"
+ROFI_EOF
+
+# Start LXQt desktop environment
+startlxqt &
+
+# Wait for desktop to fully initialize
+sleep 5
+
+# Set the wallpaper
+feh --bg-fill ~/Pictures/wallpaper.jpg 2>/dev/null || true
+
+# Configure and start Plank only once
+rm -rf ~/.config/plank/dock1/launchers
+mkdir -p ~/.config/plank/dock1/launchers
+
+# Add default apps to the dock
+if [ -f /usr/share/applications/firefox.desktop ]; then
+  sed -i 's|Exec=firefox %u|Exec=/usr/local/bin/start-firefox.sh|' /usr/share/applications/firefox.desktop
+  cat > ~/.config/plank/dock1/launchers/firefox.dockitem << 'EOF_ITEM'
+[PlankDockItemPreferences]
+Launcher=file:///usr/share/applications/firefox.desktop
+EOF_ITEM
+fi
+
+if [ -f /usr/share/applications/featherpad.desktop ]; then
+  cat > ~/.config/plank/dock1/launchers/featherpad.dockitem << 'EOF_ITEM'
+[PlankDockItemPreferences]
+Launcher=file:///usr/share/applications/featherpad.desktop
+EOF_ITEM
+fi
+
+if [ -f /usr/share/applications/chromium-browser.desktop ]; then
+  cat > ~/.config/plank/dock1/launchers/chromium-browser.dockitem << 'EOF_ITEM'
+[PlankDockItemPreferences]
+Launcher=file:///usr/share/applications/chromium-browser.desktop
+EOF_ITEM
+fi
+
+
+# Configure Qt5 settings for Arc theme
+mkdir -p ~/.config/qt5ct
+cat > ~/.config/qt5ct/qt5ct.conf << 'QT5_EOF'
+[Appearance]
+style=gtk2
+icon_theme=Papirus-Dark
+QT5_EOF
+
+# Set GTK theme
+mkdir -p ~/.config/gtk-3.0
+cat > ~/.config/gtk-3.0/settings.ini << 'GTK_EOF'
+[Settings]
+gtk-theme-name=Arc-Dark
+gtk-icon-theme-name=Papirus-Dark
+gtk-font-name=Noto Sans 10
+GTK_EOF
+
+# Start VNC server on localhost only (port 5901)
+x11vnc -display :0 -listen 127.0.0.1 -xkb -noxdamage -forever -shared -rfbport 5901 -nopw &
+
+
+# Start websockify on 0.0.0.0:6080, proxying to localhost:5901
+# This is the port that will be exposed via the shell service
+# Redirect logs to file to avoid cluttering shell output
+websockify 0.0.0.0:6080 127.0.0.1:5901
+
+# Exit after background daemons are started
+EOF
+
+RUN cat <<'EOF' > /usr/local/bin/start-chromium.sh
+#!/usr/bin/env bash
+exec chromium-browser --remote-debugging-port=9222 --remote-debugging-address=0.0.0.0 --no-sandbox "\$@"
+EOF
+
+RUN chmod +x /usr/local/bin/start-chromium.sh
+
+RUN cat <<'EOF' > /usr/local/bin/start-firefox.sh
+#!/usr/bin/env bash
+exec firefox --marionette --marionette-port 2828 "\$@"
+EOF
+
+RUN chmod +x /usr/local/bin/start-firefox.sh
+
+RUN cat <<'EOF' > /usr/share/applications/chromium-browser.desktop
+[Desktop Entry]
+Name=Chromium
+Exec=/usr/local/bin/start-chromium.sh
+Terminal=false
+Type=Application
+Icon=chromium-browser
+Categories=Network;WebBrowser;
+EOF
+
+RUN chmod +x /usr/local/bin/start-vnc.sh
+
+# Copy custom background image
+COPY computer_use_resources/bg.jpg /usr/share/backgrounds/bg.jpg
+
+# Set DISPLAY environment variable globally for GUI applications
+ENV DISPLAY=:0
+ENV LIBGL_ALWAYS_SOFTWARE=1 \
+    MESA_LOADER_DRIVER_OVERRIDE=llvmpipe \
+    QT_XCB_GL_INTEGRATION=none \
+    QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-software-rasterizer"
+
+
+COPY --from=ghcr.io/astral-sh/uv:0.4.3 /uv /uv
+COPY --from=ghcr.io/astral-sh/uv:0.4.3 /uv /usr/bin/uv
+
+ENTRYPOINT ["/uv"]

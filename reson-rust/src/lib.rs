@@ -15,6 +15,10 @@
 //! }
 //! ```
 
+// @dive-file: Crate root for reson-agentic exports, feature gates, and prelude wiring.
+// @dive-rel: Exposes optional protocol/runtime integrations such as MCP and sandbox behind features.
+// @dive-rel: Re-exports macros and convenience types consumed by downstream agent services.
+
 pub mod error;
 pub mod retry;
 pub mod runtime;
@@ -30,6 +34,8 @@ pub mod utils;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
 
 // Re-export proc macros from resonai-macros crate
 pub use resonai_macros::{agentic, agentic_generator, Deserializable, Tool};
@@ -43,7 +49,8 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::runtime::{RunParams, Runtime};
     pub use crate::types::{
-        CacheMarker, ChatMessage, ChatRole, CreateResult, Provider, ReasoningSegment, TokenUsage,
-        ToolCall, ToolResult,
+        AssistantResponse, CacheMarker, ChatMessage, ChatRole, CreateResult, MediaPart,
+        MediaSource, MediaSourceKind, MultimodalMessage, Provider, ProviderCapabilities,
+        ReasoningSegment, ResponsePart, ResponseStreamEvent, TokenUsage, ToolCall, ToolResult,
     };
 }

@@ -161,13 +161,13 @@ async fn test_google_basic_streaming() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_basic_streaming() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Say hello in 3 different languages, one per line.",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(200)
         .with_temperature(0.0);
 
@@ -370,7 +370,7 @@ async fn test_google_streaming_with_thinking() {
 async fn test_openrouter_streaming_with_reasoning() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
     // Note: This requires a model that supports reasoning
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What is 15 squared? Show your reasoning.",
@@ -378,7 +378,7 @@ async fn test_openrouter_streaming_with_reasoning() {
 
     // Note: For reasoning mode, would need to use @reasoning parameter in model string
     // This is a basic test that streaming works
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet").with_max_tokens(500);
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4").with_max_tokens(500);
 
     let mut stream = client.connect_and_listen(&messages, &config).await.unwrap();
 

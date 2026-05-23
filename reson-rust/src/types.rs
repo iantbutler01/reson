@@ -100,6 +100,142 @@ impl Provider {
                 | Provider::OpenRouterResponses
         )
     }
+
+    /// Return model-level provider capabilities using conservative allowlists.
+    pub fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+        let image_input = self.supports_image_input(model);
+        ProviderCapabilities {
+            image_input,
+            image_input_sources: if image_input {
+                match self {
+                    Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                        vec![MediaSourceKind::Base64]
+                    }
+                    Provider::OpenAI | Provider::OpenRouter => {
+                        vec![MediaSourceKind::Base64, MediaSourceKind::Url]
+                    }
+                    Provider::GoogleGenAI => {
+                        vec![MediaSourceKind::Base64, MediaSourceKind::FileUri]
+                    }
+                    Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                        vec![
+                            MediaSourceKind::Base64,
+                            MediaSourceKind::Url,
+                            MediaSourceKind::FileId,
+                        ]
+                    }
+                }
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Check whether this provider/model pair can inspect image inputs.
+    pub fn supports_image_input(&self, model: &str) -> bool {
+        if let Some(image_input) = model_image_input_override(model) {
+            return image_input;
+        }
+
+        let normalized = normalize_capability_model_name(model);
+
+        match self {
+            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                is_claude_vision_model(&normalized)
+            }
+            Provider::GoogleGenAI => is_gemini_vision_model(&normalized),
+            Provider::OpenAI | Provider::OpenAIResponses => is_openai_vision_model(&normalized),
+            Provider::OpenRouter | Provider::OpenRouterResponses => {
+                is_openrouter_vision_model(&normalized)
+            }
+        }
+    }
+}
+
+fn model_image_input_override(model: &str) -> Option<bool> {
+    model
+        .split('@')
+        .skip(1)
+        .filter_map(|param| param.split_once('='))
+        .find_map(|(key, value)| {
+            if key != "vision" {
+                return None;
+            }
+
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Some(true),
+                "0" | "false" | "no" => Some(false),
+                _ => None,
+            }
+        })
+}
+
+/// Provider-normalized capability flags for a concrete model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    /// Whether the provider/model can accept image inputs.
+    pub image_input: bool,
+    /// Source kinds accepted for image input by this provider path.
+    pub image_input_sources: Vec<MediaSourceKind>,
+}
+
+/// Media source families exposed by provider capability checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaSourceKind {
+    /// Base64 inline payload.
+    Base64,
+    /// Public or provider-resolvable URL.
+    Url,
+    /// Provider file ID.
+    FileId,
+    /// Provider file URI.
+    FileUri,
+}
+
+fn normalize_capability_model_name(model: &str) -> String {
+    model
+        .split('@')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn is_claude_vision_model(model: &str) -> bool {
+    model.contains("claude-3")
+        || model.contains("claude-4")
+        || model.contains("claude-sonnet-4")
+        || model.contains("claude-opus-4")
+        || model.contains("claude-haiku-4")
+}
+
+fn is_gemini_vision_model(model: &str) -> bool {
+    model.contains("gemini")
+}
+
+fn is_openai_vision_model(model: &str) -> bool {
+    model.starts_with("gpt-4o")
+        || model.starts_with("gpt-4.1")
+        || model.starts_with("gpt-4.5")
+        || model.starts_with("gpt-5")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+}
+
+fn is_openrouter_vision_model(model: &str) -> bool {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+    if is_openai_vision_model(model) {
+        return true;
+    }
+
+    let model = model.strip_prefix("anthropic/").unwrap_or(model);
+    if is_claude_vision_model(model) {
+        return true;
+    }
+
+    let model = model.strip_prefix("google/").unwrap_or(model);
+    is_gemini_vision_model(model)
 }
 
 /// Chat message role
@@ -123,6 +259,17 @@ pub enum ChatRole {
 pub enum CacheMarker {
     /// Ephemeral cache point
     Ephemeral,
+    /// Ephemeral cache point with a 1 hour TTL
+    Ephemeral1h,
+}
+
+impl CacheMarker {
+    pub fn anthropic_cache_control(&self) -> serde_json::Value {
+        match self {
+            Self::Ephemeral => serde_json::json!({ "type": "ephemeral" }),
+            Self::Ephemeral1h => serde_json::json!({ "type": "ephemeral", "ttl": "1h" }),
+        }
+    }
 }
 
 /// A chat message in the conversation
@@ -186,6 +333,136 @@ impl ChatMessage {
         self.cache_marker = Some(marker);
         self
     }
+}
+
+/// Canonical assistant response payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantResponse {
+    /// Ordered output emitted by the assistant.
+    pub output: Vec<ResponsePart>,
+}
+
+impl AssistantResponse {
+    /// Create a new response from ordered output items.
+    pub fn new(output: Vec<ResponsePart>) -> Self {
+        Self { output }
+    }
+
+    /// Create a text-only assistant response.
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            output: vec![ResponsePart::Text { text: text.into() }],
+        }
+    }
+
+    /// Return all text output concatenated in-order.
+    pub fn text(&self) -> String {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return the first text segment when available.
+    pub fn as_str(&self) -> Option<&str> {
+        self.output.iter().find_map(|part| match part {
+            ResponsePart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Return all reasoning output concatenated in-order.
+    pub fn reasoning(&self) -> String {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Reasoning { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return all tool calls in-order.
+    pub fn tool_calls(&self) -> Vec<&ToolCall> {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Tool { call } => Some(call),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Return all signatures in-order.
+    pub fn signatures(&self) -> Vec<&str> {
+        self.output
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Signature { value } => Some(value.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Check whether the response contains tool calls.
+    pub fn has_tool_calls(&self) -> bool {
+        self.output
+            .iter()
+            .any(|part| matches!(part, ResponsePart::Tool { .. }))
+    }
+
+    /// Append ordered output, coalescing adjacent text-like chunks.
+    pub fn push_output(&mut self, part: ResponsePart) {
+        match (self.output.last_mut(), &part) {
+            (Some(ResponsePart::Text { text: existing }), ResponsePart::Text { text }) => {
+                existing.push_str(text)
+            }
+            (
+                Some(ResponsePart::Reasoning { text: existing }),
+                ResponsePart::Reasoning { text },
+            ) => existing.push_str(text),
+            (
+                Some(ResponsePart::Signature { value: existing }),
+                ResponsePart::Signature { value },
+            ) => existing.push_str(value),
+            _ => self.output.push(part),
+        }
+    }
+}
+
+impl std::fmt::Display for AssistantResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.text())
+    }
+}
+
+/// Ordered assistant output item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResponsePart {
+    /// User-visible text.
+    Text { text: String },
+    /// Reasoning/thinking text.
+    Reasoning { text: String },
+    /// Tool call emitted by the assistant.
+    Tool { call: ToolCall },
+    /// Provider signature needed for replay fidelity.
+    Signature { value: String },
+}
+
+/// Typed streaming event for progressively building an assistant response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ResponseStreamEvent {
+    /// Ordered output emitted during streaming.
+    Output(ResponsePart),
+    /// Partial tool-call payload before a complete tool call is available.
+    ToolPartial(serde_json::Value),
+    /// Final usage statistics for the streamed response.
+    Usage(TokenUsage),
+    /// Final canonical assistant response.
+    Complete(AssistantResponse),
 }
 
 /// Token usage statistics
@@ -717,6 +994,10 @@ pub struct ToolCall {
 impl ToolCall {
     /// Create a new tool call
     pub fn new(tool_name: impl Into<String>, args: serde_json::Value) -> Self {
+        if let Ok(CreateResult::Single(tool_call)) = Self::create(args.clone()) {
+            return tool_call;
+        }
+
         Self {
             tool_use_id: Uuid::new_v4().to_string(),
             tool_name: tool_name.into(),
@@ -821,31 +1102,60 @@ impl ToolCall {
         provider: Provider,
     ) -> Result<Self> {
         match provider {
-            Provider::Anthropic | Provider::Bedrock => Ok(Self {
-                tool_use_id: provider_format["id"]
-                    .as_str()
-                    .ok_or_else(|| Error::Parse("Missing 'id' in tool call".to_string()))?
-                    .to_string(),
-                tool_name: provider_format["name"]
-                    .as_str()
-                    .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
-                    .to_string(),
-                args: provider_format["input"].clone(),
-                raw_arguments: None,
-                signature: None,
-                tool_obj: Some(provider_format),
-            }),
+            Provider::Anthropic | Provider::Bedrock => {
+                let signature = provider_format
+                    .get("signature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        provider_format
+                            .get("thought_signature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| {
+                        provider_format
+                            .get("thoughtSignature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+
+                Ok(Self {
+                    tool_use_id: provider_format["id"]
+                        .as_str()
+                        .ok_or_else(|| Error::Parse("Missing 'id' in tool call".to_string()))?
+                        .to_string(),
+                    tool_name: provider_format["name"]
+                        .as_str()
+                        .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
+                        .to_string(),
+                    args: provider_format["input"].clone(),
+                    raw_arguments: None,
+                    signature,
+                    tool_obj: Some(provider_format),
+                })
+            }
             Provider::OpenAI | Provider::OpenRouter => {
                 let function = &provider_format["function"];
                 let arguments = &function["arguments"];
+                let explicit_raw_arguments = provider_format
+                    .get("raw_arguments")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
                 // Handle both string (real API) and object (streaming accumulator) arguments
                 let (args, raw_arguments) = if let Some(args_str) = arguments.as_str() {
                     let parsed: serde_json::Value = serde_json::from_str(args_str)?;
-                    (parsed, Some(args_str.to_string()))
+                    (
+                        parsed,
+                        Some(explicit_raw_arguments.unwrap_or_else(|| args_str.to_string())),
+                    )
                 } else if arguments.is_object() {
                     let raw = serde_json::to_string(arguments)?;
-                    (arguments.clone(), Some(raw))
+                    (
+                        arguments.clone(),
+                        Some(explicit_raw_arguments.unwrap_or(raw)),
+                    )
                 } else {
                     return Err(Error::Parse("Missing 'arguments' in tool call".to_string()));
                 };
@@ -867,6 +1177,11 @@ impl ToolCall {
             }
             Provider::OpenAIResponses | Provider::OpenRouterResponses => {
                 let args_str = provider_format["arguments"].as_str().unwrap_or("");
+                let raw_arguments = provider_format
+                    .get("raw_arguments")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| args_str.to_string());
                 let call_id = provider_format
                     .get("call_id")
                     .and_then(|v| v.as_str())
@@ -879,7 +1194,7 @@ impl ToolCall {
                         .ok_or_else(|| Error::Parse("Missing 'name' in tool call".to_string()))?
                         .to_string(),
                     args: serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({})),
-                    raw_arguments: Some(args_str.to_string()),
+                    raw_arguments: Some(raw_arguments),
                     signature: None,
                     tool_obj: Some(provider_format),
                 })
@@ -903,12 +1218,29 @@ impl ToolCall {
                 let hash = hasher.finish();
                 let tool_use_id = format!("google_{}_{}", name, hash);
 
+                let signature = provider_format
+                    .get("thoughtSignature")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        provider_format
+                            .get("thought_signature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| {
+                        provider_format
+                            .get("signature")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    });
+
                 Ok(Self {
                     tool_use_id,
                     tool_name: name.to_string(),
                     args,
                     raw_arguments: None,
-                    signature: None,
+                    signature,
                     tool_obj: Some(provider_format),
                 })
             }
@@ -1201,7 +1533,7 @@ impl ReasoningSegment {
                     "text": self.content
                 });
                 if let Some(ref sig) = self.signature {
-                    obj["thought_signature"] = serde_json::Value::String(sig.clone());
+                    obj["thoughtSignature"] = serde_json::Value::String(sig.clone());
                 }
                 obj
             }
@@ -1233,6 +1565,26 @@ mod tests {
         assert_eq!(model, "openai/o4-mini");
 
         assert!(Provider::from_model_string("invalid").is_err());
+    }
+
+    #[test]
+    fn test_provider_image_input_override() {
+        assert!(
+            Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=true")
+        );
+        assert!(
+            !Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=maybe")
+        );
+        assert!(!Provider::OpenAI.supports_image_input("gpt-4o@vision=false"));
+        assert!(!Provider::OpenRouter
+            .supports_image_input("qwen/qwen2.5-vl-72b-instruct@image_input=true"));
+
+        let capabilities = Provider::OpenRouter.capabilities_for_model("custom/model@vision=true");
+        assert!(capabilities.image_input);
+        assert_eq!(
+            capabilities.image_input_sources,
+            vec![MediaSourceKind::Base64, MediaSourceKind::Url]
+        );
     }
 
     #[test]

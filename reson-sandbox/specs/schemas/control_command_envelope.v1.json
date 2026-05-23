@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reson.dev/schemas/control_command_envelope.v1.json",
+  "title": "Reson Sandbox Control Command Envelope v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "command_id",
+    "command_type",
+    "tenant_id",
+    "workspace_id",
+    "ordering_key",
+    "issued_at_unix_ms",
+    "timeout_ms",
+    "idempotency_key",
+    "trace_id",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "v1"
+    },
+    "command_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "vm_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target_node_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ordering_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "issued_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "causation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expected_fence": {},
+    "expected_versions": {},
+    "payload": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

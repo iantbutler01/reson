@@ -14,8 +14,9 @@ use tokio::sync::RwLock;
 
 use crate::error::{Error, Result};
 use crate::parsers::{Deserializable, ParsedTool, ToolConstructor};
+use crate::providers::ProviderConfig;
 use crate::schema::ToolParametersSchema;
-use crate::types::ReasoningSegment;
+use crate::types::{AssistantResponse, ReasoningSegment, ResponseStreamEvent, ToolCall};
 use crate::utils::ConversationMessage;
 use futures::future::BoxFuture;
 
@@ -37,6 +38,7 @@ pub struct ToolSchemaInfo {
     pub name: String,
     pub description: String,
     pub fields: Vec<crate::parsers::FieldDescription>,
+    pub strict: Option<bool>,
     pub parameters: ToolParametersSchema,
 }
 
@@ -53,6 +55,8 @@ pub struct Runtime {
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
     tool_constructors: Arc<RwLock<HashMap<String, Arc<ToolConstructor>>>>, // For NativeToolParser
     default_prompt: Arc<RwLock<String>>,
+    system_messages: Arc<RwLock<Vec<crate::types::ChatMessage>>>,
+    provider_config: Arc<RwLock<Option<ProviderConfig>>>,
     return_type: Arc<RwLock<Option<String>>>, // Store type name as string
     accumulators: Arc<RwLock<Accumulators>>,
     #[allow(dead_code)]
@@ -90,6 +94,10 @@ pub struct RunParams {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub timeout: Option<std::time::Duration>,
+    /// Retry policy for the provider request. When `None`, providers fall back
+    /// to `RetryConfig::default()`. Inject a longer-horizon policy from the
+    /// caller for LLM workloads that may exceed the 60s default max_time.
+    pub retry_config: Option<crate::retry::RetryConfig>,
 }
 
 /// Metadata about a tool call for execution context
@@ -100,6 +108,23 @@ pub struct ToolCallContext {
 }
 
 impl Runtime {
+    fn strip_nulls_for_non_required_fields(
+        mut json_value: serde_json::Value,
+        fields: &[crate::parsers::FieldDescription],
+    ) -> serde_json::Value {
+        let Some(object) = json_value.as_object_mut() else {
+            return json_value;
+        };
+
+        for field in fields.iter().filter(|field| !field.required) {
+            if object.get(&field.name).is_some_and(|value| value.is_null()) {
+                object.remove(&field.name);
+            }
+        }
+
+        json_value
+    }
+
     /// Create a new Runtime with default memory storage
     pub fn new() -> Self {
         Self {
@@ -111,6 +136,8 @@ impl Runtime {
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
             default_prompt: Arc::new(RwLock::new(String::new())),
+            system_messages: Arc::new(RwLock::new(Vec::new())),
+            provider_config: Arc::new(RwLock::new(None)),
             return_type: Arc::new(RwLock::new(None)),
             accumulators: Arc::new(RwLock::new(Accumulators::default())),
             messages: Arc::new(RwLock::new(Vec::new())),
@@ -129,6 +156,8 @@ impl Runtime {
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
             default_prompt: Arc::new(RwLock::new(String::new())),
+            system_messages: Arc::new(RwLock::new(Vec::new())),
+            provider_config: Arc::new(RwLock::new(None)),
             return_type: Arc::new(RwLock::new(None)),
             accumulators: Arc::new(RwLock::new(Accumulators::default())),
             messages: Arc::new(RwLock::new(Vec::new())),
@@ -222,12 +251,36 @@ impl Runtime {
             name: name.clone(),
             description,
             fields,
+            strict: schema.get("strict").and_then(|value| value.as_bool()),
             parameters,
         };
         let mut schemas = self.tool_schemas.write().await;
         schemas.insert(name, schema_info);
 
         Ok(())
+    }
+
+    /// Unregister a tool and remove all associated metadata.
+    ///
+    /// Returns `true` if the tool existed and was removed.
+    pub async fn unregister_tool(&self, name: &str) -> bool {
+        let removed = {
+            let mut tools = self.tools.write().await;
+            tools.remove(name).is_some()
+        };
+
+        let mut tool_types = self.tool_types.write().await;
+        tool_types.remove(name);
+        drop(tool_types);
+
+        let mut tool_schemas = self.tool_schemas.write().await;
+        tool_schemas.remove(name);
+        drop(tool_schemas);
+
+        let mut tool_constructors = self.tool_constructors.write().await;
+        tool_constructors.remove(name);
+
+        removed
     }
 
     /// Register a tool with type and handler (Python: runtime.tool(fn, name=..., tool_type=...))
@@ -276,8 +329,11 @@ impl Runtime {
 
         // Wrap the typed handler to deserialize JSON -> T before calling
         let handler = Arc::new(handler);
+        let nullable_field_descriptions = T::field_descriptions();
         let wrapped_handler = Box::new(move |json_value: serde_json::Value| {
             let handler = handler.clone();
+            let json_value =
+                Self::strip_nulls_for_non_required_fields(json_value, &nullable_field_descriptions);
             Box::pin(async move {
                 // Deserialize JSON into the typed struct T
                 let typed_args: T = T::from_partial(json_value)?;
@@ -301,6 +357,7 @@ impl Runtime {
             name: tool_name.clone(),
             description: format!("Tool: {}", tool_name), // Default description
             fields: field_descriptions,
+            strict: None,
             parameters,
         };
         let mut schemas = self.tool_schemas.write().await;
@@ -309,7 +366,9 @@ impl Runtime {
 
         // Store constructor for NativeToolParser (streaming use case)
         let tool_name_clone = tool_name.clone();
+        let parser_field_descriptions = T::field_descriptions();
         let constructor: ToolConstructor = Box::new(move |json: serde_json::Value| {
+            let json = Self::strip_nulls_for_non_required_fields(json, &parser_field_descriptions);
             T::from_partial(json.clone()).map(|tool| {
                 ParsedTool {
                     tool_name: tool_name_clone.clone(),
@@ -341,7 +400,7 @@ impl Runtime {
     }
 
     /// Execute a non-streaming LLM call
-    pub async fn run(&mut self, params: RunParams) -> Result<serde_json::Value> {
+    pub async fn run(&mut self, params: RunParams) -> Result<AssistantResponse> {
         // Mark as used
         self.used = true;
 
@@ -361,6 +420,8 @@ impl Runtime {
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
 
         let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
+        let runtime_system_messages = self.system_messages.read().await.clone();
+        let runtime_provider_config = self.provider_config.read().await.clone();
 
         // Call inference utilities
         let result = inference::call_llm(
@@ -372,36 +433,41 @@ impl Runtime {
             params.output_schema,
             effective_api_key.as_deref(),
             params.system.as_deref(),
+            Some(runtime_system_messages),
             params.history,
             params.temperature,
             params.top_p,
             params.max_tokens,
             params.timeout,
+            params.retry_config,
+            runtime_provider_config,
             self.current_call_args.clone(),
         )
         .await?;
 
         // Update accumulators
-        if let Some(raw) = &result.raw_response {
+        let text = result.response.text();
+        if !text.is_empty() {
             let mut acc = self.accumulators.write().await;
-            acc.raw_response.push(raw.clone());
+            acc.raw_response.push(text);
         }
 
-        if let Some(reasoning) = &result.reasoning {
+        let reasoning = result.response.reasoning();
+        if !reasoning.is_empty() {
             let mut acc = self.accumulators.write().await;
-            acc.reasoning.push(reasoning.clone());
+            acc.reasoning.push(reasoning);
         }
 
-        Ok(result.parsed_value)
+        Ok(result.response)
     }
 
     /// Execute a streaming LLM call
     ///
-    /// Returns an async stream of (chunk_type, chunk_value) tuples
+    /// Returns an async stream of typed response-building events.
     pub async fn run_stream(
         &mut self,
         params: RunParams,
-    ) -> Result<impl futures::stream::Stream<Item = Result<(String, serde_json::Value)>>> {
+    ) -> Result<impl futures::stream::Stream<Item = Result<ResponseStreamEvent>>> {
         // Mark as used
         self.used = true;
 
@@ -422,6 +488,8 @@ impl Runtime {
             .ok_or_else(|| Error::NonRetryable("No model specified".to_string()))?;
 
         let effective_api_key = params.api_key.or_else(|| self.api_key.clone());
+        let runtime_system_messages = self.system_messages.read().await.clone();
+        let runtime_provider_config = self.provider_config.read().await.clone();
 
         // Call streaming inference
         inference::call_llm_stream(
@@ -433,50 +501,55 @@ impl Runtime {
             params.output_schema,
             effective_api_key.as_deref(),
             params.system.as_deref(),
+            Some(runtime_system_messages),
             params.history,
             params.temperature,
             params.top_p,
             params.max_tokens,
             params.timeout,
+            params.retry_config,
+            runtime_provider_config,
             self.current_call_args.clone(),
             self.accumulators.clone(),
         )
         .await
     }
 
-    /// Check if a result is a tool call
-    pub fn is_tool_call(&self, result: &serde_json::Value) -> bool {
-        // Check for _tool_name field in JSON
-        result.get("_tool_name").and_then(|v| v.as_str()).is_some()
-    }
-
-    /// Get tool name from result
-    pub fn get_tool_name(&self, result: &serde_json::Value) -> Option<String> {
-        result
-            .get("_tool_name")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-
     /// Execute a tool call
-    pub async fn execute_tool(&self, tool_result: &serde_json::Value) -> Result<String> {
-        let tool_name = self
-            .get_tool_name(tool_result)
-            .ok_or_else(|| Error::NonRetryable("No tool name in result".to_string()))?;
-
+    pub async fn execute_tool_call(&self, tool_call: &ToolCall) -> Result<String> {
         let tools = self.tools.read().await;
-        let tool_fn = tools
-            .get(&tool_name)
-            .ok_or_else(|| Error::NonRetryable(format!("Tool '{}' not found", tool_name)))?;
+        let tool_fn = tools.get(&tool_call.tool_name).ok_or_else(|| {
+            Error::NonRetryable(format!("Tool '{}' not found", tool_call.tool_name))
+        })?;
 
-        // Extract arguments
-        let args = tool_result.clone();
+        let args = tool_call.args.clone();
 
         // Execute based on function type
         match tool_fn {
             ToolFunction::Sync(f) => f(args),
             ToolFunction::Async(f) => f(args).await,
         }
+    }
+
+    /// Check whether an assistant response contains tool calls.
+    pub fn is_tool_call(&self, response: &AssistantResponse) -> bool {
+        response.has_tool_calls()
+    }
+
+    /// Get the first tool name from an assistant response.
+    pub fn get_tool_name(&self, response: &AssistantResponse) -> Option<String> {
+        response
+            .tool_calls()
+            .first()
+            .map(|tool_call| tool_call.tool_name.clone())
+    }
+
+    /// Execute the first tool call in an assistant response.
+    pub async fn execute_tool(&self, response: &AssistantResponse) -> Result<String> {
+        let tool_call = response.tool_calls().first().copied().ok_or_else(|| {
+            Error::NonRetryable("Assistant response does not contain a tool call".to_string())
+        })?;
+        self.execute_tool_call(tool_call).await
     }
 
     /// Get accumulated raw response
@@ -520,6 +593,18 @@ impl Runtime {
     pub async fn set_default_prompt(&self, prompt: impl Into<String>) {
         let mut default_prompt = self.default_prompt.write().await;
         *default_prompt = prompt.into();
+    }
+
+    /// Set the structured system-message prefix for subsequent runs.
+    pub async fn set_system_messages(&self, messages: Vec<crate::types::ChatMessage>) {
+        let mut system_messages = self.system_messages.write().await;
+        *system_messages = messages;
+    }
+
+    /// Set provider-specific request shaping options for subsequent runs.
+    pub async fn set_provider_config(&self, config: Option<ProviderConfig>) {
+        let mut provider_config = self.provider_config.write().await;
+        *provider_config = config;
     }
 
     /// Set return type
@@ -641,36 +726,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_tool_call() {
+    async fn test_unregister_tool_removes_registration() {
         let runtime = Runtime::new();
 
-        let tool_call = serde_json::json!({
-            "_tool_name": "test_tool",
-            "arg1": "value1"
-        });
+        let tool_fn = ToolFunction::Sync(Box::new(|_args| Ok("result".to_string())));
+        runtime
+            .register_tool("test_tool", tool_fn, Some("TestType".to_string()))
+            .await
+            .unwrap();
 
-        assert!(runtime.is_tool_call(&tool_call));
+        let removed = runtime.unregister_tool("test_tool").await;
+        assert!(removed);
 
-        let not_tool_call = serde_json::json!({
-            "result": "value"
-        });
+        let tools = runtime.tools.read().await;
+        assert!(!tools.contains_key("test_tool"));
+        drop(tools);
 
-        assert!(!runtime.is_tool_call(&not_tool_call));
+        let tool_types = runtime.tool_types.read().await;
+        assert!(!tool_types.contains_key("test_tool"));
+        drop(tool_types);
+
+        let tool_schemas = runtime.tool_schemas.read().await;
+        assert!(!tool_schemas.contains_key("test_tool"));
     }
 
     #[tokio::test]
-    async fn test_get_tool_name() {
+    async fn test_unregister_typed_tool_allows_reregister() {
+        use futures::future::BoxFuture;
+
         let runtime = Runtime::new();
 
-        let tool_call = serde_json::json!({
-            "_tool_name": "my_tool",
-            "arg1": "value1"
-        });
+        runtime
+            .tool::<WeatherQuery, _>(
+                |_query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move { Ok("Sunny".to_string()) })
+                },
+                Some("get_weather"),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(
-            runtime.get_tool_name(&tool_call),
-            Some("my_tool".to_string())
+        let removed = runtime.unregister_tool("get_weather").await;
+        assert!(removed);
+
+        let constructors = runtime.tool_constructors.read().await;
+        assert!(!constructors.contains_key("get_weather"));
+        drop(constructors);
+
+        runtime
+            .tool::<WeatherQuery, _>(
+                |_query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move { Ok("Rainy".to_string()) })
+                },
+                Some("get_weather"),
+            )
+            .await
+            .unwrap();
+
+        let tool_call = crate::types::ToolCall::new(
+            "get_weather",
+            serde_json::json!({
+                "location": "Paris"
+            }),
         );
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
+        assert_eq!(result, "Rainy");
+    }
+
+    #[tokio::test]
+    async fn test_assistant_response_tool_helpers() {
+        let response = crate::types::AssistantResponse::new(vec![
+            crate::types::ResponsePart::Text {
+                text: "hello".to_string(),
+            },
+            crate::types::ResponsePart::Tool {
+                call: crate::types::ToolCall::new(
+                    "my_tool",
+                    serde_json::json!({ "arg1": "value1" }),
+                ),
+            },
+        ]);
+
+        assert!(response.has_tool_calls());
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_name, "my_tool");
     }
 
     #[tokio::test]
@@ -684,12 +823,14 @@ mod tests {
 
         runtime.register_tool("greet", tool_fn, None).await.unwrap();
 
-        let tool_call = serde_json::json!({
-            "_tool_name": "greet",
-            "name": "Alice"
-        });
+        let tool_call = crate::types::ToolCall::new(
+            "greet",
+            serde_json::json!({
+                "name": "Alice"
+            }),
+        );
 
-        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "Hello, Alice!");
     }
 
@@ -736,6 +877,18 @@ mod tests {
         unit: Option<String>,
     }
 
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct SearchWithDefaultCategory {
+        #[serde(default)]
+        text: String,
+        #[serde(default = "default_test_category")]
+        category: String,
+    }
+
+    fn default_test_category() -> String {
+        "general".to_string()
+    }
+
     impl crate::parsers::Deserializable for WeatherQuery {
         fn from_partial(partial: serde_json::Value) -> crate::error::Result<Self> {
             serde_json::from_value(partial)
@@ -763,6 +916,34 @@ mod tests {
                     name: "unit".to_string(),
                     field_type: "string".to_string(),
                     description: "Temperature unit (celsius or fahrenheit)".to_string(),
+                    required: false,
+                },
+            ]
+        }
+    }
+
+    impl crate::parsers::Deserializable for SearchWithDefaultCategory {
+        fn from_partial(partial: serde_json::Value) -> crate::error::Result<Self> {
+            serde_json::from_value(partial)
+                .map_err(|e| crate::error::Error::NonRetryable(format!("Parse error: {}", e)))
+        }
+
+        fn validate_complete(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn field_descriptions() -> Vec<crate::parsers::FieldDescription> {
+            vec![
+                crate::parsers::FieldDescription {
+                    name: "text".to_string(),
+                    field_type: "string".to_string(),
+                    description: "Search text".to_string(),
+                    required: true,
+                },
+                crate::parsers::FieldDescription {
+                    name: "category".to_string(),
+                    field_type: "string".to_string(),
+                    description: "Category".to_string(),
                     required: false,
                 },
             ]
@@ -890,6 +1071,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_typed_tool_treats_null_optional_fields_as_missing() {
+        use futures::future::BoxFuture;
+
+        let runtime = Runtime::new();
+        runtime
+            .tool::<SearchWithDefaultCategory, _>(
+                |query| -> BoxFuture<'static, crate::error::Result<String>> {
+                    Box::pin(async move { Ok(query.category) })
+                },
+                Some("search"),
+            )
+            .await
+            .unwrap();
+
+        let result = runtime
+            .execute_tool_call(&crate::types::ToolCall::new(
+                "search",
+                serde_json::json!({
+                    "text": "python tutorials",
+                    "category": null
+                }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result, "general");
+    }
+
+    #[tokio::test]
     async fn test_tool_hydration_and_execution() {
         use futures::future::BoxFuture;
 
@@ -914,14 +1124,16 @@ mod tests {
             .unwrap();
 
         // Simulate a tool call from LLM with JSON args
-        let tool_call = serde_json::json!({
-            "_tool_name": "get_weather",
-            "location": "Paris",
-            "unit": "fahrenheit"
-        });
+        let tool_call = crate::types::ToolCall::new(
+            "get_weather",
+            serde_json::json!({
+                "location": "Paris",
+                "unit": "fahrenheit"
+            }),
+        );
 
         // Execute the tool - it should deserialize JSON -> WeatherQuery -> call handler
-        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "Weather in Paris (fahrenheit): Sunny, 22°");
     }
 
@@ -946,13 +1158,15 @@ mod tests {
             .unwrap();
 
         // Tool call with optional field missing
-        let tool_call = serde_json::json!({
-            "_tool_name": "get_weather",
-            "location": "Tokyo"
-            // unit is not provided, should use default
-        });
+        let tool_call = crate::types::ToolCall::new(
+            "get_weather",
+            serde_json::json!({
+                "location": "Tokyo"
+                // unit is not provided, should use default
+            }),
+        );
 
-        let result = runtime.execute_tool(&tool_call).await.unwrap();
+        let result = runtime.execute_tool_call(&tool_call).await.unwrap();
         assert_eq!(result, "celsius in Tokyo");
     }
 }

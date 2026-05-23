@@ -34,13 +34,13 @@ async fn test_tracing_client_anthropic_cost_tracking() {
         }
     };
 
-    let client = AnthropicClient::new(api_key, "claude-3-haiku-20240307");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
     let store = Arc::new(MemoryCostStore::new());
     let tracing_client =
         TracingInferenceClient::new(Box::new(client)).with_cost_store(store.clone());
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user("Say hello"))];
-    let config = GenerationConfig::new("claude-3-haiku-20240307").with_max_tokens(100);
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001").with_max_tokens(100);
 
     let response = tracing_client.get_generation(&messages, &config).await;
     assert!(response.is_ok(), "Generation failed: {:?}", response.err());
@@ -81,7 +81,7 @@ async fn test_tracing_client_callback_invoked() {
         }
     };
 
-    let client = AnthropicClient::new(api_key, "claude-3-haiku-20240307");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
     let callback_count = Arc::new(AtomicU64::new(0));
     let callback_cost = Arc::new(AtomicU64::new(0));
 
@@ -99,7 +99,7 @@ async fn test_tracing_client_callback_invoked() {
         TracingInferenceClient::new(Box::new(client)).with_trace_callback(callback);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hi"))];
-    let config = GenerationConfig::new("claude-3-haiku-20240307").with_max_tokens(50);
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001").with_max_tokens(50);
 
     let _ = tracing_client.get_generation(&messages, &config).await;
 
@@ -163,12 +163,12 @@ async fn test_tracing_client_multiple_requests_accumulate() {
         }
     };
 
-    let client = AnthropicClient::new(api_key, "claude-3-haiku-20240307");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
     let store = Arc::new(MemoryCostStore::new());
     let tracing_client =
         TracingInferenceClient::new(Box::new(client)).with_cost_store(store.clone());
 
-    let config = GenerationConfig::new("claude-3-haiku-20240307").with_max_tokens(50);
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001").with_max_tokens(50);
 
     // Make 3 requests
     for i in 0..3 {
@@ -205,11 +205,11 @@ async fn test_tracing_client_trace_output() {
     // Clean up from previous runs
     let _ = std::fs::remove_dir_all(trace_dir);
 
-    let client = AnthropicClient::new(api_key, "claude-3-haiku-20240307");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
     let tracing_client = TracingInferenceClient::new(Box::new(client)).with_trace_output(trace_dir);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
-    let config = GenerationConfig::new("claude-3-haiku-20240307").with_max_tokens(50);
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001").with_max_tokens(50);
 
     let _ = tracing_client.get_generation(&messages, &config).await;
 

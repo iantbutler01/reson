@@ -155,6 +155,7 @@ async fn analyze_video(
             model: None,   // use default from agentic macro
             api_key: None, // use default from env
             timeout: None,
+            retry_config: None,
         })
         .await?;
 
@@ -162,18 +163,6 @@ async fn analyze_video(
     let content = response
         .as_str()
         .map(|s| s.to_string())
-        .or_else(|| {
-            response
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            response
-                .get("text")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-        })
         .unwrap_or_else(|| response.to_string());
 
     Ok(content)

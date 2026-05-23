@@ -246,13 +246,13 @@ fn test_provider_prefix_parsing() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_native_tools_single_call() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Use the search_database tool to search for 'python tutorials' and find 3 results",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &search_tool_schema()),
@@ -289,9 +289,9 @@ async fn test_openrouter_native_tools_single_call() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_multi_turn_tool_conversation() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![tool_schema_for("openrouter", &add_numbers_schema())])
         .with_native_tools(true);
@@ -544,9 +544,9 @@ async fn test_anthropic_native_tools_single_call() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_native_5_turn_conversation() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &add_numbers_schema()),
@@ -614,13 +614,13 @@ async fn test_native_5_turn_conversation() {
 async fn test_backwards_compatibility_single_tool() {
     // Test that single tool patterns still work correctly
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 10 + 5 using the add_numbers function",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![tool_schema_for("openrouter", &add_numbers_schema())])
         .with_native_tools(true);

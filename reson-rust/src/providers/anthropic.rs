@@ -10,15 +10,20 @@
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use reqwest::StatusCode;
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 use crate::error::{Error, Result};
 use crate::providers::{
-    GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
+    GenerationConfig, GenerationResponse, InferenceClient, ProviderConfig, StreamChunk,
+    TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{CacheMarker, ChatRole, Provider, TokenUsage};
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::schema::fix_tool_schema_for_provider;
+use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
+use crate::utils::{
+    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+};
 
 /// Anthropic API client
 #[derive(Clone)]
@@ -31,6 +36,17 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, "anthropic");
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new Anthropic client
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -61,6 +77,9 @@ impl AnthropicClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::Anthropic, model)?;
+
         // Extract system message if present
         let (system, messages) = self.extract_system_message(messages)?;
 
@@ -72,7 +91,7 @@ impl AnthropicClient {
         let formatted_messages = self.wrap_string_content(formatted_messages);
 
         let mut request = serde_json::json!({
-            "model": if config.model.is_empty() { &self.model } else { &config.model },
+            "model": model,
             "max_tokens": config.max_tokens.unwrap_or(4096),
             "messages": formatted_messages,
             "stream": stream,
@@ -93,10 +112,30 @@ impl AnthropicClient {
             request["system"] = system;
         }
 
+        if let Some(ProviderConfig::Anthropic(provider_config)) = config.provider_config.as_ref() {
+            if let Some(marker) = provider_config.automatic_prompt_caching.as_ref() {
+                request["cache_control"] = marker.anthropic_cache_control();
+            }
+        }
+
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                let mut normalized_tools = self.normalized_tools(tools);
+                if let Some(ProviderConfig::Anthropic(provider_config)) =
+                    config.provider_config.as_ref()
+                {
+                    if let Some(marker) = provider_config.tool_definitions_cache_breakpoint.as_ref()
+                    {
+                        if let Some(last_tool) = normalized_tools.last_mut() {
+                            if last_tool.get("cache_control").is_none() {
+                                last_tool["cache_control"] = marker.anthropic_cache_control();
+                            }
+                        }
+                    }
+                }
+
+                request["tools"] = serde_json::json!(normalized_tools);
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -136,21 +175,37 @@ impl AnthropicClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<serde_json::Value>, &'a [ConversationMessage])> {
-        if let Some(ConversationMessage::Chat(first)) = messages.first() {
-            if first.role == ChatRole::System {
-                let mut system_dict = serde_json::json!({
-                    "type": "text",
-                    "text": first.content
-                });
+        let mut system_blocks = Vec::new();
+        let mut consumed = 0usize;
 
-                // Add cache control if marked
-                if first.cache_marker == Some(CacheMarker::Ephemeral) {
-                    system_dict["cache_control"] = serde_json::json!({"type": "ephemeral"});
-                }
-
-                return Ok((Some(serde_json::json!([system_dict])), &messages[1..]));
+        for message in messages {
+            let ConversationMessage::Chat(chat) = message else {
+                break;
+            };
+            if chat.role != ChatRole::System {
+                break;
             }
+
+            let mut system_dict = serde_json::json!({
+                "type": "text",
+                "text": chat.content
+            });
+
+            if let Some(marker) = chat.cache_marker.as_ref() {
+                system_dict["cache_control"] = marker.anthropic_cache_control();
+            }
+
+            system_blocks.push(system_dict);
+            consumed += 1;
         }
+
+        if !system_blocks.is_empty() {
+            return Ok((
+                Some(serde_json::json!(system_blocks)),
+                &messages[consumed..],
+            ));
+        }
+
         Ok((None, messages))
     }
 
@@ -176,47 +231,53 @@ impl AnthropicClient {
         messages
     }
 
-    /// Extract text content from response
-    fn extract_text_content(&self, content: &serde_json::Value) -> String {
+    /// Extract canonical assistant response from content blocks.
+    fn extract_response(&self, content: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
         if let Some(blocks) = content.as_array() {
             for block in blocks {
-                if block["type"] == "text" {
-                    if let Some(text) = block["text"].as_str() {
-                        return text.to_string();
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
                     }
+                    Some("thinking") => {
+                        if let Some(text) = block["thinking"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    }
+                    Some("tool_use") => {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(
+                                block.clone(),
+                                Provider::Anthropic,
+                            )?,
+                        });
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-        String::new()
-    }
-
-    /// Extract reasoning/thinking content from response
-    fn extract_reasoning(&self, content: &serde_json::Value) -> Option<String> {
-        if let Some(blocks) = content.as_array() {
-            let thinking: Vec<String> = blocks
-                .iter()
-                .filter(|block| block["type"] == "thinking")
-                .filter_map(|block| block["thinking"].as_str().map(|s| s.to_string()))
-                .collect();
-
-            if !thinking.is_empty() {
-                return Some(thinking.join("\n"));
-            }
-        }
-        None
-    }
-
-    /// Extract tool calls from response content
-    fn extract_tool_calls(&self, content: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut tool_calls = Vec::new();
-        if let Some(blocks) = content.as_array() {
-            for block in blocks {
-                if block["type"] == "tool_use" {
-                    tool_calls.push(block.clone());
-                }
-            }
-        }
-        tool_calls
+        Ok(response)
     }
 
     /// Parse token usage from response
@@ -282,8 +343,9 @@ impl AnthropicClient {
         body: serde_json::Value,
         use_structured_outputs: bool,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<serde_json::Value> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self
@@ -312,7 +374,12 @@ impl InferenceClient for AnthropicClient {
         let use_structured_outputs = config.output_schema.is_some();
         let request_body = self.build_request_body(messages, config, false)?;
         let body = self
-            .make_request_with_retry(request_body, use_structured_outputs, config.timeout)
+            .make_request_with_retry(
+                request_body,
+                use_structured_outputs,
+                config.timeout,
+                config.retry_config.clone(),
+            )
             .await?;
 
         // Parse usage statistics
@@ -320,27 +387,22 @@ impl InferenceClient for AnthropicClient {
 
         // Extract content
         let content_value = &body["content"];
-        let text_content = self.extract_text_content(content_value);
-        let reasoning = self.extract_reasoning(content_value);
-        let tool_calls = self.extract_tool_calls(content_value);
+        let response = self.extract_response(content_value)?;
 
         // If tools were provided, return full response for tool extraction
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content: text_content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
-            provider_cost_dollars: None,
-            raw: if has_tools || has_tool_calls {
+            None,
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -356,7 +418,7 @@ impl InferenceClient for AnthropicClient {
         let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self
                 .make_request(request_body.clone(), use_structured_outputs, timeout)
@@ -374,26 +436,62 @@ impl InferenceClient for AnthropicClient {
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
 
-        // Parse SSE stream
         let sse_stream = parse_sse_stream(response);
 
-        // Process chunks with tool accumulator
-        let chunk_stream = sse_stream.scan(
-            ToolCallAccumulator::new(),
-            move |accumulator, sse_result| {
-                let sse_json = match sse_result {
-                    Ok(json) => json,
-                    Err(e) => return futures::future::ready(Some(vec![Err(e)])),
-                };
+        let chunk_stream = futures::stream::unfold(
+            (
+                sse_stream,
+                ToolCallAccumulator::new(),
+                VecDeque::<Result<StreamChunk>>::new(),
+                false,
+            ),
+            move |(mut sse_stream, mut accumulator, mut pending, eof_flushed)| async move {
+                loop {
+                    if let Some(item) = pending.pop_front() {
+                        return Some((item, (sse_stream, accumulator, pending, eof_flushed)));
+                    }
 
-                // Parse chunk and emit StreamChunks
-                let chunks = parse_anthropic_chunk(&sse_json, accumulator, has_tools);
-                futures::future::ready(Some(chunks.into_iter().map(Ok).collect()))
+                    if eof_flushed {
+                        return None;
+                    }
+
+                    match sse_stream.next().await {
+                        Some(Ok(sse_json)) => {
+                            pending.extend(
+                                parse_anthropic_chunk(&sse_json, &mut accumulator, has_tools)
+                                    .into_iter()
+                                    .map(Ok),
+                            );
+                        }
+                        Some(Err(e)) => {
+                            return Some((Err(e), (sse_stream, accumulator, pending, true)));
+                        }
+                        None => {
+                            let flushed = accumulator.drain_all_tools();
+                            if flushed.is_empty() {
+                                return None;
+                            }
+
+                            tracing::warn!(
+                                pending_tool_calls = flushed.len(),
+                                "anthropic SSE stream ended with unfinished tool calls; flushing pending tools at EOF"
+                            );
+                            pending.extend(
+                                flushed
+                                    .into_iter()
+                                    .map(StreamChunk::ToolCallComplete)
+                                    .map(Ok),
+                            );
+                            return pending
+                                .pop_front()
+                                .map(|item| (item, (sse_stream, accumulator, pending, true)));
+                        }
+                    }
+                }
             },
         );
 
-        // Flatten the Vec<Result<StreamChunk>> into individual items
-        Ok(Box::pin(chunk_stream.flat_map(futures::stream::iter)))
+        Ok(Box::pin(chunk_stream))
     }
 
     fn provider(&self) -> Provider {
@@ -408,7 +506,7 @@ impl InferenceClient for AnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChatMessage;
+    use crate::types::{CacheMarker, ChatMessage};
 
     #[test]
     fn test_client_creation() {
@@ -456,6 +554,42 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_system_with_one_hour_cache_marker() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(
+            ChatMessage::system("Long-lived context").with_cache_marker(CacheMarker::Ephemeral1h),
+        )];
+
+        let (system, _) = client.extract_system_message(&messages).unwrap();
+        let system_val = system.unwrap();
+        assert_eq!(system_val[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system_val[0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn test_extract_multiple_system_messages() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![
+            ConversationMessage::Chat(
+                ChatMessage::system("Stable runtime contract")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(
+                ChatMessage::system("<soul>Durable identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ),
+            ConversationMessage::Chat(ChatMessage::user("Hello")),
+        ];
+
+        let (system, remaining) = client.extract_system_message(&messages).unwrap();
+        let system_val = system.unwrap();
+        assert_eq!(system_val.as_array().unwrap().len(), 2);
+        assert_eq!(system_val[0]["text"], "Stable runtime contract");
+        assert_eq!(system_val[1]["text"], "<soul>Durable identity</soul>");
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
     fn test_wrap_string_content() {
         let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
         let messages = vec![serde_json::json!({
@@ -476,8 +610,8 @@ mod tests {
             {"type": "text", "text": "Hello, world!"}
         ]);
 
-        let text = client.extract_text_content(&content);
-        assert_eq!(text, "Hello, world!");
+        let response = client.extract_response(&content).unwrap();
+        assert_eq!(response.text(), "Hello, world!");
     }
 
     #[test]
@@ -488,10 +622,10 @@ mod tests {
             {"type": "text", "text": "Using tool..."}
         ]);
 
-        let tool_calls = client.extract_tool_calls(&content);
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0]["id"], "toolu_123");
-        assert_eq!(tool_calls[0]["name"], "get_weather");
+        let response = client.extract_response(&content).unwrap();
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_use_id, "toolu_123");
+        assert_eq!(response.tool_calls()[0].tool_name, "get_weather");
     }
 
     #[test]
@@ -541,8 +675,66 @@ mod tests {
             .unwrap();
 
         assert!(body["tools"].is_array());
+        assert!(body["tools"][0].get("strict").is_none());
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
+    fn test_build_request_with_automatic_prompt_caching() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("claude-3-opus-20240229").with_provider_config(
+            ProviderConfig::Anthropic(crate::providers::AnthropicProviderConfig {
+                automatic_prompt_caching: Some(CacheMarker::Ephemeral),
+                tool_definitions_cache_breakpoint: None,
+            }),
+        );
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_build_request_with_tool_definitions_cache_breakpoint() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![
+            serde_json::json!({"name": "get_weather"}),
+            serde_json::json!({"name": "get_time"}),
+        ];
+        let config = GenerationConfig::new("claude-3-opus-20240229")
+            .with_tools(tools)
+            .with_provider_config(ProviderConfig::Anthropic(
+                crate::providers::AnthropicProviderConfig {
+                    automatic_prompt_caching: None,
+                    tool_definitions_cache_breakpoint: Some(CacheMarker::Ephemeral),
+                },
+            ));
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_build_request_with_tools_preserves_explicit_strict() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![serde_json::json!({"name": "get_weather", "strict": false})];
+        let config = GenerationConfig::new("claude-3-opus-20240229").with_tools(tools);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["tools"][0]["strict"], false);
     }
 
     #[test]

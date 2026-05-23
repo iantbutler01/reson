@@ -226,8 +226,12 @@ mod agentic_macro_tests {
     use reson_agentic::agentic;
     use reson_agentic::error::Result;
 
-    type AgentFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send>>;
+    type AgentFuture = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<reson_agentic::types::AssistantResponse>>
+                + Send,
+        >,
+    >;
 
     #[allow(clippy::too_many_arguments)]
     fn run_params(
@@ -254,12 +258,16 @@ mod agentic_macro_tests {
             model: model.map(|s| s.to_string()),
             api_key: api_key.map(|s| s.to_string()),
             timeout: None,
+            ..Default::default()
         }
     }
 
     // Test that the macro compiles and generates a function without runtime param
     #[agentic(model = "anthropic:claude-3-5-sonnet-20241022")]
-    async fn simple_agentic_fn(input: String, runtime: Runtime) -> Result<serde_json::Value> {
+    async fn simple_agentic_fn(
+        input: String,
+        runtime: Runtime,
+    ) -> Result<reson_agentic::types::AssistantResponse> {
         // Mark runtime as used by calling run()
         // Note: This won't actually call an LLM in tests, it will fail without API key
         // but the point is to verify the macro generates valid code
@@ -291,7 +299,10 @@ mod agentic_macro_tests {
 
     // Test with no model attribute (should use None)
     #[agentic]
-    async fn no_model_agentic_fn(data: i32, runtime: Runtime) -> Result<serde_json::Value> {
+    async fn no_model_agentic_fn(
+        data: i32,
+        runtime: Runtime,
+    ) -> Result<reson_agentic::types::AssistantResponse> {
         let _ = data; // Use the parameter
         runtime
             .run(run_params(
@@ -321,7 +332,7 @@ mod agentic_macro_tests {
         name: String,
         count: u32,
         runtime: Runtime,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<reson_agentic::types::AssistantResponse> {
         let prompt = format!("Name: {}, Count: {}", name, count);
         runtime
             .run(run_params(

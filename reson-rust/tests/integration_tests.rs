@@ -11,14 +11,17 @@
 
 use reson_agentic::agentic;
 use reson_agentic::providers::{
-    AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenRouterClient,
+    AnthropicClient, AnthropicProviderConfig, GenerationConfig, GoogleGenAIClient, InferenceClient,
+    OAIClient, OpenRouterClient, ProviderConfig,
 };
 use reson_agentic::runtime::{RunParams, Runtime, ToolFunction};
 use reson_agentic::schema::{
     AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator,
 };
-use reson_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
+use reson_agentic::types::{
+    AssistantResponse, CacheMarker, ChatMessage, Provider, ResponsePart, ResponseStreamEvent,
+    TokenUsage, ToolCall, ToolResult,
+};
 use reson_agentic::utils::ConversationMessage;
 use reson_agentic::Tool;
 use serde::{Deserialize, Serialize};
@@ -42,6 +45,19 @@ fn get_google_key() -> Option<String> {
 
 fn get_openrouter_key() -> Option<String> {
     env::var("OPENROUTER_API_KEY").ok()
+}
+
+fn long_cacheable_text(label: &str) -> String {
+    // Anthropic currently requires a 4096-token minimum cacheable prefix for Claude Haiku 4.5.
+    // Keep this fixture comfortably above that threshold even when the explicit cache breakpoint
+    // only covers a single marked block.
+    (0..320)
+        .map(|i| {
+            format!(
+                "{label} block {i}: stable cached context about system design, tool orchestration, memory continuity, and artifact handling.\n"
+            )
+        })
+        .collect::<String>()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -69,7 +85,38 @@ fn run_params(
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
+        ..Default::default()
     }
+}
+
+async fn stream_to_text_and_usage(
+    runtime: &mut Runtime,
+    params: RunParams,
+) -> reson_agentic::error::Result<(String, TokenUsage)> {
+    use futures::StreamExt;
+
+    let mut stream = runtime.run_stream(params).await?;
+    let mut text = String::new();
+    let mut usage = TokenUsage::default();
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            ResponseStreamEvent::Output(ResponsePart::Text { text: chunk }) => {
+                text.push_str(&chunk);
+            }
+            ResponseStreamEvent::Usage(value) => {
+                usage = value;
+            }
+            ResponseStreamEvent::Complete(response) => {
+                if text.is_empty() {
+                    text = response.text();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((text, usage))
 }
 
 /// Common parameters for add_numbers tool
@@ -198,9 +245,34 @@ fn parse_tool_call_args(value: &serde_json::Value) -> Option<serde_json::Value> 
     }
 }
 
-fn extract_tool_call_args(
-    tool_call: &serde_json::Value,
+trait ToolCallCarrier {
+    fn first_tool_call_value(&self) -> reson_agentic::error::Result<serde_json::Value>;
+}
+
+impl ToolCallCarrier for serde_json::Value {
+    fn first_tool_call_value(&self) -> reson_agentic::error::Result<serde_json::Value> {
+        Ok(self.clone())
+    }
+}
+
+impl ToolCallCarrier for AssistantResponse {
+    fn first_tool_call_value(&self) -> reson_agentic::error::Result<serde_json::Value> {
+        let tool_call = self.tool_calls().first().copied().ok_or_else(|| {
+            reson_agentic::error::Error::NonRetryable(
+                "Assistant response did not contain a tool call".to_string(),
+            )
+        })?;
+        Ok(tool_call
+            .tool_obj
+            .clone()
+            .unwrap_or_else(|| serde_json::to_value(tool_call).unwrap()))
+    }
+}
+
+fn extract_tool_call_args<T: ToolCallCarrier>(
+    tool_call: &T,
 ) -> reson_agentic::error::Result<serde_json::Value> {
+    let tool_call = tool_call.first_tool_call_value()?;
     let direct_args = tool_call
         .get("arguments")
         .or_else(|| tool_call.get("input"))
@@ -234,14 +306,18 @@ fn tool_call_name(tool_call: &serde_json::Value) -> Option<&str> {
         })
 }
 
-fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::error::Result<i64> {
+fn require_i64_field<T: ToolCallCarrier>(
+    value: &T,
+    field: &str,
+) -> reson_agentic::error::Result<i64> {
+    let value = value.first_tool_call_value()?;
     if let Some(raw) = value.get(field) {
         return parse_i64_value(raw).ok_or_else(|| {
             reson_agentic::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
         });
     }
 
-    let args = extract_tool_call_args(value)?;
+    let args = extract_tool_call_args(&value)?;
     let raw = args.get(field).ok_or_else(|| {
         reson_agentic::error::Error::NonRetryable(format!("Missing '{}' field", field))
     })?;
@@ -250,7 +326,8 @@ fn require_i64_field(value: &serde_json::Value, field: &str) -> reson_agentic::e
     })
 }
 
-fn require_tool_call_id(tool_call: &serde_json::Value) -> reson_agentic::error::Result<String> {
+fn require_tool_call_id<T: ToolCallCarrier>(tool_call: &T) -> reson_agentic::error::Result<String> {
+    let tool_call = tool_call.first_tool_call_value()?;
     let id = tool_call
         .get("id")
         .and_then(|v| v.as_str())
@@ -423,35 +500,38 @@ async fn openai_responses_tool_stream_agent(
 
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
-            Ok((chunk_type, value)) => {
-                if chunk_type == "tool_call_complete" {
-                    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if id.is_empty() {
-                        return Err(reson_agentic::error::Error::NonRetryable(
-                            "Missing tool call id in stream".to_string(),
-                        ));
-                    }
-
-                    let name = tool_call_name(&value);
-                    if name != Some("add_numbers") {
-                        return Err(reson_agentic::error::Error::NonRetryable(format!(
-                            "Unexpected tool name in stream: {:?}",
-                            name
-                        )));
-                    }
-
-                    let a = require_i64_field(&value, "a")?;
-                    let b = require_i64_field(&value, "b")?;
-                    if a != 25 || b != 35 {
-                        return Err(reson_agentic::error::Error::NonRetryable(format!(
-                            "Unexpected stream args: a={}, b={}",
-                            a, b
-                        )));
-                    }
-
-                    saw_tool = true;
+            Ok(ResponseStreamEvent::Output(ResponsePart::Tool { call })) => {
+                let value = call
+                    .tool_obj
+                    .clone()
+                    .unwrap_or_else(|| serde_json::to_value(&call).unwrap());
+                let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    return Err(reson_agentic::error::Error::NonRetryable(
+                        "Missing tool call id in stream".to_string(),
+                    ));
                 }
+
+                let name = tool_call_name(&value);
+                if name != Some("add_numbers") {
+                    return Err(reson_agentic::error::Error::NonRetryable(format!(
+                        "Unexpected tool name in stream: {:?}",
+                        name
+                    )));
+                }
+
+                let a = require_i64_field(&value, "a")?;
+                let b = require_i64_field(&value, "b")?;
+                if a != 25 || b != 35 {
+                    return Err(reson_agentic::error::Error::NonRetryable(format!(
+                        "Unexpected stream args: a={}, b={}",
+                        a, b
+                    )));
+                }
+
+                saw_tool = true;
             }
+            Ok(_) => {}
             Err(e) => {
                 return Err(reson_agentic::error::Error::NonRetryable(format!(
                     "Stream error: {}",
@@ -990,6 +1070,159 @@ async fn test_anthropic_simple_generation() {
 
 #[tokio::test]
 #[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_user_cache_marker_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
+
+    let messages = vec![
+        ConversationMessage::Chat(
+            ChatMessage::user(long_cacheable_text("ephemeral-user"))
+                .with_cache_marker(CacheMarker::Ephemeral),
+        ),
+        ConversationMessage::Chat(ChatMessage::user("Return exactly the word READY.")),
+    ];
+
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001")
+        .with_max_tokens(32)
+        .with_temperature(0.0);
+
+    let response1 = client.get_generation(&messages, &config).await.unwrap();
+    let response2 = client.get_generation(&messages, &config).await.unwrap();
+
+    println!(
+        "Anthropic ephemeral user cache usage: first={} second={}",
+        response1.usage.cached_tokens, response2.usage.cached_tokens
+    );
+
+    assert!(response1.content.contains("READY"));
+    assert!(response2.content.contains("READY"));
+    assert!(
+        response2.usage.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_system_one_hour_cache_marker_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
+
+    let messages = vec![
+        ConversationMessage::Chat(
+            ChatMessage::system(long_cacheable_text("system-1h"))
+                .with_cache_marker(CacheMarker::Ephemeral1h),
+        ),
+        ConversationMessage::Chat(ChatMessage::user("Return exactly the word READY.")),
+    ];
+
+    let config = GenerationConfig::new("claude-haiku-4-5-20251001")
+        .with_max_tokens(32)
+        .with_temperature(0.0);
+
+    let response1 = client.get_generation(&messages, &config).await.unwrap();
+    let response2 = client.get_generation(&messages, &config).await.unwrap();
+
+    println!(
+        "Anthropic 1h system cache usage: first={} second={}",
+        response1.usage.cached_tokens, response2.usage.cached_tokens
+    );
+
+    assert!(response1.content.contains("READY"));
+    assert!(response2.content.contains("READY"));
+    assert!(
+        response2.usage.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_runtime_automatic_prompt_caching_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let mut runtime = Runtime::new();
+    runtime
+        .set_provider_config(Some(ProviderConfig::Anthropic(AnthropicProviderConfig {
+            automatic_prompt_caching: Some(CacheMarker::Ephemeral),
+            tool_definitions_cache_breakpoint: None,
+        })))
+        .await;
+
+    let params = RunParams {
+        prompt: Some(format!(
+            "{}\n\nReturn exactly the word READY.",
+            long_cacheable_text("runtime-prompt-ephemeral")
+        )),
+        model: Some("anthropic:claude-haiku-4-5-20251001".to_string()),
+        api_key: Some(api_key.clone()),
+        max_tokens: Some(32),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    let (text1, usage1) = stream_to_text_and_usage(&mut runtime, params.clone())
+        .await
+        .unwrap();
+    let (text2, usage2) = stream_to_text_and_usage(&mut runtime, params)
+        .await
+        .unwrap();
+
+    println!(
+        "Anthropic runtime prompt cache usage: first={} second={}",
+        usage1.cached_tokens, usage2.cached_tokens
+    );
+
+    assert!(!text1.trim().is_empty());
+    assert!(!text2.trim().is_empty());
+    assert!(
+        usage2.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
+async fn test_anthropic_runtime_system_message_cache_marker_live() {
+    let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
+    let mut runtime = Runtime::new();
+    runtime
+        .set_system_messages(vec![ChatMessage::system(long_cacheable_text(
+            "runtime-system-1h",
+        ))
+        .with_cache_marker(CacheMarker::Ephemeral1h)])
+        .await;
+
+    let params = RunParams {
+        prompt: Some("Return exactly the word READY.".to_string()),
+        model: Some("anthropic:claude-haiku-4-5-20251001".to_string()),
+        api_key: Some(api_key.clone()),
+        max_tokens: Some(32),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    let (text1, usage1) = stream_to_text_and_usage(&mut runtime, params.clone())
+        .await
+        .unwrap();
+    let (text2, usage2) = stream_to_text_and_usage(&mut runtime, params)
+        .await
+        .unwrap();
+
+    println!(
+        "Anthropic runtime system cache usage: first={} second={}",
+        usage1.cached_tokens, usage2.cached_tokens
+    );
+
+    assert!(text1.contains("READY"));
+    assert!(text2.contains("READY"));
+    assert!(
+        usage2.cached_tokens > 0,
+        "Expected cache hit on second request"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Requires ANTHROPIC_API_KEY"]
 async fn test_anthropic_with_tools() {
     let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
     let client = AnthropicClient::new(api_key, "claude-haiku-4-5-20251001");
@@ -1113,6 +1346,36 @@ async fn test_openai_simple_generation() {
 
 #[tokio::test]
 #[ignore = "Requires OPENAI_API_KEY"]
+async fn test_openai_runtime_model_string_with_cache_retention() {
+    let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
+    let mut runtime = Runtime::new();
+
+    let response = runtime
+        .run(run_params(
+            Some("What is 3+3? Just the number."),
+            Some("You are helpful. Be concise."),
+            None,
+            None,
+            None,
+            Some(0.0),
+            None,
+            Some(100),
+            Some("openai:gpt-4o-mini@cache=24h"),
+            Some(&api_key),
+        ))
+        .await
+        .unwrap();
+
+    let response_str = response
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| response.to_string());
+    println!("Response: {}", response_str);
+    assert!(response_str.contains("6"));
+}
+
+#[tokio::test]
+#[ignore = "Requires OPENAI_API_KEY"]
 async fn test_openai_with_tools() {
     let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
     let client = OAIClient::new(api_key, "gpt-4o-mini");
@@ -1147,6 +1410,40 @@ async fn test_openai_responses_simple_generation() {
 
     println!("Response: {}", response);
     let value = response
+        .trim()
+        .parse::<i64>()
+        .expect("Response should be an integer");
+    assert_eq!(value, 6);
+}
+
+#[tokio::test]
+#[ignore = "Requires OPENAI_API_KEY"]
+async fn test_openai_responses_runtime_model_string_with_cache_retention() {
+    let api_key = get_openai_key().expect("OPENAI_API_KEY not set");
+    let mut runtime = Runtime::new();
+
+    let response = runtime
+        .run(run_params(
+            Some("What is 3+3? Just the number."),
+            Some("You are helpful. Be concise."),
+            None,
+            None,
+            None,
+            Some(0.0),
+            None,
+            Some(100),
+            Some("openai:resp:gpt-4o-mini@cache=in_memory"),
+            Some(&api_key),
+        ))
+        .await
+        .unwrap();
+
+    let response_str = response
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| response.to_string());
+    println!("Response: {}", response_str);
+    let value = response_str
         .trim()
         .parse::<i64>()
         .expect("Response should be an integer");
@@ -1295,14 +1592,14 @@ async fn test_google_with_thinking() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_anthropic_model() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![
         ConversationMessage::Chat(ChatMessage::system("Be very concise.")),
         ConversationMessage::Chat(ChatMessage::user("What is 7+7? Just number.")),
     ];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(100)
         .with_temperature(0.0);
 
@@ -1317,13 +1614,13 @@ async fn test_openrouter_anthropic_model() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_with_tools() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "You must use the add_numbers tool to calculate 25 + 35. Do not calculate it yourself - use the tool.",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![openai_add_tool()])
         .with_native_tools(true);
@@ -1345,13 +1642,13 @@ async fn test_openrouter_with_tools_streaming() {
     for attempt in 1..=3 {
         let attempt_result = timeout(Duration::from_secs(20), async {
             let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-            let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+            let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
             let messages = vec![ConversationMessage::Chat(ChatMessage::user(
                 "You must use the add_numbers tool to calculate 25 + 35. Do not calculate it yourself - use the tool.",
             ))];
 
-            let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+            let config = GenerationConfig::new("anthropic/claude-sonnet-4")
                 .with_max_tokens(1024)
                 .with_tools(vec![openai_add_tool()])
                 .with_native_tools(true);
@@ -1506,9 +1803,9 @@ async fn test_openrouter_responses_multi_turn_with_tools() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_5_turn_tool_conversation() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![openai_add_tool(), openai_multiply_tool()])
         .with_native_tools(true);

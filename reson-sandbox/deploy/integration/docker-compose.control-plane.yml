@@ -1,0 +1,63 @@
+# @dive-file: Canonical docker compose manifest for real integration control-plane dependencies (etcd quorum + NATS JetStream).
+# @dive-rel: Used by scripts/integration/up.sh and related lifecycle scripts via profile-provided compose path.
+# @dive-rel: Provides deterministic control-plane endpoints for real distributed integration gates.
+services:
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=${RESON_SANDBOX_INTEGRATION_CLUSTER_TOKEN:-reson-sandbox-integration}
+    ports:
+      - "${RESON_SANDBOX_INTEGRATION_ETCD_PORT:-32379}:2379"
+    restart: unless-stopped
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=${RESON_SANDBOX_INTEGRATION_CLUSTER_TOKEN:-reson-sandbox-integration}
+    restart: unless-stopped
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.14
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd3
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=${RESON_SANDBOX_INTEGRATION_CLUSTER_TOKEN:-reson-sandbox-integration}
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - --jetstream
+      - --http_port
+      - "8222"
+      - --store_dir
+      - /data
+    ports:
+      - "${RESON_SANDBOX_INTEGRATION_NATS_PORT:-14222}:4222"
+      - "${RESON_SANDBOX_INTEGRATION_NATS_MONITOR_PORT:-18222}:8222"
+    restart: unless-stopped

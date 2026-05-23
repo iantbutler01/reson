@@ -262,14 +262,14 @@ async fn test_openai_parallel_tool_calling() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_anthropic_parallel_tool_calling() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Please: 1) Get weather for 'London', 2) Search for 'machine learning', \
          and 3) Get current time. Use the tools available.",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &weather_tool_schema()),
@@ -421,13 +421,13 @@ async fn test_google_parallel_tool_calling() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_backwards_compatibility_single_tool() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 10 + 5 using the calculate function",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![tool_schema_for(
             "openrouter",
@@ -470,13 +470,13 @@ async fn test_parallel_execution_pattern() {
     use tokio::task::JoinSet;
 
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Get weather for 'Paris', calculate 20 + 22, and get current time",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &weather_tool_schema()),
@@ -546,7 +546,7 @@ async fn test_parallel_execution_pattern() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_mixed_parallel_tool_types() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Calculate 8 * 7 (use multiply operation), get current time, \
@@ -554,7 +554,7 @@ async fn test_mixed_parallel_tool_types() {
     ))];
 
     // Mix of tools with different parameter requirements
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &calculate_tool_schema()), // Requires a, b params
@@ -681,14 +681,14 @@ async fn test_google_compositional_chaining() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_multi_turn_parallel_tools() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key.clone(), "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key.clone(), "anthropic/claude-sonnet-4", None, None);
 
     // First turn - request multiple tools
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Get weather for 'Miami' and calculate 100 + 200",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(1024)
         .with_tools(vec![
             tool_schema_for("openrouter", &weather_tool_schema()),
@@ -745,7 +745,7 @@ async fn test_multi_turn_parallel_tools() {
     }
 
     // Second turn - provide tool results and ask follow-up
-    let client2 = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client2 = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     conversation.push(ConversationMessage::Chat(ChatMessage::user(
         "Thanks! Now what's the difference between the calculation result and 250?",

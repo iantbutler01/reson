@@ -1,4 +1,9 @@
 //! Integration tests for MCP Apps extension (SEP-1865)
+#![cfg(feature = "apps")]
+
+// @dive-file: Integration tests validating MCP Apps extension behavior over real websocket transport.
+// @dive-rel: Exercised only when the `apps` feature is enabled via Cargo required-features gating.
+// @dive-rel: Verifies server-side UI metadata wiring implemented under src/apps and src/server/handler.rs.
 
 use reson_mcp::apps::{UiResource, UiResourceCsp, UiToolMeta, Visibility, MCP_APP_MIME_TYPE};
 use reson_mcp::server::{McpServer, ServerTransport};

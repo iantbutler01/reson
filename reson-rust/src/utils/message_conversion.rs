@@ -3,10 +3,11 @@
 //! Converts mixed ChatMessage/ToolResult/ToolCall/ReasoningSegment lists to provider-specific formats.
 //! Handles message coalescing for Anthropic/Google providers.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{
-    ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage, Provider, ReasoningSegment,
-    ToolCall, ToolResult, VideoMetadata,
+    AssistantResponse, CacheMarker, ChatMessage, ChatRole, MediaPart, MediaSource,
+    MultimodalMessage, Provider, ReasoningSegment, ResponsePart, ToolCall, ToolResult,
+    VideoMetadata,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -16,6 +17,8 @@ use uuid::Uuid;
 pub enum ConversationMessage {
     /// Regular chat message (user, assistant, system)
     Chat(ChatMessage),
+    /// Durable assistant response with ordered output.
+    AssistantResponse(AssistantResponse),
     /// Tool call from the assistant
     ToolCall(ToolCall),
     /// Tool result from execution
@@ -29,6 +32,12 @@ pub enum ConversationMessage {
 impl From<ChatMessage> for ConversationMessage {
     fn from(msg: ChatMessage) -> Self {
         ConversationMessage::Chat(msg)
+    }
+}
+
+impl From<AssistantResponse> for ConversationMessage {
+    fn from(response: AssistantResponse) -> Self {
+        ConversationMessage::AssistantResponse(response)
     }
 }
 
@@ -294,32 +303,30 @@ fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
             "text": text
         }),
 
-        MediaPart::Image { source, .. } => match source {
-            MediaSource::Base64 { data, mime_type } => json!({
-                "type": "input_image",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", mime_type, data)
-                }
-            }),
-            MediaSource::Url { url } => json!({
-                "type": "input_image",
-                "image_url": {
-                    "url": url
-                }
-            }),
-            MediaSource::FileId { file_id } => json!({
-                "type": "input_image",
-                "image_file": {
+        MediaPart::Image { source, detail } => {
+            let mut image = match source {
+                MediaSource::Base64 { data, mime_type } => json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{}", mime_type, data)
+                }),
+                MediaSource::Url { url } => json!({
+                    "type": "input_image",
+                    "image_url": url
+                }),
+                MediaSource::FileId { file_id } => json!({
+                    "type": "input_image",
                     "file_id": file_id
-                }
-            }),
-            MediaSource::FileUri { uri, .. } => json!({
-                "type": "input_image",
-                "image_url": {
-                    "url": uri
-                }
-            }),
-        },
+                }),
+                MediaSource::FileUri { uri, .. } => json!({
+                    "type": "input_image",
+                    "image_url": uri
+                }),
+            };
+            if let Some(detail) = detail {
+                image["detail"] = json!(detail);
+            }
+            image
+        }
 
         MediaPart::Audio { source, format } => match source {
             MediaSource::Base64 { data, .. } => {
@@ -344,6 +351,31 @@ fn media_part_to_openai_responses_format(part: &MediaPart) -> Value {
             "text": "[Video/Document not supported by this provider]"
         }),
     }
+}
+
+/// Return true when the conversation contains user-supplied image input.
+pub fn messages_contain_image_input(messages: &[ConversationMessage]) -> bool {
+    messages.iter().any(|message| match message {
+        ConversationMessage::Multimodal(multimodal) => multimodal
+            .parts
+            .iter()
+            .any(|part| matches!(part, MediaPart::Image { .. })),
+        _ => false,
+    })
+}
+
+/// Fail before dispatch when a provider/model cannot carry image input.
+pub fn validate_image_input_supported(
+    messages: &[ConversationMessage],
+    provider: Provider,
+    model: &str,
+) -> Result<()> {
+    if messages_contain_image_input(messages) && !provider.supports_image_input(model) {
+        return Err(Error::Validation(
+            "This Nym's current model cannot inspect images.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Convert a MultimodalMessage to provider-specific format
@@ -381,6 +413,212 @@ fn multimodal_to_provider_format(msg: &MultimodalMessage, provider: Provider) ->
             "content": parts
         }),
     }
+}
+
+fn tool_call_to_provider_part(tool_call: &ToolCall, provider: Provider) -> Value {
+    match provider {
+        Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => json!({
+            "type": "tool_use",
+            "id": tool_call.tool_use_id,
+            "name": tool_call.tool_name,
+            "input": tool_call.args
+        }),
+        Provider::GoogleGenAI => {
+            let mut part = json!({
+                "functionCall": {
+                    "name": tool_call.tool_name,
+                    "args": tool_call.args
+                }
+            });
+            if let Some(ref signature) = tool_call.signature {
+                part["thoughtSignature"] = json!(signature);
+            } else if let Some(ref obj) = tool_call.tool_obj {
+                if let Some(signature) = obj.get("thoughtSignature") {
+                    part["thoughtSignature"] = signature.clone();
+                }
+            }
+            part
+        }
+        _ => json!({}),
+    }
+}
+
+fn anthropic_text_block(text: &str, cache_marker: Option<&CacheMarker>) -> Value {
+    let mut block = json!({
+        "type": "text",
+        "text": text
+    });
+    if let Some(marker) = cache_marker {
+        block["cache_control"] = marker.anthropic_cache_control();
+    }
+    block
+}
+
+fn attach_signature_to_value(value: &mut Value, signature: &str, provider: Provider) {
+    match provider {
+        Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+            value["signature"] = json!(signature);
+        }
+        Provider::GoogleGenAI => {
+            value["thoughtSignature"] = json!(signature);
+        }
+        Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+            value["signature"] = json!(signature);
+        }
+        Provider::OpenAI | Provider::OpenRouter => {}
+    }
+}
+
+fn assistant_response_to_openai_chat_message(response: &AssistantResponse) -> Value {
+    let content = response.text();
+    let tool_calls: Vec<Value> = response
+        .tool_calls()
+        .into_iter()
+        .map(|tool_call| {
+            let args_str = tool_call.raw_arguments.clone().unwrap_or_else(|| {
+                serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())
+            });
+            json!({
+                "id": tool_call.tool_use_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.tool_name,
+                    "arguments": args_str
+                }
+            })
+        })
+        .collect();
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+    message
+}
+
+fn assistant_response_to_anthropic_message(
+    response: &AssistantResponse,
+    provider: Provider,
+) -> Value {
+    let mut content = Vec::new();
+    let mut idx = 0;
+    while idx < response.output.len() {
+        match &response.output[idx] {
+            ResponsePart::Text { text } => content.push(json!({
+                "type": "text",
+                "text": text
+            })),
+            ResponsePart::Reasoning { text } => {
+                let mut block = ReasoningSegment::new(text.clone()).to_provider_format(provider);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut block, value, provider);
+                    idx += 1;
+                }
+                content.push(block);
+            }
+            ResponsePart::Tool { call } => {
+                let mut block = tool_call_to_provider_part(call, provider);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut block, value, provider);
+                    idx += 1;
+                }
+                content.push(block);
+            }
+            ResponsePart::Signature { .. } => {}
+        }
+        idx += 1;
+    }
+
+    json!({
+        "role": "assistant",
+        "content": content
+    })
+}
+
+fn assistant_response_to_google_message(response: &AssistantResponse) -> Value {
+    let mut parts = Vec::new();
+    let mut idx = 0;
+    while idx < response.output.len() {
+        match &response.output[idx] {
+            ResponsePart::Text { text } => parts.push(json!({ "text": text })),
+            ResponsePart::Reasoning { text } => {
+                let mut part = json!({
+                    "thought": true,
+                    "text": text
+                });
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut part, value, Provider::GoogleGenAI);
+                    idx += 1;
+                }
+                parts.push(part);
+            }
+            ResponsePart::Tool { call } => {
+                let mut part = tool_call_to_provider_part(call, Provider::GoogleGenAI);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut part, value, Provider::GoogleGenAI);
+                    idx += 1;
+                }
+                parts.push(part);
+            }
+            ResponsePart::Signature { .. } => {}
+        }
+        idx += 1;
+    }
+
+    json!({
+        "role": "model",
+        "parts": parts
+    })
+}
+
+fn assistant_response_to_responses_items(response: &AssistantResponse) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut idx = 0;
+    while idx < response.output.len() {
+        match &response.output[idx] {
+            ResponsePart::Text { text } => {
+                items.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "id": format!("msg_{}", Uuid::new_v4()),
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": []
+                    }]
+                }));
+            }
+            ResponsePart::Reasoning { text } => {
+                let mut item = json!({
+                    "type": "reasoning",
+                    "content": [{
+                        "type": "output_text",
+                        "text": text
+                    }]
+                });
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut item, value, Provider::OpenAIResponses);
+                    idx += 1;
+                }
+                items.push(item);
+            }
+            ResponsePart::Tool { call } => {
+                let mut item = call.to_provider_assistant_message(Provider::OpenAIResponses);
+                if let Some(ResponsePart::Signature { value }) = response.output.get(idx + 1) {
+                    attach_signature_to_value(&mut item, value, Provider::OpenAIResponses);
+                    idx += 1;
+                }
+                items.push(item);
+            }
+            ResponsePart::Signature { .. } => {}
+        }
+        idx += 1;
+    }
+    items
 }
 
 /// Convert messages to OpenAI/OpenRouter Responses API input format.
@@ -433,6 +671,9 @@ pub fn convert_messages_to_responses_input(
                     }));
                 }
             },
+            ConversationMessage::AssistantResponse(response) => {
+                input_items.extend(assistant_response_to_responses_items(response));
+            }
             ConversationMessage::ToolCall(tool_call) => {
                 let args_str = tool_call.raw_arguments.clone().unwrap_or_else(|| {
                     serde_json::to_string(&tool_call.args).unwrap_or_else(|_| "{}".to_string())
@@ -542,23 +783,21 @@ pub fn convert_messages_to_provider_format(
                          anthropic_blocks: &mut Vec<Value>,
                          google_parts: &mut Vec<Value>| {
         match provider {
-            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
-                if !anthropic_blocks.is_empty() {
-                    converted.push(json!({
-                        "role": "user",
-                        "content": anthropic_blocks.clone()
-                    }));
-                    anthropic_blocks.clear();
-                }
+            Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic
+                if !anthropic_blocks.is_empty() =>
+            {
+                converted.push(json!({
+                    "role": "user",
+                    "content": anthropic_blocks.clone()
+                }));
+                anthropic_blocks.clear();
             }
-            Provider::GoogleGenAI => {
-                if !google_parts.is_empty() {
-                    converted.push(json!({
-                        "role": "user",
-                        "content": google_parts.clone()
-                    }));
-                    google_parts.clear();
-                }
+            Provider::GoogleGenAI if !google_parts.is_empty() => {
+                converted.push(json!({
+                    "role": "user",
+                    "content": google_parts.clone()
+                }));
+                google_parts.clear();
             }
             _ => {}
         }
@@ -586,10 +825,10 @@ pub fn convert_messages_to_provider_format(
                         // Only add text block if content is non-empty
                         // (Anthropic rejects "text content blocks must be non-empty")
                         if !chat_msg.content.is_empty() {
-                            pending_anthropic_blocks.push(json!({
-                                "type": "text",
-                                "text": chat_msg.content
-                            }));
+                            pending_anthropic_blocks.push(anthropic_text_block(
+                                &chat_msg.content,
+                                chat_msg.cache_marker.as_ref(),
+                            ));
                         }
                         flush_pending(
                             &mut converted_messages,
@@ -629,10 +868,46 @@ pub fn convert_messages_to_provider_format(
                     ChatRole::Tool => "tool",
                 };
 
-                converted_messages.push(json!({
-                    "role": role,
-                    "content": chat_msg.content
-                }));
+                if matches!(
+                    provider,
+                    Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic
+                ) && chat_msg.cache_marker.is_some()
+                {
+                    converted_messages.push(json!({
+                        "role": role,
+                        "content": [anthropic_text_block(&chat_msg.content, chat_msg.cache_marker.as_ref())]
+                    }));
+                } else {
+                    converted_messages.push(json!({
+                        "role": role,
+                        "content": chat_msg.content
+                    }));
+                }
+            }
+
+            ConversationMessage::AssistantResponse(response) => {
+                flush_pending(
+                    &mut converted_messages,
+                    &mut pending_anthropic_blocks,
+                    &mut pending_google_parts,
+                );
+
+                match provider {
+                    Provider::Anthropic | Provider::Bedrock | Provider::GoogleAnthropic => {
+                        converted_messages
+                            .push(assistant_response_to_anthropic_message(response, provider));
+                    }
+                    Provider::GoogleGenAI => {
+                        converted_messages.push(assistant_response_to_google_message(response));
+                    }
+                    Provider::OpenAI | Provider::OpenRouter => {
+                        converted_messages
+                            .push(assistant_response_to_openai_chat_message(response));
+                    }
+                    Provider::OpenAIResponses | Provider::OpenRouterResponses => {
+                        converted_messages.extend(assistant_response_to_responses_items(response));
+                    }
+                }
             }
 
             ConversationMessage::ToolCall(tool_call) => {
@@ -880,5 +1155,36 @@ mod tests {
         // Reasoning segments should be separate messages
         assert_eq!(result.len(), 3);
         assert_eq!(result[1]["type"], "thinking");
+    }
+
+    #[test]
+    fn test_anthropic_chat_cache_marker_becomes_cache_control_block() {
+        let messages = vec![ConversationMessage::Chat(
+            ChatMessage::user("Large reusable context").with_cache_marker(CacheMarker::Ephemeral),
+        )];
+
+        let result = convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["role"], "user");
+        let content = result[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Large reusable context");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn test_anthropic_chat_one_hour_cache_marker_adds_ttl() {
+        let messages = vec![ConversationMessage::Chat(
+            ChatMessage::user("Long-lived reusable context")
+                .with_cache_marker(CacheMarker::Ephemeral1h),
+        )];
+
+        let formatted =
+            convert_messages_to_provider_format(&messages, Provider::Anthropic).unwrap();
+        let content = formatted[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h");
     }
 }

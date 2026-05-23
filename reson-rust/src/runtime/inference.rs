@@ -11,21 +11,238 @@ use tokio::sync::RwLock;
 use crate::error::{Error, Result};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
+    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient, PromptCacheRetention,
+    ProviderConfig, StreamChunk,
 };
-use crate::schema::{fix_output_schema_for_provider, fix_tool_schema_for_provider};
-use crate::types::ChatMessage;
+use crate::schema::{
+    apply_tool_strict_for_provider, fix_output_schema_for_provider,
+    fix_tool_parameters_schema_for_provider,
+};
+use crate::types::{
+    AssistantResponse, ChatMessage, CreateResult, Provider, ReasoningSegment, ResponsePart,
+    ResponseStreamEvent, TokenUsage, ToolCall,
+};
 use crate::utils::ConversationMessage;
 
 use super::{Accumulators, ToolFunction, ToolSchemaInfo};
 
+fn supports_system_message_blocks(provider: Provider) -> bool {
+    matches!(provider, Provider::Anthropic | Provider::GoogleAnthropic)
+}
+
+fn build_runtime_messages(
+    prompt: Option<&str>,
+    system: Option<&str>,
+    system_messages: Option<Vec<ChatMessage>>,
+    history: Option<Vec<ConversationMessage>>,
+    provider: Option<Provider>,
+) -> Vec<ConversationMessage> {
+    let mut messages = Vec::new();
+
+    if let Some(system_messages) = system_messages.filter(|messages| !messages.is_empty()) {
+        if provider.is_some_and(supports_system_message_blocks) {
+            messages.extend(system_messages.into_iter().map(ConversationMessage::Chat));
+        } else {
+            let joined = system_messages
+                .into_iter()
+                .map(|msg| msg.content)
+                .filter(|content| !content.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !joined.is_empty() {
+                messages.push(ConversationMessage::Chat(ChatMessage::system(joined)));
+            }
+        }
+    } else if let Some(sys) = system {
+        messages.push(ConversationMessage::Chat(ChatMessage::system(sys)));
+    }
+
+    if let Some(hist) = history {
+        messages.extend(hist);
+    }
+
+    if let Some(p) = prompt {
+        messages.push(ConversationMessage::Chat(ChatMessage::user(p)));
+    }
+
+    messages
+}
+
+fn resolve_provider_for_caching(model: &str) -> Option<Provider> {
+    Provider::from_model_string(model)
+        .ok()
+        .map(|(provider, _)| provider)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedModelString {
+    provider: String,
+    model_name: String,
+    reasoning: Option<String>,
+    server_url: Option<String>,
+    inline_api_key: Option<String>,
+    prompt_cache_retention: Option<PromptCacheRetention>,
+}
+
+fn parse_prompt_cache_retention(value: &str) -> Result<PromptCacheRetention> {
+    match value {
+        "in_memory" => Ok(PromptCacheRetention::InMemory),
+        "24h" => Ok(PromptCacheRetention::H24),
+        other => Err(Error::NonRetryable(format!(
+            "Unsupported @cache value '{}'. Expected 'in_memory' or '24h'",
+            other
+        ))),
+    }
+}
+
+fn parse_model_string(model_str: &str) -> Result<ParsedModelString> {
+    let parts: Vec<&str> = model_str.split(':').collect();
+    if parts.len() < 2 {
+        return Err(Error::NonRetryable(format!(
+            "Invalid model string format: {}. Expected 'provider:model'",
+            model_str
+        )));
+    }
+
+    let (provider, model_part) = if parts.len() >= 3 && parts[1] == "resp" {
+        (format!("{}-responses", parts[0]), parts[2..].join(":"))
+    } else {
+        (parts[0].to_string(), parts[1..].join(":"))
+    };
+
+    let mut reasoning = None;
+    let mut server_url = None;
+    let mut inline_api_key = None;
+    let mut prompt_cache_retention = None;
+
+    let model_name = if model_part.contains('@') {
+        let model_parts: Vec<&str> = model_part.split('@').collect();
+
+        for param in &model_parts[1..] {
+            if param.starts_with("reasoning=") {
+                reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
+            } else if param.starts_with("server_url=") {
+                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
+            } else if param.starts_with("api_key=") {
+                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
+            } else if param.starts_with("cache=") {
+                prompt_cache_retention = Some(parse_prompt_cache_retention(
+                    param.strip_prefix("cache=").unwrap(),
+                )?);
+            }
+        }
+
+        model_parts[0].to_string()
+    } else {
+        model_part.to_string()
+    };
+
+    Ok(ParsedModelString {
+        provider,
+        model_name,
+        reasoning,
+        server_url,
+        inline_api_key,
+        prompt_cache_retention,
+    })
+}
+
 /// Result from non-streaming LLM call
 pub struct CallResult {
-    pub parsed_value: serde_json::Value,
-    pub raw_response: Option<String>,
-    pub reasoning: Option<String>,
-    /// Tool calls from the response (if any)
-    pub tool_calls: Vec<serde_json::Value>,
+    pub response: AssistantResponse,
+}
+
+async fn stream_chunk_to_runtime_events(
+    chunk: StreamChunk,
+    accumulators: Arc<RwLock<Accumulators>>,
+    response: Arc<RwLock<AssistantResponse>>,
+) -> Result<Vec<ResponseStreamEvent>> {
+    match chunk {
+        StreamChunk::Content(text) => {
+            {
+                let mut acc = accumulators.write().await;
+                acc.raw_response.push(text.clone());
+            }
+            {
+                let mut response = response.write().await;
+                response.push_output(ResponsePart::Text { text: text.clone() });
+            }
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Text {
+                text,
+            })])
+        }
+        StreamChunk::Reasoning(text) => {
+            let mut acc = accumulators.write().await;
+            acc.reasoning.push(text.clone());
+
+            if let Some(current) = acc.current_reasoning_segment.as_mut() {
+                current.content.push_str(&text);
+                let updated_content = current.content.clone();
+                if let Some(last) = acc.reasoning_segments.last_mut() {
+                    last.content = updated_content;
+                }
+            } else {
+                let segment =
+                    ReasoningSegment::with_index(text.clone(), acc.reasoning_segments.len());
+                acc.reasoning_segments.push(segment.clone());
+                acc.current_reasoning_segment = Some(segment);
+            }
+            drop(acc);
+
+            {
+                let mut response = response.write().await;
+                response.push_output(ResponsePart::Reasoning { text: text.clone() });
+            }
+
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Reasoning {
+                text,
+            })])
+        }
+        StreamChunk::Signature(sig) => {
+            let mut acc = accumulators.write().await;
+            if let Some(current) = acc.current_reasoning_segment.as_mut() {
+                current.signature = Some(sig.clone());
+                if let Some(last) = acc.reasoning_segments.last_mut() {
+                    last.signature = Some(sig.clone());
+                }
+            }
+            drop(acc);
+
+            {
+                let mut response = response.write().await;
+                response.push_output(ResponsePart::Signature { value: sig.clone() });
+            }
+
+            Ok(vec![ResponseStreamEvent::Output(ResponsePart::Signature {
+                value: sig,
+            })])
+        }
+        StreamChunk::ToolCallComplete(tool) => {
+            let tool_calls = match ToolCall::create(tool)? {
+                CreateResult::Single(call) => vec![call],
+                CreateResult::Multiple(calls) => calls,
+                CreateResult::Empty => Vec::new(),
+            };
+
+            let mut events = Vec::new();
+            let mut response_guard = response.write().await;
+            for call in tool_calls {
+                response_guard.push_output(ResponsePart::Tool { call: call.clone() });
+                events.push(ResponseStreamEvent::Output(ResponsePart::Tool { call }));
+            }
+            Ok(events)
+        }
+        StreamChunk::ToolCallPartial(tool) => Ok(vec![ResponseStreamEvent::ToolPartial(tool)]),
+        StreamChunk::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => Ok(vec![ResponseStreamEvent::Usage(TokenUsage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        })]),
+    }
 }
 
 /// Generate native tool schemas for the given model/provider
@@ -50,24 +267,27 @@ fn generate_tool_schemas(
     // For each tool, generate schema
     let mut schemas = Vec::new();
 
-    for (tool_name, _tool_fn) in tools.iter() {
+    let mut tool_names: Vec<&String> = tools.keys().collect();
+    tool_names.sort();
+
+    for tool_name in tool_names {
         // Check if we have schema info for this tool
         let tool_schema = if let Some(schema_info) = tool_schemas.get(tool_name) {
             let mut parameters = schema_info.parameters.to_json_schema();
-            fix_tool_schema_for_provider(&mut parameters, &provider);
-
-            generator.generate_schema(tool_name, &schema_info.description, parameters)
+            fix_tool_parameters_schema_for_provider(&mut parameters, &provider);
+            let mut tool_schema =
+                generator.generate_schema(tool_name, &schema_info.description, parameters);
+            apply_tool_strict_for_provider(&mut tool_schema, &provider, schema_info.strict);
+            tool_schema
         } else {
             // No schema info - generate minimal schema
-            generator.generate_schema(
-                tool_name,
-                &format!("Tool: {}", tool_name),
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }),
-            )
+            let mut parameters = serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            });
+            fix_output_schema_for_provider(&mut parameters, &provider);
+            generator.generate_schema(tool_name, &format!("Tool: {}", tool_name), parameters)
         };
 
         schemas.push(tool_schema);
@@ -96,12 +316,16 @@ fn resolve_provider_key(model: &str) -> String {
 ///
 /// Parameters:
 /// - `@reasoning=<value>` - reasoning effort (numeric budget or level like `high`)
+/// - `@cache=<value>` - OpenAI prompt cache retention (`in_memory` or `24h`)
+/// - `@vision=<true|false>` - image-input capability override consumed by `Provider::supports_image_input`
 /// - `@server_url=<url>` - custom API endpoint (required for `custom-openai`, optional for `openai`)
 /// - `@api_key=<key>` - inline API key (overrides env var and `api_key` parameter)
 ///
 /// Examples:
 /// - `anthropic:claude-3-5-sonnet-20241022`
 /// - `openrouter:openai/gpt-4o@reasoning=high`
+/// - `openrouter:qwen/qwen2.5-vl-72b-instruct@vision=true`
+/// - `openai:gpt-5.1@cache=24h`
 /// - `openai:gpt-4o`
 /// - `openai:resp:gpt-4o`
 /// - `openrouter:resp:openai/o4-mini`
@@ -111,41 +335,12 @@ pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
-    // Parse model string
-    let parts: Vec<&str> = model_str.split(':').collect();
-    if parts.len() < 2 {
-        return Err(Error::NonRetryable(format!(
-            "Invalid model string format: {}. Expected 'provider:model'",
-            model_str
-        )));
-    }
-    let (provider, model_part) = if parts.len() >= 3 && parts[1] == "resp" {
-        (format!("{}-responses", parts[0]), parts[2..].join(":"))
-    } else {
-        (parts[0].to_string(), parts[1..].join(":"))
-    };
-
-    // Parse parameters (e.g., @reasoning=1024, @server_url=http://localhost:8000/v1, @api_key=sk-...)
-    let mut reasoning = None;
-    let mut server_url = None;
-    let mut inline_api_key = None;
-    let model_name = if model_part.contains('@') {
-        let model_parts: Vec<&str> = model_part.split('@').collect();
-
-        for param in &model_parts[1..] {
-            if param.starts_with("reasoning=") {
-                reasoning = Some(param.strip_prefix("reasoning=").unwrap().to_string());
-            } else if param.starts_with("server_url=") {
-                server_url = Some(param.strip_prefix("server_url=").unwrap().to_string());
-            } else if param.starts_with("api_key=") {
-                inline_api_key = Some(param.strip_prefix("api_key=").unwrap().to_string());
-            }
-        }
-
-        model_parts[0].to_string()
-    } else {
-        model_part.to_string()
-    };
+    let parsed = parse_model_string(model_str)?;
+    let provider = parsed.provider;
+    let reasoning = parsed.reasoning;
+    let server_url = parsed.server_url;
+    let inline_api_key = parsed.inline_api_key;
+    let model_name = parsed.model_name;
 
     // Resolve API key: @api_key= > api_key parameter > env var
     let key = if let Some(k) = inline_api_key {
@@ -177,7 +372,7 @@ pub fn create_inference_client(
                 return Err(Error::NonRetryable(format!(
                     "Unknown provider: {}",
                     provider
-                )))
+                )));
             }
         }
     };
@@ -251,7 +446,7 @@ pub fn create_inference_client(
             return Err(Error::NonRetryable(format!(
                 "Unsupported provider: {}",
                 provider
-            )))
+            )));
         }
     };
 
@@ -269,30 +464,24 @@ pub async fn call_llm(
     output_schema: Option<serde_json::Value>,
     api_key: Option<&str>,
     system: Option<&str>,
+    system_messages: Option<Vec<ChatMessage>>,
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
+    retry_config: Option<crate::retry::RetryConfig>,
+    provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 ) -> Result<CallResult> {
     // Create client
     let client = create_inference_client(model, api_key)?;
+    let parsed_model = parse_model_string(model)?;
+    let provider_key = resolve_provider_key(model);
+    let message_provider = resolve_provider_for_caching(model);
 
-    // Build messages
-    let mut messages = Vec::new();
-
-    if let Some(sys) = system {
-        messages.push(ConversationMessage::Chat(ChatMessage::system(sys)));
-    }
-
-    if let Some(hist) = history {
-        messages.extend(hist);
-    }
-
-    if let Some(p) = prompt {
-        messages.push(ConversationMessage::Chat(ChatMessage::user(p)));
-    }
+    let messages =
+        build_runtime_messages(prompt, system, system_messages, history, message_provider);
 
     if messages.is_empty() {
         return Err(Error::NonRetryable(
@@ -312,9 +501,8 @@ pub async fn call_llm(
     };
 
     // Fix output schema for provider-specific requirements
-    let provider = resolve_provider_key(model);
     let fixed_output_schema = output_schema.map(|mut schema| {
-        fix_output_schema_for_provider(&mut schema, &provider);
+        fix_output_schema_for_provider(&mut schema, &provider_key);
         schema
     });
 
@@ -331,88 +519,25 @@ pub async fn call_llm(
         output_schema: fixed_output_schema,
         output_type_name,
         timeout,
+        retry_config,
+        prompt_cache_retention: match provider_key.as_str() {
+            "openai" | "openai-responses" => parsed_model.prompt_cache_retention,
+            _ => None,
+        },
+        provider_config,
     };
 
     // Make API call
     let response = client.get_generation(&messages, &config).await?;
 
-    // Check if response contains tool calls
-    if response.has_tool_calls() {
-        // Return tool calls - we need to format them for the runtime
-        // Add _tool_name field so runtime.is_tool_call() works
-        let formatted_tool_calls: Vec<serde_json::Value> = response
-            .tool_calls
-            .iter()
-            .map(|tc| {
-                let mut tool_call = tc.clone();
-                // For Anthropic format: {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
-                if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
-                    if let Some(obj) = tool_call.as_object_mut() {
-                        obj.insert("_tool_name".to_string(), serde_json::json!(name));
-                        // Also copy input fields to top level for easier access
-                        if let Some(input) = tc.get("input").cloned() {
-                            if let Some(input_obj) = input.as_object() {
-                                for (k, v) in input_obj {
-                                    obj.insert(k.clone(), v.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                // For OpenAI format: {"id": "...", "function": {"name": "...", "arguments": "..."}}
-                else if let Some(func) = tc.get("function") {
-                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                        if let Some(obj) = tool_call.as_object_mut() {
-                            obj.insert("_tool_name".to_string(), serde_json::json!(name));
-                            // Parse arguments JSON and copy to top level
-                            if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
-                                if let Ok(args) =
-                                    serde_json::from_str::<serde_json::Value>(args_str)
-                                {
-                                    if let Some(args_obj) = args.as_object() {
-                                        for (k, v) in args_obj {
-                                            obj.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                tool_call
-            })
-            .collect();
-
-        // Return first tool call as parsed_value (for single tool call case)
-        // and all tool calls in the tool_calls vec
-        let parsed_value = if formatted_tool_calls.len() == 1 {
-            formatted_tool_calls[0].clone()
-        } else {
-            serde_json::json!(formatted_tool_calls)
-        };
-
-        return Ok(CallResult {
-            parsed_value,
-            raw_response: Some(response.content),
-            reasoning: response.reasoning,
-            tool_calls: formatted_tool_calls,
-        });
+    if response.response.output.is_empty() {
+        return Err(Error::Inference(
+            "Provider returned an empty assistant response".to_string(),
+        ));
     }
 
-    // Parse response as text/JSON
-    let parsed_value = if !response.content.is_empty() {
-        // Try to parse as JSON, fallback to string
-        serde_json::from_str(&response.content)
-            .unwrap_or_else(|_| serde_json::json!(response.content))
-    } else {
-        serde_json::Value::Null
-    };
-
     Ok(CallResult {
-        parsed_value,
-        raw_response: Some(response.content),
-        reasoning: response.reasoning,
-        tool_calls: Vec::new(),
+        response: response.response,
     })
 }
 
@@ -427,31 +552,25 @@ pub async fn call_llm_stream(
     output_schema: Option<serde_json::Value>,
     api_key: Option<&str>,
     system: Option<&str>,
+    system_messages: Option<Vec<ChatMessage>>,
     history: Option<Vec<ConversationMessage>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_tokens: Option<u32>,
     timeout: Option<std::time::Duration>,
+    retry_config: Option<crate::retry::RetryConfig>,
+    provider_config: Option<ProviderConfig>,
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
-    _accumulators: Arc<RwLock<Accumulators>>,
-) -> Result<Pin<Box<dyn Stream<Item = Result<(String, serde_json::Value)>> + Send>>> {
+    accumulators: Arc<RwLock<Accumulators>>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
     let client = create_inference_client(model, api_key)?;
+    let parsed_model = parse_model_string(model)?;
+    let provider_key = resolve_provider_key(model);
+    let message_provider = resolve_provider_for_caching(model);
 
-    // Build messages
-    let mut messages = Vec::new();
-
-    if let Some(sys) = system {
-        messages.push(ConversationMessage::Chat(ChatMessage::system(sys)));
-    }
-
-    if let Some(hist) = history {
-        messages.extend(hist);
-    }
-
-    if let Some(p) = prompt {
-        messages.push(ConversationMessage::Chat(ChatMessage::user(p)));
-    }
+    let messages =
+        build_runtime_messages(prompt, system, system_messages, history, message_provider);
 
     if messages.is_empty() {
         return Err(Error::NonRetryable(
@@ -471,9 +590,8 @@ pub async fn call_llm_stream(
     };
 
     // Fix output schema for provider-specific requirements
-    let provider = resolve_provider_key(model);
     let fixed_output_schema = output_schema.map(|mut schema| {
-        fix_output_schema_for_provider(&mut schema, &provider);
+        fix_output_schema_for_provider(&mut schema, &provider_key);
         schema
     });
 
@@ -490,49 +608,58 @@ pub async fn call_llm_stream(
         output_schema: fixed_output_schema,
         output_type_name,
         timeout,
+        retry_config,
+        prompt_cache_retention: match provider_key.as_str() {
+            "openai" | "openai-responses" => parsed_model.prompt_cache_retention,
+            _ => None,
+        },
+        provider_config,
     };
 
     // Get streaming response
     let stream = client.connect_and_listen(&messages, &config).await?;
 
-    // Transform stream to (chunk_type, value) tuples
-    let transformed = stream.map(move |chunk_result| match chunk_result {
-        Ok(chunk) => {
-            use crate::providers::StreamChunk;
-            match chunk {
-                StreamChunk::Content(text) => Ok(("content".to_string(), serde_json::json!(text))),
-                StreamChunk::Reasoning(text) => {
-                    Ok(("reasoning".to_string(), serde_json::json!(text)))
+    let response = Arc::new(RwLock::new(AssistantResponse::default()));
+    let stream_response = response.clone();
+
+    let transformed = stream
+        .then(move |chunk_result| {
+            let accumulators = accumulators.clone();
+            let response = stream_response.clone();
+            async move {
+                match chunk_result {
+                    Ok(chunk) => {
+                        match stream_chunk_to_runtime_events(chunk, accumulators, response).await {
+                            Ok(events) => events.into_iter().map(Ok).collect(),
+                            Err(e) => vec![Err(e)],
+                        }
+                    }
+                    Err(e) => vec![Err(e)],
                 }
-                StreamChunk::Signature(sig) => {
-                    Ok(("signature".to_string(), serde_json::json!(sig)))
-                }
-                StreamChunk::ToolCallComplete(tool) => Ok(("tool_call_complete".to_string(), tool)),
-                StreamChunk::ToolCallPartial(tool) => Ok(("tool_call_partial".to_string(), tool)),
-                StreamChunk::Usage {
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                } => Ok((
-                    "usage".to_string(),
-                    serde_json::json!({
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cached_tokens": cached_tokens
-                    }),
-                )),
             }
+        })
+        .flat_map(futures::stream::iter);
+
+    let final_response = response.clone();
+    let completed = futures::stream::once(async move {
+        let response = final_response.read().await.clone();
+        if response.output.is_empty() {
+            Err(Error::Inference(
+                "Provider returned an empty assistant response".to_string(),
+            ))
+        } else {
+            Ok(ResponseStreamEvent::Complete(response))
         }
-        Err(e) => Err(e),
     });
 
-    Ok(Box::pin(transformed))
+    Ok(Box::pin(transformed.chain(completed)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::ToolParametersSchema;
+    use crate::types::{CacheMarker, ChatRole};
 
     #[test]
     fn test_create_inference_client_anthropic() {
@@ -570,6 +697,59 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_model_string_with_openai_cache_retention() {
+        let parsed = parse_model_string("openai:gpt-5.1@cache=24h").unwrap();
+        assert_eq!(parsed.provider, "openai");
+        assert_eq!(parsed.model_name, "gpt-5.1");
+        assert_eq!(
+            parsed.prompt_cache_retention,
+            Some(PromptCacheRetention::H24)
+        );
+    }
+
+    #[test]
+    fn test_parse_model_string_strips_capability_overrides_from_provider_model() {
+        let parsed =
+            parse_model_string("openrouter:qwen/qwen2.5-vl-72b-instruct@vision=true").unwrap();
+        assert_eq!(parsed.provider, "openrouter");
+        assert_eq!(parsed.model_name, "qwen/qwen2.5-vl-72b-instruct");
+
+        let parsed = parse_model_string("openai:resp:gpt-4o@vision=false").unwrap();
+        assert_eq!(parsed.provider, "openai-responses");
+        assert_eq!(parsed.model_name, "gpt-4o");
+    }
+
+    #[test]
+    fn test_parse_model_string_rejects_invalid_cache_retention() {
+        let result = parse_model_string("openai:gpt-5.1@cache=forever");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_content_updates_raw_response_accumulator() {
+        let accumulators = Arc::new(RwLock::new(Accumulators::default()));
+        let response = Arc::new(RwLock::new(AssistantResponse::default()));
+        let events = stream_chunk_to_runtime_events(
+            StreamChunk::Content("hello".to_string()),
+            accumulators.clone(),
+            response.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ResponseStreamEvent::Output(ResponsePart::Text { text }) if text == "hello"
+        ));
+        assert_eq!(
+            accumulators.read().await.raw_response,
+            vec!["hello".to_string()]
+        );
+        assert_eq!(response.read().await.text(), "hello");
+    }
+
+    #[test]
     fn test_create_inference_client_openrouter() {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
         let result = create_inference_client("openrouter:openai/gpt-4o", None);
@@ -581,6 +761,130 @@ mod tests {
         std::env::set_var("OPENROUTER_API_KEY", "test-key");
         let result = create_inference_client("openrouter:resp:openai/o4-mini", None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_runtime_messages_preserves_system_array_for_anthropic_family() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            None,
+            Some(vec![
+                ChatMessage::system("Runtime contract").with_cache_marker(CacheMarker::Ephemeral),
+                ChatMessage::system("<soul>Identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ]),
+            None,
+            Some(Provider::Anthropic),
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: Some(CacheMarker::Ephemeral),
+                ..
+            }) if content == "Runtime contract"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: Some(CacheMarker::Ephemeral),
+                ..
+            }) if content == "<soul>Identity</soul>"
+        ));
+    }
+
+    #[test]
+    fn test_build_runtime_messages_collapses_system_array_for_string_only_providers() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            None,
+            Some(vec![
+                ChatMessage::system("Runtime contract").with_cache_marker(CacheMarker::Ephemeral),
+                ChatMessage::system("<soul>Identity</soul>")
+                    .with_cache_marker(CacheMarker::Ephemeral),
+            ]),
+            None,
+            Some(Provider::Bedrock),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Runtime contract\n\n<soul>Identity</soul>"
+        ));
+    }
+
+    #[test]
+    fn test_build_runtime_messages_preserves_plain_system_when_structured_system_is_empty() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            Some("Plain system"),
+            Some(Vec::new()),
+            None,
+            Some(Provider::Anthropic),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::System,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Plain system"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::User,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Prompt"
+        ));
+    }
+
+    #[test]
+    fn test_build_runtime_messages_does_not_invent_prompt_cache_markers() {
+        let messages = build_runtime_messages(
+            Some("Prompt"),
+            None,
+            None,
+            Some(vec![ConversationMessage::Chat(ChatMessage::user(
+                "Prior user message",
+            ))]),
+            Some(Provider::Anthropic),
+        );
+
+        assert!(matches!(
+            &messages[0],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::User,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Prior user message"
+        ));
+        assert!(matches!(
+            &messages[1],
+            ConversationMessage::Chat(ChatMessage {
+                role: ChatRole::User,
+                content,
+                cache_marker: None,
+                ..
+            }) if content == "Prompt"
+        ));
     }
 
     #[test]
@@ -612,6 +916,7 @@ mod tests {
                     description: "The city name".to_string(),
                     required: true,
                 }],
+                strict: None,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -633,6 +938,9 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "get_weather");
         assert!(schemas[0]["input_schema"].is_object());
+        assert!(schemas[0]["input_schema"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["location"]["type"],
             "string"
@@ -659,6 +967,7 @@ mod tests {
                     description: "Math expression to evaluate".to_string(),
                     required: true,
                 }],
+                strict: None,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -680,10 +989,39 @@ mod tests {
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["type"], "function");
         assert_eq!(schemas[0]["function"]["name"], "calculate");
+        assert!(schemas[0]["function"]["parameters"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
         );
+    }
+
+    #[test]
+    fn test_generate_tool_schemas_uses_stable_name_order() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "zeta".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("z".to_string()))),
+        );
+        tools.insert(
+            "alpha".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("a".to_string()))),
+        );
+        tools.insert(
+            "beta".to_string(),
+            ToolFunction::Sync(Box::new(|_args| Ok("b".to_string()))),
+        );
+
+        let schemas =
+            generate_tool_schemas(&tools, &HashMap::new(), "anthropic:claude-3").expect("schemas");
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|schema| schema["name"].as_str())
+            .collect();
+
+        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
     }
 
     #[test]
@@ -720,6 +1058,7 @@ mod tests {
                         required: false,
                     },
                 ],
+                strict: None,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -751,6 +1090,9 @@ mod tests {
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "search");
+        assert!(schemas[0]["input_schema"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["ids"]["items"]["type"],
             "integer"
@@ -785,6 +1127,7 @@ mod tests {
                 name: "write_thread".to_string(),
                 description: "Write a thread".to_string(),
                 fields: vec![],
+                strict: None,
                 parameters: ToolParametersSchema::from_json_schema(&serde_json::json!({
                     "type": "object",
                     "properties": {

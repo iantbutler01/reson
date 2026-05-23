@@ -75,13 +75,13 @@ async fn test_openai_reasoning() {
 async fn test_anthropic_reasoning_via_openrouter() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
     // Claude with reasoning budget
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "What's the most efficient algorithm for sorting a large dataset?",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(5000)
         .with_thinking_budget(2000);
 
@@ -237,13 +237,13 @@ async fn test_reasoning_stream_openrouter() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_anthropic_reasoning_stream() {
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
-    let client = OpenRouterClient::new(api_key, "anthropic/claude-3-5-sonnet", None, None);
+    let client = OpenRouterClient::new(api_key, "anthropic/claude-sonnet-4", None, None);
 
     let messages = vec![ConversationMessage::Chat(ChatMessage::user(
         "Explain quantum computing in simple terms.",
     ))];
 
-    let config = GenerationConfig::new("anthropic/claude-3-5-sonnet")
+    let config = GenerationConfig::new("anthropic/claude-sonnet-4")
         .with_max_tokens(5000)
         .with_thinking_budget(2000);
 
@@ -472,7 +472,7 @@ fn test_reasoning_segment_google_format() {
         "This is test reasoning content"
     );
     assert_eq!(
-        google_format.get("thought_signature").unwrap(),
+        google_format.get("thoughtSignature").unwrap(),
         "test_signature_123"
     );
 }

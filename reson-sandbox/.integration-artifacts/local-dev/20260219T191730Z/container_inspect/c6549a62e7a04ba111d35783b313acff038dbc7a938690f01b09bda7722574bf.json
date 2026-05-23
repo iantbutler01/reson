@@ -1,0 +1,255 @@
+[
+    {
+        "Id": "c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf",
+        "Created": "2026-02-19T19:17:30.474902002Z",
+        "Path": "docker-entrypoint.sh",
+        "Args": [
+            "--jetstream",
+            "--http_port",
+            "8222",
+            "--store_dir",
+            "/data"
+        ],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 94486,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2026-02-19T19:17:30.577169585Z",
+            "FinishedAt": "0001-01-01T00:00:00Z"
+        },
+        "Image": "sha256:dcadf8f23b60edaaafbe901db7773e2c07947f269c475d8d33d3b46a18b0a7f9",
+        "ResolvConfPath": "/var/lib/docker/containers/c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf/resolv.conf",
+        "HostnamePath": "/var/lib/docker/containers/c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf/hostname",
+        "HostsPath": "/var/lib/docker/containers/c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf/hosts",
+        "LogPath": "/var/lib/docker/containers/c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf/c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf-json.log",
+        "Name": "/reson-sandbox-int-local-dev-nats-1",
+        "RestartCount": 0,
+        "Driver": "overlay2",
+        "Platform": "linux",
+        "MountLabel": "",
+        "ProcessLabel": "",
+        "AppArmorProfile": "",
+        "ExecIDs": null,
+        "HostConfig": {
+            "Binds": null,
+            "ContainerIDFile": "",
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+            "NetworkMode": "reson-sandbox-int-local-dev_default",
+            "PortBindings": {
+                "4222/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "14222"
+                    }
+                ],
+                "8222/tcp": [
+                    {
+                        "HostIp": "",
+                        "HostPort": "18222"
+                    }
+                ]
+            },
+            "RestartPolicy": {
+                "Name": "unless-stopped",
+                "MaximumRetryCount": 0
+            },
+            "AutoRemove": false,
+            "VolumeDriver": "",
+            "VolumesFrom": null,
+            "ConsoleSize": [
+                0,
+                0
+            ],
+            "CapAdd": null,
+            "CapDrop": null,
+            "CgroupnsMode": "private",
+            "Dns": null,
+            "DnsOptions": null,
+            "DnsSearch": null,
+            "ExtraHosts": [],
+            "GroupAdd": null,
+            "IpcMode": "private",
+            "Cgroup": "",
+            "Links": null,
+            "OomScoreAdj": 0,
+            "PidMode": "",
+            "Privileged": false,
+            "PublishAllPorts": false,
+            "ReadonlyRootfs": false,
+            "SecurityOpt": null,
+            "UTSMode": "",
+            "UsernsMode": "",
+            "ShmSize": 67108864,
+            "Runtime": "runc",
+            "Isolation": "",
+            "CpuShares": 0,
+            "Memory": 0,
+            "NanoCpus": 0,
+            "CgroupParent": "",
+            "BlkioWeight": 0,
+            "BlkioWeightDevice": null,
+            "BlkioDeviceReadBps": null,
+            "BlkioDeviceWriteBps": null,
+            "BlkioDeviceReadIOps": null,
+            "BlkioDeviceWriteIOps": null,
+            "CpuPeriod": 0,
+            "CpuQuota": 0,
+            "CpuRealtimePeriod": 0,
+            "CpuRealtimeRuntime": 0,
+            "CpusetCpus": "",
+            "CpusetMems": "",
+            "Devices": null,
+            "DeviceCgroupRules": null,
+            "DeviceRequests": null,
+            "MemoryReservation": 0,
+            "MemorySwap": 0,
+            "MemorySwappiness": null,
+            "OomKillDisable": null,
+            "PidsLimit": null,
+            "Ulimits": null,
+            "CpuCount": 0,
+            "CpuPercent": 0,
+            "IOMaximumIOps": 0,
+            "IOMaximumBandwidth": 0,
+            "MaskedPaths": [
+                "/proc/acpi",
+                "/proc/asound",
+                "/proc/interrupts",
+                "/proc/kcore",
+                "/proc/keys",
+                "/proc/latency_stats",
+                "/proc/sched_debug",
+                "/proc/scsi",
+                "/proc/timer_list",
+                "/proc/timer_stats",
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware"
+            ],
+            "ReadonlyPaths": [
+                "/proc/bus",
+                "/proc/fs",
+                "/proc/irq",
+                "/proc/sys",
+                "/proc/sysrq-trigger"
+            ]
+        },
+        "GraphDriver": {
+            "Data": {
+                "ID": "c6549a62e7a04ba111d35783b313acff038dbc7a938690f01b09bda7722574bf",
+                "LowerDir": "/var/lib/docker/overlay2/8410c00d0436b5715303808a78957f5d1f249441e27c10c0b9866948d83281a8-init/diff:/var/lib/docker/overlay2/8fa27ff1ab30f118a970788a7e8600151e3b7eaa96bb9eccf7264eb9ed1842b3/diff:/var/lib/docker/overlay2/6fb85ac6511380d4b422fd6bacd4f55acf01fc921c630e962c89ab9becdc8730/diff:/var/lib/docker/overlay2/b3b654af107ff2b8e8e78bce65c978a5e7bdf55e6a70216d7c05c7e082bfc0fc/diff:/var/lib/docker/overlay2/ebd975e43450f417836668c27cc762d88d72c0003db08ea4ad8a8def1f490cd4/diff",
+                "MergedDir": "/var/lib/docker/overlay2/8410c00d0436b5715303808a78957f5d1f249441e27c10c0b9866948d83281a8/merged",
+                "UpperDir": "/var/lib/docker/overlay2/8410c00d0436b5715303808a78957f5d1f249441e27c10c0b9866948d83281a8/diff",
+                "WorkDir": "/var/lib/docker/overlay2/8410c00d0436b5715303808a78957f5d1f249441e27c10c0b9866948d83281a8/work"
+            },
+            "Name": "overlay2"
+        },
+        "Mounts": [],
+        "Config": {
+            "Hostname": "c6549a62e7a0",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "ExposedPorts": {
+                "4222/tcp": {},
+                "6222/tcp": {},
+                "8222/tcp": {}
+            },
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "NATS_SERVER=2.10.29"
+            ],
+            "Cmd": [
+                "--jetstream",
+                "--http_port",
+                "8222",
+                "--store_dir",
+                "/data"
+            ],
+            "Image": "nats:2.10-alpine",
+            "Volumes": null,
+            "WorkingDir": "/",
+            "Entrypoint": [
+                "docker-entrypoint.sh"
+            ],
+            "Labels": {
+                "com.docker.compose.config-hash": "f83a1addfebb9330c204dc2d83ea47ce1eb0b68c633875dc012e4c7988d601b4",
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "",
+                "com.docker.compose.image": "sha256:dcadf8f23b60edaaafbe901db7773e2c07947f269c475d8d33d3b46a18b0a7f9",
+                "com.docker.compose.oneoff": "False",
+                "com.docker.compose.project": "reson-sandbox-int-local-dev",
+                "com.docker.compose.project.config_files": "/Users/crow/SoftwareProjects/reson/reson-sandbox/deploy/integration/docker-compose.control-plane.yml",
+                "com.docker.compose.project.working_dir": "/Users/crow/SoftwareProjects/reson/reson-sandbox/deploy/integration",
+                "com.docker.compose.service": "nats",
+                "com.docker.compose.version": "5.0.2"
+            },
+            "StopTimeout": 1
+        },
+        "NetworkSettings": {
+            "SandboxID": "b420201376d2625d5505d878b23246dca516a5e3af0b0fb7cbc115365234e740",
+            "SandboxKey": "/var/run/docker/netns/b420201376d2",
+            "Ports": {
+                "4222/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "14222"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "14222"
+                    }
+                ],
+                "8222/tcp": [
+                    {
+                        "HostIp": "0.0.0.0",
+                        "HostPort": "18222"
+                    },
+                    {
+                        "HostIp": "::",
+                        "HostPort": "18222"
+                    }
+                ]
+            },
+            "Networks": {
+                "reson-sandbox-int-local-dev_default": {
+                    "IPAMConfig": null,
+                    "Links": null,
+                    "Aliases": [
+                        "reson-sandbox-int-local-dev-nats-1",
+                        "nats"
+                    ],
+                    "DriverOpts": null,
+                    "GwPriority": 0,
+                    "NetworkID": "ce1519c39d3a7d81751a8b56447b8845b69ea5bcd4074057effb73c039c5e9ec",
+                    "EndpointID": "34940f5a439b857256fd82dae6c3bea1993c7de7ed219b492cd009f519a7ba49",
+                    "Gateway": "172.29.0.1",
+                    "IPAddress": "172.29.0.3",
+                    "MacAddress": "5a:d0:44:b4:e7:a5",
+                    "IPPrefixLen": 16,
+                    "IPv6Gateway": "",
+                    "GlobalIPv6Address": "",
+                    "GlobalIPv6PrefixLen": 0,
+                    "DNSNames": [
+                        "reson-sandbox-int-local-dev-nats-1",
+                        "nats",
+                        "c6549a62e7a0"
+                    ]
+                }
+            }
+        }
+    }
+]

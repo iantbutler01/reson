@@ -17,10 +17,11 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{Provider, TokenUsage};
+use crate::schema::fix_tool_schema_for_provider;
+use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
     convert_messages_to_responses_input, parse_json_value_strict_str, parse_sse_stream,
-    ConversationMessage,
+    validate_image_input_supported, ConversationMessage,
 };
 
 use super::openai_responses_streaming::{parse_openai_responses_event, ResponsesToolAccumulator};
@@ -66,6 +67,21 @@ impl std::fmt::Debug for OpenAIResponsesClient {
 }
 
 impl OpenAIResponsesClient {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        let provider = match self.provider {
+            Provider::OpenRouterResponses => "openrouter-responses",
+            _ => "openai-responses",
+        };
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, provider);
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new OpenAI Responses client
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -114,17 +130,26 @@ impl OpenAIResponsesClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, self.provider, model)?;
+
         let (instructions, input_items) =
             convert_messages_to_responses_input(messages, self.provider)?;
 
         let mut request = serde_json::json!({
-            "model": if config.model.is_empty() { &self.model } else { &config.model },
+            "model": model,
             "input": input_items,
             "max_output_tokens": config.max_tokens.unwrap_or(4096),
             "temperature": config.temperature.unwrap_or(0.7),
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
+
+        if matches!(self.provider, Provider::OpenAIResponses) {
+            if let Some(retention) = config.prompt_cache_retention {
+                request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
+            }
+        }
 
         if let Some(instructions) = instructions {
             if !instructions.is_empty() {
@@ -134,7 +159,7 @@ impl OpenAIResponsesClient {
 
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 request["tool_choice"] = serde_json::json!("auto");
             }
         }
@@ -184,91 +209,69 @@ impl OpenAIResponsesClient {
         }
     }
 
-    fn extract_output_text(&self, body: &serde_json::Value) -> String {
-        let mut content = String::new();
+    fn extract_response(&self, body: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
         if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
             for item in output {
-                if item.get("type").and_then(|v| v.as_str()) == Some("message")
-                    && item.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                {
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
+                match item.get("type").and_then(|v| v.as_str()) {
+                    Some("message")
+                        if item.get("role").and_then(|v| v.as_str()) == Some("assistant") =>
+                    {
+                        if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                            for part in parts {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                                {
+                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                        if !text.is_empty() {
+                                            response.push_output(ResponsePart::Text {
+                                                text: text.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(summary) = item.get("summary") {
+                            if let Some(arr) = summary.as_array() {
+                                for part in arr {
+                                    if let Some(text) = part.as_str() {
+                                        response.push_output(ResponsePart::Reasoning {
+                                            text: text.to_string(),
+                                        });
+                                    }
+                                }
+                            } else if let Some(text) = summary.as_str() {
+                                if !text.is_empty() {
+                                    response.push_output(ResponsePart::Reasoning {
+                                        text: text.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
+                            for part in parts {
                                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                    content.push_str(text);
+                                    if !text.is_empty() {
+                                        response.push_output(ResponsePart::Reasoning {
+                                            text: text.to_string(),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
-        content
-    }
-
-    fn extract_reasoning(&self, body: &serde_json::Value) -> Option<String> {
-        let mut reasoning = String::new();
-        if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
-            for item in output {
-                if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-                    if let Some(summary) = item.get("summary") {
-                        if let Some(arr) = summary.as_array() {
-                            for part in arr {
-                                if let Some(text) = part.as_str() {
-                                    reasoning.push_str(text);
-                                }
-                            }
-                        } else if let Some(text) = summary.as_str() {
-                            reasoning.push_str(text);
-                        }
+                    Some("function_call") => {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(item.clone(), self.provider)?,
+                        });
                     }
-                    if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
-                        for part in parts {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                reasoning.push_str(text);
-                            }
-                        }
-                    }
+                    _ => {}
                 }
             }
         }
-        if reasoning.is_empty() {
-            None
-        } else {
-            Some(reasoning)
-        }
-    }
-
-    fn extract_tool_calls(&self, body: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut tool_calls = Vec::new();
-        if let Some(output) = body.get("output").and_then(|v| v.as_array()) {
-            for item in output {
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("id").and_then(|v| v.as_str()))
-                        .unwrap_or("");
-                    let args = item
-                        .get("arguments")
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_else(|| "{}".to_string());
-                    tool_calls.push(serde_json::json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": args
-                        }
-                    }));
-                }
-            }
-        }
-        tool_calls
+        Ok(response)
     }
 
     async fn make_request(
@@ -316,8 +319,9 @@ impl OpenAIResponsesClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<String> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), timeout).await?;
@@ -343,7 +347,7 @@ impl InferenceClient for OpenAIResponsesClient {
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
         let response_text = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         let body: serde_json::Value = parse_json_value_strict_str(&response_text).map_err(|e| {
@@ -381,26 +385,21 @@ impl InferenceClient for OpenAIResponsesClient {
             None
         };
 
-        let content = self.extract_output_text(&body);
-        let reasoning = self.extract_reasoning(&body);
-        let tool_calls = self.extract_tool_calls(&body);
+        let response = self.extract_response(&body)?;
 
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
             provider_cost_dollars,
-            raw: if has_tools || has_tool_calls {
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -411,7 +410,7 @@ impl InferenceClient for OpenAIResponsesClient {
         let request_body = self.build_request_body(messages, config, true)?;
         let timeout = config.timeout;
 
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();
@@ -507,6 +506,39 @@ mod tests {
     }
 
     #[test]
+    fn test_build_request_with_prompt_cache_retention() {
+        use crate::providers::PromptCacheRetention;
+
+        let client = OpenAIResponsesClient::new("test-key", "gpt-4");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("gpt-4")
+            .with_prompt_cache_retention(PromptCacheRetention::InMemory);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["prompt_cache_retention"], "in_memory");
+    }
+
+    #[test]
+    fn test_build_request_ignores_prompt_cache_retention_for_openrouter_responses() {
+        use crate::providers::PromptCacheRetention;
+
+        let client = OpenAIResponsesClient::new("test-key", "gpt-4")
+            .with_provider(Provider::OpenRouterResponses);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config =
+            GenerationConfig::new("gpt-4").with_prompt_cache_retention(PromptCacheRetention::H24);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
     fn test_parse_usage() {
         let client = OpenAIResponsesClient::new("test-key", "gpt-4");
         let usage = serde_json::json!({
@@ -535,9 +567,9 @@ mod tests {
             }]
         });
 
-        let calls = client.extract_tool_calls(&body);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["id"], "call_123");
-        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        let response = client.extract_response(&body).unwrap();
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.tool_calls()[0].tool_use_id, "call_123");
+        assert_eq!(response.tool_calls()[0].tool_name, "get_weather");
     }
 }

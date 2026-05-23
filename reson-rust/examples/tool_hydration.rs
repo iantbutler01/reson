@@ -39,6 +39,7 @@ fn run_params(
         model: model.map(|s| s.to_string()),
         api_key: api_key.map(|s| s.to_string()),
         timeout: None,
+        retry_config: None,
     }
 }
 
@@ -236,11 +237,10 @@ async fn assistant(request: String, runtime: Runtime) -> Result<String> {
             .await?;
     }
 
-    // Extract content from response
-    Ok(result["content"]
+    Ok(result
         .as_str()
-        .unwrap_or(&format!("{:?}", result))
-        .to_string())
+        .map(str::to_owned)
+        .unwrap_or_else(|| result.to_string()))
 }
 
 #[tokio::main]

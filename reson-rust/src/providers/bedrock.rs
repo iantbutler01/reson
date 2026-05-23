@@ -21,9 +21,13 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 #[cfg(feature = "bedrock")]
-use crate::types::Provider;
+use crate::schema::fix_tool_schema_for_provider;
 #[cfg(feature = "bedrock")]
-use crate::utils::{convert_messages_to_provider_format, ConversationMessage};
+use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
+#[cfg(feature = "bedrock")]
+use crate::utils::{
+    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+};
 
 #[cfg(feature = "bedrock")]
 use {
@@ -34,6 +38,7 @@ use {
         primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
     },
     futures::StreamExt,
+    std::collections::VecDeque,
     std::sync::Arc,
     tokio::sync::OnceCell,
 };
@@ -52,6 +57,17 @@ pub struct BedrockClient {
 
 #[cfg(feature = "bedrock")]
 impl BedrockClient {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, "bedrock");
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new Bedrock client
     ///
     /// # Arguments
@@ -90,6 +106,9 @@ impl BedrockClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, Provider::Bedrock, model)?;
+
         // Extract system message if present
         let (system, remaining_messages) = self.extract_system_message(messages)?;
 
@@ -134,7 +153,7 @@ impl BedrockClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 // Enable parallel tool calling via tool_choice
                 request["tool_choice"] = serde_json::json!({
                     "type": "auto",
@@ -198,23 +217,36 @@ impl InferenceClient for BedrockClient {
             let response_json: serde_json::Value = parse_json_value_strict_bytes(body_bytes)?;
 
             // Parse response (same format as Anthropic)
-            // Extract text content and tool calls from content blocks
             let content_blocks = response_json["content"].as_array();
-
-            let mut text_content = String::new();
-            let mut tool_calls = Vec::new();
+            let mut response = AssistantResponse::default();
 
             if let Some(blocks) = content_blocks {
                 for block in blocks {
-                    // Extract text content
                     if block["type"] == "text" {
                         if let Some(text) = block["text"].as_str() {
-                            text_content.push_str(text);
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Text {
+                                    text: text.to_string(),
+                                });
+                            }
                         }
-                    }
-                    // Extract tool calls
-                    else if block["type"] == "tool_use" {
-                        tool_calls.push(block.clone());
+                    } else if block["type"] == "thinking" {
+                        if let Some(text) = block["thinking"].as_str() {
+                            if !text.is_empty() {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
+                            response.push_output(ResponsePart::Signature {
+                                value: signature.to_string(),
+                            });
+                        }
+                    } else if block["type"] == "tool_use" {
+                        response.push_output(ResponsePart::Tool {
+                            call: ToolCall::from_provider_format(block.clone(), Provider::Bedrock)?,
+                        });
                     }
                 }
             }
@@ -231,21 +263,18 @@ impl InferenceClient for BedrockClient {
 
             // If tools were provided, return full response for tool extraction
             let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-            let has_tool_calls = !tool_calls.is_empty();
+            let has_tool_calls = response.has_tool_calls();
 
-            Ok(GenerationResponse {
-                content: text_content,
-                reasoning: None,
-                tool_calls,
-                reasoning_segments: Vec::new(),
+            Ok(GenerationResponse::from_assistant_response(
+                response,
                 usage,
-                provider_cost_dollars: None,
-                raw: if has_tools || has_tool_calls {
+                None,
+                if has_tools || has_tool_calls {
                     Some(response_json)
                 } else {
                     None
                 },
-            })
+            ))
         }
 
         #[cfg(not(feature = "bedrock"))]
@@ -289,54 +318,104 @@ impl InferenceClient for BedrockClient {
                     ToolCallAccumulator::new(),
                     JsonStreamAccumulator::new(),
                     has_tools,
+                    VecDeque::<Result<StreamChunk>>::new(),
+                    false,
                 ),
-                |(mut recv, mut accumulator, mut json_parser, has_tools)| async move {
-                    match recv.recv().await {
-                        Ok(Some(event)) => {
-                            // Extract the chunk bytes from the AWS event
-                            // ResponseStream is an enum with a Chunk variant
-                            let chunk_bytes = match event {
-                                ResponseStream::Chunk(payload_part) => payload_part
-                                    .bytes
-                                    .map(|b| b.into_inner())
-                                    .unwrap_or_default(),
-                                _ => Vec::new(),
-                            };
-
-                            // Parse as Anthropic-format JSON event
-                            let chunks = match json_parser.push_bytes(&chunk_bytes) {
-                                Ok(values) => {
-                                    let mut out = Vec::new();
-                                    for json in values {
-                                        out.extend(
-                                            parse_anthropic_chunk(
-                                                &json,
-                                                &mut accumulator,
-                                                has_tools,
-                                            )
-                                            .into_iter()
-                                            .map(Ok),
-                                        );
-                                    }
-                                    out
-                                }
-                                Err(e) => vec![Err(e)],
-                            };
-                            Some((
-                                futures::stream::iter(chunks),
-                                (recv, accumulator, json_parser, has_tools),
-                            ))
+                |(
+                    mut recv,
+                    mut accumulator,
+                    mut json_parser,
+                    has_tools,
+                    mut pending,
+                    eof_flushed,
+                )| async move {
+                    loop {
+                        if let Some(item) = pending.pop_front() {
+                            return Some((
+                                futures::stream::iter(vec![item]),
+                                (
+                                    recv,
+                                    accumulator,
+                                    json_parser,
+                                    has_tools,
+                                    pending,
+                                    eof_flushed,
+                                ),
+                            ));
                         }
-                        Ok(None) => None, // Stream ended
-                        Err(e) => {
-                            // Return error and then end stream
-                            Some((
-                                futures::stream::iter(vec![Err(Error::Inference(format!(
-                                    "Bedrock stream error: {}",
-                                    e
-                                )))]),
-                                (recv, accumulator, json_parser, has_tools),
-                            ))
+
+                        if eof_flushed {
+                            return None;
+                        }
+
+                        match recv.recv().await {
+                            Ok(Some(event)) => {
+                                let chunk_bytes = match event {
+                                    ResponseStream::Chunk(payload_part) => payload_part
+                                        .bytes
+                                        .map(|b| b.into_inner())
+                                        .unwrap_or_default(),
+                                    _ => Vec::new(),
+                                };
+
+                                match json_parser.push_bytes(&chunk_bytes) {
+                                    Ok(values) => {
+                                        for json in values {
+                                            pending.extend(
+                                                parse_anthropic_chunk(
+                                                    &json,
+                                                    &mut accumulator,
+                                                    has_tools,
+                                                )
+                                                .into_iter()
+                                                .map(Ok),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        pending.push_back(Err(e));
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                let flushed = accumulator.drain_all_tools();
+                                if flushed.is_empty() {
+                                    return None;
+                                }
+
+                                tracing::warn!(
+                                    pending_tool_calls = flushed.len(),
+                                    "bedrock anthropic stream ended with unfinished tool calls; flushing pending tools at EOF"
+                                );
+                                pending.extend(
+                                    flushed
+                                        .into_iter()
+                                        .map(StreamChunk::ToolCallComplete)
+                                        .map(Ok),
+                                );
+                                return pending.pop_front().map(|item| {
+                                    (
+                                        futures::stream::iter(vec![item]),
+                                        (
+                                            recv,
+                                            accumulator,
+                                            json_parser,
+                                            has_tools,
+                                            pending,
+                                            true,
+                                        ),
+                                    )
+                                });
+                            }
+                            Err(e) => {
+                                return Some((
+                                    futures::stream::iter(vec![Err(Error::Inference(format!(
+                                        "Bedrock stream error: {}",
+                                        e
+                                    )))]),
+                                    (recv, accumulator, json_parser, has_tools, pending, true),
+                                ));
+                            }
                         }
                     }
                 },
@@ -453,6 +532,20 @@ mod tests {
         assert!(first_msg["content"].is_array());
         assert_eq!(first_msg["content"][0]["type"], "text");
         assert_eq!(first_msg["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_build_request_body_with_tools_defaults_to_strict() {
+        let client = BedrockClient::new("test-model", None);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let tools = vec![serde_json::json!({"name": "get_weather"})];
+        let config = GenerationConfig::new("test-model").with_tools(tools);
+
+        let body = client.build_request_body(&messages, &config).unwrap();
+
+        assert!(body["tools"][0].get("strict").is_none());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }
 
     #[tokio::test]

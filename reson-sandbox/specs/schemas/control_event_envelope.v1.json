@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reson.dev/schemas/control_event_envelope.v1.json",
+  "title": "Reson Sandbox Control Event Envelope v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event",
+    "timestamp_unix_ms",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "v1"
+    },
+    "event": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

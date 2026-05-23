@@ -17,9 +17,11 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
 use crate::retry::{retry_with_backoff, RetryConfig};
-use crate::types::{Provider, TokenUsage};
+use crate::schema::fix_tool_schema_for_provider;
+use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str, ConversationMessage,
+    convert_messages_to_provider_format, parse_json_value_strict_str,
+    validate_image_input_supported, ConversationMessage,
 };
 
 /// OpenAI API client (also serves as base for OpenRouter)
@@ -63,6 +65,21 @@ impl std::fmt::Debug for OAIClient {
 }
 
 impl OAIClient {
+    fn normalized_tools(&self, tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        let provider = match self.provider {
+            Provider::OpenRouter => "openrouter",
+            _ => "openai",
+        };
+        tools
+            .iter()
+            .cloned()
+            .map(|mut tool| {
+                fix_tool_schema_for_provider(&mut tool, provider);
+                tool
+            })
+            .collect()
+    }
+
     /// Create a new OpenAI client
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
@@ -75,6 +92,36 @@ impl OAIClient {
             trace_callback: None,
             provider: Provider::OpenAI,
         }
+    }
+
+    fn extract_response(&self, message: &serde_json::Value) -> Result<AssistantResponse> {
+        let mut response = AssistantResponse::default();
+
+        if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+            if !content.is_empty() {
+                response.push_output(ResponsePart::Text {
+                    text: content.to_string(),
+                });
+            }
+        }
+
+        if let Some(reasoning) = message.get("reasoning").and_then(|r| r.as_str()) {
+            if !reasoning.is_empty() {
+                response.push_output(ResponsePart::Reasoning {
+                    text: reasoning.to_string(),
+                });
+            }
+        }
+
+        if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array()) {
+            for tool_call in tool_calls {
+                response.push_output(ResponsePart::Tool {
+                    call: ToolCall::from_provider_format(tool_call.clone(), self.provider)?,
+                });
+            }
+        }
+
+        Ok(response)
     }
 
     /// Set reasoning mode (for o-series models)
@@ -111,17 +158,26 @@ impl OAIClient {
         config: &GenerationConfig,
         stream: bool,
     ) -> Result<serde_json::Value> {
+        let model = config.effective_model(&self.model);
+        validate_image_input_supported(messages, self.provider, model)?;
+
         // Convert messages to provider format
         let formatted_messages = convert_messages_to_provider_format(messages, self.provider)?;
 
         let mut request = serde_json::json!({
-            "model": if config.model.is_empty() { &self.model } else { &config.model },
+            "model": model,
             "messages": formatted_messages,
             "max_completion_tokens": config.max_tokens.unwrap_or(4096),
             "temperature": config.temperature.unwrap_or(0.7),
             "top_p": config.top_p.unwrap_or(1.0),
             "stream": stream,
         });
+
+        if matches!(self.provider, Provider::OpenAI) {
+            if let Some(retention) = config.prompt_cache_retention {
+                request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
+            }
+        }
 
         // Add stream_options for usage tracking when streaming
         if stream {
@@ -131,7 +187,7 @@ impl OAIClient {
         // Add tools if provided
         if let Some(ref tools) = config.tools {
             if !tools.is_empty() {
-                request["tools"] = serde_json::json!(tools);
+                request["tools"] = serde_json::json!(self.normalized_tools(tools));
                 request["tool_choice"] = serde_json::json!("auto");
             }
         }
@@ -240,8 +296,9 @@ impl OAIClient {
         &self,
         body: serde_json::Value,
         timeout: Option<std::time::Duration>,
+        retry_config: Option<RetryConfig>,
     ) -> Result<String> {
-        let config = RetryConfig::default();
+        let config = retry_config.unwrap_or_default();
 
         retry_with_backoff(config, || async {
             let response = self.make_request(body.clone(), timeout).await?;
@@ -267,7 +324,7 @@ impl InferenceClient for OAIClient {
     ) -> Result<GenerationResponse> {
         let request_body = self.build_request_body(messages, config, false)?;
         let response_text = self
-            .make_request_with_retry(request_body, config.timeout)
+            .make_request_with_retry(request_body, config.timeout, config.retry_config.clone())
             .await?;
 
         // Parse JSON - provide better error context if it fails
@@ -311,38 +368,22 @@ impl InferenceClient for OAIClient {
         // Extract message and content
         let choice = &body["choices"][0];
         let message = &choice["message"];
-        let content = message["content"].as_str().unwrap_or("").to_string();
-
-        // Extract reasoning if present
-        let reasoning = message
-            .get("reasoning")
-            .and_then(|r| r.as_str())
-            .map(|s| s.to_string());
-
-        // Extract tool calls if present
-        let tool_calls = message
-            .get("tool_calls")
-            .and_then(|tc| tc.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let response = self.extract_response(message)?;
 
         // If tools were provided, return full response for tool extraction
         let has_tools = config.tools.is_some() && !config.tools.as_ref().unwrap().is_empty();
-        let has_tool_calls = !tool_calls.is_empty();
+        let has_tool_calls = response.has_tool_calls();
 
-        Ok(GenerationResponse {
-            content,
-            reasoning,
-            tool_calls,
-            reasoning_segments: Vec::new(),
+        Ok(GenerationResponse::from_assistant_response(
+            response,
             usage,
             provider_cost_dollars,
-            raw: if has_tools || has_tool_calls {
+            if has_tools || has_tool_calls {
                 Some(body)
             } else {
                 None
             },
-        })
+        ))
     }
 
     async fn connect_and_listen(
@@ -357,7 +398,7 @@ impl InferenceClient for OAIClient {
         let timeout = config.timeout;
 
         // Retry the connection establishment with backoff
-        let retry_config = RetryConfig::default();
+        let retry_config = config.retry_config.clone().unwrap_or_default();
         let response = retry_with_backoff(retry_config, || async {
             let resp = self.make_request(request_body.clone(), timeout).await?;
             let status = resp.status();
@@ -472,6 +513,38 @@ mod tests {
 
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn test_build_request_with_prompt_cache_retention() {
+        use crate::providers::PromptCacheRetention;
+
+        let client = OAIClient::new("test-key", "gpt-4");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config =
+            GenerationConfig::new("gpt-4").with_prompt_cache_retention(PromptCacheRetention::H24);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn test_build_request_ignores_prompt_cache_retention_for_openrouter() {
+        use crate::providers::PromptCacheRetention;
+
+        let client = OAIClient::new("test-key", "gpt-4").with_provider(Provider::OpenRouter);
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config =
+            GenerationConfig::new("gpt-4").with_prompt_cache_retention(PromptCacheRetention::H24);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]
