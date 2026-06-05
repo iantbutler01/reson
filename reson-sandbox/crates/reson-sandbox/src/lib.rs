@@ -2712,6 +2712,8 @@ impl Sandbox {
 
         let mut cmd = Command::new(bin);
         cmd.arg("--listen").arg(&self.inner.cfg.daemon_listen);
+        cmd.arg("--disable-node-registry");
+        cmd.arg("--disable-control-bus");
         if let Some(data_dir) = &self.inner.cfg.daemon_data_dir {
             cmd.arg("--data-dir").arg(data_dir);
         }

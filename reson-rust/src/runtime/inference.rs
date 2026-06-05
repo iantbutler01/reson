@@ -361,10 +361,13 @@ pub fn create_inference_client(
             "openrouter-responses" => std::env::var("OPENROUTER_API_KEY")
                 .or_else(|_| std::env::var("OPENROUTER_KEY"))
                 .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
-            "google-gemini" | "google-genai" | "gemini" => {
-                std::env::var("GOOGLE_GEMINI_API_KEY")
-                    .map_err(|_| Error::NonRetryable("GOOGLE_GEMINI_API_KEY not set".to_string()))?
-            }
+            "google-gemini" | "google-genai" | "gemini" => std::env::var("GOOGLE_GEMINI_API_KEY")
+                .or_else(|_| std::env::var("GEMINI_API_KEY"))
+                .map_err(|_| {
+                    Error::NonRetryable(
+                        "GOOGLE_GEMINI_API_KEY or GEMINI_API_KEY not set".to_string(),
+                    )
+                })?,
             "custom-openai" => {
                 std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "not-needed".to_string())
             }

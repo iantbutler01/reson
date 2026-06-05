@@ -208,8 +208,8 @@ pub async fn start(config: &Config) -> Result<Option<NetworkServicesHandle>> {
 }
 
 fn needs_coredns(config: &Config) -> bool {
-    let _ = config;
-    true
+    config.guest_network.dns_server.is_some()
+        || config.guest_network.http_proxy_upstream_addr.is_some()
 }
 
 async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
@@ -1340,6 +1340,20 @@ mod tests {
             test_vm_proxy_listener("127.0.0.1:43128"),
         );
         assert!(should_run_envoy(&config, &policies));
+    }
+
+    #[test]
+    fn coredns_only_runs_for_guest_dns_or_proxy_mode() {
+        let mut config = Config::default();
+        config.guest_network = Default::default();
+        assert!(!needs_coredns(&config));
+
+        config.guest_network.dns_server = Some("10.0.2.3".to_string());
+        assert!(needs_coredns(&config));
+
+        config.guest_network.dns_server = None;
+        config.guest_network.http_proxy_upstream_addr = Some("127.0.0.1:3128".to_string());
+        assert!(needs_coredns(&config));
     }
 
     #[test]

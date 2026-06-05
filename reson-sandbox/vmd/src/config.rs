@@ -208,11 +208,14 @@ impl NetworkServicesConfig {
             self.envoy_log_level = "info".to_string();
         }
         self.envoy_admin_addr = normalize_socket_addr(&self.envoy_admin_addr, "envoy admin addr")?;
-        let _ = guest_network;
-        self.envoy_bin = resolve_binary(&self.envoy_bin, "envoy")?;
-        self.coredns_bin = resolve_binary(&self.coredns_bin, "coredns")?;
-        self.coredns_bind_addr =
-            normalize_socket_addr(&self.coredns_bind_addr, "coredns bind addr")?;
+        if guest_network.http_proxy_upstream_addr.is_some() {
+            self.envoy_bin = resolve_binary(&self.envoy_bin, "envoy")?;
+        }
+        if guest_network.http_proxy_upstream_addr.is_some() || guest_network.dns_server.is_some() {
+            self.coredns_bin = resolve_binary(&self.coredns_bin, "coredns")?;
+            self.coredns_bind_addr =
+                normalize_socket_addr(&self.coredns_bind_addr, "coredns bind addr")?;
+        }
         self.coredns_threat_hosts_path = self.coredns_threat_hosts_path.trim().to_string();
         if self.coredns_threat_hosts_path.is_empty() {
             self.coredns_threat_hosts_path = "/opt/reson/network/threat-domains.hosts".to_string();
@@ -1572,5 +1575,38 @@ mod tests {
             .normalize()
             .expect("proxy-enabled guest should default slirp dns");
         assert_eq!(guest_network.dns_server.as_deref(), Some("10.0.2.3"));
+    }
+
+    #[test]
+    fn network_services_normalize_keeps_local_mode_free_of_proxy_binaries() {
+        let guest_network = GuestNetworkConfig::default();
+        let mut network_services = NetworkServicesConfig {
+            envoy_bin: "__missing_envoy_for_local_mode_test__".to_string(),
+            coredns_bin: "__missing_coredns_for_local_mode_test__".to_string(),
+            ..NetworkServicesConfig::default()
+        };
+
+        network_services
+            .normalize(&guest_network)
+            .expect("local mode should not require envoy or coredns binaries");
+    }
+
+    #[test]
+    fn network_services_normalize_requires_proxy_binaries_when_enabled() {
+        let guest_network = GuestNetworkConfig {
+            dns_server: None,
+            http_proxy_guest_addr: Some("10.0.2.100:3128".to_string()),
+            http_proxy_upstream_addr: Some("127.0.0.1:3128".to_string()),
+        };
+        let mut network_services = NetworkServicesConfig {
+            envoy_bin: "__missing_envoy_for_proxy_mode_test__".to_string(),
+            coredns_bin: "__missing_coredns_for_proxy_mode_test__".to_string(),
+            ..NetworkServicesConfig::default()
+        };
+
+        let err = network_services
+            .normalize(&guest_network)
+            .expect_err("proxy mode should require envoy/coredns binaries");
+        assert!(format!("{err:#}").contains("__missing_envoy_for_proxy_mode_test__"));
     }
 }
