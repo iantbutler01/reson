@@ -11,3 +11,5 @@ target/
 
 # Virtual environments
 .venv
+
+.run
