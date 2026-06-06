@@ -49,7 +49,7 @@ pub struct StatusInfo {
     pub status: String,
 }
 
-const DEFAULT_D2VM_IMAGE: &str = "ghcr.io/iantbutler01/reson/d2vm:latest";
+const DEFAULT_D2VM_IMAGE: &str = "linkacloud/d2vm:latest";
 const D2VM_CONTAINER_DIR: &str = "/workspace";
 
 fn configured_d2vm_bin() -> Option<String> {
@@ -69,6 +69,30 @@ fn configured_d2vm_image() -> String {
         .unwrap_or_else(|| DEFAULT_D2VM_IMAGE.to_string())
 }
 
+fn configured_d2vm_include_bootstrap_arg() -> bool {
+    std::env::var("RESON_SANDBOX_D2VM_INCLUDE_BOOTSTRAP")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_INCLUDE_BOOTSTRAP"))
+        .ok()
+        .as_deref()
+        .is_some_and(parse_env_bool)
+}
+
+fn configured_d2vm_docker_api_version() -> Option<String> {
+    std::env::var("RESON_SANDBOX_D2VM_DOCKER_API_VERSION")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_D2VM_DOCKER_API_VERSION"))
+        .or_else(|_| std::env::var("DOCKER_API_VERSION"))
+        .map(|raw| raw.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_env_bool(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn host_container_platform() -> Option<&'static str> {
     match std::env::consts::ARCH {
         "aarch64" | "arm64" => Some("linux/arm64"),
@@ -83,6 +107,8 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
     }
     let d2vm_bin = configured_d2vm_bin();
     let d2vm_image = configured_d2vm_image();
+    let include_bootstrap_arg = opts.include_bootstrap && configured_d2vm_include_bootstrap_arg();
+    let docker_api_version = configured_d2vm_docker_api_version();
     let output_name = if opts.output.trim().is_empty() {
         "disk.qcow2".to_string()
     } else {
@@ -100,6 +126,8 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         platform = ?opts.platform,
         pull = opts.pull,
         include_bootstrap = opts.include_bootstrap,
+        include_bootstrap_arg,
+        docker_api_version = ?docker_api_version,
         converter_image = %d2vm_image,
         converter_bin = ?d2vm_bin,
         converter_platform = ?converter_platform,
@@ -125,7 +153,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
                 cmd.arg("--platform").arg(platform);
             }
         }
-        if opts.include_bootstrap {
+        if include_bootstrap_arg {
             cmd.arg("--include-bootstrap");
         }
         trace!(command = ?cmd, "spawning native d2vm");
@@ -138,7 +166,7 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
         return Ok(());
     }
 
-    let build_cmd = |include_bootstrap: bool| {
+    let build_cmd = |include_bootstrap_arg: bool| {
         let mut cmd = Command::new(docker_bin);
         cmd.arg("run")
             .arg("--rm")
@@ -155,8 +183,11 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
                 converter_platform
                     .map(|platform| vec!["--platform", platform])
                     .unwrap_or_default(),
-            )
-            .arg(&d2vm_image)
+            );
+        if let Some(version) = docker_api_version.as_deref() {
+            cmd.arg("-e").arg(format!("DOCKER_API_VERSION={version}"));
+        }
+        cmd.arg(&d2vm_image)
             .arg("--verbose")
             .arg("convert")
             .arg(&opts.image)
@@ -173,13 +204,13 @@ pub async fn run_d2vm(docker_bin: &str, host_dir: &Path, opts: D2VmOptions) -> R
                 cmd.arg("--platform").arg(platform);
             }
         }
-        if include_bootstrap {
+        if include_bootstrap_arg {
             cmd.arg("--include-bootstrap");
         }
         cmd
     };
 
-    let mut cmd = build_cmd(opts.include_bootstrap);
+    let mut cmd = build_cmd(include_bootstrap_arg);
     trace!(command = ?cmd, "spawning docker d2vm");
     let output = cmd.output().await.context("spawn docker d2vm")?;
     if !output.status.success() {
@@ -1050,7 +1081,7 @@ pub async fn spawn_virtiofsd(
     //        filesystems (ext4/xfs/btrfs/etc).
     cmd.arg("--migration-mode=find-paths");
     // @dive: Read-only enforcement runs on two layers: (1) the host filesystem at the
-    //        nymfs export root is already mounted ro, and (2) bootstrap/init.sh appends
+    //        VFS export root is already mounted ro, and (2) bootstrap/init.sh appends
     //        `,ro` to the guest `mount -t virtiofs` options when the SharedMountSpec
     //        marks the mount read-only. Linux enforces it at the VFS layer, which is
     //        sufficient — virtiofsd has no daemon-side `--readonly` flag.
@@ -1243,9 +1274,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[derive(Clone, Copy)]
     enum ManifestMode {
@@ -1329,6 +1363,111 @@ exit 2
             fs::set_permissions(&script_path, perms).expect("set script executable");
         }
         (tmp, script_path.to_string_lossy().to_string(), log_path)
+    }
+
+    fn create_fake_d2vm_docker() -> (tempfile::TempDir, String, PathBuf) {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let log_path = tmp.path().join("fake-d2vm-docker.log");
+        let script_path = tmp.path().join("fake-d2vm-docker.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "{log_path}"
+if [ "${{1:-}}" = "run" ]; then
+  exit 0
+fi
+echo "unsupported args: $*" >&2
+exit 2
+"#,
+            log_path = log_path.display(),
+        );
+        fs::write(&script_path, script).expect("write fake docker script");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&script_path)
+                .expect("read script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("set script executable");
+        }
+        (tmp, script_path.to_string_lossy().to_string(), log_path)
+    }
+
+    fn clear_d2vm_env() {
+        unsafe {
+            std::env::remove_var("RESON_SANDBOX_D2VM_BIN");
+            std::env::remove_var("BRACKET_SANDBOX_D2VM_BIN");
+            std::env::remove_var("RESON_SANDBOX_D2VM_IMAGE");
+            std::env::remove_var("BRACKET_SANDBOX_D2VM_IMAGE");
+            std::env::remove_var("RESON_SANDBOX_D2VM_INCLUDE_BOOTSTRAP");
+            std::env::remove_var("BRACKET_SANDBOX_D2VM_INCLUDE_BOOTSTRAP");
+            std::env::remove_var("RESON_SANDBOX_D2VM_DOCKER_API_VERSION");
+            std::env::remove_var("BRACKET_SANDBOX_D2VM_DOCKER_API_VERSION");
+            std::env::remove_var("DOCKER_API_VERSION");
+        }
+    }
+
+    fn d2vm_options() -> D2VmOptions {
+        D2VmOptions {
+            image: "ubuntu:22.04".to_string(),
+            output: "disk.qcow2".to_string(),
+            disk_gb: 10,
+            pull: true,
+            platform: Some("linux/amd64".to_string()),
+            include_bootstrap: true,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_d2vm_uses_public_converter_without_private_bootstrap_flag_by_default() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        clear_d2vm_env();
+        let (tmp, docker_bin, log_path) = create_fake_d2vm_docker();
+
+        run_d2vm(&docker_bin, tmp.path(), d2vm_options())
+            .await
+            .expect("fake docker run should succeed");
+
+        let log = fs::read_to_string(log_path).expect("read fake docker log");
+        assert!(log.contains("linkacloud/d2vm:latest"));
+        assert!(!log.contains("--include-bootstrap"));
+        clear_d2vm_env();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_d2vm_can_opt_into_legacy_include_bootstrap_flag() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        clear_d2vm_env();
+        unsafe {
+            std::env::set_var("RESON_SANDBOX_D2VM_INCLUDE_BOOTSTRAP", "true");
+        }
+        let (tmp, docker_bin, log_path) = create_fake_d2vm_docker();
+
+        run_d2vm(&docker_bin, tmp.path(), d2vm_options())
+            .await
+            .expect("fake docker run should succeed");
+
+        let log = fs::read_to_string(log_path).expect("read fake docker log");
+        assert!(log.contains("--include-bootstrap"));
+        clear_d2vm_env();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_d2vm_passes_docker_api_version_to_converter_container() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        clear_d2vm_env();
+        unsafe {
+            std::env::set_var("RESON_SANDBOX_D2VM_DOCKER_API_VERSION", "1.42");
+        }
+        let (tmp, docker_bin, log_path) = create_fake_d2vm_docker();
+
+        run_d2vm(&docker_bin, tmp.path(), d2vm_options())
+            .await
+            .expect("fake docker run should succeed");
+
+        let log = fs::read_to_string(log_path).expect("read fake docker log");
+        assert!(log.contains("-e DOCKER_API_VERSION=1.42"));
+        clear_d2vm_env();
     }
 
     #[tokio::test]

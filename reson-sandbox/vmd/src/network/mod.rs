@@ -104,7 +104,7 @@ struct NetworkController {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmProxyPolicyConfig {
     #[serde(default)]
-    pub nym_id: Option<String>,
+    pub owner_id: Option<String>,
     #[serde(default)]
     pub domain_allowlist: Option<Vec<String>>,
     #[serde(default)]
@@ -118,7 +118,7 @@ pub struct VmProxyPolicyConfig {
 impl Default for VmProxyPolicyConfig {
     fn default() -> Self {
         Self {
-            nym_id: None,
+            owner_id: None,
             domain_allowlist: None,
             domain_blocklist: Vec::new(),
             custom_port_allowlist: Vec::new(),
@@ -351,7 +351,11 @@ async fn start_envoy(
         .arg("-c")
         .arg(&paths.config_path)
         .arg("--log-level")
-        .arg(&config.network_services.envoy_log_level)
+        .arg(&config.network_services.envoy_log_level);
+    if let Some(base_id) = config.network_services.envoy_base_id {
+        child.arg("--base-id").arg(base_id.to_string());
+    }
+    child
         .stdin(Stdio::null())
         .stdout(Stdio::from(process_log.into_std().await))
         .stderr(Stdio::from(process_log_err.into_std().await));
@@ -640,13 +644,18 @@ async fn validate_envoy_candidate_config(
         )
         .await?;
 
-        let output = Command::new(&config.network_services.envoy_bin)
+        let mut command = Command::new(&config.network_services.envoy_bin);
+        command
             .arg("--mode")
             .arg("validate")
             .arg("-c")
             .arg(&validation_path)
             .arg("--log-level")
-            .arg(&config.network_services.envoy_log_level)
+            .arg(&config.network_services.envoy_log_level);
+        if let Some(base_id) = config.network_services.envoy_base_id {
+            command.arg("--base-id").arg(base_id.to_string());
+        }
+        let output = command
             .stdin(Stdio::null())
             .output()
             .await
@@ -1313,7 +1322,7 @@ mod tests {
         VmProxyListener {
             listen_addr: listen_addr.parse().expect("listen addr"),
             policy: VmProxyPolicyConfig {
-                nym_id: Some("nym-123".to_string()),
+                owner_id: Some("owner-123".to_string()),
                 domain_allowlist: Some(vec!["api.github.com".to_string()]),
                 domain_blocklist: vec!["bad.example".to_string()],
                 custom_port_allowlist: vec![8080],

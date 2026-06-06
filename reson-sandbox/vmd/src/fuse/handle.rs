@@ -9,8 +9,8 @@ use tokio::runtime::Handle;
 use crate::config::Config;
 use crate::state::types::SharedMountSpec;
 
-use super::client::NymVfsClient;
-use super::fs::NymFuseFs;
+use super::client::RemoteVfsClient;
+use super::fs::RemoteFuseFs;
 
 pub struct FuseHandle {
     session: Arc<Mutex<Option<fuser::BackgroundSession>>>,
@@ -40,24 +40,24 @@ impl FuseHandle {
     }
 }
 
-pub async fn mount_nymfs_fuse(
+pub async fn mount_vfs_fuse(
     cfg: &Config,
     mount: &SharedMountSpec,
     vm_dir: &Path,
 ) -> Result<FuseHandle> {
     if !cfg!(target_os = "linux") {
-        bail!("nymfs fuse mounts are only supported on linux hosts");
+        bail!("vfs fuse mounts are only supported on linux hosts");
     }
-    let auth_token = cfg.nymfs_internal_service_token.as_deref().ok_or_else(|| {
-        anyhow!("missing RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN for fuse-backed mount")
+    let auth_token = cfg.vfs_internal_service_token.as_deref().ok_or_else(|| {
+        anyhow!("missing RESON_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN for fuse-backed mount")
     })?;
     let mountpoint = vm_dir.join("fuse-mounts").join(&mount.mount_tag);
     tokio::fs::create_dir_all(&mountpoint)
         .await
         .with_context(|| format!("create fuse mountpoint {}", mountpoint.display()))?;
 
-    let client = NymVfsClient::new(&mount.vfs_endpoint, auth_token, &mount.vfs_scope_path)?;
-    let filesystem = NymFuseFs::new(client, mount.read_only, Handle::current());
+    let client = RemoteVfsClient::new(&mount.vfs_endpoint, auth_token, &mount.vfs_scope_path)?;
+    let filesystem = RemoteFuseFs::new(client, mount.read_only, Handle::current());
     let options = filesystem.mount_options(&mount.mount_tag);
     let session = fuser::spawn_mount2(filesystem, &mountpoint, &options)
         .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;

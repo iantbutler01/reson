@@ -27,6 +27,8 @@ use uuid::Uuid;
 #[cfg(feature = "distributed-control")]
 mod distributed;
 pub mod slo;
+pub mod vfs;
+pub mod vm;
 
 pub mod proto {
     pub mod bracket {
@@ -698,6 +700,22 @@ struct PortproxyClientAccess {
     auth_header: Option<MetadataValue<Ascii>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RebindRestorePolicy {
+    RequireTierBRestoreMarker,
+    AllowLiveReclaimWithoutRestoreMarker,
+}
+
+impl RebindRestorePolicy {
+    fn enforce_tier_b_restore_marker(self) -> bool {
+        matches!(self, Self::RequireTierBRestoreMarker)
+    }
+
+    fn preflight_candidate_runtime(self) -> bool {
+        matches!(self, Self::RequireTierBRestoreMarker)
+    }
+}
+
 impl Session {
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -743,6 +761,23 @@ impl Session {
         let (resolved_endpoint, next_fence) = self
             .sandbox
             .resolve_session_endpoint(
+                &self.session_id,
+                &self.vm_id,
+                &current_endpoint,
+                expected_fence.as_deref(),
+            )
+            .await?;
+        self.update_route_state(&current_endpoint, &resolved_endpoint, next_fence)
+            .await;
+        Ok(resolved_endpoint)
+    }
+
+    async fn resolve_session_endpoint_for_active_stream(&self) -> Result<String> {
+        let current_endpoint = self.current_node_endpoint().await;
+        let expected_fence = self.ownership_fence().await;
+        let (resolved_endpoint, next_fence) = self
+            .sandbox
+            .resolve_session_endpoint_for_active_stream(
                 &self.session_id,
                 &self.vm_id,
                 &current_endpoint,
@@ -1108,12 +1143,16 @@ impl Session {
             current_target_node_id,
             current_producer_epoch,
         } = params;
-        let resolved_endpoint = self.resolve_session_endpoint().await?;
-        let target_node_id = self
+        let resolved_endpoint = self.resolve_session_endpoint_for_active_stream().await?;
+        let endpoint_changed = resolved_endpoint != current_endpoint;
+        let target_node_id = match self
             .resolve_distributed_exec_target(control, resolved_endpoint.as_str())
             .await
-            .unwrap_or_else(|_| current_target_node_id.to_string());
-        let endpoint_changed = resolved_endpoint != current_endpoint;
+        {
+            Ok(target_node_id) => target_node_id,
+            Err(err) if endpoint_changed => return Err(err),
+            Err(_) => current_target_node_id.to_string(),
+        };
         let target_changed = target_node_id != current_target_node_id;
         let producer_epoch = if endpoint_changed || target_changed {
             current_producer_epoch.saturating_add(1)
@@ -2997,6 +3036,7 @@ impl Sandbox {
                         &resolved_endpoint,
                         next_fence.as_deref().or(expected_fence),
                         "ensure_vm_and_get_rpc_port",
+                        RebindRestorePolicy::RequireTierBRestoreMarker,
                     )
                     .await?
                 {
@@ -3018,6 +3058,44 @@ impl Sandbox {
         endpoint: &str,
         expected_fence: Option<&str>,
     ) -> Result<(String, Option<String>)> {
+        self.resolve_session_endpoint_with_policy(
+            session_id,
+            vm_id,
+            endpoint,
+            expected_fence,
+            "resolve_session_endpoint",
+            RebindRestorePolicy::RequireTierBRestoreMarker,
+        )
+        .await
+    }
+
+    async fn resolve_session_endpoint_for_active_stream(
+        &self,
+        session_id: &str,
+        vm_id: &str,
+        endpoint: &str,
+        expected_fence: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        self.resolve_session_endpoint_with_policy(
+            session_id,
+            vm_id,
+            endpoint,
+            expected_fence,
+            "resolve_active_stream_endpoint",
+            RebindRestorePolicy::AllowLiveReclaimWithoutRestoreMarker,
+        )
+        .await
+    }
+
+    async fn resolve_session_endpoint_with_policy(
+        &self,
+        session_id: &str,
+        vm_id: &str,
+        endpoint: &str,
+        expected_fence: Option<&str>,
+        reason: &str,
+        restore_policy: RebindRestorePolicy,
+    ) -> Result<(String, Option<String>)> {
         let normalized_endpoint = normalize_endpoint(endpoint)?;
         match self.ensure_vm_running(vm_id, &normalized_endpoint).await {
             Ok(_) => Ok((normalized_endpoint, None)),
@@ -3028,7 +3106,8 @@ impl Sandbox {
                         vm_id,
                         &normalized_endpoint,
                         expected_fence,
-                        "resolve_session_endpoint",
+                        reason,
+                        restore_policy,
                     )
                     .await?
                 {
@@ -3046,6 +3125,7 @@ impl Sandbox {
         from_endpoint: &str,
         expected_fence: Option<&str>,
         reason: &str,
+        restore_policy: RebindRestorePolicy,
     ) -> Result<Option<(String, Option<String>)>> {
         let candidates = {
             #[cfg(feature = "distributed-control")]
@@ -3099,7 +3179,7 @@ impl Sandbox {
                     vm_id,
                     &candidate,
                     &candidate_vm,
-                    true,
+                    restore_policy.enforce_tier_b_restore_marker(),
                 )
                 .await
             {
@@ -3129,34 +3209,38 @@ impl Sandbox {
                 }
             };
 
-            let running_vm = match self.ensure_vm_running(vm_id, &candidate).await {
-                Ok(vm) => vm,
-                Err(_) => {
-                    #[cfg(feature = "distributed-control")]
-                    if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-                        let _ = control
-                            .publish_event(
-                                "stream.failed",
-                                json!({
-                                    "session_id": session_id,
-                                    "vm_id": vm_id,
-                                    "from_endpoint": from_endpoint,
-                                    "to_endpoint": candidate.clone(),
-                                    "stage": "ensure_vm_running",
-                                    "reason": reason,
-                                }),
-                            )
-                            .await;
+            let running_vm = if restore_policy.preflight_candidate_runtime() {
+                match self.ensure_vm_running(vm_id, &candidate).await {
+                    Ok(vm) => vm,
+                    Err(_) => {
+                        #[cfg(feature = "distributed-control")]
+                        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                            let _ = control
+                                .publish_event(
+                                    "stream.failed",
+                                    json!({
+                                        "session_id": session_id,
+                                        "vm_id": vm_id,
+                                        "from_endpoint": from_endpoint,
+                                        "to_endpoint": candidate.clone(),
+                                        "stage": "ensure_vm_running",
+                                        "reason": reason,
+                                    }),
+                                )
+                                .await;
+                        }
+                        continue;
                     }
-                    continue;
                 }
+            } else {
+                candidate_vm.clone()
             };
 
-            // @dive: Route ownership is switched only after guest RPC/portproxy is actually reachable on candidate node.
-            if self
-                .ensure_vm_and_get_rpc_port(vm_id, &candidate)
-                .await
-                .is_err()
+            if restore_policy.preflight_candidate_runtime()
+                && self
+                    .ensure_vm_and_get_rpc_port(vm_id, &candidate)
+                    .await
+                    .is_err()
             {
                 #[cfg(feature = "distributed-control")]
                 if let ControlBackend::Distributed(control) = &self.inner.control_backend {
@@ -3175,6 +3259,24 @@ impl Sandbox {
                         .await;
                 }
                 continue;
+            }
+
+            if !restore_policy.preflight_candidate_runtime() {
+                #[cfg(feature = "distributed-control")]
+                if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+                    let _ = control
+                        .publish_event(
+                            "stream.resume_preflight_skipped",
+                            json!({
+                                "session_id": session_id,
+                                "vm_id": vm_id,
+                                "from_endpoint": from_endpoint,
+                                "to_endpoint": candidate.clone(),
+                                "reason": reason,
+                            }),
+                        )
+                        .await;
+                }
             }
 
             let mut next_fence = None;
@@ -3578,7 +3680,7 @@ impl Sandbox {
 
         let mut client = self.vmd_client_for_endpoint(endpoint).await?;
         let _ = client
-            .stop_vm(self.request_with_auth(VmActionRequest {
+            .force_stop_vm(self.request_with_auth(VmActionRequest {
                 vm_id: vm_id.to_string(),
             }))
             .await;

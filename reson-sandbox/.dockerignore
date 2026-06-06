@@ -1,6 +1,8 @@
 **
 !vmd/
 !vmd/**
+!crates/
+!crates/**
 !proto/
 !proto/**
 !portproxy/bin/

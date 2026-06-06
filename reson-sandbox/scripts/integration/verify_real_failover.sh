@@ -101,6 +101,7 @@ fi
 TMP_DIR="$(mktemp -d "/tmp/rsb-real-failover.XXXXXX")"
 SHARED_DATA_DIR="$TMP_DIR/shared-data"
 mkdir -p "$SHARED_DATA_DIR"
+chmod 0755 "$TMP_DIR" "$SHARED_DATA_DIR"
 NODE1_LOG="$TMP_DIR/node1.log"
 NODE2_LOG="$TMP_DIR/node2.log"
 NODE1_PID=""
@@ -183,6 +184,7 @@ start_nodes() {
 
   rm -rf "$SHARED_DATA_DIR"
   mkdir -p "$SHARED_DATA_DIR"
+  chmod 0755 "$TMP_DIR" "$SHARED_DATA_DIR"
   : >"$NODE1_LOG"
   : >"$NODE2_LOG"
   rm -f "$SECONDARY_PID_FILE"

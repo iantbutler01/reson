@@ -232,15 +232,15 @@ fn tcp_policy_filters(name: &str, policy: Option<&VmProxyPolicyConfig>) -> Vec<V
     if let Some(policy) = policy {
         if !policy.domain_blocklist.is_empty() {
             filters.push(tcp_sni_deny_filter(
-                format!("{name}_nym_deny").as_str(),
-                "nym_domain_blocklist",
+                format!("{name}_runtime_deny").as_str(),
+                "runtime_domain_blocklist",
                 sni_domain_regex(&policy.domain_blocklist).as_str(),
             ));
         }
         if policy.domain_allowlist.is_some() {
             filters.push(tcp_sni_allow_filter(
-                format!("{name}_nym_allow").as_str(),
-                "nym_domain_allowlist",
+                format!("{name}_runtime_allow").as_str(),
+                "runtime_domain_allowlist",
                 sni_domain_regex(policy.domain_allowlist.as_deref().unwrap_or_default()).as_str(),
                 &policy_allowed_ports(policy),
             ));
@@ -271,7 +271,7 @@ fn tcp_system_deny_filter(name: &str) -> Value {
     network_rbac_filter(
         format!("{name}_system_deny").as_str(),
         "DENY",
-        "nym_system_denied_destination",
+        "runtime_system_denied_destination",
         permissions,
     )
 }
@@ -404,7 +404,7 @@ fn policy_allowed_ports(policy: &VmProxyPolicyConfig) -> Vec<u16> {
 
 fn sni_domain_regex(domains: &[String]) -> String {
     if domains.is_empty() {
-        return String::from("__nym_no_hosts_allowed__");
+        return String::from("__reson_no_hosts_allowed__");
     }
     let hosts = domains
         .iter()
@@ -454,7 +454,7 @@ fn http_access_log_format(
     json!({
         "timestamp": "%START_TIME(%Y-%m-%dT%H:%M:%S.%3fZ)%",
         "vm_id": vm_id.unwrap_or_default(),
-        "nym_id": policy.and_then(|value| value.nym_id.as_deref()).unwrap_or_default(),
+        "owner_id": policy.and_then(|value| value.owner_id.as_deref()).unwrap_or_default(),
         "listener": name,
         "authority": "%REQ(:AUTHORITY)%",
         "method": "%REQ(:METHOD)%",
@@ -472,7 +472,7 @@ fn tcp_access_log_format(name: &str, policy: Option<&VmProxyPolicyConfig>, vm_id
     json!({
         "timestamp": "%START_TIME(%Y-%m-%dT%H:%M:%S.%3fZ)%",
         "vm_id": vm_id,
-        "nym_id": policy.and_then(|value| value.nym_id.as_deref()).unwrap_or_default(),
+        "owner_id": policy.and_then(|value| value.owner_id.as_deref()).unwrap_or_default(),
         "listener": name,
         "authority": "%REQUESTED_SERVER_NAME%",
         "method": "TCP",
@@ -619,7 +619,7 @@ fn authority_allow_regex(domain_allowlist: Option<&[String]>, allowed_ports: &[u
     let host_regex = match domain_allowlist {
         Some(domains) => {
             if domains.is_empty() {
-                String::from("__nym_no_hosts_allowed__")
+                String::from("__reson_no_hosts_allowed__")
             } else {
                 domains
                     .iter()
@@ -691,7 +691,7 @@ mod tests {
         VmProxyListener {
             listen_addr: listen_addr.parse().expect("listen addr"),
             policy: VmProxyPolicyConfig {
-                nym_id: Some("nym-123".to_string()),
+                owner_id: Some("owner-123".to_string()),
                 domain_allowlist: Some(vec!["api.github.com".to_string()]),
                 domain_blocklist: vec!["bad.example".to_string()],
                 custom_port_allowlist: vec![8080],
@@ -806,7 +806,7 @@ mod tests {
         );
         let parsed = parse_envoy_config(&rendered);
         assert!(value_contains_str(&parsed, "vm-123"));
-        assert!(value_contains_str(&parsed, "nym-123"));
+        assert!(value_contains_str(&parsed, "owner-123"));
         assert!(value_contains_str(&parsed, r"bad\.example"));
         assert!(value_contains_str(&parsed, r"api\.github\.com"));
         assert!(value_contains_u64(&parsed, 8080));

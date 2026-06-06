@@ -62,8 +62,8 @@ const META_TIER_B_ELIGIBLE: &str = "reson.tier_b_eligible";
 const META_EXECUTION_FIDELITY_REQUIREMENT: &str = "reson.execution_fidelity_requirement";
 const META_TENANT_ID: &str = "tenant_id";
 const META_WORKSPACE_ID: &str = "workspace_id";
-const META_NYM_NETWORK_POLICY: &str = "nym_network_policy";
-const META_NYM_NETWORK_POLICY_PROXY_UPSTREAM: &str = "nym_network_policy_proxy_upstream";
+const META_NETWORK_POLICY: &str = "reson.network_policy";
+const META_NETWORK_POLICY_PROXY_UPSTREAM: &str = "reson.network_policy_proxy_upstream";
 const META_NETWORK_EGRESS_SNAPSHOT: &str = "reson.network_egress";
 const META_PORTPROXY_AUTH_TOKEN: &str = "reson.portproxy_auth_token";
 const MAINTENANCE_DIR_NAME: &str = "_maintenance";
@@ -75,10 +75,13 @@ const VM_RUNNING_TIMEOUT: Duration = Duration::from_secs(60);
 const INCOMING_RESTORE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const INCOMING_RESTORE_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 const AMD64_QEMU_RUNTIME_FINGERPRINT: &str = "qemu-amd64-apic-vapic-off-v1";
-const ARM64_BIOS_CANDIDATES: [&str; 3] = [
+const ARM64_BIOS_CANDIDATES: [&str; 6] = [
     "/usr/share/qemu/edk2-aarch64-code.fd",
     "/usr/share/AAVMF/AAVMF_CODE.fd",
     "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+    "/opt/homebrew/opt/qemu/share/qemu/edk2-aarch64-code.fd",
+    "/usr/local/opt/qemu/share/qemu/edk2-aarch64-code.fd",
+    "/Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -248,9 +251,9 @@ impl Manager {
         if let Some(value) = existing.get(META_PORTPROXY_AUTH_TOKEN) {
             updated.insert(META_PORTPROXY_AUTH_TOKEN.to_string(), value.clone());
         }
-        if let Some(value) = existing.get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM) {
+        if let Some(value) = existing.get(META_NETWORK_POLICY_PROXY_UPSTREAM) {
             updated.insert(
-                META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                META_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
                 value.clone(),
             );
         }
@@ -266,7 +269,7 @@ impl Manager {
             return Ok(());
         }
 
-        let Some(upstream_addr) = metadata.get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM) else {
+        let Some(upstream_addr) = metadata.get(META_NETWORK_POLICY_PROXY_UPSTREAM) else {
             return Ok(());
         };
         let listen_addr = upstream_addr
@@ -274,7 +277,7 @@ impl Manager {
             .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
             .map_err(ManagerError::Other)?;
 
-        let policy = match metadata.get(META_NYM_NETWORK_POLICY) {
+        let policy = match metadata.get(META_NETWORK_POLICY) {
             Some(policy_json) if !policy_json.trim().is_empty() => {
                 serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
                     .with_context(|| format!("parse vm network policy for {vm_id}"))
@@ -822,14 +825,26 @@ impl Manager {
             let inner = vm.lock().await;
             inner.metadata.metadata.get(META_FORK_BASE_PATH).cloned()
         };
+        let state = {
+            let inner = vm.lock().await;
+            inner.runtime.state
+        };
+        if matches!(state, VmState::Running | VmState::Paused) {
+            self.force_stop_vm(id).await?;
+        }
         {
             let inner = vm.lock().await;
             if matches!(inner.runtime.state, VmState::Running | VmState::Paused) {
                 return Err(ManagerError::InvalidState);
             }
         }
+        let runtime_dir = {
+            let inner = vm.lock().await;
+            inner.runtime.runtime_dir.clone()
+        };
 
         fs::remove_dir_all(&vm.dir)?;
+        let _ = fs::remove_dir_all(runtime_dir);
         self.vms.write().await.remove(id);
         self.snapshots
             .write()
@@ -1610,6 +1625,134 @@ impl Manager {
         }
     }
 
+    #[instrument(skip(self), fields(vm_id = %id))]
+    pub async fn start_vm_for_exec_stream_resume(&self, id: &str) -> ManagerResult<VmMetadata> {
+        let vm = self.vm_by_id(id).await?;
+        if let Some(meta) = Self::try_adopt_local_runtime_for_resume(&self.cfg, vm, id).await? {
+            return Ok(meta);
+        }
+        self.start_vm(id).await
+    }
+
+    async fn try_adopt_local_runtime_for_resume(
+        cfg: &Config,
+        vm: Arc<Vm>,
+        id: &str,
+    ) -> ManagerResult<Option<VmMetadata>> {
+        let (vm_dir, qmp_path, pid_path) = {
+            let inner = vm.lock().await;
+            if matches!(inner.runtime.state, VmState::Running) {
+                return Ok(Some(inner.metadata.clone()));
+            }
+            (
+                vm.dir.clone(),
+                inner.runtime.qmp_path.clone(),
+                inner.runtime.pid_path.clone(),
+            )
+        };
+        if !qmp_path.exists() {
+            return Ok(None);
+        }
+
+        let monitor =
+            match virt::wait_for_monitor(qmp_path.as_path(), Duration::from_millis(750)).await {
+                Ok(monitor) => monitor,
+                Err(err) => {
+                    debug!(
+                        vm_id = %id,
+                        qmp_path = %qmp_path.display(),
+                        error = %err,
+                        "existing qmp socket was not adoptable for exec stream resume"
+                    );
+                    return Ok(None);
+                }
+            };
+        if let Err(err) = virt::wait_for_running(&monitor, Duration::from_secs(2)).await {
+            debug!(
+                vm_id = %id,
+                qmp_path = %qmp_path.display(),
+                error = %err,
+                "existing qemu runtime was not running for exec stream resume adoption"
+            );
+            return Ok(None);
+        }
+
+        let Some(pid) = read_pid_file(pid_path.as_path()).filter(|pid| pid_exists(*pid)) else {
+            debug!(
+                vm_id = %id,
+                pid_path = %pid_path.display(),
+                "existing qemu runtime had no live pid for exec stream resume adoption"
+            );
+            return Ok(None);
+        };
+        let Some(command) = read_process_command(pid) else {
+            debug!(
+                vm_id = %id,
+                pid,
+                "existing qemu pid could not be inspected for exec stream resume adoption"
+            );
+            return Ok(None);
+        };
+        if !pid_command_matches_vm(command.as_str(), vm_dir.as_path(), qmp_path.as_path()) {
+            debug!(
+                vm_id = %id,
+                pid,
+                command = %command,
+                "existing qemu pid did not match VM markers for exec stream resume adoption"
+            );
+            return Ok(None);
+        }
+
+        let meta = {
+            let mut inner = vm.lock().await;
+            if matches!(inner.runtime.state, VmState::Running) {
+                return Ok(Some(inner.metadata.clone()));
+            }
+            inner.runtime.monitor = Some(monitor);
+            inner.runtime.state = VmState::Running;
+            inner.runtime.started_at = Some(Utc::now());
+            inner.runtime.reset_health_tracking();
+            inner.runtime.command_pid = Some(pid);
+            {
+                let mut exit = inner
+                    .runtime
+                    .exit_status
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *exit = None;
+            }
+            inner.metadata.state = VmState::Running;
+            inner.metadata.started_at = inner.runtime.started_at;
+            if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
+                warn!(vm_id = %id, error = %err, "failed to persist metadata after runtime adoption");
+            }
+            inner.metadata.clone()
+        };
+
+        if let Err(err) = network::register_vm_process(id, pid).await {
+            if cfg.ha_mode {
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err.context(
+                    "failed to register adopted vm process for network guardrails",
+                )));
+            }
+            warn!(
+                vm_id = %id,
+                pid,
+                error = %err,
+                "failed to register adopted vm process for network guardrails"
+            );
+        }
+
+        info!(
+            vm_id = %id,
+            pid,
+            rpc_port = meta.network.rpc_port,
+            "adopted existing qemu runtime for exec stream resume"
+        );
+        Ok(Some(meta))
+    }
+
     async fn start_vm_inner(
         cfg: Config,
         host_arch: String,
@@ -1618,7 +1761,16 @@ impl Manager {
     ) -> ManagerResult<VmMetadata> {
         let id = id.as_str();
 
-        let (binary, meta_snapshot, vm_dir, qmp_path, pid_path, log_path, cleanup_stale_sidecars) = {
+        let (
+            binary,
+            meta_snapshot,
+            vm_dir,
+            runtime_dir,
+            qmp_path,
+            pid_path,
+            log_path,
+            cleanup_stale_sidecars,
+        ) = {
             let mut inner = vm.lock().await;
             if matches!(inner.runtime.state, VmState::Running) {
                 return Ok(inner.metadata.clone());
@@ -1629,6 +1781,7 @@ impl Manager {
                 Self::qemu_binary_for_arch_from(&cfg, &host_arch, &inner.metadata.architecture)?;
 
             let vm_dir = vm.dir.clone();
+            let runtime_dir = inner.runtime.runtime_dir.clone();
             let qmp_path = inner.runtime.qmp_path.clone();
             let pid_path = inner.runtime.pid_path.clone();
             let log_path = vm_dir.join("qemu.log");
@@ -1653,6 +1806,12 @@ impl Manager {
                 }
             };
 
+            if let Err(err) = prepare_qemu_runtime_dir(runtime_dir.as_path(), &cfg) {
+                inner.runtime.state = VmState::Error;
+                inner.metadata.state = VmState::Error;
+                let _ = save_metadata(&vm.dir, &mut inner.metadata);
+                return Err(ManagerError::Other(err));
+            }
             let _ = fs::remove_file(&qmp_path);
             let _ = fs::remove_file(&pid_path);
 
@@ -1702,6 +1861,7 @@ impl Manager {
                 binary,
                 snapshot,
                 vm_dir,
+                runtime_dir,
                 qmp_path,
                 pid_path,
                 log_path,
@@ -1714,40 +1874,48 @@ impl Manager {
         };
         let mut meta_snapshot = meta_snapshot;
         if cleanup_stale_sidecars {
-            cleanup_stale_runtime_sidecars(id, vm_dir.as_path()).await;
+            cleanup_stale_runtime_sidecars(id, vm_dir.as_path(), runtime_dir.as_path()).await;
         }
 
-        let mut reserved_proxy_ports = HashSet::from([
-            meta_snapshot.network.proxy_port,
-            meta_snapshot.network.rpc_port,
-        ]);
-        let upstream_port = allocate_host_port(0, &mut reserved_proxy_ports)?;
-        let upstream_addr = format!("0.0.0.0:{upstream_port}");
-        let proxy_policy =
-            vm_proxy_policy_from_metadata(&meta_snapshot).map_err(ManagerError::Other)?;
-        network::register_vm_proxy_policy(
-            id,
-            upstream_addr
-                .parse()
-                .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
-                .map_err(ManagerError::Other)?,
-            proxy_policy,
-        )
-        .await
-        .map_err(ManagerError::Other)?;
-        meta_snapshot.metadata.insert(
-            META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
-            upstream_addr.clone(),
-        );
-        let tap_spec = network::tap::spec_for_vm(
-            id,
-            port_forward_bind_address().as_str(),
-            meta_snapshot.network.proxy_port,
-            meta_snapshot.network.rpc_port,
-            upstream_port as u16,
-        )
-        .map_err(ManagerError::Other)?;
-        let vm_proxy_upstream_addr = Some(upstream_addr);
+        let use_managed_tap_network = requires_managed_tap_network(&cfg, &meta_snapshot);
+        let (tap_spec, vm_proxy_upstream_addr) = if use_managed_tap_network {
+            let mut reserved_proxy_ports = HashSet::from([
+                meta_snapshot.network.proxy_port,
+                meta_snapshot.network.rpc_port,
+            ]);
+            let upstream_port = allocate_host_port(0, &mut reserved_proxy_ports)?;
+            let upstream_addr = format!("0.0.0.0:{upstream_port}");
+            let proxy_policy =
+                vm_proxy_policy_from_metadata(&meta_snapshot).map_err(ManagerError::Other)?;
+            network::register_vm_proxy_policy(
+                id,
+                upstream_addr
+                    .parse()
+                    .with_context(|| format!("parse vm proxy upstream addr {upstream_addr}"))
+                    .map_err(ManagerError::Other)?,
+                proxy_policy,
+            )
+            .await
+            .map_err(ManagerError::Other)?;
+            meta_snapshot.metadata.insert(
+                META_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                upstream_addr.clone(),
+            );
+            let tap_spec = network::tap::spec_for_vm(
+                id,
+                port_forward_bind_address().as_str(),
+                meta_snapshot.network.proxy_port,
+                meta_snapshot.network.rpc_port,
+                upstream_port as u16,
+            )
+            .map_err(ManagerError::Other)?;
+            (Some(tap_spec), Some(upstream_addr))
+        } else {
+            meta_snapshot
+                .metadata
+                .remove(META_NETWORK_POLICY_PROXY_UPSTREAM);
+            (None, None)
+        };
         if let Err(err) = bootstrap::create_iso(
             vm_dir.join("bootstrap.iso"),
             bootstrap::Config {
@@ -1760,7 +1928,9 @@ impl Manager {
                     .cloned()
                     .map(map_bootstrap_shared_mount)
                     .collect(),
-                network: Some(map_bootstrap_network(&meta_snapshot)),
+                network: tap_spec
+                    .as_ref()
+                    .map(|_| map_bootstrap_network(&meta_snapshot)),
                 http_proxy_url: None,
                 portproxy_auth_token: meta_snapshot
                     .metadata
@@ -1787,7 +1957,7 @@ impl Manager {
         let mut fuse_handles: Vec<fuse::FuseHandle> = Vec::new();
         for mount in &mut meta_snapshot.shared_mounts {
             if mount.is_fuse_backed() {
-                let handle = match fuse::mount_nymfs_fuse(&cfg, mount, vm_dir.as_path()).await {
+                let handle = match fuse::mount_vfs_fuse(&cfg, mount, vm_dir.as_path()).await {
                     Ok(handle) => handle,
                     Err(err) => {
                         if vm_proxy_upstream_addr.is_some() {
@@ -1811,7 +1981,7 @@ impl Manager {
             && Path::new(&cfg.virtiofsd_bin).exists();
         if can_use_virtiofsd {
             for (index, mount) in meta_snapshot.shared_mounts.iter().enumerate() {
-                let socket_path = vm_dir.join(format!("virtiofsd-{index}.sock"));
+                let socket_path = runtime_dir.join(format!("virtiofsd-{index}.sock"));
                 let log_path = vm_dir.join(format!("virtiofsd-{index}.log"));
                 let spawn = virt::VirtiofsdSpawn {
                     source_path: PathBuf::from(&mount.host_path),
@@ -1850,7 +2020,7 @@ impl Manager {
             qmp_path.as_path(),
             pid_path.as_path(),
             &host_arch,
-            &tap_spec,
+            tap_spec.as_ref(),
             &virtiofsd_handles,
         ) {
             Ok(args) => args,
@@ -1868,22 +2038,24 @@ impl Manager {
                 return Err(ManagerError::Other(err));
             }
         };
-        let mut tap_network_handle = match network::tap::start_vm_tap_network(&cfg, &tap_spec).await
-        {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                if vm_proxy_upstream_addr.is_some() {
-                    let _ = network::unregister_vm_proxy_policy(id).await;
+        let mut tap_network_handle = match tap_spec.as_ref() {
+            Some(tap_spec) => match network::tap::start_vm_tap_network(&cfg, tap_spec).await {
+                Ok(handle) => Some(handle),
+                Err(err) => {
+                    if vm_proxy_upstream_addr.is_some() {
+                        let _ = network::unregister_vm_proxy_policy(id).await;
+                    }
+                    for handle in &virtiofsd_handles {
+                        virt::terminate_virtiofsd(handle);
+                    }
+                    for handle in &fuse_handles {
+                        let _ = fuse::unmount_fuse(handle).await;
+                    }
+                    mark_vm_state(&vm, VmState::Error).await;
+                    return Err(ManagerError::Other(err));
                 }
-                for handle in &virtiofsd_handles {
-                    virt::terminate_virtiofsd(handle);
-                }
-                for handle in &fuse_handles {
-                    let _ = fuse::unmount_fuse(handle).await;
-                }
-                mark_vm_state(&vm, VmState::Error).await;
-                return Err(ManagerError::Other(err));
-            }
+            },
+            None => None,
         };
         debug!(
             vm_id = %id,
@@ -1897,7 +2069,9 @@ impl Manager {
         cmd.args(&args);
         cmd.current_dir(&vm_dir);
         cmd.stdin(std::process::Stdio::null());
-        if let Err(err) = configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), &cfg) {
+        if let Err(err) =
+            configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), runtime_dir.as_path(), &cfg)
+        {
             if let Some(handle) = tap_network_handle.take() {
                 handle.shutdown().await;
             }
@@ -2079,14 +2253,14 @@ impl Manager {
             inner.metadata.started_at = inner.runtime.started_at;
             if let Some(upstream_addr) = &vm_proxy_upstream_addr {
                 inner.metadata.metadata.insert(
-                    META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                    META_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
                     upstream_addr.clone(),
                 );
             } else {
                 inner
                     .metadata
                     .metadata
-                    .remove(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM);
+                    .remove(META_NETWORK_POLICY_PROXY_UPSTREAM);
             }
             if let Err(err) = save_metadata(&vm.dir, &mut inner.metadata) {
                 warn!(vm_id = %id, error = %err, "failed to persist metadata after start");
@@ -2249,26 +2423,49 @@ impl Manager {
         };
 
         let mut stopped_with_monitor = false;
+        let mut force_reclaimed_runtime = false;
         if matches!(runtime_state, VmState::Running | VmState::Paused) {
             if let Some(monitor) = monitor {
                 let quit_result = virt::quit(&monitor).await;
                 if quit_result.is_err() && pid > 0 {
                     kill_process(pid).map_err(ManagerError::Other)?;
                 }
-                wait_for_exit(&vm, Duration::from_secs(30)).await?;
-                stopped_with_monitor = true;
+                match wait_for_exit(&vm, Duration::from_secs(3)).await {
+                    Ok(()) => {
+                        stopped_with_monitor = true;
+                    }
+                    Err(err) => {
+                        warn!(
+                            vm_id = %id,
+                            pid,
+                            error = %err,
+                            "timeout waiting for qemu exit after force-stop; killing vm pid"
+                        );
+                        if pid > 0 {
+                            if pid_exists(pid) {
+                                kill_process(pid).map_err(ManagerError::Other)?;
+                            }
+                            let _ = wait_for_pid_exit(pid, Duration::from_secs(5)).await;
+                            force_reclaimed_runtime = true;
+                        }
+                    }
+                }
             }
         }
 
         if !stopped_with_monitor {
-            let reclaimed = reclaim_local_runtime_ownership(
-                id,
-                vm_dir.as_path(),
-                qmp_path.as_path(),
-                pid_path.as_path(),
-            )
-            .await
-            .map_err(ManagerError::Other)?;
+            let reclaimed = if force_reclaimed_runtime {
+                true
+            } else {
+                reclaim_local_runtime_ownership(
+                    id,
+                    vm_dir.as_path(),
+                    qmp_path.as_path(),
+                    pid_path.as_path(),
+                )
+                .await
+                .map_err(ManagerError::Other)?
+            };
             if reclaimed {
                 let _ = network::unregister_vm_proxy_policy(id).await;
                 cleanup_runtime_mounts(&vm).await;
@@ -2947,7 +3144,7 @@ fn build_qemu_args(
     qmp_path: &Path,
     pid_path: &Path,
     host_arch: &str,
-    tap_network: &network::tap::VmTapNetworkSpec,
+    tap_network: Option<&network::tap::VmTapNetworkSpec>,
     virtiofsd_handles: &[virt::VirtiofsdHandle],
 ) -> Result<Vec<String>> {
     let guest_arch = if meta.architecture.trim().is_empty() {
@@ -3014,10 +3211,13 @@ fn build_qemu_args(
     };
 
     let disk_path = vm_dir.join("disk.qcow2");
-    let netdev = format!(
-        "tap,id=net0,ifname={},script=no,downscript=no",
-        tap_network.tap_name
-    );
+    let netdev = match tap_network {
+        Some(tap_network) => format!(
+            "tap,id=net0,ifname={},script=no,downscript=no",
+            tap_network.tap_name
+        ),
+        None => qemu_user_netdev(meta)?,
+    };
 
     let mut args = Vec::new();
     args.push("-machine".to_string());
@@ -3132,6 +3332,20 @@ fn build_qemu_args(
     Ok(args)
 }
 
+fn qemu_user_netdev(meta: &VmMetadata) -> Result<String> {
+    if meta.network.proxy_port <= 0 {
+        bail!("qemu user networking requires a positive proxy port");
+    }
+    if meta.network.rpc_port <= 0 {
+        bail!("qemu user networking requires a positive rpc port");
+    }
+    let bind_addr = port_forward_bind_address();
+    Ok(format!(
+        "user,id=net0,hostfwd=tcp:{bind_addr}:{}-:13337,hostfwd=tcp:{bind_addr}:{}-:13338",
+        meta.network.proxy_port, meta.network.rpc_port
+    ))
+}
+
 fn resolve_arm64_bios_path() -> Result<String> {
     for candidate in ARM64_BIOS_CANDIDATES {
         if Path::new(candidate).exists() {
@@ -3220,13 +3434,25 @@ fn boot_incoming_ram_format(meta: &VmMetadata) -> &str {
 }
 
 fn vm_proxy_policy_from_metadata(meta: &VmMetadata) -> Result<network::VmProxyPolicyConfig> {
-    match meta.metadata.get(META_NYM_NETWORK_POLICY) {
+    match meta.metadata.get(META_NETWORK_POLICY) {
         Some(policy_json) if !policy_json.trim().is_empty() => {
             serde_json::from_str::<network::VmProxyPolicyConfig>(policy_json)
                 .with_context(|| format!("parse vm network policy for {}", meta.id))
         }
         _ => Ok(network::VmProxyPolicyConfig::default()),
     }
+}
+
+fn has_explicit_network_policy(meta: &VmMetadata) -> bool {
+    meta.metadata
+        .get(META_NETWORK_POLICY)
+        .is_some_and(|policy| !policy.trim().is_empty())
+}
+
+fn requires_managed_tap_network(cfg: &Config, meta: &VmMetadata) -> bool {
+    cfg.ha_mode
+        || cfg.guest_network.http_proxy_upstream_addr.is_some()
+        || has_explicit_network_policy(meta)
 }
 
 fn normalize_shared_mounts(
@@ -3634,7 +3860,12 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf, expected_pi
 }
 
 #[cfg(unix)]
-fn configure_qemu_process_identity(cmd: &mut Command, vm_dir: &Path, cfg: &Config) -> Result<()> {
+fn configure_qemu_process_identity(
+    cmd: &mut Command,
+    vm_dir: &Path,
+    runtime_dir: &Path,
+    cfg: &Config,
+) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
@@ -3646,6 +3877,18 @@ fn configure_qemu_process_identity(cmd: &mut Command, vm_dir: &Path, cfg: &Confi
         &[vm_dir.join("fuse-mounts")],
     )
     .with_context(|| format!("chown vm dir {} for qemu user", vm_dir.display()))?;
+    recursively_chown_path_skipping(
+        runtime_dir,
+        cfg.qemu_process.run_as_uid,
+        cfg.qemu_process.run_as_gid,
+        &[],
+    )
+    .with_context(|| {
+        format!(
+            "chown qemu runtime dir {} for qemu user",
+            runtime_dir.display()
+        )
+    })?;
 
     let uid = cfg.qemu_process.run_as_uid;
     let gid = cfg.qemu_process.run_as_gid;
@@ -3679,8 +3922,35 @@ fn configure_qemu_process_identity(cmd: &mut Command, vm_dir: &Path, cfg: &Confi
 fn configure_qemu_process_identity(
     _cmd: &mut Command,
     _vm_dir: &Path,
+    _runtime_dir: &Path,
     _cfg: &Config,
 ) -> Result<()> {
+    Ok(())
+}
+
+fn prepare_qemu_runtime_dir(runtime_dir: &Path, cfg: &Config) -> Result<()> {
+    fs::create_dir_all(runtime_dir)
+        .with_context(|| format!("create qemu runtime dir {}", runtime_dir.display()))?;
+    ensure_qemu_writable_runtime_dir(runtime_dir, cfg)
+}
+
+#[cfg(unix)]
+fn ensure_qemu_writable_runtime_dir(path: &Path, cfg: &Config) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    chown_single_path(
+        path,
+        cfg.qemu_process.run_as_uid,
+        cfg.qemu_process.run_as_gid,
+    )?;
+    let permissions = fs::Permissions::from_mode(0o2770);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("chmod qemu runtime dir {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_qemu_writable_runtime_dir(_path: &Path, _cfg: &Config) -> Result<()> {
     Ok(())
 }
 
@@ -3764,7 +4034,11 @@ fn kill_process(pid: u32) -> Result<()> {
     }
     let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(code) if code == libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(err.into());
     }
     Ok(())
 }
@@ -3846,8 +4120,8 @@ async fn reclaim_local_runtime_ownership(
     Ok(reclaimed)
 }
 
-async fn cleanup_stale_runtime_sidecars(vm_id: &str, vm_dir: &Path) {
-    for pid in list_local_virtiofsd_pids_for_vm(vm_dir) {
+async fn cleanup_stale_runtime_sidecars(vm_id: &str, vm_dir: &Path, runtime_dir: &Path) {
+    for pid in list_local_virtiofsd_pids_for_vm(vm_dir, runtime_dir) {
         if !pid_exists(pid) {
             continue;
         }
@@ -4019,7 +4293,7 @@ fn list_local_qemu_pids_for_vm(vm_dir: &Path, qmp_path: &Path) -> Vec<u32> {
     out
 }
 
-fn list_local_virtiofsd_pids_for_vm(vm_dir: &Path) -> Vec<u32> {
+fn list_local_virtiofsd_pids_for_vm(vm_dir: &Path, runtime_dir: &Path) -> Vec<u32> {
     let output = StdCommand::new("ps")
         .arg("-Ao")
         .arg("pid=,command=")
@@ -4035,6 +4309,7 @@ fn list_local_virtiofsd_pids_for_vm(vm_dir: &Path) -> Vec<u32> {
     };
 
     let vm_dir_str = vm_dir.to_string_lossy();
+    let runtime_dir_str = runtime_dir.to_string_lossy();
     let mut out = Vec::new();
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -4055,7 +4330,9 @@ fn list_local_virtiofsd_pids_for_vm(vm_dir: &Path) -> Vec<u32> {
         if pid == 0 {
             continue;
         }
-        if command.contains("virtiofsd") && command.contains(vm_dir_str.as_ref()) {
+        if command.contains("virtiofsd")
+            && (command.contains(vm_dir_str.as_ref()) || command.contains(runtime_dir_str.as_ref()))
+        {
             out.push(pid);
         }
     }
@@ -4314,7 +4591,7 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
-            nymfs_internal_service_token: None,
+            vfs_internal_service_token: None,
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4386,8 +4663,8 @@ mod tests {
             snapshots: Vec::new(),
             shared_mounts: vec![SharedMountSpec {
                 host_path: parent_dir.to_string_lossy().to_string(),
-                guest_path: "/nym".to_string(),
-                mount_tag: "nymfs".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "runtimefs".to_string(),
                 read_only: false,
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
@@ -4462,8 +4739,8 @@ mod tests {
             Some("daemon-restart-same-node")
         );
         assert_eq!(child_after.shared_mounts, parent_after.shared_mounts);
-        assert_eq!(child_after.shared_mounts[0].guest_path, "/nym");
-        assert_eq!(child_after.shared_mounts[0].mount_tag, "nymfs");
+        assert_eq!(child_after.shared_mounts[0].guest_path, "/workspace");
+        assert_eq!(child_after.shared_mounts[0].mount_tag, "runtimefs");
 
         let fork_base_path = parent_after
             .metadata
@@ -4556,7 +4833,7 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
-            nymfs_internal_service_token: None,
+            vfs_internal_service_token: None,
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4606,7 +4883,7 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
-            nymfs_internal_service_token: None,
+            vfs_internal_service_token: None,
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4700,7 +4977,7 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
-            nymfs_internal_service_token: None,
+            vfs_internal_service_token: None,
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4809,7 +5086,7 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
-            nymfs_internal_service_token: None,
+            vfs_internal_service_token: None,
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4902,7 +5179,7 @@ mod tests {
             ha_mode: false,
             node_registry: None,
             control_bus: None,
-            nymfs_internal_service_token: None,
+            vfs_internal_service_token: None,
             qemu_process: Default::default(),
             guest_network: Default::default(),
             network_services: Default::default(),
@@ -4945,11 +5222,11 @@ mod tests {
             metadata: HashMap::from([
                 (
                     META_SESSION_ID.to_string(),
-                    "nym-session-existing".to_string(),
+                    "runtime-session-existing".to_string(),
                 ),
                 (
                     META_BRANCH_ID.to_string(),
-                    "nym-session-existing".to_string(),
+                    "runtime-session-existing".to_string(),
                 ),
                 (META_TENANT_ID.to_string(), "tenant-existing".to_string()),
                 (
@@ -4961,11 +5238,11 @@ mod tests {
                     "true".to_string(),
                 ),
                 (
-                    META_NYM_NETWORK_POLICY.to_string(),
+                    META_NETWORK_POLICY.to_string(),
                     "{\"domain_allowlist\":[\"github.com\"],\"domain_blocklist\":[],\"custom_port_allowlist\":[],\"bandwidth_cap_mb_per_hour\":1024,\"max_connections_per_minute\":1000}".to_string(),
                 ),
                 (
-                    META_NYM_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
+                    META_NETWORK_POLICY_PROXY_UPSTREAM.to_string(),
                     "127.0.0.1:43128".to_string(),
                 ),
                 (
@@ -4990,7 +5267,7 @@ mod tests {
                 UpdateVmParams {
                     name: None,
                     metadata: Some(HashMap::from([(
-                        META_NYM_NETWORK_POLICY.to_string(),
+                        META_NETWORK_POLICY.to_string(),
                         "{\"domain_allowlist\":[\"api.openai.com\"],\"domain_blocklist\":[],\"custom_port_allowlist\":[8080],\"bandwidth_cap_mb_per_hour\":512,\"max_connections_per_minute\":100}".to_string(),
                     ), (
                         META_PORTPROXY_AUTH_TOKEN.to_string(),
@@ -5004,7 +5281,7 @@ mod tests {
         assert_eq!(
             updated
                 .metadata
-                .get(META_NYM_NETWORK_POLICY_PROXY_UPSTREAM)
+                .get(META_NETWORK_POLICY_PROXY_UPSTREAM)
                 .map(String::as_str),
             Some("127.0.0.1:43128")
         );
@@ -5017,11 +5294,11 @@ mod tests {
         );
         assert_eq!(
             updated.metadata.get(META_SESSION_ID).map(String::as_str),
-            Some("nym-session-existing")
+            Some("runtime-session-existing")
         );
         assert_eq!(
             updated.metadata.get(META_BRANCH_ID).map(String::as_str),
-            Some("nym-session-existing")
+            Some("runtime-session-existing")
         );
         assert_eq!(
             updated.metadata.get(META_TENANT_ID).map(String::as_str),
@@ -5041,7 +5318,7 @@ mod tests {
         assert!(
             updated
                 .metadata
-                .get(META_NYM_NETWORK_POLICY)
+                .get(META_NETWORK_POLICY)
                 .is_some_and(|value| value.contains("api.openai.com"))
         );
     }
@@ -5076,9 +5353,9 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: vec![SharedMountSpec {
-                host_path: "/tmp/nymfs".to_string(),
-                guest_path: "/nym".to_string(),
-                mount_tag: "nymfs".to_string(),
+                host_path: "/tmp/runtimefs".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "runtimefs".to_string(),
                 read_only: true,
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
@@ -5095,7 +5372,7 @@ mod tests {
             Path::new("/tmp/vm-9p/qmp.sock"),
             Path::new("/tmp/vm-9p/qemu.pid"),
             ARCH_AMD64,
-            &test_tap_spec(&meta.id),
+            Some(&test_tap_spec(&meta.id)),
             &[],
         )
         .expect("build qemu args");
@@ -5115,8 +5392,8 @@ mod tests {
         // Legacy -virtfs device with the same mount tag and readonly flag.
         assert!(args.iter().any(|arg| arg == "-virtfs"));
         assert!(args.iter().any(|arg| {
-            arg.contains("path=/tmp/nymfs")
-                && arg.contains("mount_tag=nymfs")
+            arg.contains("path=/tmp/runtimefs")
+                && arg.contains("mount_tag=runtimefs")
                 && arg.contains("readonly=on")
         }));
     }
@@ -5160,7 +5437,7 @@ mod tests {
             Path::new("/tmp/vm-incoming/qmp.sock"),
             Path::new("/tmp/vm-incoming/qemu.pid"),
             ARCH_AMD64,
-            &test_tap_spec(&meta.id),
+            Some(&test_tap_spec(&meta.id)),
             &[],
         )
         .expect("build qemu args");
@@ -5211,7 +5488,7 @@ mod tests {
             Path::new("/tmp/vm-vapic-off/qmp.sock"),
             Path::new("/tmp/vm-vapic-off/qemu.pid"),
             ARCH_AMD64,
-            &test_tap_spec(&meta.id),
+            Some(&test_tap_spec(&meta.id)),
             &[],
         )
         .expect("build qemu args");
@@ -5273,7 +5550,7 @@ mod tests {
             Path::new("/tmp/vm-guest-network/qmp.sock"),
             Path::new("/tmp/vm-guest-network/qemu.pid"),
             ARCH_AMD64,
-            &tap_spec,
+            Some(&tap_spec),
             &[],
         )
         .expect("build qemu args");
@@ -5293,7 +5570,7 @@ mod tests {
     }
 
     #[test]
-    fn build_qemu_args_does_not_emit_qemu_user_networking() {
+    fn build_qemu_args_emits_qemu_user_networking_without_managed_tap() {
         let meta = VmMetadata {
             id: "vm-guest-network-override".to_string(),
             name: "guest-network-override".to_string(),
@@ -5327,7 +5604,7 @@ mod tests {
             Path::new("/tmp/vm-guest-network-override/qmp.sock"),
             Path::new("/tmp/vm-guest-network-override/qemu.pid"),
             ARCH_AMD64,
-            &test_tap_spec(&meta.id),
+            None,
             &[],
         )
         .expect("build qemu args");
@@ -5338,10 +5615,12 @@ mod tests {
             .expect("missing -netdev arg");
         let netdev = args
             .get(netdev_idx + 1)
-            .expect("missing tap netdev value after -netdev");
-        assert!(!netdev.starts_with("user,"));
+            .expect("missing user netdev value after -netdev");
+        assert!(netdev.starts_with("user,id=net0"));
+        assert!(netdev.contains("hostfwd=tcp:127.0.0.1:3000-:13337"));
+        assert!(netdev.contains("hostfwd=tcp:127.0.0.1:3001-:13338"));
         assert!(!netdev.contains("guestfwd="));
-        assert!(!netdev.contains("hostfwd="));
+        assert!(!netdev.starts_with("tap,"));
     }
 
     #[test]
@@ -5440,9 +5719,9 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: vec![SharedMountSpec {
-                host_path: "/tmp/nymfs".to_string(),
-                guest_path: "/nym".to_string(),
-                mount_tag: "nymfs".to_string(),
+                host_path: "/tmp/runtimefs".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "runtimefs".to_string(),
                 read_only: true,
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
@@ -5456,8 +5735,8 @@ mod tests {
         let virtiofsd_handles = vec![virt::VirtiofsdHandle {
             pid: 0,
             socket_path: PathBuf::from("/tmp/vm-shared/virtiofsd-0.sock"),
-            source_path: PathBuf::from("/tmp/nymfs"),
-            tag: "nymfs".to_string(),
+            source_path: PathBuf::from("/tmp/runtimefs"),
+            tag: "runtimefs".to_string(),
             read_only: true,
         }];
 
@@ -5467,7 +5746,7 @@ mod tests {
             Path::new("/tmp/vm-shared/qmp.sock"),
             Path::new("/tmp/vm-shared/qemu.pid"),
             ARCH_AMD64,
-            &test_tap_spec(&meta.id),
+            Some(&test_tap_spec(&meta.id)),
             &virtiofsd_handles,
         )
         .expect("build qemu args");
@@ -5488,7 +5767,7 @@ mod tests {
         );
 
         // `-chardev socket,id=vfsd0,path=...` pairing with a `-device
-        // vhost-user-fs-pci ...,chardev=vfsd0,tag=nymfs`.
+        // vhost-user-fs-pci ...,chardev=vfsd0,tag=runtimefs`.
         assert!(args.iter().any(|arg| {
             arg.starts_with("socket,id=vfsd0")
                 && arg.contains("path=/tmp/vm-shared/virtiofsd-0.sock")
@@ -5496,7 +5775,7 @@ mod tests {
         assert!(args.iter().any(|arg| {
             arg.starts_with("vhost-user-fs-pci")
                 && arg.contains("chardev=vfsd0")
-                && arg.contains("tag=nymfs")
+                && arg.contains("tag=runtimefs")
         }));
     }
 
@@ -5578,14 +5857,15 @@ mod tests {
     fn normalize_shared_mounts_allows_fuse_backed_mounts_without_host_path() {
         let normalized = normalize_shared_mounts(vec![SharedMountSpec {
             host_path: String::new(),
-            guest_path: "/nym".to_string(),
-            mount_tag: "nymfs".to_string(),
+            guest_path: "/workspace".to_string(),
+            mount_tag: "runtimefs".to_string(),
             read_only: true,
             availability: SharedMountAvailability::SharedStorage,
             continuity: SharedMountContinuity::RestoreCrossNode,
             backend_profile: "gcs-vfs-fuse".to_string(),
-            vfs_endpoint: " http://nym-api.reson-vm.svc.cluster.local:3001/v1/internal/nymfs/123 "
-                .to_string(),
+            vfs_endpoint:
+                " http://runtime-api.reson-vm.svc.cluster.local:3001/v1/internal/runtimefs/123 "
+                    .to_string(),
             vfs_scope_path: " conversations/example/shared ".to_string(),
         }])
         .expect("normalize fuse-backed mount");
@@ -5594,7 +5874,7 @@ mod tests {
         assert!(normalized[0].host_path.is_empty());
         assert_eq!(
             normalized[0].vfs_endpoint,
-            "http://nym-api.reson-vm.svc.cluster.local:3001/v1/internal/nymfs/123"
+            "http://runtime-api.reson-vm.svc.cluster.local:3001/v1/internal/runtimefs/123"
         );
         assert_eq!(normalized[0].vfs_scope_path, "conversations/example/shared");
         assert!(normalized[0].is_fuse_backed());
@@ -5642,7 +5922,7 @@ mod tests {
                 ha_mode: false,
                 node_registry: None,
                 control_bus: None,
-                nymfs_internal_service_token: None,
+                vfs_internal_service_token: None,
                 qemu_process: Default::default(),
                 guest_network: Default::default(),
                 network_services: Default::default(),
@@ -5674,7 +5954,7 @@ mod tests {
         let skipped = vec![vm_dir.join("fuse-mounts")];
 
         assert!(should_skip_chown_path(
-            &vm_dir.join("fuse-mounts").join("nymfs"),
+            &vm_dir.join("fuse-mounts").join("runtimefs"),
             &skipped
         ));
         assert!(!should_skip_chown_path(

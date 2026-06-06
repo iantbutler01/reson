@@ -806,9 +806,9 @@ async fn session_create_forwards_shared_mounts_contract() {
             session_id: Some("session-mounts".to_string()),
             auto_start: false,
             shared_mounts: vec![SharedMount {
-                host_path: "/tmp/nymfs".to_string(),
-                guest_path: "/nym".to_string(),
-                mount_tag: "nymfs".to_string(),
+                host_path: "/tmp/runtimefs".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "runtimefs".to_string(),
                 read_only: false,
                 availability: SharedMountAvailability::SharedStorage,
                 continuity: SharedMountContinuity::RestoreCrossNode,
@@ -827,9 +827,9 @@ async fn session_create_forwards_shared_mounts_contract() {
         .last()
         .expect("expected create request to be recorded");
     assert_eq!(req.shared_mounts.len(), 1);
-    assert_eq!(req.shared_mounts[0].host_path, "/tmp/nymfs");
-    assert_eq!(req.shared_mounts[0].guest_path, "/nym");
-    assert_eq!(req.shared_mounts[0].mount_tag, "nymfs");
+    assert_eq!(req.shared_mounts[0].host_path, "/tmp/runtimefs");
+    assert_eq!(req.shared_mounts[0].guest_path, "/workspace");
+    assert_eq!(req.shared_mounts[0].mount_tag, "runtimefs");
     assert!(!req.shared_mounts[0].read_only);
     assert_eq!(
         req.shared_mounts[0].availability,

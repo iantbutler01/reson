@@ -80,6 +80,7 @@ fi
 TMP_DIR="$(mktemp -d "/tmp/rsb-control-failures.XXXXXX")"
 DATA_DIR="$TMP_DIR/data"
 mkdir -p "$DATA_DIR"
+chmod 0755 "$TMP_DIR" "$DATA_DIR"
 NODE1_LOG="$TMP_DIR/node1.log"
 NODE1_PID=""
 FAILED=0
@@ -113,6 +114,7 @@ wait_node_ready() {
 start_node() {
   rm -rf "$DATA_DIR"
   mkdir -p "$DATA_DIR"
+  chmod 0755 "$TMP_DIR" "$DATA_DIR"
   : >"$NODE1_LOG"
   local endpoint="http://127.0.0.1:${NODE1_PORT}"
 

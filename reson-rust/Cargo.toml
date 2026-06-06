@@ -85,6 +85,7 @@ google-adc = ["gcp_auth"]
 mcp = ["dep:reson-mcp"]
 mcp-apps = ["mcp", "reson-mcp/apps"]
 sandbox = ["dep:reson-sandbox"]
+sandbox-vfs-server = ["sandbox", "reson-sandbox/vfs-server"]
 
 [[example]]
 name = "sandbox_agent_demo"

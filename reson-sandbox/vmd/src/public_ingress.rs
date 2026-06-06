@@ -27,7 +27,11 @@ use crate::config::Config;
 use crate::state::manager::Manager;
 use crate::state::types::{VmMetadata, VmState};
 
-const VM_METADATA_PUBLIC_INGRESSES: &str = "nym_public_ingresses";
+const VM_METADATA_PUBLIC_INGRESSES: &str = "reson.public_ingresses";
+const OWNER_BEARER_HEADER: &str = "x-reson-owner-bearer";
+const OWNER_COOKIE_HEADER: &str = "x-reson-owner-cookie";
+const INGRESS_TOKEN_HEADER: &str = "x-reson-ingress-token";
+const INGRESS_TOKEN_QUERY_PARAM: &str = "reson_ingress_token";
 const ROUTE_CACHE_TTL: Duration = Duration::from_secs(1);
 const DENIED_PUBLIC_GUEST_PORTS: &[u16] =
     &[22, 11211, 2375, 2376, 3306, 5432, 6379, 13337, 13338, 27017];
@@ -58,7 +62,7 @@ struct PublicIngressState {
 
 #[derive(Debug, Clone, Deserialize)]
 struct PublicIngressExposure {
-    nym_id: Uuid,
+    owner_id: Uuid,
     public_hostname: String,
     guest_port: u16,
     #[serde(default = "default_auth_required")]
@@ -67,7 +71,7 @@ struct PublicIngressExposure {
 
 #[derive(Debug, Clone)]
 struct ResolvedIngressRoute {
-    nym_id: Uuid,
+    owner_id: Uuid,
     guest_port: u16,
     auth_required: bool,
     proxy_port: u16,
@@ -167,7 +171,7 @@ async fn handle_public_ingress_inner(
     if route.auth_required {
         authorize_owner(
             &state,
-            route.nym_id,
+            route.owner_id,
             extract_bearer_token(req.headers()).as_deref(),
             req.headers()
                 .get(header::COOKIE)
@@ -222,7 +226,7 @@ async fn resolve_route(
         for exposure in exposures {
             if !public_guest_port_allowed(exposure.guest_port) {
                 warn!(
-                    nym_id = %exposure.nym_id,
+                    owner_id = %exposure.owner_id,
                     guest_port = exposure.guest_port,
                     hostname = %exposure.public_hostname,
                     "ignoring public ingress exposure for denied guest port"
@@ -232,7 +236,7 @@ async fn resolve_route(
             routes.insert(
                 normalize_host(&exposure.public_hostname),
                 ResolvedIngressRoute {
-                    nym_id: exposure.nym_id,
+                    owner_id: exposure.owner_id,
                     guest_port: exposure.guest_port,
                     auth_required: exposure.auth_required,
                     proxy_port,
@@ -264,7 +268,7 @@ fn default_auth_required() -> bool {
 
 async fn authorize_owner(
     state: &PublicIngressState,
-    nym_id: Uuid,
+    owner_id: Uuid,
     bearer_token: Option<&str>,
     cookie_header: Option<&str>,
     ingress_token: Option<&str>,
@@ -283,10 +287,10 @@ async fn authorize_owner(
     }
     let service_token = state
         .cfg
-        .nymfs_internal_service_token
+        .vfs_internal_service_token
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "missing RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN".to_string())?;
+        .ok_or_else(|| "missing RESON_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN".to_string())?;
     let base_url = state
         .cfg
         .network_services
@@ -297,20 +301,20 @@ async fn authorize_owner(
     let url = format!(
         "{}/v1/internal/vm-ingress/{}/authorize",
         base_url.trim_end_matches('/'),
-        nym_id
+        owner_id
     );
     let mut request = state
         .http_client
         .get(url)
         .header(header::AUTHORIZATION, format!("Bearer {service_token}"));
     if let Some(token) = user_token {
-        request = request.header("x-nym-user-bearer", token);
+        request = request.header(OWNER_BEARER_HEADER, token);
     }
     if let Some(cookie) = cookie_header {
-        request = request.header("x-nym-user-cookie", cookie);
+        request = request.header(OWNER_COOKIE_HEADER, cookie);
     }
     if let Some(token) = ingress_token {
-        request = request.header("x-nym-ingress-token", token);
+        request = request.header(INGRESS_TOKEN_HEADER, token);
     }
     let response = request
         .send()
@@ -438,7 +442,7 @@ fn extract_access_token_from_cookie(cookie_header: Option<&str>) -> Option<Strin
 fn extract_ingress_token_from_query(uri: &axum::http::Uri) -> Option<String> {
     uri.query()?.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
-        if key == "nym_ingress_token" && !value.trim().is_empty() {
+        if key == INGRESS_TOKEN_QUERY_PARAM && !value.trim().is_empty() {
             Some(value.to_string())
         } else {
             None
@@ -455,7 +459,7 @@ fn sanitized_upstream_path_and_query(uri: &axum::http::Uri) -> String {
         .split('&')
         .filter(|pair| {
             pair.split_once('=')
-                .map(|(key, _)| key != "nym_ingress_token")
+                .map(|(key, _)| key != INGRESS_TOKEN_QUERY_PARAM)
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>()
@@ -549,10 +553,10 @@ mod tests {
     }
 
     #[test]
-    fn public_ingress_legacy_exposures_default_to_auth_required() {
+    fn public_ingress_exposures_default_to_auth_required() {
         let exposure = serde_json::from_str::<PublicIngressExposure>(
             r#"{
-                "nym_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "owner_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "public_hostname": "example.test",
                 "guest_port": 3000
             }"#,

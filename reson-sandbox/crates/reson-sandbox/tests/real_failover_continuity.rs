@@ -52,7 +52,7 @@ fn kill_pid(pid: i32) {
 }
 
 fn failover_sandbox_config(secondary_endpoint: String) -> SandboxConfig {
-    SandboxConfig {
+    let mut cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
         connect_timeout: Duration::from_secs(30),
@@ -62,7 +62,9 @@ fn failover_sandbox_config(secondary_endpoint: String) -> SandboxConfig {
         endpoint_overrides: parse_endpoint_overrides_env("RESON_SANDBOX_REAL_ENDPOINT_OVERRIDES"),
         auth_token: optional_env("RESON_SANDBOX_REAL_AUTH_TOKEN"),
         ..SandboxConfig::default()
-    }
+    };
+    cfg.default_architecture = optional_env("RESON_SANDBOX_REAL_DEFAULT_ARCHITECTURE");
+    cfg
 }
 
 async fn collect_exec(

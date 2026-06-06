@@ -492,10 +492,10 @@ if command -v netplan >/dev/null 2>&1; then
 network:
   version: 2
   ethernets:
-    nym0:
+    reson0:
       match:
         macaddress: "$TAP_MAC"
-      set-name: nym0
+      set-name: reson0
       dhcp4: false
       dhcp6: false
       addresses:
@@ -511,8 +511,8 @@ EOF
   netplan apply || true
 fi
 
-if ip link show nym0 >/dev/null 2>&1; then
-  TAP_IFACE=nym0
+if ip link show reson0 >/dev/null 2>&1; then
+  TAP_IFACE=reson0
 fi
 ip link set "$TAP_IFACE" up || true
 ip addr flush dev "$TAP_IFACE" || true
@@ -649,8 +649,8 @@ fn shell_escape(value: &str) -> String {
 }
 
 fn build_shared_mounts_file(shared_mounts: &[SharedMount]) -> String {
-    // @dive: Nested guest mountpoints must appear after their parents so the guest mounts `/nym`
-    // before `/nym/task-overlays`, while the bootstrap script precreates both paths ahead of time.
+    // @dive: Nested guest mountpoints must appear after their parents so the guest mounts `/workspace`
+    // before `/workspace/task-overlays`, while the bootstrap script precreates both paths ahead of time.
     let mut ordered_mounts = shared_mounts.to_vec();
     ordered_mounts.sort_by(|left, right| {
         let left_depth = Path::new(&left.guest_path).components().count();
@@ -1014,8 +1014,8 @@ mod tests {
             hostname: "vm-test".to_string(),
             arch: "amd64".to_string(),
             shared_mounts: vec![SharedMount {
-                guest_path: "/nym".to_string(),
-                mount_tag: "nymfs".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "runtimefs".to_string(),
                 read_only: false,
             }],
             network: None,
@@ -1044,32 +1044,32 @@ mod tests {
     fn build_shared_mounts_file_orders_parent_before_nested_writable_children() {
         let mounts = vec![
             SharedMount {
-                guest_path: "/nym/conversations/conv-a/0007_assistant/mount".to_string(),
-                mount_tag: "nymfs-task-conv-a-0007".to_string(),
+                guest_path: "/workspace/conversations/conv-a/0007_assistant/mount".to_string(),
+                mount_tag: "runtimefs-task-conv-a-0007".to_string(),
                 read_only: false,
             },
             SharedMount {
-                guest_path: "/nym/conversations/conv-a/shared".to_string(),
-                mount_tag: "nymfs-shared-conv-a".to_string(),
+                guest_path: "/workspace/conversations/conv-a/shared".to_string(),
+                mount_tag: "runtimefs-shared-conv-a".to_string(),
                 read_only: false,
             },
             SharedMount {
-                guest_path: "/nym".to_string(),
-                mount_tag: "nymfs".to_string(),
+                guest_path: "/workspace".to_string(),
+                mount_tag: "runtimefs".to_string(),
                 read_only: true,
             },
         ];
 
         let file = build_shared_mounts_file(&mounts);
         let lines: Vec<&str> = file.lines().collect();
-        assert_eq!(lines[0], "nymfs\t/nym\tro");
+        assert_eq!(lines[0], "runtimefs\t/workspace\tro");
         assert_eq!(
             lines[1],
-            "nymfs-shared-conv-a\t/nym/conversations/conv-a/shared\trw"
+            "runtimefs-shared-conv-a\t/workspace/conversations/conv-a/shared\trw"
         );
         assert_eq!(
             lines[2],
-            "nymfs-task-conv-a-0007\t/nym/conversations/conv-a/0007_assistant/mount\trw"
+            "runtimefs-task-conv-a-0007\t/workspace/conversations/conv-a/0007_assistant/mount\trw"
         );
     }
 

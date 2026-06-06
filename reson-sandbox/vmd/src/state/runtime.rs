@@ -2,7 +2,7 @@
 // @dive-rel: Owned by vmd state manager lifecycle operations for running VM bookkeeping.
 // @dive-rel: Carries process/socket paths and transient runtime flags not persisted to metadata.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,6 +16,7 @@ use crate::virt::{MonitorHandle, VirtiofsdHandle};
 
 #[derive(Clone, Debug)]
 pub struct VmRuntime {
+    pub runtime_dir: PathBuf,
     pub qmp_path: PathBuf,
     pub pid_path: PathBuf,
     pub state: VmState,
@@ -37,8 +38,10 @@ pub struct VmRuntime {
 
 impl VmRuntime {
     pub fn new(vm_dir: &PathBuf) -> Self {
+        let runtime_dir = qemu_runtime_dir_for_vm(vm_dir);
         Self {
-            qmp_path: vm_dir.join("qmp.sock"),
+            qmp_path: runtime_dir.join("qmp.sock"),
+            runtime_dir,
             pid_path: vm_dir.join("qemu.pid"),
             state: VmState::Stopped,
             started_at: None,
@@ -63,5 +66,53 @@ impl VmRuntime {
 
     pub fn clear_health_failures(&mut self) {
         self.consecutive_health_failures = 0;
+    }
+}
+
+fn qemu_runtime_dir_for_vm(vm_dir: &Path) -> PathBuf {
+    configured_runtime_root().join(runtime_component_for_vm_dir(vm_dir))
+}
+
+fn configured_runtime_root() -> PathBuf {
+    std::env::var("RESON_SANDBOX_RUNTIME_DIR")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_RUNTIME_DIR"))
+        .map(|raw| raw.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/reson-vmd"))
+}
+
+fn runtime_component_for_vm_dir(vm_dir: &Path) -> String {
+    vm_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_runtime_component)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown-vm".to_string())
+}
+
+fn sanitize_runtime_component(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_socket_path_stays_short_for_long_vm_data_roots() {
+        let vm_dir = PathBuf::from(
+            "/home/crow/reson-sandbox-migration-test/.run/ovh-vmd-data-node2/e023ca02-7f6d-4dfc-8667-e2bda4e483fa",
+        );
+        let runtime = VmRuntime::new(&vm_dir);
+
+        assert_eq!(
+            runtime.qmp_path,
+            PathBuf::from("/tmp/reson-vmd/e023ca02-7f6d-4dfc-8667-e2bda4e483fa/qmp.sock")
+        );
+        assert!(runtime.qmp_path.to_string_lossy().len() < 108);
     }
 }

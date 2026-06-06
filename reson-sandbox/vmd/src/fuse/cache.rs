@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use super::client::{RemoteDirEntry, RemoteMetadata};
+use reson_sandbox::vfs::{VfsDirEntry as RemoteDirEntry, VfsMetadata as RemoteMetadata};
 
 const FILE_TTL: Duration = Duration::from_secs(60);
 const DIR_TTL: Duration = Duration::from_secs(5);
@@ -34,11 +34,11 @@ struct CacheState {
 }
 
 #[derive(Default)]
-pub struct NymFuseCache {
+pub struct RemoteFuseCache {
     inner: Mutex<CacheState>,
 }
 
-impl NymFuseCache {
+impl RemoteFuseCache {
     pub fn get_file(&self, path: &str) -> Option<(Vec<u8>, Option<RemoteMetadata>)> {
         let mut inner = self.lock_inner();
         let entry = inner.files.get_mut(path)?;
@@ -152,8 +152,8 @@ fn parent_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_DIR_ENTRIES, MAX_DIRS, NymFuseCache};
-    use crate::fuse::client::RemoteDirEntry;
+    use super::{MAX_DIR_ENTRIES, MAX_DIRS, RemoteFuseCache};
+    use reson_sandbox::vfs::VfsDirEntry as RemoteDirEntry;
 
     fn entry(name: &str) -> RemoteDirEntry {
         RemoteDirEntry {
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn directory_cache_evicts_by_capacity() {
-        let cache = NymFuseCache::default();
+        let cache = RemoteFuseCache::default();
         for index in 0..=MAX_DIRS {
             cache.put_dir(&format!("dir-{index}"), vec![entry("file")]);
         }
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn directory_cache_skips_oversized_directories() {
-        let cache = NymFuseCache::default();
+        let cache = RemoteFuseCache::default();
         let entries = (0..=MAX_DIR_ENTRIES)
             .map(|index| entry(&format!("file-{index}")))
             .collect();

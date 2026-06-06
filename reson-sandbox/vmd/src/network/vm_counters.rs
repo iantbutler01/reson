@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 const MAX_RECENT_EVENTS_PER_VM: usize = 200;
 const MAX_ACCESS_LOG_READ_BYTES_PER_REFRESH: u64 = 1024 * 1024;
+const ACCESS_LOG_HEAD_SAMPLE_BYTES: u64 = 4096;
 const MAX_VM_COUNTER_STATES: usize = 2048;
 const CONNECTION_WINDOW_SECS: i64 = 60;
 const BANDWIDTH_WINDOW_SECS: i64 = 60 * 60;
@@ -59,6 +60,7 @@ pub struct VmCounters {
     access_log_path: PathBuf,
     read_offset: u64,
     last_modified_at: Option<SystemTime>,
+    file_head_sample: Vec<u8>,
     partial_line: String,
     next_seq: u64,
     by_vm: HashMap<String, VmCounterState>,
@@ -181,9 +183,15 @@ impl VmCounters {
             .with_context(|| format!("stat envoy access log {}", self.access_log_path.display()))?;
         let file_len = metadata.len();
         let modified_at = metadata.modified().ok();
+        let file_head_sample = read_file_head_sample(&mut file, file_len).with_context(|| {
+            format!("sample envoy access log {}", self.access_log_path.display())
+        })?;
 
         if file_len < self.read_offset
             || (file_len <= self.read_offset && modified_at != self.last_modified_at)
+            || (!self.file_head_sample.is_empty()
+                && !file_head_sample.is_empty()
+                && file_head_sample != self.file_head_sample)
         {
             self.read_offset = 0;
             self.partial_line.clear();
@@ -203,6 +211,7 @@ impl VmCounters {
             .min(file_len);
         if self.read_offset == file_len {
             self.last_modified_at = modified_at;
+            self.file_head_sample = file_head_sample;
         }
 
         if buf.is_empty() {
@@ -412,6 +421,18 @@ impl VmCounterState {
 
 fn parse_counter(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
+}
+
+fn read_file_head_sample(file: &mut File, file_len: u64) -> Result<Vec<u8>> {
+    let sample_len = file_len.min(ACCESS_LOG_HEAD_SAMPLE_BYTES);
+    if sample_len == 0 {
+        return Ok(Vec::new());
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut sample = Vec::with_capacity(sample_len as usize);
+    file.take(sample_len).read_to_end(&mut sample)?;
+    Ok(sample)
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {

@@ -2303,7 +2303,10 @@ name = "reson-sandbox"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "async-trait",
+ "axum 0.8.8",
  "bytes",
+ "chrono",
  "etcd-client",
  "futures",
  "prost 0.14.3",
@@ -2318,6 +2321,7 @@ dependencies = [
  "tonic 0.14.4",
  "tonic-prost",
  "tonic-prost-build",
+ "tower 0.5.3",
  "tracing",
  "uuid",
 ]
@@ -3433,6 +3437,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rand 0.9.2",
  "reqwest",
+ "reson-sandbox",
  "serde",
  "serde_json",
  "sha2",

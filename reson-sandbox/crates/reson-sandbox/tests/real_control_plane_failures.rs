@@ -1,7 +1,9 @@
 // @dive-file: Real distributed control-plane failure probes that validate fail-closed behavior and recovery for etcd/NATS outages.
 // @dive-rel: Executed by scripts/integration/verify_control_plane_failures.sh against live compose-backed etcd+nats infrastructure.
 // @dive-rel: Uses public facade APIs to verify L3 distributed semantics without test-only runtime shortcuts.
+use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -63,25 +65,29 @@ fn distributed_control_config_from_env() -> DistributedControlConfig {
 }
 
 fn control_plane_sandbox_config() -> SandboxConfig {
-    SandboxConfig {
+    let mut cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
         connect_timeout: Duration::from_secs(15),
         daemon_start_timeout: Duration::from_secs(20),
         distributed_control: Some(distributed_control_config_from_env()),
         ..SandboxConfig::default()
-    }
+    };
+    cfg.default_architecture = optional_env("RESON_SANDBOX_REAL_DEFAULT_ARCHITECTURE");
+    cfg
 }
 
 fn direct_sandbox_config() -> SandboxConfig {
-    SandboxConfig {
+    let mut cfg = SandboxConfig {
         auto_spawn: false,
         prewarm_on_start: false,
         connect_timeout: Duration::from_secs(15),
         daemon_start_timeout: Duration::from_secs(20),
         distributed_control: None,
         ..SandboxConfig::default()
-    }
+    };
+    cfg.default_architecture = optional_env("RESON_SANDBOX_REAL_DEFAULT_ARCHITECTURE");
+    cfg
 }
 
 fn run_docker(args: &[&str]) {
@@ -233,6 +239,42 @@ async fn publish_reconcile_command(
         .expect("ack reconcile publish");
 }
 
+async fn publish_session_attach_probe_command(
+    nats_url: &str,
+    subject_prefix: &str,
+    command_id: &str,
+    ordering_key: &str,
+    idempotency_key: &str,
+    session_id: &str,
+    expected_fence: Option<&str>,
+) {
+    let client = async_nats::connect(nats_url.to_string())
+        .await
+        .expect("connect nats for session attach probe command publish");
+    let jetstream = jetstream::new(client);
+    let subject = format!("{subject_prefix}.cmd.session.attach");
+    let envelope = json!({
+        "schema_version": "v1",
+        "command_id": command_id,
+        "command_type": "session.attach",
+        "ordering_key": ordering_key,
+        "idempotency_key": idempotency_key,
+        "expected_fence": expected_fence,
+        "payload": {
+            "session_id": session_id,
+            "expected_fence": expected_fence
+        }
+    });
+    let bytes =
+        serde_json::to_vec(&envelope).expect("serialize session attach probe command envelope");
+    jetstream
+        .publish(subject, bytes.into())
+        .await
+        .expect("publish session attach probe command")
+        .await
+        .expect("ack session attach probe publish");
+}
+
 async fn collect_dead_letters_for_commands(
     nats_url: &str,
     subject_prefix: &str,
@@ -355,6 +397,67 @@ async fn wait_for_session_route_endpoint(
     None
 }
 
+async fn read_session_fence_value(
+    etcd_endpoints: &[String],
+    etcd_prefix: &str,
+    session_id: &str,
+) -> Option<String> {
+    let mut client = EtcdClient::connect(etcd_endpoints.to_vec(), None)
+        .await
+        .ok()?;
+    let fence_key = session_fence_key(etcd_prefix, session_id);
+    let legacy_fence_key = legacy_session_fence_key(etcd_prefix, session_id);
+    let mut response = client.get(fence_key.clone(), None).await.ok()?;
+    if response.kvs().is_empty() && fence_key != legacy_fence_key {
+        response = client.get(legacy_fence_key, None).await.ok()?;
+    }
+    let kv = response.kvs().first()?;
+    let value = String::from_utf8(kv.value().to_vec()).ok()?;
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+async fn wait_for_session_fence_value(
+    etcd_endpoints: &[String],
+    etcd_prefix: &str,
+    session_id: &str,
+    timeout_dur: Duration,
+) -> Option<String> {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < timeout_dur {
+        if let Some(fence) = read_session_fence_value(etcd_endpoints, etcd_prefix, session_id).await
+        {
+            return Some(fence);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
+fn session_fence_key(etcd_prefix: &str, session_id: &str) -> String {
+    let trimmed = etcd_prefix.trim_end_matches('/');
+    let shard = shard_for_key(session_id, 16);
+    format!("{trimmed}/session_fences/{shard:02}/{session_id}")
+}
+
+fn legacy_session_fence_key(etcd_prefix: &str, session_id: &str) -> String {
+    format!(
+        "{}/session_fences/{}",
+        etcd_prefix.trim_end_matches('/'),
+        session_id
+    )
+}
+
+fn shard_for_key(key: &str, shard_count: u8) -> u8 {
+    let shard_count = shard_count.max(1);
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() % shard_count as u64) as u8
+}
+
 async fn wait_for_key_absent(etcd_endpoints: &[String], key: &str, timeout_dur: Duration) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < timeout_dur {
@@ -442,6 +545,8 @@ async fn nats_outage_fails_closed_and_recovers() {
 #[ignore = "requires real distributed control-plane daemons; run via scripts/integration/verify_control_plane_failures.sh"]
 async fn ownership_fence_conflicts_under_concurrent_mutators_resolve_deterministically() {
     let endpoint = required_env("RESON_SANDBOX_REAL_PRIMARY_ENDPOINT");
+    let etcd_endpoints = parse_csv_env("RESON_SANDBOX_REAL_ETCD_ENDPOINTS");
+    let etcd_prefix = required_env("RESON_SANDBOX_REAL_ETCD_PREFIX");
     let nats_url = required_env("RESON_SANDBOX_REAL_NATS_URL");
     let subject_prefix = required_env("RESON_SANDBOX_REAL_NATS_SUBJECT_PREFIX");
     let stream_name = required_env("RESON_SANDBOX_REAL_NATS_STREAM");
@@ -453,39 +558,52 @@ async fn ownership_fence_conflicts_under_concurrent_mutators_resolve_determinist
     let session_id = format!("real-fence-conflict-{}", Uuid::new_v4());
     let session = sandbox
         .session(SessionOptions {
-            session_id: Some(session_id),
+            session_id: Some(session_id.clone()),
             auto_start: false,
             ..SessionOptions::default()
         })
         .await
         .expect("create session anchor for ownership fence conflict test");
 
+    let current_fence = wait_for_session_fence_value(
+        &etcd_endpoints,
+        &etcd_prefix,
+        &session_id,
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("session anchor should publish an ownership fence");
     let ordering_key = format!("real-fence-ordering-{}", Uuid::new_v4());
-    let command_a = format!("real-fence-cmd-a-{}", Uuid::new_v4());
-    let command_b = format!("real-fence-cmd-b-{}", Uuid::new_v4());
-    let idem_a = format!("real-fence-idem-a-{}", Uuid::new_v4());
-    let idem_b = format!("real-fence-idem-b-{}", Uuid::new_v4());
-    let publish_a = publish_reconcile_command(
+    let accepted_command = format!("real-fence-cmd-accepted-{}", Uuid::new_v4());
+    let stale_command = format!("real-fence-cmd-stale-{}", Uuid::new_v4());
+    let accepted_idem = format!("real-fence-idem-accepted-{}", Uuid::new_v4());
+    let stale_idem = format!("real-fence-idem-stale-{}", Uuid::new_v4());
+    let stale_fence = format!("stale-{}", Uuid::new_v4());
+    let publish_accepted = publish_session_attach_probe_command(
         &nats_url,
         &subject_prefix,
-        &command_a,
+        &accepted_command,
         &ordering_key,
-        &idem_a,
+        &accepted_idem,
+        &session_id,
+        Some(current_fence.as_str()),
     );
-    let publish_b = publish_reconcile_command(
+    let publish_stale = publish_session_attach_probe_command(
         &nats_url,
         &subject_prefix,
-        &command_b,
+        &stale_command,
         &ordering_key,
-        &idem_b,
+        &stale_idem,
+        &session_id,
+        Some(stale_fence.as_str()),
     );
-    let _ = tokio::join!(publish_a, publish_b);
+    let _ = tokio::join!(publish_accepted, publish_stale);
 
     let dlq_hits = collect_dead_letters_for_commands(
         &nats_url,
         &subject_prefix,
         &stream_name,
-        &[command_a.clone(), command_b.clone()],
+        &[accepted_command.clone(), stale_command.clone()],
         Duration::from_secs(90),
     )
     .await;
@@ -499,9 +617,9 @@ async fn ownership_fence_conflicts_under_concurrent_mutators_resolve_determinist
         "expected exactly one contender to dead-letter under ownership-fence conflict, got {dlq_hits:?}"
     );
     let (failed_command_id, reason, delivered) = &dlq_hits[0];
-    assert!(
-        failed_command_id == &command_a || failed_command_id == &command_b,
-        "dead-letter command id should belong to conflicting contenders: {dlq_hits:?}"
+    assert_eq!(
+        failed_command_id, &stale_command,
+        "dead-letter command id should be the stale-fence contender: {dlq_hits:?}"
     );
     assert_eq!(
         reason, "ownership_fence_conflict",

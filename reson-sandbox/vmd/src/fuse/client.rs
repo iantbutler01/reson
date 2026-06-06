@@ -2,57 +2,22 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, StatusCode, header};
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct RemoteDirEntry {
-    pub name: String,
-    pub kind: String,
-    pub size_bytes: u64,
-    pub content_hash: Option<String>,
-    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct RemoteMetadata {
-    pub kind: String,
-    pub size_bytes: u64,
-    pub content_hash: Option<String>,
-    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct LeaseGrant {
-    pub resource_key: String,
-    pub owner_token: Uuid,
-    pub task_id: Option<Uuid>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct LeaseAcquireRequest<'a> {
-    path: &'a str,
-    mutation_count: i32,
-    component: &'a str,
-    run_id: Option<Uuid>,
-    reason: &'a str,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct LeaseReleaseRequest<'a> {
-    resource_key: &'a str,
-    owner_token: Uuid,
-}
+use reson_sandbox::vfs::{
+    RESON_VFS_COMPONENT_HEADER, RESON_VFS_LOCK_OWNER_TOKEN_HEADER, RESON_VFS_OPERATION_HEADER,
+    RESON_VFS_RESOURCE_KEY_HEADER, RESON_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
+    VfsDirEntry as RemoteDirEntry, VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant,
+    VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata, scoped_vfs_path,
+};
 
 #[derive(Clone, Debug)]
-pub struct NymVfsClient {
+pub struct RemoteVfsClient {
     client: Client,
     endpoint: String,
     auth_token: String,
     scope_path: String,
 }
 
-impl NymVfsClient {
+impl RemoteVfsClient {
     pub fn new(endpoint: &str, auth_token: &str, scope_path: &str) -> Result<Self> {
         let mut builder = Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -62,7 +27,7 @@ impl NymVfsClient {
         if endpoint.trim_start().starts_with("http://") {
             builder = builder.http2_prior_knowledge();
         }
-        let client = builder.build().context("build nymfs reqwest client")?;
+        let client = builder.build().context("build vfs reqwest client")?;
         Ok(Self {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -85,7 +50,7 @@ impl NymVfsClient {
         response
             .json()
             .await
-            .context("decode nymfs tree response")
+            .context("decode vfs tree response")
             .map(Some)
     }
 
@@ -101,12 +66,12 @@ impl NymVfsClient {
             return Ok(None);
         }
         if !response.status().is_success() {
-            bail!("nymfs stat failed: {}", response.status());
+            bail!("vfs stat failed: {}", response.status());
         }
         response
             .json()
             .await
-            .context("decode nymfs stat response")
+            .context("decode vfs stat response")
             .map(Some)
     }
 
@@ -122,7 +87,7 @@ impl NymVfsClient {
             .bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .context("read nymfs raw bytes")
+            .context("read vfs raw bytes")
     }
 
     pub async fn read_file_range(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>> {
@@ -141,7 +106,7 @@ impl NymVfsClient {
             .bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .context("read nymfs ranged bytes")
+            .context("read vfs ranged bytes")
     }
 
     pub async fn write_file(
@@ -156,11 +121,14 @@ impl NymVfsClient {
             self.client
                 .put(self.url("/file"))
                 .query(&[("path", self.path_arg(path))])
-                .header("x-nymfs-component", "vm_runtime")
-                .header("x-nymfs-surface-kind", surface_kind)
-                .header("x-nymfs-operation", operation)
-                .header("x-nymfs-resource-key", lease.resource_key.as_str())
-                .header("x-nymfs-lock-owner-token", lease.owner_token.to_string())
+                .header(RESON_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(RESON_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(RESON_VFS_OPERATION_HEADER, operation)
+                .header(RESON_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    RESON_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                )
                 .body(bytes.to_vec()),
         )
         .await?;
@@ -178,11 +146,14 @@ impl NymVfsClient {
             self.client
                 .delete(self.url("/file"))
                 .query(&[("path", self.path_arg(path))])
-                .header("x-nymfs-component", "vm_runtime")
-                .header("x-nymfs-surface-kind", surface_kind)
-                .header("x-nymfs-operation", operation)
-                .header("x-nymfs-resource-key", lease.resource_key.as_str())
-                .header("x-nymfs-lock-owner-token", lease.owner_token.to_string()),
+                .header(RESON_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(RESON_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(RESON_VFS_OPERATION_HEADER, operation)
+                .header(RESON_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    RESON_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                ),
         )
         .await?;
         Ok(())
@@ -199,11 +170,14 @@ impl NymVfsClient {
             self.client
                 .put(self.url("/dir"))
                 .query(&[("path", self.path_arg(path))])
-                .header("x-nymfs-component", "vm_runtime")
-                .header("x-nymfs-surface-kind", surface_kind)
-                .header("x-nymfs-operation", operation)
-                .header("x-nymfs-resource-key", lease.resource_key.as_str())
-                .header("x-nymfs-lock-owner-token", lease.owner_token.to_string()),
+                .header(RESON_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(RESON_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(RESON_VFS_OPERATION_HEADER, operation)
+                .header(RESON_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    RESON_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                ),
         )
         .await?;
         Ok(())
@@ -220,11 +194,14 @@ impl NymVfsClient {
             self.client
                 .delete(self.url("/dir"))
                 .query(&[("path", self.path_arg(path))])
-                .header("x-nymfs-component", "vm_runtime")
-                .header("x-nymfs-surface-kind", surface_kind)
-                .header("x-nymfs-operation", operation)
-                .header("x-nymfs-resource-key", lease.resource_key.as_str())
-                .header("x-nymfs-lock-owner-token", lease.owner_token.to_string()),
+                .header(RESON_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(RESON_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(RESON_VFS_OPERATION_HEADER, operation)
+                .header(RESON_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    RESON_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                ),
         )
         .await?;
         Ok(())
@@ -242,11 +219,14 @@ impl NymVfsClient {
             self.client
                 .post(self.url("/rename"))
                 .query(&[("from", self.path_arg(from)), ("to", self.path_arg(to))])
-                .header("x-nymfs-component", "vm_runtime")
-                .header("x-nymfs-surface-kind", surface_kind)
-                .header("x-nymfs-operation", operation)
-                .header("x-nymfs-resource-key", lease.resource_key.as_str())
-                .header("x-nymfs-lock-owner-token", lease.owner_token.to_string()),
+                .header(RESON_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
+                .header(RESON_VFS_SURFACE_KIND_HEADER, surface_kind)
+                .header(RESON_VFS_OPERATION_HEADER, operation)
+                .header(RESON_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    RESON_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    lease.owner_token.to_string(),
+                ),
         )
         .await?;
         Ok(())
@@ -262,26 +242,26 @@ impl NymVfsClient {
         self.request(
             self.client
                 .post(self.url("/lease"))
-                .json(&LeaseAcquireRequest {
-                    path: scoped_path.as_str(),
-                    mutation_count,
-                    component: "vm_runtime",
+                .json(&VfsLeaseAcquireRequest {
+                    path: scoped_path,
+                    mutation_count: Some(mutation_count),
+                    component: Some(VFS_COMPONENT_VM_RUNTIME.to_string()),
                     run_id: None,
-                    reason,
+                    reason: Some(reason.to_string()),
                 }),
         )
         .await?
         .json()
         .await
-        .context("decode nymfs lease response")
+        .context("decode vfs lease response")
     }
 
     pub async fn release_lease(&self, lease: &LeaseGrant) -> Result<()> {
         self.request(
             self.client
                 .delete(self.url("/lease"))
-                .json(&LeaseReleaseRequest {
-                    resource_key: lease.resource_key.as_str(),
+                .json(&VfsLeaseReleaseRequest {
+                    resource_key: lease.resource_key.clone(),
                     owner_token: lease.owner_token,
                 }),
         )
@@ -290,14 +270,7 @@ impl NymVfsClient {
     }
 
     fn path_arg(&self, relative: &str) -> String {
-        let rel = relative.trim_matches('/');
-        if self.scope_path.is_empty() {
-            rel.to_string()
-        } else if rel.is_empty() {
-            self.scope_path.clone()
-        } else {
-            format!("{}/{}", self.scope_path, rel)
-        }
+        scoped_vfs_path(self.scope_path.as_str(), relative)
     }
 
     fn url(&self, suffix: &str) -> String {
@@ -309,7 +282,7 @@ impl NymVfsClient {
             .bearer_auth(&self.auth_token)
             .send()
             .await
-            .context("send nymfs request")?;
+            .context("send vfs request")?;
         if response.status().is_success() || response.status() == StatusCode::PARTIAL_CONTENT {
             return Ok(response);
         }
@@ -318,6 +291,6 @@ impl NymVfsClient {
         }
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        Err(anyhow!("nymfs request failed: {status} {body}"))
+        Err(anyhow!("vfs request failed: {status} {body}"))
     }
 }

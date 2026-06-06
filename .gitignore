@@ -9,6 +9,9 @@ wheels/
 # Rust build output
 target/
 
+# Local tool/runtime state
+.run/
+
 # Virtual environments
 .venv
 

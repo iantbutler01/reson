@@ -178,6 +178,7 @@ impl QemuProcessConfig {
 pub struct NetworkServicesConfig {
     pub envoy_bin: String,
     pub envoy_log_level: String,
+    pub envoy_base_id: Option<u32>,
     pub envoy_admin_addr: String,
     pub coredns_bin: String,
     pub coredns_bind_addr: String,
@@ -191,6 +192,7 @@ impl Default for NetworkServicesConfig {
         Self {
             envoy_bin: default_envoy_bin_from_env(),
             envoy_log_level: default_envoy_log_level_from_env(),
+            envoy_base_id: default_envoy_base_id_from_env(),
             envoy_admin_addr: default_envoy_admin_addr_from_env(),
             coredns_bin: default_coredns_bin_from_env(),
             coredns_bind_addr: default_coredns_bind_addr_from_env(),
@@ -308,7 +310,7 @@ pub struct Config {
     pub fork_compaction_depth_threshold: usize,
     pub storage_profile: StorageProfile,
     pub shared_mount_profiles: Vec<String>,
-    pub nymfs_internal_service_token: Option<String>,
+    pub vfs_internal_service_token: Option<String>,
     pub qemu_process: QemuProcessConfig,
     pub guest_network: GuestNetworkConfig,
     pub network_services: NetworkServicesConfig,
@@ -341,7 +343,7 @@ impl Default for Config {
             fork_compaction_depth_threshold: default_fork_compaction_depth_threshold_from_env(),
             storage_profile: default_storage_profile_from_env(),
             shared_mount_profiles: default_shared_mount_profiles_from_env(),
-            nymfs_internal_service_token: default_nymfs_internal_service_token_from_env(),
+            vfs_internal_service_token: default_vfs_internal_service_token_from_env(),
             qemu_process: QemuProcessConfig::default(),
             guest_network: default_guest_network_from_env(),
             network_services: NetworkServicesConfig::default(),
@@ -529,7 +531,12 @@ impl Config {
 
         let dedupe_prefix = control.dedupe_prefix.trim().trim_matches('/');
         control.dedupe_prefix = if dedupe_prefix.is_empty() {
-            DEFAULT_CONTROL_DEDUPE_PREFIX.to_string()
+            self.node_registry
+                .as_ref()
+                .and_then(|registry| {
+                    control_dedupe_prefix_from_registry_prefix(&registry.key_prefix)
+                })
+                .unwrap_or_else(|| DEFAULT_CONTROL_DEDUPE_PREFIX.to_string())
         } else {
             format!("/{dedupe_prefix}")
         };
@@ -779,9 +786,7 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
         .into_iter()
         .map(|value| normalize_endpoint_like(&value))
         .collect();
-    let dedupe_prefix = env::var("RESON_SANDBOX_CONTROL_DEDUPE_PREFIX")
-        .or_else(|_| env::var("BRACKET_SANDBOX_CONTROL_DEDUPE_PREFIX"))
-        .unwrap_or_else(|_| DEFAULT_CONTROL_DEDUPE_PREFIX.to_string());
+    let dedupe_prefix = default_control_dedupe_prefix_from_env();
     let stream_name = env::var("RESON_SANDBOX_NATS_STREAM")
         .or_else(|_| env::var("BRACKET_SANDBOX_NATS_STREAM"))
         .unwrap_or_else(|_| DEFAULT_CONTROL_STREAM_NAME.to_string());
@@ -853,6 +858,38 @@ fn default_control_bus_from_env() -> Option<ControlBusConfig> {
         dead_letter_subject,
         replay_subject,
     })
+}
+
+fn default_control_dedupe_prefix_from_env() -> String {
+    env::var("RESON_SANDBOX_CONTROL_DEDUPE_PREFIX")
+        .or_else(|_| env::var("BRACKET_SANDBOX_CONTROL_DEDUPE_PREFIX"))
+        .ok()
+        .and_then(|value| normalize_nonempty_prefix(&value))
+        .or_else(|| {
+            env::var("RESON_SANDBOX_ETCD_PREFIX")
+                .or_else(|_| env::var("BRACKET_SANDBOX_ETCD_PREFIX"))
+                .ok()
+                .and_then(|value| control_dedupe_prefix_from_registry_prefix(&value))
+        })
+        .unwrap_or_else(|| DEFAULT_CONTROL_DEDUPE_PREFIX.to_string())
+}
+
+fn control_dedupe_prefix_from_registry_prefix(registry_prefix: &str) -> Option<String> {
+    let prefix = normalize_nonempty_prefix(registry_prefix)?;
+    if prefix.ends_with("/command-dedupe") {
+        Some(prefix)
+    } else {
+        Some(format!("{prefix}/command-dedupe"))
+    }
+}
+
+fn normalize_nonempty_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!("/{trimmed}"))
+    }
 }
 
 fn default_max_active_vms_from_env() -> Option<usize> {
@@ -966,9 +1003,9 @@ fn default_shared_mount_profiles_from_env() -> Vec<String> {
         .unwrap_or_else(|| vec![DEFAULT_SHARED_MOUNT_PROFILE_LOCAL.to_string()])
 }
 
-fn default_nymfs_internal_service_token_from_env() -> Option<String> {
-    env::var("RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN")
-        .or_else(|_| env::var("BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN"))
+fn default_vfs_internal_service_token_from_env() -> Option<String> {
+    env::var("RESON_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN")
+        .or_else(|_| env::var("BRACKET_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN"))
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1040,6 +1077,13 @@ fn default_envoy_log_level_from_env() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "info".to_string())
+}
+
+fn default_envoy_base_id_from_env() -> Option<u32> {
+    env::var("RESON_SANDBOX_ENVOY_BASE_ID")
+        .or_else(|_| env::var("BRACKET_SANDBOX_ENVOY_BASE_ID"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
 fn default_envoy_admin_addr_from_env() -> String {
@@ -1401,39 +1445,111 @@ mod tests {
     }
 
     #[test]
-    fn nymfs_internal_service_token_prefers_reson_env_then_legacy_fallback() {
+    fn vfs_internal_service_token_prefers_reson_env_then_legacy_fallback() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
-            env::remove_var("RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
-            env::remove_var("BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
+            env::remove_var("RESON_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN");
+            env::remove_var("BRACKET_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN");
         }
-        assert_eq!(default_nymfs_internal_service_token_from_env(), None);
+        assert_eq!(default_vfs_internal_service_token_from_env(), None);
 
         unsafe {
-            env::set_var(
-                "BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN",
-                "legacy-token",
-            );
+            env::set_var("BRACKET_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN", "legacy-token");
         }
         assert_eq!(
-            default_nymfs_internal_service_token_from_env().as_deref(),
+            default_vfs_internal_service_token_from_env().as_deref(),
             Some("legacy-token")
         );
 
         unsafe {
-            env::set_var(
-                "RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN",
-                "primary-token",
-            );
+            env::set_var("RESON_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN", "primary-token");
         }
         assert_eq!(
-            default_nymfs_internal_service_token_from_env().as_deref(),
+            default_vfs_internal_service_token_from_env().as_deref(),
             Some("primary-token")
         );
 
         unsafe {
-            env::remove_var("RESON_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
-            env::remove_var("BRACKET_SANDBOX_NYMFS_INTERNAL_SERVICE_TOKEN");
+            env::remove_var("RESON_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN");
+            env::remove_var("BRACKET_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN");
+        }
+    }
+
+    #[test]
+    fn envoy_base_id_prefers_reson_env_then_legacy_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::remove_var("RESON_SANDBOX_ENVOY_BASE_ID");
+            env::remove_var("BRACKET_SANDBOX_ENVOY_BASE_ID");
+        }
+        assert_eq!(default_envoy_base_id_from_env(), None);
+
+        unsafe {
+            env::set_var("BRACKET_SANDBOX_ENVOY_BASE_ID", "7");
+        }
+        assert_eq!(default_envoy_base_id_from_env(), Some(7));
+
+        unsafe {
+            env::set_var("RESON_SANDBOX_ENVOY_BASE_ID", "11");
+        }
+        assert_eq!(default_envoy_base_id_from_env(), Some(11));
+
+        unsafe {
+            env::remove_var("RESON_SANDBOX_ENVOY_BASE_ID");
+            env::remove_var("BRACKET_SANDBOX_ENVOY_BASE_ID");
+        }
+    }
+
+    #[test]
+    fn control_dedupe_prefix_defaults_to_registry_prefix() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::remove_var("RESON_SANDBOX_CONTROL_DEDUPE_PREFIX");
+            env::remove_var("BRACKET_SANDBOX_CONTROL_DEDUPE_PREFIX");
+            env::remove_var("RESON_SANDBOX_ETCD_PREFIX");
+            env::remove_var("BRACKET_SANDBOX_ETCD_PREFIX");
+            env::remove_var("RESON_SANDBOX_NATS_URL");
+            env::remove_var("BRACKET_SANDBOX_NATS_URL");
+        }
+
+        unsafe {
+            env::set_var("RESON_SANDBOX_NATS_URL", "nats://127.0.0.1:4222");
+            env::set_var("BRACKET_SANDBOX_ETCD_PREFIX", "/legacy-registry");
+        }
+        assert_eq!(
+            default_control_bus_from_env()
+                .expect("control bus config")
+                .dedupe_prefix,
+            "/legacy-registry/command-dedupe"
+        );
+
+        unsafe {
+            env::set_var("RESON_SANDBOX_ETCD_PREFIX", "/reson-sandbox-otheryou");
+        }
+        assert_eq!(
+            default_control_bus_from_env()
+                .expect("control bus config")
+                .dedupe_prefix,
+            "/reson-sandbox-otheryou/command-dedupe"
+        );
+
+        unsafe {
+            env::set_var("RESON_SANDBOX_CONTROL_DEDUPE_PREFIX", "/custom-dedupe");
+        }
+        assert_eq!(
+            default_control_bus_from_env()
+                .expect("control bus config")
+                .dedupe_prefix,
+            "/custom-dedupe"
+        );
+
+        unsafe {
+            env::remove_var("RESON_SANDBOX_CONTROL_DEDUPE_PREFIX");
+            env::remove_var("BRACKET_SANDBOX_CONTROL_DEDUPE_PREFIX");
+            env::remove_var("RESON_SANDBOX_ETCD_PREFIX");
+            env::remove_var("BRACKET_SANDBOX_ETCD_PREFIX");
+            env::remove_var("RESON_SANDBOX_NATS_URL");
+            env::remove_var("BRACKET_SANDBOX_NATS_URL");
         }
     }
 

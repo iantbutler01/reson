@@ -260,17 +260,18 @@ async fn main() -> Result<()> {
         cfg.control_bus = None;
     }
 
-    let has_registry_overrides = args.registry_etcd_endpoints.is_some()
-        || args.registry_prefix.is_some()
-        || args.node_id.is_some()
-        || args.advertise_endpoint.is_some()
-        || args.registry_ttl_secs.is_some()
-        || args.region.is_some()
-        || args.zone.is_some()
-        || args.rack.is_some()
-        || args.continuity_tier.is_some()
-        || args.degraded_mode
-        || args.admission_frozen;
+    let has_registry_overrides = !args.disable_node_registry
+        && (args.registry_etcd_endpoints.is_some()
+            || args.registry_prefix.is_some()
+            || args.node_id.is_some()
+            || args.advertise_endpoint.is_some()
+            || args.registry_ttl_secs.is_some()
+            || args.region.is_some()
+            || args.zone.is_some()
+            || args.rack.is_some()
+            || args.continuity_tier.is_some()
+            || args.degraded_mode
+            || args.admission_frozen);
     if has_registry_overrides {
         let mut registry = cfg
             .node_registry
@@ -317,9 +318,10 @@ async fn main() -> Result<()> {
         cfg.node_registry = Some(registry);
     }
 
-    let has_control_overrides = args.control_nats_url.is_some()
-        || args.control_subject_prefix.is_some()
-        || args.control_node_id.is_some();
+    let has_control_overrides = !args.disable_control_bus
+        && (args.control_nats_url.is_some()
+            || args.control_subject_prefix.is_some()
+            || args.control_node_id.is_some());
     if has_control_overrides {
         let mut control = cfg.control_bus.clone().unwrap_or(ControlBusConfig {
             nats_url: "nats://127.0.0.1:4222".to_string(),

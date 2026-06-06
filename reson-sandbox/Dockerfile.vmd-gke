@@ -18,6 +18,7 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY vmd ./vmd
+COPY crates ./crates
 COPY proto ./proto
 COPY portproxy/bin ./portproxy/bin
 

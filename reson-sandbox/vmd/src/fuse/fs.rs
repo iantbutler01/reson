@@ -10,11 +10,17 @@ use fuser::{
     INodeNo, InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
+use reson_sandbox::vfs::{
+    VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SETATTR_SIZE,
+    VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED,
+    VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry, VfsLeaseGrant as LeaseGrant,
+    VfsMetadata as RemoteMetadata,
+};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 
-use super::cache::NymFuseCache;
-use super::client::{LeaseGrant, NymVfsClient, RemoteDirEntry, RemoteMetadata};
+use super::cache::RemoteFuseCache;
+use super::client::RemoteVfsClient;
 
 const TTL: Duration = Duration::from_secs(1);
 const ROOT_INO_RAW: u64 = 1;
@@ -124,9 +130,9 @@ struct FileState {
     revision: u64,
 }
 
-pub struct NymFuseFs {
-    client: NymVfsClient,
-    cache: NymFuseCache,
+pub struct RemoteFuseFs {
+    client: RemoteVfsClient,
+    cache: RemoteFuseCache,
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
     read_only: bool,
@@ -135,11 +141,11 @@ pub struct NymFuseFs {
     gid: u32,
 }
 
-impl NymFuseFs {
-    pub fn new(client: NymVfsClient, read_only: bool, tokio: Handle) -> Self {
+impl RemoteFuseFs {
+    pub fn new(client: RemoteVfsClient, read_only: bool, tokio: Handle) -> Self {
         Self {
             client,
-            cache: NymFuseCache::default(),
+            cache: RemoteFuseCache::default(),
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
             read_only,
@@ -152,7 +158,7 @@ impl NymFuseFs {
     pub fn mount_options(&self, tag: &str) -> fuser::Config {
         let mut mount_options = vec![
             MountOption::FSName(tag.to_string()),
-            MountOption::Subtype("nymfs".to_string()),
+            MountOption::Subtype("reson-vfs".to_string()),
             MountOption::DefaultPermissions,
             MountOption::NoExec,
         ];
@@ -348,7 +354,7 @@ impl NymFuseFs {
             .tokio
             .block_on(
                 self.client
-                    .acquire_lease(&state.path, 1, "flush nymfs fuse writes"),
+                    .acquire_lease(&state.path, 1, "flush vfs fuse writes"),
             )
             .map_err(|_| Errno::EIO)?;
         let metadata = match self.stat_path(&state.path) {
@@ -375,11 +381,7 @@ impl NymFuseFs {
             let _ = self.tokio.block_on(self.client.release_lease(&lease));
             return Err(Errno::EBUSY);
         }
-        let surface = if state.path.contains("/shared") {
-            "vm_conversation_shared_fuse"
-        } else {
-            "vm_task_overlay_fuse"
-        };
+        let surface = Self::surface_kind_for_path(&state.path);
         let write_result = if already_persisted {
             Ok(())
         } else {
@@ -388,7 +390,7 @@ impl NymFuseFs {
                 &state.buffer,
                 &lease,
                 surface,
-                "fuse_write_through",
+                VFS_OPERATION_WRITE_THROUGH,
             ))
         };
         let _ = self.tokio.block_on(self.client.release_lease(&lease));
@@ -441,19 +443,15 @@ impl NymFuseFs {
         bytes.resize(size as usize, 0);
         let lease = self
             .tokio
-            .block_on(self.client.acquire_lease(path, 1, "resize nymfs fuse file"))
+            .block_on(self.client.acquire_lease(path, 1, "resize vfs fuse file"))
             .map_err(|_| Errno::EIO)?;
-        let surface = if path.contains("/shared") {
-            "vm_conversation_shared_fuse"
-        } else {
-            "vm_task_overlay_fuse"
-        };
+        let surface = Self::surface_kind_for_path(path);
         let write_result = self.tokio.block_on(self.client.write_file(
             path,
             &bytes,
             &lease,
             surface,
-            "fuse_setattr_size",
+            VFS_OPERATION_SETATTR_SIZE,
         ));
         let _ = self.tokio.block_on(self.client.release_lease(&lease));
         write_result.map_err(|_| Errno::EIO)?;
@@ -474,16 +472,12 @@ impl NymFuseFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        let surface = if path.contains("/shared") {
-            "vm_conversation_shared_fuse"
-        } else {
-            "vm_task_overlay_fuse"
-        };
+        let surface = Self::surface_kind_for_path(path);
         let lease = self
             .tokio
             .block_on(
                 self.client
-                    .acquire_lease(path, 1, "apply nymfs namespace mutation"),
+                    .acquire_lease(path, 1, "apply vfs namespace mutation"),
             )
             .map_err(|_| Errno::EIO)?;
         let result = op(&lease, surface);
@@ -513,6 +507,14 @@ impl NymFuseFs {
         handle.buffer = bytes;
         handle.loaded = true;
         Ok(())
+    }
+
+    fn surface_kind_for_path(path: &str) -> &'static str {
+        if path.contains("/shared") {
+            VFS_SURFACE_KIND_VM_SHARED
+        } else {
+            VFS_SURFACE_KIND_VM_WORKSPACE
+        }
     }
 
     fn same_scope(from: &str, to: &str) -> bool {
@@ -574,15 +576,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use fuser::InitFlags;
 
-    use super::{InodeTable, NymFuseFs, ROOT_INO, content_hash_conflicts, content_hash_for_bytes};
+    use super::{
+        InodeTable, ROOT_INO, RemoteFuseFs, content_hash_conflicts, content_hash_for_bytes,
+    };
 
     #[test]
     fn same_scope_accepts_same_task_workspace_and_rejects_cross_scope_rename() {
-        assert!(NymFuseFs::same_scope(
+        assert!(RemoteFuseFs::same_scope(
             "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/a.txt",
             "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/b.txt"
         ));
-        assert!(!NymFuseFs::same_scope(
+        assert!(!RemoteFuseFs::same_scope(
             "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/a.txt",
             "conversations/11111111-1111-1111-1111-111111111111/shared/a.txt"
         ));
@@ -591,11 +595,11 @@ mod tests {
     #[test]
     fn writable_mounts_request_writeback_cache_capability() {
         assert_eq!(
-            NymFuseFs::requested_init_capabilities_for(false),
+            RemoteFuseFs::requested_init_capabilities_for(false),
             InitFlags::FUSE_WRITEBACK_CACHE
         );
         assert_eq!(
-            NymFuseFs::requested_init_capabilities_for(true),
+            RemoteFuseFs::requested_init_capabilities_for(true),
             InitFlags::empty()
         );
     }
@@ -630,7 +634,7 @@ mod tests {
     }
 }
 
-impl NymFuseFs {
+impl RemoteFuseFs {
     fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
         if read_only {
             InitFlags::empty()
@@ -640,7 +644,7 @@ impl NymFuseFs {
     }
 }
 
-impl Filesystem for NymFuseFs {
+impl Filesystem for RemoteFuseFs {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         let requested = self.requested_init_capabilities();
         if requested.is_empty() {
@@ -649,7 +653,7 @@ impl Filesystem for NymFuseFs {
         if let Err(unsupported) = config.add_capabilities(requested) {
             tracing::warn!(
                 ?unsupported,
-                "nymfs fuse kernel did not accept requested cache capabilities"
+                "vfs fuse kernel did not accept requested cache capabilities"
             );
         }
         Ok(())
@@ -976,8 +980,10 @@ impl Filesystem for NymFuseFs {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
             self.mutate_namespace(&path, |lease, surface| {
-                self.tokio
-                    .block_on(self.client.mkdir(&path, lease, surface, "fuse_mkdir"))
+                self.tokio.block_on(
+                    self.client
+                        .mkdir(&path, lease, surface, VFS_OPERATION_MKDIR),
+                )
             })?;
             let metadata = self.stat_path(&path)?.ok_or(Errno::EIO)?;
             Ok(self.attr_for_path(&path, &metadata))
@@ -993,10 +999,12 @@ impl Filesystem for NymFuseFs {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
             self.mutate_namespace(&path, |lease, surface| {
-                self.tokio.block_on(
-                    self.client
-                        .delete_file(&path, lease, surface, "fuse_unlink"),
-                )
+                self.tokio.block_on(self.client.delete_file(
+                    &path,
+                    lease,
+                    surface,
+                    VFS_OPERATION_UNLINK,
+                ))
             })
         })();
         match result {
@@ -1010,8 +1018,10 @@ impl Filesystem for NymFuseFs {
             let parent_path = self.path_for_ino(parent)?;
             let path = Self::child_path(parent_path.as_str(), name)?;
             self.mutate_namespace(&path, |lease, surface| {
-                self.tokio
-                    .block_on(self.client.rmdir(&path, lease, surface, "fuse_rmdir"))
+                self.tokio.block_on(
+                    self.client
+                        .rmdir(&path, lease, surface, VFS_OPERATION_RMDIR),
+                )
             })
         })();
         match result {
@@ -1039,10 +1049,13 @@ impl Filesystem for NymFuseFs {
                 return Err(Errno::EXDEV);
             }
             self.mutate_namespace(&from, |lease, surface| {
-                self.tokio.block_on(
-                    self.client
-                        .rename(&from, &to, lease, surface, "fuse_rename"),
-                )
+                self.tokio.block_on(self.client.rename(
+                    &from,
+                    &to,
+                    lease,
+                    surface,
+                    VFS_OPERATION_RENAME,
+                ))
             })?;
             self.cache.invalidate(&to);
             Ok(())

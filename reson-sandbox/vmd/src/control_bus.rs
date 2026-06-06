@@ -390,16 +390,15 @@ impl EtcdOwnershipFenceStore {
         session_id: Option<&str>,
         expected_fence: Option<&str>,
     ) -> Result<()> {
-        let Some(expected_fence) = expected_fence
+        let expected_fence = expected_fence
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
+            .filter(|value| !value.is_empty());
+        let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            if expected_fence.is_some() {
+                return Err(anyhow!("expected ownership fence requires session_id"));
+            }
             return Ok(());
         };
-        let session_id = session_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("expected ownership fence requires session_id"))?;
         let key = self.session_fence_key(session_id);
         let legacy_key = self.legacy_session_fence_key(session_id);
         let mut client = self.etcd.lock().await;
@@ -407,10 +406,11 @@ impl EtcdOwnershipFenceStore {
         if current.is_none() && key != legacy_key {
             current = read_fence_value(&mut client, &legacy_key).await?;
         }
-        if current.as_deref() != Some(expected_fence) {
+        if !ownership_fence_allows_transition(current.as_deref(), expected_fence) {
             let current_display = current.as_deref().unwrap_or("<none>");
+            let expected_display = expected_fence.unwrap_or("<none>");
             return Err(anyhow!(
-                "session ownership fence mismatch for session_id={session_id}: expected={expected_fence} current={current_display}"
+                "session ownership fence mismatch for session_id={session_id}: expected={expected_display} current={current_display}"
             ));
         }
         Ok(())
@@ -1095,6 +1095,7 @@ async fn process_command_message(
     {
         if target_node_id != node_id {
             // @dive: Node-target filtering must happen before dedupe/fence CAS so non-owner consumers never steal ownership transitions.
+            //        Targeted commands use a shared JetStream consumer, so a wrong-node delivery must be redelivered instead of acked.
             debug!(
                 node_id = %node_id,
                 target_node_id = %target_node_id,
@@ -1102,12 +1103,15 @@ async fn process_command_message(
                 command_type = %envelope.command_type,
                 "skipping control command targeted at a different node"
             );
-            if let Err(err) = message.ack().await {
+            if let Err(err) = message
+                .ack_with(AckKind::Nak(Some(Duration::from_millis(250))))
+                .await
+            {
                 warn!(
                     node_id = %node_id,
                     command_id = %envelope.command_id,
                     err = %err,
-                    "failed to ack command targeted at different node"
+                    "failed to nack command targeted at different node"
                 );
             }
             return;
@@ -1936,98 +1940,85 @@ async fn handle_exec_stream_start_command(
         return Ok(());
     }
 
-    let mut vm = manager
-        .start_vm(payload.vm_id.as_str())
-        .await
-        .map_err(|err| anyhow!("ensure vm running for exec.stream.start: {err}"))?;
+    let mut vm = if resume_only {
+        manager
+            .start_vm_for_exec_stream_resume(payload.vm_id.as_str())
+            .await
+            .map_err(|err| anyhow!("ensure vm running for exec.stream.resume: {err}"))?
+    } else {
+        manager
+            .start_vm(payload.vm_id.as_str())
+            .await
+            .map_err(|err| anyhow!("ensure vm running for exec.stream.start: {err}"))?
+    };
     info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T3 after_manager_start_vm");
     let mut vm_metadata = vm.metadata.clone();
     let tier_b_eligible = metadata_tier_b_eligible(&vm_metadata);
     if resume_only && tier_b_eligible {
-        let Some(snapshot_id) = resolve_execution_restore_snapshot_id(
+        if let Some(snapshot_id) = resolve_execution_restore_snapshot_id(
             manager.as_ref(),
             payload.vm_id.as_str(),
             &vm_metadata,
         )
         .await?
-        else {
-            // @dive: Tier-B resume cannot rerun commands; missing restore marker is emitted as a terminal stream error.
-            sequence = sequence.saturating_add(1);
-            publish_exec_stream_event(
-                config,
-                jetstream,
-                ExecStreamEvent {
-                    cluster_id: cluster_id.clone(),
-                    logical_stream_id: logical_stream_id.clone(),
-                    stream_id: stream_id.clone(),
-                    event_seq: sequence,
-                    event_id: next_stream_event_id(cluster_id.as_str()),
-                    producer_epoch,
-                    command_id: command_id.clone(),
-                    session_id: session_id.clone(),
-                    vm_id: vm_id.clone(),
-                    kind: "error".to_string(),
-                    data: Vec::new(),
-                    exit_code: None,
-                    timed_out: false,
-                    error: Some(
-                        "tier_b_eligible exec stream resume requires execution restore snapshot marker"
-                            .to_string(),
-                    ),
-                    sequence,
-                    emitted_by_node_id: node_id.to_string(),
-                    emitted_at_unix_ms: unix_millis(),
-                },
-            )
-            .await?;
-            return Ok(());
-        };
-        match manager
-            .restore_snapshot(payload.vm_id.as_str(), snapshot_id.as_str())
-            .await
         {
-            Ok(restored_vm) => {
-                vm = restored_vm;
-                vm_metadata = vm.metadata.clone();
-                ready_timeout = GUEST_EXEC_READY_TIMEOUT;
-                info!(
-                    vm_id = %vm_id,
-                    stream_id = %stream_id,
-                    snapshot_id = %snapshot_id,
-                    "restored tier-b execution snapshot for exec stream resume"
-                );
+            match manager
+                .restore_snapshot(payload.vm_id.as_str(), snapshot_id.as_str())
+                .await
+            {
+                Ok(restored_vm) => {
+                    vm = restored_vm;
+                    vm_metadata = vm.metadata.clone();
+                    ready_timeout = GUEST_EXEC_READY_TIMEOUT;
+                    info!(
+                        vm_id = %vm_id,
+                        stream_id = %stream_id,
+                        snapshot_id = %snapshot_id,
+                        "restored tier-b execution snapshot for exec stream resume"
+                    );
+                }
+                Err(err) => {
+                    // @dive: Resume attach remains no-rerun; restore failure must terminate stream instead of replaying command.
+                    sequence = sequence.saturating_add(1);
+                    publish_exec_stream_event(
+                        config,
+                        jetstream,
+                        ExecStreamEvent {
+                            cluster_id: cluster_id.clone(),
+                            logical_stream_id: logical_stream_id.clone(),
+                            stream_id: stream_id.clone(),
+                            event_seq: sequence,
+                            event_id: next_stream_event_id(cluster_id.as_str()),
+                            producer_epoch,
+                            command_id: command_id.clone(),
+                            session_id: session_id.clone(),
+                            vm_id: vm_id.clone(),
+                            kind: "error".to_string(),
+                            data: Vec::new(),
+                            exit_code: None,
+                            timed_out: false,
+                            error: Some(format!(
+                                "tier-b execution snapshot restore failed for exec stream resume: {err}"
+                            )),
+                            sequence,
+                            emitted_by_node_id: node_id.to_string(),
+                            emitted_at_unix_ms: unix_millis(),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
-            Err(err) => {
-                // @dive: Resume attach remains no-rerun; restore failure must terminate stream instead of replaying command.
-                sequence = sequence.saturating_add(1);
-                publish_exec_stream_event(
-                    config,
-                    jetstream,
-                    ExecStreamEvent {
-                        cluster_id: cluster_id.clone(),
-                        logical_stream_id: logical_stream_id.clone(),
-                        stream_id: stream_id.clone(),
-                        event_seq: sequence,
-                        event_id: next_stream_event_id(cluster_id.as_str()),
-                        producer_epoch,
-                        command_id: command_id.clone(),
-                        session_id: session_id.clone(),
-                        vm_id: vm_id.clone(),
-                        kind: "error".to_string(),
-                        data: Vec::new(),
-                        exit_code: None,
-                        timed_out: false,
-                        error: Some(format!(
-                            "tier-b execution snapshot restore failed for exec stream resume: {err}"
-                        )),
-                        sequence,
-                        emitted_by_node_id: node_id.to_string(),
-                        emitted_at_unix_ms: unix_millis(),
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
+        } else {
+            // @dive: Active stream resume is attach-only, so a missing restore
+            // marker can still recover by live-reclaiming the running VM. If
+            // the daemon target is absent, the attach path below emits the
+            // terminal no-rerun error.
+            info!(
+                vm_id = %vm_id,
+                stream_id = %stream_id,
+                "tier-b exec stream resume has no restore snapshot marker; trying live attach"
+            );
         }
     }
     let rpc_port = vm.network.rpc_port;
@@ -3572,6 +3563,8 @@ fn background_snapshot_unsupported(err: &crate::state::ManagerError) -> bool {
         || message.contains("userfaultfd is not available")
         || message.contains("uffd-wp")
         || message.contains("the kernel does not support background snapshot")
+        || (message.contains("parameter 'capability'")
+            && (message.contains("background-snapshot") || message.contains("mapped-ram")))
 }
 
 fn dedupe_key(envelope: &CommandEnvelope) -> String {
@@ -3610,7 +3603,6 @@ fn shard_for_key(key: &str, shard_count: u8) -> u8 {
     (hasher.finish() % shard_count as u64) as u8
 }
 
-#[cfg(test)]
 fn ownership_fence_allows_transition(current: Option<&str>, expected: Option<&str>) -> bool {
     match expected {
         Some(expected) => current.is_some_and(|value| value == expected),

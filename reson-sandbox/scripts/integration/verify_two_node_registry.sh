@@ -138,6 +138,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$NODE1_DIR" "$NODE2_DIR"
+chmod 0755 "$TMP_DIR" "$NODE1_DIR" "$NODE2_DIR"
 
 integration_log "starting shared integration control plane (profile=${RESON_SANDBOX_INTEGRATION_PROFILE})"
 "$SCRIPT_DIR/up.sh" "${profile_args[@]}" >/dev/null
