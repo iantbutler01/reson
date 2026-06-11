@@ -25,12 +25,12 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{RetryConfig, retry_with_backoff};
+use crate::retry::{retry_with_backoff, RetryConfig};
 use crate::types::ChatRole;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    ConversationMessage, JsonStreamAccumulator, media_part_to_google_format,
-    validate_image_input_supported,
+    media_part_to_google_format, validate_image_input_supported, ConversationMessage,
+    JsonStreamAccumulator,
 };
 
 #[cfg(feature = "google-adc")]

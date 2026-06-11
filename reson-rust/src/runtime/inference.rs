@@ -957,7 +957,12 @@ mod tests {
     fn test_generate_tool_schemas_empty() {
         let tools = HashMap::new();
         let tool_schemas = HashMap::new();
-        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "anthropic:claude-3");
+        let result = generate_tool_schemas(
+            &tools,
+            &tool_schemas,
+            &sorted_order(&tools),
+            "anthropic:claude-3",
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }
@@ -997,18 +1002,21 @@ mod tests {
             },
         );
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "anthropic:claude-3");
+        let result = generate_tool_schemas(
+            &tools,
+            &tool_schemas,
+            &sorted_order(&tools),
+            "anthropic:claude-3",
+        );
         assert!(result.is_ok());
 
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "get_weather");
         assert!(schemas[0]["input_schema"].is_object());
-        assert!(
-            schemas[0]["input_schema"]
-                .get("additionalProperties")
-                .is_none()
-        );
+        assert!(schemas[0]["input_schema"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["location"]["type"],
             "string"
@@ -1050,18 +1058,21 @@ mod tests {
             },
         );
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "openai:gpt-4o");
+        let result = generate_tool_schemas(
+            &tools,
+            &tool_schemas,
+            &sorted_order(&tools),
+            "openai:gpt-4o",
+        );
         assert!(result.is_ok());
 
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["type"], "function");
         assert_eq!(schemas[0]["function"]["name"], "calculate");
-        assert!(
-            schemas[0]["function"]["parameters"]
-                .get("additionalProperties")
-                .is_none()
-        );
+        assert!(schemas[0]["function"]["parameters"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
@@ -1175,17 +1186,20 @@ mod tests {
             },
         );
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "anthropic:claude-3");
+        let result = generate_tool_schemas(
+            &tools,
+            &tool_schemas,
+            &sorted_order(&tools),
+            "anthropic:claude-3",
+        );
         assert!(result.is_ok());
 
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "search");
-        assert!(
-            schemas[0]["input_schema"]
-                .get("additionalProperties")
-                .is_none()
-        );
+        assert!(schemas[0]["input_schema"]
+            .get("additionalProperties")
+            .is_none());
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["ids"]["items"]["type"],
             "integer"
@@ -1201,7 +1215,12 @@ mod tests {
         );
         let tool_schemas = HashMap::new();
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "unsupported:model");
+        let result = generate_tool_schemas(
+            &tools,
+            &tool_schemas,
+            &sorted_order(&tools),
+            "unsupported:model",
+        );
         assert!(result.is_err());
     }
 
@@ -1251,15 +1270,18 @@ mod tests {
             },
         );
 
-        let google =
-            generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "gemini:gemini-3-flash-preview").unwrap();
+        let google = generate_tool_schemas(
+            &tools,
+            &tool_schemas,
+            &sorted_order(&tools),
+            "gemini:gemini-3-flash-preview",
+        )
+        .unwrap();
         let nested = &google[0]["parameters"]["properties"]["items"]["items"]["properties"];
         assert_eq!(nested["text"]["type"], "string");
         assert_eq!(nested["image_ids"]["items"]["type"], "integer");
-        assert!(
-            google[0]["parameters"]["properties"]["items"]["items"]
-                .get("additionalProperties")
-                .is_none()
-        );
+        assert!(google[0]["parameters"]["properties"]["items"]["items"]
+            .get("additionalProperties")
+            .is_none());
     }
 }

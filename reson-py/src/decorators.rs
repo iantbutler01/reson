@@ -44,7 +44,8 @@ struct AgenticDecorator {
 impl AgenticDecorator {
     fn __call__(&self, py: Python<'_>, func: PyObject) -> PyResult<PyObject> {
         let func_name: String = func.getattr(py, "__name__")?.extract(py)?;
-        let docstring: Option<String> = func.getattr(py, "__doc__")
+        let docstring: Option<String> = func
+            .getattr(py, "__doc__")
             .ok()
             .and_then(|doc| doc.extract(py).ok());
 
@@ -82,11 +83,7 @@ impl AgenticWrapper {
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Create a new Runtime
-        let runtime = Runtime::create(
-            self.model.clone(),
-            self.api_key.clone(),
-            self.native_tools,
-        );
+        let runtime = Runtime::create(self.model.clone(), self.api_key.clone(), self.native_tools);
 
         let runtime_obj = Py::new(py, runtime)?;
 
@@ -107,9 +104,10 @@ impl AgenticWrapper {
         // Check if it's a coroutine
         let asyncio = py.import("asyncio")?;
         if !asyncio.call_method1("iscoroutine", (&coro,))?.is_truthy()? {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                format!("@agentic decorated function '{}' must be async", self.func_name)
-            ));
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "@agentic decorated function '{}' must be async",
+                self.func_name
+            )));
         }
 
         Ok(coro.into_bound(py))
@@ -129,9 +127,7 @@ impl AgenticWrapper {
                 };
                 Ok(Py::new(py, bound_method)?.into_py(py))
             }
-            None => {
-                Ok(slf.into_py(py))
-            }
+            None => Ok(slf.into_py(py)),
         }
     }
 
@@ -169,11 +165,11 @@ impl BoundAgenticMethod {
         let new_args_tuple = PyTuple::new(py, new_args)?;
 
         // Call the wrapper
-        self.wrapper.call_bound(py, &new_args_tuple, kwargs)
+        self.wrapper
+            .call_bound(py, &new_args_tuple, kwargs)
             .map(|obj| obj.into_bound(py))
     }
 }
-
 
 /// The @agentic_generator decorator for async generator functions
 #[pyfunction]
@@ -209,7 +205,8 @@ struct AgenticGeneratorDecorator {
 impl AgenticGeneratorDecorator {
     fn __call__(&self, py: Python<'_>, func: PyObject) -> PyResult<PyObject> {
         let func_name: String = func.getattr(py, "__name__")?.extract(py)?;
-        let docstring: Option<String> = func.getattr(py, "__doc__")
+        let docstring: Option<String> = func
+            .getattr(py, "__doc__")
             .ok()
             .and_then(|doc| doc.extract(py).ok());
 
@@ -246,11 +243,7 @@ impl AgenticGeneratorWrapper {
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let runtime = Runtime::create(
-            self.model.clone(),
-            self.api_key.clone(),
-            self.native_tools,
-        );
+        let runtime = Runtime::create(self.model.clone(), self.api_key.clone(), self.native_tools);
 
         let runtime_obj = Py::new(py, runtime)?;
 
@@ -282,9 +275,7 @@ impl AgenticGeneratorWrapper {
                 };
                 Ok(Py::new(py, bound_method)?.into_py(py))
             }
-            None => {
-                Ok(slf.into_py(py))
-            }
+            None => Ok(slf.into_py(py)),
         }
     }
 
@@ -320,7 +311,8 @@ impl BoundAgenticGeneratorMethod {
         }
         let new_args_tuple = PyTuple::new(py, new_args)?;
 
-        self.wrapper.call_bound(py, &new_args_tuple, kwargs)
+        self.wrapper
+            .call_bound(py, &new_args_tuple, kwargs)
             .map(|obj| obj.into_bound(py))
     }
 }

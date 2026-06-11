@@ -1,10 +1,10 @@
 //! Python type wrappers for reson core types
 
+use once_cell::sync::Lazy;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use once_cell::sync::Lazy;
 
 // Global registry to store original Python objects for ToolCall.tool_obj
 // Key is a unique ID, value is the Python object
@@ -38,12 +38,15 @@ impl ChatRole {
     }
 
     fn __repr__(&self) -> String {
-        format!("ChatRole.{}", match self {
-            ChatRole::System => "SYSTEM",
-            ChatRole::User => "USER",
-            ChatRole::Assistant => "ASSISTANT",
-            ChatRole::Tool => "TOOL",
-        })
+        format!(
+            "ChatRole.{}",
+            match self {
+                ChatRole::System => "SYSTEM",
+                ChatRole::User => "USER",
+                ChatRole::Assistant => "ASSISTANT",
+                ChatRole::Tool => "TOOL",
+            }
+        )
     }
 }
 
@@ -88,22 +91,42 @@ impl ChatMessage {
     #[new]
     #[pyo3(signature = (role, content, cache_marker=false, signature=None))]
     fn new(role: ChatRole, content: String, cache_marker: bool, signature: Option<String>) -> Self {
-        Self { role, content, cache_marker, signature }
+        Self {
+            role,
+            content,
+            cache_marker,
+            signature,
+        }
     }
 
     #[staticmethod]
     fn user(content: String) -> Self {
-        Self { role: ChatRole::User, content, cache_marker: false, signature: None }
+        Self {
+            role: ChatRole::User,
+            content,
+            cache_marker: false,
+            signature: None,
+        }
     }
 
     #[staticmethod]
     fn assistant(content: String) -> Self {
-        Self { role: ChatRole::Assistant, content, cache_marker: false, signature: None }
+        Self {
+            role: ChatRole::Assistant,
+            content,
+            cache_marker: false,
+            signature: None,
+        }
     }
 
     #[staticmethod]
     fn system(content: String) -> Self {
-        Self { role: ChatRole::System, content, cache_marker: false, signature: None }
+        Self {
+            role: ChatRole::System,
+            content,
+            cache_marker: false,
+            signature: None,
+        }
     }
 
     fn model_dump(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -125,24 +148,40 @@ impl ChatMessage {
             "user" => ChatRole::User,
             "assistant" => ChatRole::Assistant,
             "tool" => ChatRole::Tool,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Invalid role: {}", role_str))),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid role: {}",
+                    role_str
+                )))
+            }
         };
         let content: String = data.get_item("content")?.unwrap().extract()?;
-        let cache_marker: bool = data.get_item("cache_marker")
+        let cache_marker: bool = data
+            .get_item("cache_marker")
             .ok()
             .flatten()
             .map(|v| v.extract().unwrap_or(false))
             .unwrap_or(false);
-        let signature: Option<String> = data.get_item("signature")
+        let signature: Option<String> = data
+            .get_item("signature")
             .ok()
             .flatten()
             .and_then(|v| v.extract().ok());
 
-        Ok(Self { role, content, cache_marker, signature })
+        Ok(Self {
+            role,
+            content,
+            cache_marker,
+            signature,
+        })
     }
 
     fn __repr__(&self) -> String {
-        format!("ChatMessage(role={:?}, content={:?})", self.role.value(), self.content)
+        format!(
+            "ChatMessage(role={:?}, content={:?})",
+            self.role.value(),
+            self.content
+        )
     }
 }
 
@@ -162,7 +201,11 @@ impl From<ChatMessage> for reson_agentic::types::ChatMessage {
         Self {
             role: msg.role.into(),
             content: msg.content,
-            cache_marker: if msg.cache_marker { Some(reson_agentic::types::CacheMarker::Ephemeral) } else { None },
+            cache_marker: if msg.cache_marker {
+                Some(reson_agentic::types::CacheMarker::Ephemeral)
+            } else {
+                None
+            },
             model_families: None,
             signature: msg.signature,
         }
@@ -234,7 +277,11 @@ impl ToolCall {
     /// Returns a single ToolCall or list of ToolCalls depending on input.
     #[staticmethod]
     #[pyo3(signature = (tool_call_obj_or_list, signature=None))]
-    fn create(py: Python<'_>, tool_call_obj_or_list: &Bound<'_, PyAny>, signature: Option<String>) -> PyResult<PyObject> {
+    fn create(
+        py: Python<'_>,
+        tool_call_obj_or_list: &Bound<'_, PyAny>,
+        signature: Option<String>,
+    ) -> PyResult<PyObject> {
         // Store original Python object in registry before conversion
         let registry_key = uuid::Uuid::new_v4().to_string();
         {
@@ -244,22 +291,26 @@ impl ToolCall {
 
         // Try to convert Python object to JSON
         // If direct conversion fails and it's an object with __dict__, extract attributes
-        let json_value: serde_json::Value = if let Ok(val) = pythonize::depythonize(tool_call_obj_or_list) {
+        let json_value: serde_json::Value = if let Ok(val) =
+            pythonize::depythonize(tool_call_obj_or_list)
+        {
             val
         } else if tool_call_obj_or_list.hasattr("__dict__")? {
             // It's a Python object with attributes - convert __dict__ to JSON
             let dict = tool_call_obj_or_list.getattr("__dict__")?;
-            pythonize::depythonize(&dict)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to convert object: {}", e)))?
+            pythonize::depythonize(&dict).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Failed to convert object: {}", e))
+            })?
         } else {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "Failed to convert input: unsupported type"
+                "Failed to convert input: unsupported type",
             ));
         };
 
         // Call Rust create function
-        let result = reson_agentic::types::ToolCall::create(json_value)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Unsupported tool call format: {}", e)))?;
+        let result = reson_agentic::types::ToolCall::create(json_value).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Unsupported tool call format: {}", e))
+        })?;
 
         // Convert result back to Python
         match result {
@@ -274,19 +325,22 @@ impl ToolCall {
                 Ok(py_tc.into_pyobject(py)?.unbind().into_any())
             }
             reson_agentic::types::CreateResult::Multiple(tcs) => {
-                let py_list: Vec<ToolCall> = tcs.into_iter().map(|mut tc| {
-                    if signature.is_some() {
-                        tc.signature = signature.clone();
-                    }
-                    let mut py_tc: ToolCall = tc.into();
-                    py_tc.tool_obj_registry_key = Some(registry_key.clone());
-                    py_tc
-                }).collect();
+                let py_list: Vec<ToolCall> = tcs
+                    .into_iter()
+                    .map(|mut tc| {
+                        if signature.is_some() {
+                            tc.signature = signature.clone();
+                        }
+                        let mut py_tc: ToolCall = tc.into();
+                        py_tc.tool_obj_registry_key = Some(registry_key.clone());
+                        py_tc
+                    })
+                    .collect();
                 Ok(py_list.into_pyobject(py)?.unbind().into_any())
             }
-            reson_agentic::types::CreateResult::Empty => {
-                Err(pyo3::exceptions::PyValueError::new_err("No tool calls provided"))
-            }
+            reson_agentic::types::CreateResult::Empty => Err(
+                pyo3::exceptions::PyValueError::new_err("No tool calls provided"),
+            ),
         }
     }
 
@@ -319,8 +373,8 @@ impl ToolCall {
         }
         // Fall back to JSON representation
         if let Some(ref json_str) = self.tool_obj_json {
-            let value: serde_json::Value = serde_json::from_str(json_str)
-                .unwrap_or(serde_json::Value::Null);
+            let value: serde_json::Value =
+                serde_json::from_str(json_str).unwrap_or(serde_json::Value::Null);
             pythonize::pythonize(py, &value)
                 .map(|bound| bound.unbind())
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
@@ -342,7 +396,11 @@ impl ToolCall {
     }
 
     /// Convert to provider-specific assistant message format.
-    fn to_provider_assistant_message(&self, py: Python<'_>, provider: &crate::services::InferenceProvider) -> PyResult<PyObject> {
+    fn to_provider_assistant_message(
+        &self,
+        py: Python<'_>,
+        provider: &crate::services::InferenceProvider,
+    ) -> PyResult<PyObject> {
         // Convert to Rust type, call method, convert back
         let rust_provider: reson_agentic::types::Provider = (*provider).into();
         let rust_tc: reson_agentic::types::ToolCall = self.clone().into();
@@ -356,7 +414,7 @@ impl ToolCall {
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = PyDict::new(py);
         dict.set_item("tool_use_id", &self.tool_use_id)?;
-        dict.set_item("tool_call_id", &self.tool_use_id)?;  // Alias for compatibility
+        dict.set_item("tool_call_id", &self.tool_use_id)?; // Alias for compatibility
         dict.set_item("tool_name", &self.tool_name)?;
         dict.set_item("args", self.args(py)?)?;
         if let Some(ref raw) = self.raw_arguments {
@@ -366,8 +424,8 @@ impl ToolCall {
             dict.set_item("signature", sig)?;
         }
         if let Some(ref obj_json) = self.tool_obj_json {
-            let value: serde_json::Value = serde_json::from_str(obj_json)
-                .unwrap_or(serde_json::Value::Null);
+            let value: serde_json::Value =
+                serde_json::from_str(obj_json).unwrap_or(serde_json::Value::Null);
             let py_val = pythonize::pythonize(py, &value)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
             dict.set_item("tool_obj", py_val)?;
@@ -377,23 +435,42 @@ impl ToolCall {
 
     #[staticmethod]
     fn from_dict(data: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let tool_use_id: String = data.get_item("tool_use_id")?
+        let tool_use_id: String = data
+            .get_item("tool_use_id")?
             .or_else(|| data.get_item("tool_call_id").ok().flatten())
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("tool_use_id or tool_call_id required"))?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err("tool_use_id or tool_call_id required")
+            })?
             .extract()?;
         let tool_name: String = data.get_item("tool_name")?.unwrap().extract()?;
         let args: Option<Bound<'_, PyAny>> = data.get_item("args")?;
-        let raw_arguments: Option<String> = data.get_item("raw_arguments")
-            .ok().flatten().and_then(|v| v.extract().ok());
-        let signature: Option<String> = data.get_item("signature")
-            .ok().flatten().and_then(|v| v.extract().ok());
+        let raw_arguments: Option<String> = data
+            .get_item("raw_arguments")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok());
+        let signature: Option<String> = data
+            .get_item("signature")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok());
         let tool_obj: Option<Bound<'_, PyAny>> = data.get_item("tool_obj").ok().flatten();
 
-        Self::new(tool_use_id, tool_name, args.as_ref(), raw_arguments, signature, tool_obj.as_ref())
+        Self::new(
+            tool_use_id,
+            tool_name,
+            args.as_ref(),
+            raw_arguments,
+            signature,
+            tool_obj.as_ref(),
+        )
     }
 
     fn __repr__(&self) -> String {
-        format!("ToolCall(tool_name={:?}, tool_use_id={:?})", self.tool_name, self.tool_use_id)
+        format!(
+            "ToolCall(tool_name={:?}, tool_use_id={:?})",
+            self.tool_name, self.tool_use_id
+        )
     }
 }
 
@@ -406,7 +483,7 @@ impl From<reson_agentic::types::ToolCall> for ToolCall {
             raw_arguments: tc.raw_arguments,
             signature: tc.signature,
             tool_obj_json: tc.tool_obj.and_then(|v| serde_json::to_string(&v).ok()),
-            tool_obj_registry_key: None,  // Set separately after conversion when needed
+            tool_obj_registry_key: None, // Set separately after conversion when needed
         }
     }
 }
@@ -416,7 +493,8 @@ impl From<ToolCall> for reson_agentic::types::ToolCall {
         Self {
             tool_use_id: tc.tool_use_id,
             tool_name: tc.tool_name,
-            args: serde_json::from_str(&tc.args_json).unwrap_or(serde_json::Value::Object(Default::default())),
+            args: serde_json::from_str(&tc.args_json)
+                .unwrap_or(serde_json::Value::Object(Default::default())),
             raw_arguments: tc.raw_arguments,
             signature: tc.signature,
             tool_obj: tc.tool_obj_json.and_then(|s| serde_json::from_str(&s).ok()),
@@ -451,7 +529,13 @@ impl ToolResult {
         signature: Option<String>,
         tool_name: Option<String>,
     ) -> Self {
-        Self { tool_use_id, content, is_error, signature, tool_name }
+        Self {
+            tool_use_id,
+            content,
+            is_error,
+            signature,
+            tool_name,
+        }
     }
 
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -472,18 +556,37 @@ impl ToolResult {
     fn from_dict(data: &Bound<'_, PyDict>) -> PyResult<Self> {
         let tool_use_id: String = data.get_item("tool_use_id")?.unwrap().extract()?;
         let content: String = data.get_item("content")?.unwrap().extract()?;
-        let is_error: bool = data.get_item("is_error")
-            .ok().flatten().map(|v| v.extract().unwrap_or(false)).unwrap_or(false);
-        let signature: Option<String> = data.get_item("signature")
-            .ok().flatten().and_then(|v| v.extract().ok());
-        let tool_name: Option<String> = data.get_item("tool_name")
-            .ok().flatten().and_then(|v| v.extract().ok());
+        let is_error: bool = data
+            .get_item("is_error")
+            .ok()
+            .flatten()
+            .map(|v| v.extract().unwrap_or(false))
+            .unwrap_or(false);
+        let signature: Option<String> = data
+            .get_item("signature")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok());
+        let tool_name: Option<String> = data
+            .get_item("tool_name")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract().ok());
 
-        Ok(Self { tool_use_id, content, is_error, signature, tool_name })
+        Ok(Self {
+            tool_use_id,
+            content,
+            is_error,
+            signature,
+            tool_name,
+        })
     }
 
     fn __repr__(&self) -> String {
-        format!("ToolResult(tool_use_id={:?}, is_error={})", self.tool_use_id, self.is_error)
+        format!(
+            "ToolResult(tool_use_id={:?}, is_error={})",
+            self.tool_use_id, self.is_error
+        )
     }
 }
 
@@ -544,7 +647,12 @@ impl ReasoningSegment {
             "{}".to_string()
         };
 
-        Ok(Self { content, signature, segment_index, metadata_json })
+        Ok(Self {
+            content,
+            signature,
+            segment_index,
+            metadata_json,
+        })
     }
 
     #[getter]
@@ -562,7 +670,11 @@ impl ReasoningSegment {
     }
 
     /// Convert to provider-specific format
-    fn to_provider_format(&self, py: Python<'_>, provider: &crate::services::InferenceProvider) -> PyResult<PyObject> {
+    fn to_provider_format(
+        &self,
+        py: Python<'_>,
+        provider: &crate::services::InferenceProvider,
+    ) -> PyResult<PyObject> {
         let dict = PyDict::new(py);
 
         // Parse existing metadata
@@ -616,7 +728,8 @@ impl From<reson_agentic::types::ReasoningSegment> for ReasoningSegment {
             content: rs.content,
             signature: rs.signature,
             segment_index: rs.segment_index,
-            metadata_json: rs.provider_metadata
+            metadata_json: rs
+                .provider_metadata
                 .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()))
                 .unwrap_or_else(|| "{}".to_string()),
         }

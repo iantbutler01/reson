@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 use reson_agentic::utils::ConversationMessage;
 
-use crate::types::{ChatMessage, ToolCall, ToolResult, ReasoningSegment};
+use crate::types::{ChatMessage, ReasoningSegment, ToolCall, ToolResult};
 
 /// Inference provider enum matching the Python InferenceProvider
 #[pyclass(eq, eq_int)]
@@ -30,7 +30,9 @@ impl InferenceProvider {
             InferenceProvider::ANTHROPIC => "InferenceProvider.ANTHROPIC".to_string(),
             InferenceProvider::GOOGLE_GENAI => "InferenceProvider.GOOGLE_GENAI".to_string(),
             InferenceProvider::OPENROUTER => "InferenceProvider.OPENROUTER".to_string(),
-            InferenceProvider::OPENROUTER_RESPONSES => "InferenceProvider.OPENROUTER_RESPONSES".to_string(),
+            InferenceProvider::OPENROUTER_RESPONSES => {
+                "InferenceProvider.OPENROUTER_RESPONSES".to_string()
+            }
             InferenceProvider::BEDROCK => "InferenceProvider.BEDROCK".to_string(),
             InferenceProvider::GOOGLE_ANTHROPIC => "InferenceProvider.GOOGLE_ANTHROPIC".to_string(),
         }
@@ -81,7 +83,10 @@ pub struct InferenceClient {
 impl InferenceClient {
     #[new]
     #[pyo3(signature = (*_args, **_kwargs))]
-    fn new(_args: &Bound<'_, pyo3::types::PyTuple>, _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>) -> Self {
+    fn new(
+        _args: &Bound<'_, pyo3::types::PyTuple>,
+        _kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> Self {
         Self {}
     }
 
@@ -117,9 +122,10 @@ impl InferenceClient {
                 let rust_rs: reson_agentic::types::ReasoningSegment = reasoning.into();
                 conversation_messages.push(ConversationMessage::Reasoning(rust_rs));
             } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    format!("Unsupported message type: {:?}", item.get_type().name())
-                ));
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "Unsupported message type: {:?}",
+                    item.get_type().name()
+                )));
             }
         }
 

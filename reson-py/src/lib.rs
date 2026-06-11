@@ -5,12 +5,12 @@
 
 use pyo3::prelude::*;
 
-mod errors;
-mod types;
-mod stores;
-mod runtime;
 mod decorators;
+mod errors;
+mod runtime;
 mod services;
+mod stores;
+mod types;
 mod utils;
 
 /// Create the `types` submodule
@@ -25,7 +25,8 @@ fn create_types_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&types_module)?;
 
     // Make it importable as `from reson.types import ...`
-    m.py().import("sys")?
+    m.py()
+        .import("sys")?
         .getattr("modules")?
         .set_item("reson.types", types_module)?;
 
@@ -40,7 +41,8 @@ fn create_stores_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&stores_module)?;
 
     // Make it importable as `from reson.stores import ...`
-    m.py().import("sys")?
+    m.py()
+        .import("sys")?
         .getattr("modules")?
         .set_item("reson.stores", stores_module)?;
 
@@ -90,15 +92,22 @@ fn create_reson_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add main exports that tests import from reson.reson
     reson_module.add_class::<runtime::Runtime>()?;
     reson_module.add_function(wrap_pyfunction!(decorators::agentic, &reson_module)?)?;
-    reson_module.add_function(wrap_pyfunction!(decorators::agentic_generator, &reson_module)?)?;
+    reson_module.add_function(wrap_pyfunction!(
+        decorators::agentic_generator,
+        &reson_module
+    )?)?;
 
     // Add _generate_native_tool_schemas function (used by some tests)
-    reson_module.add_function(wrap_pyfunction!(utils::_generate_native_tool_schemas, &reson_module)?)?;
+    reson_module.add_function(wrap_pyfunction!(
+        utils::_generate_native_tool_schemas,
+        &reson_module
+    )?)?;
 
     m.add_submodule(&reson_module)?;
 
     // Make it importable
-    m.py().import("sys")?
+    m.py()
+        .import("sys")?
         .getattr("modules")?
         .set_item("reson.reson", reson_module)?;
 
@@ -109,10 +118,22 @@ fn create_reson_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pymodule]
 fn reson(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register exception types at top level
-    m.add("NonRetryableException", m.py().get_type::<errors::NonRetryableException>())?;
-    m.add("InferenceException", m.py().get_type::<errors::InferenceException>())?;
-    m.add("ContextLengthExceeded", m.py().get_type::<errors::ContextLengthExceeded>())?;
-    m.add("RetriesExceeded", m.py().get_type::<errors::RetriesExceeded>())?;
+    m.add(
+        "NonRetryableException",
+        m.py().get_type::<errors::NonRetryableException>(),
+    )?;
+    m.add(
+        "InferenceException",
+        m.py().get_type::<errors::InferenceException>(),
+    )?;
+    m.add(
+        "ContextLengthExceeded",
+        m.py().get_type::<errors::ContextLengthExceeded>(),
+    )?;
+    m.add(
+        "RetriesExceeded",
+        m.py().get_type::<errors::RetriesExceeded>(),
+    )?;
 
     // Register type classes at top level (for backwards compatibility)
     m.add_class::<types::ChatRole>()?;

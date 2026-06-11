@@ -14,7 +14,10 @@ use crate::types::{ChatMessage, ReasoningSegment, ToolResult};
 type ChunkStream = Pin<
     Box<
         dyn Stream<
-                Item = Result<reson_agentic::types::ResponseStreamEvent, reson_agentic::error::Error>,
+                Item = Result<
+                    reson_agentic::types::ResponseStreamEvent,
+                    reson_agentic::error::Error,
+                >,
             > + Send,
     >,
 >;
@@ -39,10 +42,9 @@ fn response_stream_event_to_chunk(
             reson_agentic::types::ResponsePart::Reasoning { text } => {
                 ("reasoning".to_string(), serde_json::Value::String(text))
             }
-            reson_agentic::types::ResponsePart::Tool { call } => (
-                "tool_call".to_string(),
-                serialize_or_error(&call),
-            ),
+            reson_agentic::types::ResponsePart::Tool { call } => {
+                ("tool_call".to_string(), serialize_or_error(&call))
+            }
             reson_agentic::types::ResponsePart::Signature { value } => {
                 ("signature".to_string(), serde_json::Value::String(value))
             }
@@ -50,14 +52,12 @@ fn response_stream_event_to_chunk(
         reson_agentic::types::ResponseStreamEvent::ToolPartial(payload) => {
             ("tool_call_partial".to_string(), payload)
         }
-        reson_agentic::types::ResponseStreamEvent::Usage(usage) => (
-            "usage".to_string(),
-            serialize_or_error(&usage),
-        ),
-        reson_agentic::types::ResponseStreamEvent::Complete(response) => (
-            "complete".to_string(),
-            serialize_or_error(&response),
-        ),
+        reson_agentic::types::ResponseStreamEvent::Usage(usage) => {
+            ("usage".to_string(), serialize_or_error(&usage))
+        }
+        reson_agentic::types::ResponseStreamEvent::Complete(response) => {
+            ("complete".to_string(), serialize_or_error(&response))
+        }
     }
 }
 
@@ -340,10 +340,13 @@ impl StreamIterator {
                     let accumulators =
                         Arc::new(RwLock::new(reson_agentic::runtime::Accumulators::default()));
 
+                    let rust_tool_order: Arc<RwLock<Vec<String>>> =
+                        Arc::new(RwLock::new(Vec::new()));
                     let new_stream = reson_agentic::runtime::inference::call_llm_stream(
                         p.prompt.as_deref(),
                         &p.model,
                         rust_tools,
+                        rust_tool_order,
                         rust_tool_schemas,
                         p.output_type_name,
                         p.output_schema,
@@ -848,10 +851,12 @@ impl Runtime {
                 Arc::new(RwLock::new(None));
 
             // Call the Rust inference engine
+            let rust_tool_order: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
             let result = reson_agentic::runtime::inference::call_llm(
                 prompt_clone.as_deref(),
                 &effective_model,
                 rust_tools,
+                rust_tool_order,
                 rust_tool_schemas,
                 output_type_name,
                 output_schema,

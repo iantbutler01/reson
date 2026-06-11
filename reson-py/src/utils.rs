@@ -22,9 +22,17 @@ pub fn supports_native_tools(provider: &str) -> bool {
     let provider_name = resolve_provider_name(provider);
 
     match provider_name.as_str() {
-        "openai" | "anthropic" | "google-gemini" | "google-genai" | "vertex-gemini"
-        | "openrouter" | "bedrock" | "custom-openai" | "google-anthropic"
-        | "openai-responses" | "openrouter-responses" => true,
+        "openai"
+        | "anthropic"
+        | "google-gemini"
+        | "google-genai"
+        | "vertex-gemini"
+        | "openrouter"
+        | "bedrock"
+        | "custom-openai"
+        | "google-anthropic"
+        | "openai-responses"
+        | "openrouter-responses" => true,
         _ => false,
     }
 }
@@ -36,7 +44,8 @@ fn python_type_to_json_schema(py: Python<'_>, type_obj: &Bound<'_, PyAny>) -> se
         name.extract::<String>().unwrap_or_default()
     } else if let Ok(origin) = type_obj.getattr("__origin__") {
         // Handle generic types like List[str], Optional[int]
-        origin.getattr("__name__")
+        origin
+            .getattr("__name__")
             .and_then(|n| n.extract::<String>())
             .unwrap_or_default()
     } else {
@@ -109,14 +118,18 @@ fn python_type_to_json_schema(py: Python<'_>, type_obj: &Bound<'_, PyAny>) -> se
 }
 
 /// Introspect a Python function and extract parameter schema
-fn introspect_function(py: Python<'_>, func: &Bound<'_, PyAny>) -> PyResult<(String, serde_json::Value)> {
+fn introspect_function(
+    py: Python<'_>,
+    func: &Bound<'_, PyAny>,
+) -> PyResult<(String, serde_json::Value)> {
     // Get function name
     let _name: String = func.getattr("__name__")?.extract()?;
 
     // Check if there's a tool_type attached (takes priority for description)
     let description: String = if let Ok(tool_type) = func.getattr("__reson_tool_type__") {
         // Use tool_type's __doc__ if available
-        tool_type.getattr("__doc__")
+        tool_type
+            .getattr("__doc__")
             .and_then(|d| d.extract::<Option<String>>())
             .unwrap_or(None)
             .unwrap_or_else(|| {
@@ -178,7 +191,11 @@ impl SchemaGenerator {
     }
 
     /// Generate tool schemas for registered tools
-    fn generate_tool_schemas(&self, py: Python<'_>, tools: &Bound<'_, PyDict>) -> PyResult<PyObject> {
+    fn generate_tool_schemas(
+        &self,
+        py: Python<'_>,
+        tools: &Bound<'_, PyDict>,
+    ) -> PyResult<PyObject> {
         let mut schemas = Vec::new();
 
         for (name, func) in tools.iter() {
@@ -212,7 +229,12 @@ impl SchemaGenerator {
 
 impl SchemaGenerator {
     /// Generate schema with introspected parameters
-    fn generate_schema_with_params(&self, name: &str, description: &str, params: serde_json::Value) -> serde_json::Value {
+    fn generate_schema_with_params(
+        &self,
+        name: &str,
+        description: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
         let provider_name = resolve_provider_name(&self.provider);
 
         match provider_name.as_str() {
@@ -273,7 +295,11 @@ pub fn get_schema_generator(provider: &str) -> PyResult<SchemaGenerator> {
 
 /// Generate native tool schemas (used by reson.reson module)
 #[pyfunction]
-pub fn _generate_native_tool_schemas(py: Python<'_>, tools: &Bound<'_, PyDict>, provider: &str) -> PyResult<PyObject> {
+pub fn _generate_native_tool_schemas(
+    py: Python<'_>,
+    tools: &Bound<'_, PyDict>,
+    provider: &str,
+) -> PyResult<PyObject> {
     let generator = get_schema_generator(provider)?;
     generator.generate_tool_schemas(py, tools)
 }

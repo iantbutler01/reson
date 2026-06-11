@@ -26,16 +26,16 @@ use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
 #[cfg(feature = "bedrock")]
 use crate::utils::{
-    ConversationMessage, convert_messages_to_provider_format, validate_image_input_supported,
+    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
 };
 
 #[cfg(feature = "bedrock")]
 use {
+    crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator},
     crate::providers::TokenUsage,
-    crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk},
-    crate::utils::{JsonStreamAccumulator, parse_json_value_strict_bytes},
+    crate::utils::{parse_json_value_strict_bytes, JsonStreamAccumulator},
     aws_sdk_bedrockruntime::{
-        Client as BedrockRuntimeClient, primitives::Blob, types::ResponseStream,
+        primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
     },
     futures::StreamExt,
     std::collections::VecDeque,
