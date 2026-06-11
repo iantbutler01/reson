@@ -476,6 +476,10 @@ pub struct TokenUsage {
 
     /// Cached tokens (for Anthropic caching)
     pub cached_tokens: u64,
+
+    /// Cache write / cache creation tokens (for Anthropic caching)
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
 }
 
 impl TokenUsage {
@@ -485,6 +489,7 @@ impl TokenUsage {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_write_input_tokens: 0,
         }
     }
 
@@ -532,7 +537,7 @@ impl CostInfo {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_input_tokens: usage.cached_tokens,
-            cache_write_input_tokens: 0, // Not tracked in TokenUsage currently
+            cache_write_input_tokens: usage.cache_write_input_tokens,
             microdollar_cost: 0,
             provider_cost_microdollars: None,
             microdollar_adjust: 0,
@@ -1576,8 +1581,10 @@ mod tests {
             !Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=maybe")
         );
         assert!(!Provider::OpenAI.supports_image_input("gpt-4o@vision=false"));
-        assert!(!Provider::OpenRouter
-            .supports_image_input("qwen/qwen2.5-vl-72b-instruct@image_input=true"));
+        assert!(
+            !Provider::OpenRouter
+                .supports_image_input("qwen/qwen2.5-vl-72b-instruct@image_input=true")
+        );
 
         let capabilities = Provider::OpenRouter.capabilities_for_model("custom/model@vision=true");
         assert!(capabilities.image_input);

@@ -135,6 +135,7 @@ pub fn parse_openai_chunk(
                         .and_then(|d| d.get("cached_tokens"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
+                    cache_write_input_tokens: 0,
                 });
             }
             return chunks;
@@ -531,6 +532,7 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                ..
             } => {
                 assert_eq!(*input_tokens, 100);
                 assert_eq!(*output_tokens, 50);

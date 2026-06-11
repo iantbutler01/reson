@@ -237,10 +237,12 @@ async fn stream_chunk_to_runtime_events(
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_write_input_tokens,
         } => Ok(vec![ResponseStreamEvent::Usage(TokenUsage {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_write_input_tokens,
         })]),
     }
 }
@@ -249,9 +251,19 @@ async fn stream_chunk_to_runtime_events(
 ///
 /// Creates provider-specific tool schemas from registered tools.
 /// Uses the tool_schemas mapping for tools with explicit schema info.
+///
+/// Tools are serialized in REGISTRATION order, not sorted order. Tool
+/// definitions render at the very front of the provider prompt, so their byte
+/// order is the root of the prompt-cache prefix: appending a newly selected
+/// tool extends the prefix (cheap — prior tool bytes still match), whereas
+/// re-sorting would splice it into the middle and invalidate every cached
+/// prefix from the insertion point onward. Names absent from `tool_order`
+/// (defensive — should not happen) are appended in sorted order so output
+/// stays deterministic.
 fn generate_tool_schemas(
     tools: &HashMap<String, ToolFunction>,
     tool_schemas: &HashMap<String, ToolSchemaInfo>,
+    tool_order: &[String],
     model: &str,
 ) -> Result<Vec<serde_json::Value>> {
     if tools.is_empty() {
@@ -267,8 +279,16 @@ fn generate_tool_schemas(
     // For each tool, generate schema
     let mut schemas = Vec::new();
 
-    let mut tool_names: Vec<&String> = tools.keys().collect();
-    tool_names.sort();
+    let mut tool_names: Vec<&String> = tool_order
+        .iter()
+        .filter(|name| tools.contains_key(*name))
+        .collect();
+    let mut unordered: Vec<&String> = tools
+        .keys()
+        .filter(|name| !tool_order.contains(name))
+        .collect();
+    unordered.sort();
+    tool_names.extend(unordered);
 
     for tool_name in tool_names {
         // Check if we have schema info for this tool
@@ -384,9 +404,29 @@ pub fn create_inference_client(
     let client: Box<dyn InferenceClient> = match provider.as_str() {
         "anthropic" => {
             let mut client = AnthropicClient::new(key, model_name);
+            // `@reasoning=` mapping for Anthropic models:
+            //   <number>                      -> legacy extended thinking with a
+            //                                    token budget (pre-4.6 models;
+            //                                    400s on Opus 4.7+ / Fable)
+            //   adaptive                      -> adaptive thinking
+            //   low|medium|high|xhigh|max     -> adaptive thinking + that
+            //                                    `output_config.effort` level
+            // Anything else is rejected loudly instead of being silently
+            // dropped (the previous behavior for non-numeric values).
             if let Some(r) = reasoning {
                 if let Ok(budget) = r.parse::<u32>() {
                     client = client.with_thinking_budget(budget);
+                } else if r == "adaptive" {
+                    client = client.with_adaptive_thinking();
+                } else if matches!(r.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+                    client = client.with_adaptive_thinking().with_effort(r);
+                } else {
+                    return Err(Error::NonRetryable(format!(
+                        "Unsupported @reasoning value '{}' for anthropic. Expected a numeric \
+                         thinking budget, 'adaptive', or an effort level \
+                         (low|medium|high|xhigh|max).",
+                        r
+                    )));
                 }
             }
             Box::new(client)
@@ -462,6 +502,7 @@ pub async fn call_llm(
     prompt: Option<&str>,
     model: &str,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
+    tool_order: Arc<RwLock<Vec<String>>>,
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
@@ -496,8 +537,14 @@ pub async fn call_llm(
     let tool_schemas = {
         let tools_guard = tools.read().await;
         let schemas_guard = tool_schema_info.read().await;
+        let order_guard = tool_order.read().await;
         if !tools_guard.is_empty() {
-            Some(generate_tool_schemas(&tools_guard, &schemas_guard, model)?)
+            Some(generate_tool_schemas(
+                &tools_guard,
+                &schemas_guard,
+                &order_guard,
+                model,
+            )?)
         } else {
             None
         }
@@ -550,6 +597,7 @@ pub async fn call_llm_stream(
     prompt: Option<&str>,
     model: &str,
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
+    tool_order: Arc<RwLock<Vec<String>>>,
     tool_schema_info: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
@@ -585,8 +633,14 @@ pub async fn call_llm_stream(
     let tool_schemas = {
         let tools_guard = tools.read().await;
         let schemas_guard = tool_schema_info.read().await;
+        let order_guard = tool_order.read().await;
         if !tools_guard.is_empty() {
-            Some(generate_tool_schemas(&tools_guard, &schemas_guard, model)?)
+            Some(generate_tool_schemas(
+                &tools_guard,
+                &schemas_guard,
+                &order_guard,
+                model,
+            )?)
         } else {
             None
         }
@@ -663,6 +717,15 @@ mod tests {
     use super::*;
     use crate::schema::ToolParametersSchema;
     use crate::types::{CacheMarker, ChatRole};
+
+    /// Alphabetical order helper for tests that don't care about registration
+    /// order — mirrors the old sorted serialization those tests were written
+    /// against.
+    fn sorted_order(tools: &HashMap<String, ToolFunction>) -> Vec<String> {
+        let mut names: Vec<String> = tools.keys().cloned().collect();
+        names.sort();
+        names
+    }
 
     #[test]
     fn test_create_inference_client_anthropic() {
@@ -894,7 +957,7 @@ mod tests {
     fn test_generate_tool_schemas_empty() {
         let tools = HashMap::new();
         let tool_schemas = HashMap::new();
-        let result = generate_tool_schemas(&tools, &tool_schemas, "anthropic:claude-3");
+        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "anthropic:claude-3");
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }
@@ -934,16 +997,18 @@ mod tests {
             },
         );
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, "anthropic:claude-3");
+        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "anthropic:claude-3");
         assert!(result.is_ok());
 
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "get_weather");
         assert!(schemas[0]["input_schema"].is_object());
-        assert!(schemas[0]["input_schema"]
-            .get("additionalProperties")
-            .is_none());
+        assert!(
+            schemas[0]["input_schema"]
+                .get("additionalProperties")
+                .is_none()
+        );
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["location"]["type"],
             "string"
@@ -985,16 +1050,18 @@ mod tests {
             },
         );
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, "openai:gpt-4o");
+        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "openai:gpt-4o");
         assert!(result.is_ok());
 
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["type"], "function");
         assert_eq!(schemas[0]["function"]["name"], "calculate");
-        assert!(schemas[0]["function"]["parameters"]
-            .get("additionalProperties")
-            .is_none());
+        assert!(
+            schemas[0]["function"]["parameters"]
+                .get("additionalProperties")
+                .is_none()
+        );
         assert_eq!(
             schemas[0]["function"]["parameters"]["properties"]["expression"]["type"],
             "string"
@@ -1002,29 +1069,50 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_tool_schemas_uses_stable_name_order() {
+    fn test_generate_tool_schemas_uses_registration_order() {
         let mut tools = HashMap::new();
-        tools.insert(
-            "zeta".to_string(),
-            ToolFunction::Sync(Box::new(|_args| Ok("z".to_string()))),
-        );
-        tools.insert(
-            "alpha".to_string(),
-            ToolFunction::Sync(Box::new(|_args| Ok("a".to_string()))),
-        );
-        tools.insert(
-            "beta".to_string(),
-            ToolFunction::Sync(Box::new(|_args| Ok("b".to_string()))),
-        );
+        for name in ["zeta", "alpha", "beta"] {
+            tools.insert(
+                name.to_string(),
+                ToolFunction::Sync(Box::new(|_args| Ok("x".to_string()))),
+            );
+        }
+        // Registration order intentionally non-alphabetical: serialization must
+        // follow it so mid-session appends extend (not resort) the cached
+        // prompt prefix.
+        let order = vec!["zeta".to_string(), "alpha".to_string(), "beta".to_string()];
 
-        let schemas =
-            generate_tool_schemas(&tools, &HashMap::new(), "anthropic:claude-3").expect("schemas");
+        let schemas = generate_tool_schemas(&tools, &HashMap::new(), &order, "anthropic:claude-3")
+            .expect("schemas");
         let names: Vec<&str> = schemas
             .iter()
             .filter_map(|schema| schema["name"].as_str())
             .collect();
 
-        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+        assert_eq!(names, vec!["zeta", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn test_generate_tool_schemas_appends_unordered_names_deterministically() {
+        let mut tools = HashMap::new();
+        for name in ["zeta", "alpha", "mu"] {
+            tools.insert(
+                name.to_string(),
+                ToolFunction::Sync(Box::new(|_args| Ok("x".to_string()))),
+            );
+        }
+        // "mu" and "alpha" missing from the order record: they must still be
+        // emitted, after the ordered names, in sorted order.
+        let order = vec!["zeta".to_string()];
+
+        let schemas = generate_tool_schemas(&tools, &HashMap::new(), &order, "anthropic:claude-3")
+            .expect("schemas");
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|schema| schema["name"].as_str())
+            .collect();
+
+        assert_eq!(names, vec!["zeta", "alpha", "mu"]);
     }
 
     #[test]
@@ -1087,15 +1175,17 @@ mod tests {
             },
         );
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, "anthropic:claude-3");
+        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "anthropic:claude-3");
         assert!(result.is_ok());
 
         let schemas = result.unwrap();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "search");
-        assert!(schemas[0]["input_schema"]
-            .get("additionalProperties")
-            .is_none());
+        assert!(
+            schemas[0]["input_schema"]
+                .get("additionalProperties")
+                .is_none()
+        );
         assert_eq!(
             schemas[0]["input_schema"]["properties"]["ids"]["items"]["type"],
             "integer"
@@ -1111,7 +1201,7 @@ mod tests {
         );
         let tool_schemas = HashMap::new();
 
-        let result = generate_tool_schemas(&tools, &tool_schemas, "unsupported:model");
+        let result = generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "unsupported:model");
         assert!(result.is_err());
     }
 
@@ -1162,12 +1252,14 @@ mod tests {
         );
 
         let google =
-            generate_tool_schemas(&tools, &tool_schemas, "gemini:gemini-3-flash-preview").unwrap();
+            generate_tool_schemas(&tools, &tool_schemas, &sorted_order(&tools), "gemini:gemini-3-flash-preview").unwrap();
         let nested = &google[0]["parameters"]["properties"]["items"]["items"]["properties"];
         assert_eq!(nested["text"]["type"], "string");
         assert_eq!(nested["image_ids"]["items"]["type"], "integer");
-        assert!(google[0]["parameters"]["properties"]["items"]["items"]
-            .get("additionalProperties")
-            .is_none());
+        assert!(
+            google[0]["parameters"]["properties"]["items"]["items"]
+                .get("additionalProperties")
+                .is_none()
+        );
     }
 }

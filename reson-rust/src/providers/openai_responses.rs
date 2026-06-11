@@ -16,15 +16,15 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_responses_input, parse_json_value_strict_str, parse_sse_stream,
-    validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_responses_input, parse_json_value_strict_str,
+    parse_sse_stream, validate_image_input_supported,
 };
 
-use super::openai_responses_streaming::{parse_openai_responses_event, ResponsesToolAccumulator};
+use super::openai_responses_streaming::{ResponsesToolAccumulator, parse_openai_responses_event};
 
 /// OpenAI Responses API client (also serves as base for OpenRouter Responses)
 pub struct OpenAIResponsesClient {
@@ -206,6 +206,7 @@ impl OpenAIResponsesClient {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            cache_write_input_tokens: 0,
         }
     }
 

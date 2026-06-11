@@ -26,16 +26,16 @@ use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, ToolCall};
 #[cfg(feature = "bedrock")]
 use crate::utils::{
-    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, validate_image_input_supported,
 };
 
 #[cfg(feature = "bedrock")]
 use {
-    crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator},
     crate::providers::TokenUsage,
-    crate::utils::{parse_json_value_strict_bytes, JsonStreamAccumulator},
+    crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk},
+    crate::utils::{JsonStreamAccumulator, parse_json_value_strict_bytes},
     aws_sdk_bedrockruntime::{
-        primitives::Blob, types::ResponseStream, Client as BedrockRuntimeClient,
+        Client as BedrockRuntimeClient, primitives::Blob, types::ResponseStream,
     },
     futures::StreamExt,
     std::collections::VecDeque,
@@ -257,6 +257,9 @@ impl InferenceClient for BedrockClient {
                     .as_u64()
                     .unwrap_or(0),
                 cached_tokens: response_json["usage"]["cache_read_input_tokens"]
+                    .as_u64()
+                    .unwrap_or(0),
+                cache_write_input_tokens: response_json["usage"]["cache_creation_input_tokens"]
                     .as_u64()
                     .unwrap_or(0),
             };

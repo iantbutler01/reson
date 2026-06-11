@@ -20,8 +20,8 @@
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -284,14 +284,16 @@ impl TracingInferenceClient {
                     input_tokens,
                     output_tokens,
                     cached_tokens,
+                    cache_write_input_tokens,
                 }) = &chunk
                 {
                     // Calculate and record cost
-                    let usage = crate::types::TokenUsage::new(
+                    let mut usage = crate::types::TokenUsage::new(
                         *input_tokens,
                         *output_tokens,
                         *cached_tokens,
                     );
+                    usage.cache_write_input_tokens = *cache_write_input_tokens;
                     let cost = CostInfo::from_usage(&usage, &model);
 
                     if let Some(ref store) = cost_store {
@@ -497,6 +499,7 @@ mod tests {
                         input_tokens: 100,
                         output_tokens: 50,
                         cached_tokens: 0,
+                        cache_write_input_tokens: 0,
                     },
                     None,
                     None,

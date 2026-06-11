@@ -2,7 +2,7 @@
 //!
 //! Handles SSE parsing and progressive tool call accumulation for Anthropic API.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::utils::parse_json_value_strict_str;
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ struct StreamUsageAccumulator {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
+    cache_write_input_tokens: u64,
 }
 
 impl ToolCallAccumulator {
@@ -136,6 +137,7 @@ impl ToolCallAccumulator {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cached_tokens: Option<u64>,
+        cache_write_input_tokens: Option<u64>,
     ) -> StreamChunk {
         if let Some(value) = input_tokens {
             self.usage.input_tokens = value;
@@ -146,11 +148,15 @@ impl ToolCallAccumulator {
         if let Some(value) = cached_tokens {
             self.usage.cached_tokens = value;
         }
+        if let Some(value) = cache_write_input_tokens {
+            self.usage.cache_write_input_tokens = value;
+        }
 
         StreamChunk::Usage {
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cached_tokens: self.usage.cached_tokens,
+            cache_write_input_tokens: self.usage.cache_write_input_tokens,
         }
     }
 }
@@ -335,7 +341,7 @@ pub fn parse_anthropic_chunk(
                 let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
                 // message_delta carries output_tokens; input comes from message_start
                 if output_tokens > 0 || input_tokens > 0 {
-                    results.push(accumulator.update_usage(None, Some(output_tokens), None));
+                    results.push(accumulator.update_usage(None, Some(output_tokens), None, None));
                 }
             }
 
@@ -359,11 +365,16 @@ pub fn parse_anthropic_chunk(
                     .get("cache_read_input_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                let cache_write_input_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if input_tokens > 0 {
                     results.push(accumulator.update_usage(
                         Some(input_tokens),
                         Some(0),
                         Some(cached_tokens),
+                        Some(cache_write_input_tokens),
                     ));
                 }
             }
@@ -561,10 +572,12 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_write_input_tokens,
             } => {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 0);
                 assert_eq!(*cached_tokens, 900);
+                assert_eq!(*cache_write_input_tokens, 0);
             }
             _ => panic!("Expected Usage chunk"),
         }
@@ -584,10 +597,12 @@ mod tests {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                cache_write_input_tokens,
             } => {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 42);
                 assert_eq!(*cached_tokens, 900);
+                assert_eq!(*cache_write_input_tokens, 0);
             }
             _ => panic!("Expected Usage chunk"),
         }

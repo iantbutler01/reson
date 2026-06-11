@@ -51,6 +51,12 @@ pub struct Runtime {
 
     // Private state (using interior mutability)
     tools: Arc<RwLock<HashMap<String, ToolFunction>>>,
+    /// Registration order of tool names. Providers serialize tool definitions
+    /// in this order so that appending a tool mid-session extends the prompt
+    /// prefix instead of resorting it — re-sorting (e.g. alphabetically) moves
+    /// existing tool bytes and invalidates provider prompt caches from the
+    /// insertion point onward.
+    tool_order: Arc<RwLock<Vec<String>>>,
     tool_types: Arc<RwLock<HashMap<String, String>>>, // tool_name -> type_name mapping
     tool_schemas: Arc<RwLock<HashMap<String, ToolSchemaInfo>>>, // tool_name -> schema info
     tool_constructors: Arc<RwLock<HashMap<String, Arc<ToolConstructor>>>>, // For NativeToolParser
@@ -132,6 +138,7 @@ impl Runtime {
             api_key: None,
             used: false,
             tools: Arc::new(RwLock::new(HashMap::new())),
+            tool_order: Arc::new(RwLock::new(Vec::new())),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -152,6 +159,7 @@ impl Runtime {
             api_key,
             used: false,
             tools: Arc::new(RwLock::new(HashMap::new())),
+            tool_order: Arc::new(RwLock::new(Vec::new())),
             tool_types: Arc::new(RwLock::new(HashMap::new())),
             tool_schemas: Arc::new(RwLock::new(HashMap::new())),
             tool_constructors: Arc::new(RwLock::new(HashMap::new())),
@@ -189,6 +197,8 @@ impl Runtime {
         }
         tools.insert(name.clone(), tool_fn);
         drop(tools);
+
+        self.tool_order.write().await.push(name.clone());
 
         // Store tool type if provided
         if let Some(type_name) = tool_type {
@@ -243,6 +253,8 @@ impl Runtime {
         tools.insert(name.clone(), tool_fn);
         drop(tools);
 
+        self.tool_order.write().await.push(name.clone());
+
         // Parse and store full schema information while preserving
         // flat field metadata for introspection and existing callers.
         let parameters = ToolParametersSchema::from_json_schema(&schema)?;
@@ -268,6 +280,10 @@ impl Runtime {
             let mut tools = self.tools.write().await;
             tools.remove(name).is_some()
         };
+
+        if removed {
+            self.tool_order.write().await.retain(|n| n != name);
+        }
 
         let mut tool_types = self.tool_types.write().await;
         tool_types.remove(name);
@@ -342,8 +358,14 @@ impl Runtime {
             }) as BoxFuture<'static, Result<String>>
         });
 
-        tools.insert(tool_name.clone(), ToolFunction::Async(wrapped_handler));
+        let was_new = tools
+            .insert(tool_name.clone(), ToolFunction::Async(wrapped_handler))
+            .is_none();
         drop(tools);
+
+        if was_new {
+            self.tool_order.write().await.push(tool_name.clone());
+        }
 
         // Store type name for introspection
         let mut tool_types = self.tool_types.write().await;
@@ -428,6 +450,7 @@ impl Runtime {
             Some(&prompt_text),
             &effective_model,
             self.tools.clone(),
+            self.tool_order.clone(),
             self.tool_schemas.clone(),
             params.output_type,
             params.output_schema,
@@ -496,6 +519,7 @@ impl Runtime {
             Some(&prompt_text),
             &effective_model,
             self.tools.clone(),
+            self.tool_order.clone(),
             self.tool_schemas.clone(),
             params.output_type,
             params.output_schema,

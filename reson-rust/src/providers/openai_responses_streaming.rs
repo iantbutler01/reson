@@ -234,6 +234,7 @@ pub fn parse_openai_responses_event(
                             .and_then(|d| d.get("cached_tokens"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0),
+                        cache_write_input_tokens: 0,
                     });
                 }
             }

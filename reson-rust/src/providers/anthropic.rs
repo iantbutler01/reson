@@ -18,11 +18,11 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, ProviderConfig, StreamChunk,
     TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, validate_image_input_supported,
 };
 
 /// Anthropic API client
@@ -32,6 +32,14 @@ pub struct AnthropicClient {
     api_key: String,
     api_url: String,
     thinking_budget: Option<u32>,
+    /// Adaptive thinking (`thinking: {"type": "adaptive"}`) — the only
+    /// supported thinking mode on Opus 4.7+ / Fable, where
+    /// `enabled`+`budget_tokens` returns a 400. Mutually exclusive with
+    /// `thinking_budget`; when both are set, `thinking_budget` wins (legacy).
+    adaptive_thinking: bool,
+    /// `output_config.effort` level (low|medium|high|xhigh|max) for models
+    /// that support it (Opus 4.5+/Sonnet 4.6/Fable).
+    effort: Option<String>,
     trace_callback: Option<TraceCallback>,
 }
 
@@ -54,6 +62,8 @@ impl AnthropicClient {
             api_key: api_key.into(),
             api_url: "https://api.anthropic.com/v1/messages".to_string(),
             thinking_budget: None,
+            adaptive_thinking: false,
+            effort: None,
             trace_callback: None,
         }
     }
@@ -61,6 +71,18 @@ impl AnthropicClient {
     /// Set the thinking budget for extended thinking mode
     pub fn with_thinking_budget(mut self, budget: u32) -> Self {
         self.thinking_budget = Some(budget);
+        self
+    }
+
+    /// Enable adaptive thinking (`thinking: {"type": "adaptive"}`).
+    pub fn with_adaptive_thinking(mut self) -> Self {
+        self.adaptive_thinking = true;
+        self
+    }
+
+    /// Set the `output_config.effort` level (low|medium|high|xhigh|max).
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
         self
     }
 
@@ -90,6 +112,39 @@ impl AnthropicClient {
         // Wrap string content in proper format
         let formatted_messages = self.wrap_string_content(formatted_messages);
 
+        let mut formatted_messages = formatted_messages;
+        // "Automatic" prompt caching: stamp an explicit cache_control marker on
+        // the SECOND-TO-LAST message (falling back to the only message). Two
+        // reasons, both empirical (verified via runtime_llm_usage_events):
+        //
+        // 1. The top-level `cache_control` request field never produced
+        //    readable message-history entries — every agent-loop turn re-wrote
+        //    its byte-identical history at the cache-write premium while
+        //    cache_read stayed pinned to the system prefix.
+        // 2. The final message is frequently ephemeral: `Runtime::run` appends
+        //    `prompt`/`default_prompt` (e.g. a "[System continuation]" nudge)
+        //    that is NOT part of durable history, so its bytes vanish from the
+        //    next request. A marker on it keys a cache entry no later request
+        //    can ever match. Stamping the message before it puts the breakpoint
+        //    at the end of the SHARED prefix — the documented placement — and
+        //    lets the volatile tail ride after the breakpoint uncached.
+        if let Some(ProviderConfig::Anthropic(provider_config)) = config.provider_config.as_ref() {
+            if let Some(marker) = provider_config.automatic_prompt_caching.as_ref() {
+                let target_index = formatted_messages.len().saturating_sub(2);
+                if let Some(blocks) = formatted_messages
+                    .get_mut(target_index)
+                    .and_then(|msg| msg.get_mut("content"))
+                    .and_then(|content| content.as_array_mut())
+                {
+                    if let Some(last_block) = blocks.last_mut() {
+                        if last_block.get("cache_control").is_none() {
+                            last_block["cache_control"] = marker.anthropic_cache_control();
+                        }
+                    }
+                }
+            }
+        }
+
         let mut request = serde_json::json!({
             "model": model,
             "max_tokens": config.max_tokens.unwrap_or(4096),
@@ -97,8 +152,10 @@ impl AnthropicClient {
             "stream": stream,
         });
 
-        // Add temperature and top_p if not in thinking mode
-        if self.thinking_budget.is_none() {
+        // Add temperature and top_p if not in thinking mode. (Sampling params
+        // are incompatible with extended thinking, and removed entirely on the
+        // models that require adaptive thinking.)
+        if self.thinking_budget.is_none() && !self.adaptive_thinking {
             if let Some(temp) = config.temperature {
                 request["temperature"] = serde_json::json!(temp);
             }
@@ -110,12 +167,6 @@ impl AnthropicClient {
         // Add system if present
         if let Some(system) = system {
             request["system"] = system;
-        }
-
-        if let Some(ProviderConfig::Anthropic(provider_config)) = config.provider_config.as_ref() {
-            if let Some(marker) = provider_config.automatic_prompt_caching.as_ref() {
-                request["cache_control"] = marker.anthropic_cache_control();
-            }
         }
 
         // Add tools if provided
@@ -144,7 +195,10 @@ impl AnthropicClient {
             }
         }
 
-        // Add extended thinking if configured
+        // Add thinking if configured. Legacy budgeted extended thinking takes
+        // precedence (pre-4.7 models); adaptive thinking is the only on-mode
+        // for Opus 4.7+/Fable and needs none of the legacy max_tokens or
+        // temperature adjustments.
         if let Some(budget) = self.thinking_budget {
             request["thinking"] = serde_json::json!({
                 "type": "enabled",
@@ -157,14 +211,28 @@ impl AnthropicClient {
             if let Some(obj) = request.as_object_mut() {
                 obj.remove("top_p");
             }
+        } else if self.adaptive_thinking {
+            request["thinking"] = serde_json::json!({ "type": "adaptive" });
         }
 
-        // Add structured output schema if provided
+        // output_config carries structured outputs and effort. The top-level
+        // `output_format` parameter is deprecated API-wide; `output_config`
+        // with a nested `format` is the canonical replacement.
+        let mut output_config = serde_json::Map::new();
+        if let Some(effort) = self.effort.as_deref() {
+            output_config.insert("effort".to_string(), serde_json::json!(effort));
+        }
         if let Some(ref schema) = config.output_schema {
-            request["output_format"] = serde_json::json!({
-                "type": "json_schema",
-                "schema": schema
-            });
+            output_config.insert(
+                "format".to_string(),
+                serde_json::json!({
+                    "type": "json_schema",
+                    "schema": schema
+                }),
+            );
+        }
+        if !output_config.is_empty() {
+            request["output_config"] = serde_json::Value::Object(output_config);
         }
 
         Ok(request)
@@ -286,6 +354,7 @@ impl AnthropicClient {
             input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
             output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
             cached_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+            cache_write_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
         }
     }
 
@@ -410,7 +479,7 @@ impl InferenceClient for AnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
+        use crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk};
         use crate::utils::parse_sse_stream;
 
         let use_structured_outputs = config.output_schema.is_some();
@@ -695,7 +764,96 @@ mod tests {
             .build_request_body(&messages, &config, false)
             .unwrap();
 
-        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        // Automatic caching stamps an explicit marker on the second-to-last
+        // message (sole message here), not the top-level request field. The
+        // last message is often an ephemeral appended prompt whose bytes never
+        // recur, so a marker there can never be read back.
+        assert!(body.get("cache_control").is_none());
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn test_build_request_adaptive_thinking() {
+        let client = AnthropicClient::new("test-key", "claude-opus-4-8").with_adaptive_thinking();
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("claude-opus-4-8")
+            .with_temperature(0.7)
+            .with_max_tokens(4096);
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        // Sampling params are removed on adaptive-thinking models; max_tokens
+        // must not get the legacy budget adjustment.
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn test_build_request_effort_lands_in_output_config() {
+        let client = AnthropicClient::new("test-key", "claude-opus-4-8")
+            .with_adaptive_thinking()
+            .with_effort("xhigh");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let config = GenerationConfig::new("claude-opus-4-8");
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn test_build_request_output_schema_uses_output_config_format() {
+        let client = AnthropicClient::new("test-key", "claude-opus-4-8");
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
+        let schema = serde_json::json!({"type": "object", "properties": {}});
+        let config = GenerationConfig::new("claude-opus-4-8")
+            .with_output_schema(schema.clone(), "TestOutput");
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        // Deprecated top-level param must be gone; canonical nested form used.
+        assert!(body.get("output_format").is_none());
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(body["output_config"]["format"]["schema"], schema);
+    }
+
+    #[test]
+    fn test_automatic_prompt_caching_skips_trailing_ephemeral_prompt() {
+        let client = AnthropicClient::new("test-key", "claude-3-opus-20240229");
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("Durable history tail")),
+            ConversationMessage::Chat(ChatMessage::user("[System continuation] nudge")),
+        ];
+        let config = GenerationConfig::new("claude-3-opus-20240229").with_provider_config(
+            ProviderConfig::Anthropic(crate::providers::AnthropicProviderConfig {
+                automatic_prompt_caching: Some(CacheMarker::Ephemeral),
+                tool_definitions_cache_breakpoint: None,
+            }),
+        );
+
+        let body = client
+            .build_request_body(&messages, &config, false)
+            .unwrap();
+
+        let durable_blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            durable_blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        let trailing_blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert!(trailing_blocks.last().unwrap().get("cache_control").is_none());
     }
 
     #[test]

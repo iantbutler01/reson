@@ -368,6 +368,7 @@ pub enum StreamChunk {
         input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+        cache_write_input_tokens: u64,
     },
 }
 

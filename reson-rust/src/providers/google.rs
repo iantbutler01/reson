@@ -25,12 +25,12 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::types::ChatRole;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    media_part_to_google_format, validate_image_input_supported, ConversationMessage,
-    JsonStreamAccumulator,
+    ConversationMessage, JsonStreamAccumulator, media_part_to_google_format,
+    validate_image_input_supported,
 };
 
 #[cfg(feature = "google-adc")]
@@ -443,6 +443,7 @@ fn parse_google_stream_value(
             input_tokens: input,
             output_tokens: output,
             cached_tokens: cached,
+            cache_write_input_tokens: 0,
         }));
     }
 
@@ -1200,6 +1201,7 @@ impl GoogleGenAIClient {
             cached_tokens: usage_metadata["cachedContentTokenCount"]
                 .as_u64()
                 .unwrap_or(0),
+            cache_write_input_tokens: 0,
         }
     }
 
