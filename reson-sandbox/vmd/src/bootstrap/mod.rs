@@ -232,7 +232,13 @@ while IFS=$'\t' read -r TAG GUEST MODE; do
 
   # @dive: Precreate every mountpoint before mounting anything so nested writable mounts remain
   # mountable even when their parent path will become a read-only shared root.
-  mkdir -p "$GUEST"
+  if [ -e "$GUEST" ]; then
+    continue
+  fi
+  if ! mkdir -p "$GUEST"; then
+    log "failed to create mountpoint tag=$TAG guest=$GUEST"
+    exit 1
+  fi
 done < "$CONFIG"
 
 while IFS=$'\t' read -r TAG GUEST MODE; do
@@ -255,18 +261,30 @@ while IFS=$'\t' read -r TAG GUEST MODE; do
     NINEP_OPTS="$NINEP_OPTS,ro"
   fi
 
-  if {{
-    if [ -n "$VFS_OPTS" ]; then
-      mount -t virtiofs -o "$VFS_OPTS" "$TAG" "$GUEST" 2>/dev/null
-    else
-      mount -t virtiofs "$TAG" "$GUEST" 2>/dev/null
+  MOUNTED=""
+  for ATTEMPT in 1 2 3 4 5; do
+    if {{
+      if [ -n "$VFS_OPTS" ]; then
+        mount -t virtiofs -o "$VFS_OPTS" "$TAG" "$GUEST" 2>/dev/null
+      else
+        mount -t virtiofs "$TAG" "$GUEST" 2>/dev/null
+      fi
+    }}; then
+      log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=virtiofs attempt=$ATTEMPT"
+      MOUNTED=1
+      break
+    elif mount -t 9p -o "$NINEP_OPTS" "$TAG" "$GUEST"; then
+      log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=9p attempt=$ATTEMPT"
+      MOUNTED=1
+      break
     fi
-  }}; then
-    log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=virtiofs"
-  elif mount -t 9p -o "$NINEP_OPTS" "$TAG" "$GUEST"; then
-    log "mounted tag=$TAG guest=$GUEST mode=${{MODE:-rw}} fs=9p"
-  else
+    log "mount attempt failed tag=$TAG guest=$GUEST mode=${{MODE:-rw}} attempt=$ATTEMPT"
+    sleep 1
+  done
+
+  if [ -z "$MOUNTED" ]; then
     log "failed tag=$TAG guest=$GUEST mode=${{MODE:-rw}}"
+    exit 1
   fi
 done < "$CONFIG"
 EOF
