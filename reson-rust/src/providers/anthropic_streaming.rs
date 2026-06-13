@@ -339,9 +339,17 @@ pub fn parse_anthropic_chunk(
             if usage.is_object() {
                 let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                 let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                let cache_write_input_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64());
                 // message_delta carries output_tokens; input comes from message_start
-                if output_tokens > 0 || input_tokens > 0 {
-                    results.push(accumulator.update_usage(None, Some(output_tokens), None, None));
+                if output_tokens > 0 || input_tokens > 0 || cache_write_input_tokens.is_some() {
+                    results.push(accumulator.update_usage(
+                        None,
+                        Some(output_tokens),
+                        None,
+                        cache_write_input_tokens,
+                    ));
                 }
             }
 
@@ -560,7 +568,8 @@ mod tests {
             "message": {
                 "usage": {
                     "input_tokens": 1200,
-                    "cache_read_input_tokens": 900
+                    "cache_read_input_tokens": 900,
+                    "cache_creation_input_tokens": 300
                 }
             }
         });
@@ -577,7 +586,7 @@ mod tests {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 0);
                 assert_eq!(*cached_tokens, 900);
-                assert_eq!(*cache_write_input_tokens, 0);
+                assert_eq!(*cache_write_input_tokens, 300);
             }
             _ => panic!("Expected Usage chunk"),
         }
@@ -602,7 +611,7 @@ mod tests {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 42);
                 assert_eq!(*cached_tokens, 900);
-                assert_eq!(*cache_write_input_tokens, 0);
+                assert_eq!(*cache_write_input_tokens, 300);
             }
             _ => panic!("Expected Usage chunk"),
         }
