@@ -262,6 +262,9 @@ mod server {
 
         async fn list_dir(&self, owner_id: &str, path: &str) -> VfsResult<Vec<VfsDirEntry>>;
         async fn stat(&self, owner_id: &str, path: &str) -> VfsResult<VfsMetadata>;
+        async fn stat_for_raw_read(&self, owner_id: &str, path: &str) -> VfsResult<VfsMetadata> {
+            self.stat(owner_id, path).await
+        }
         async fn read_file(
             &self,
             owner_id: &str,
@@ -401,7 +404,7 @@ mod server {
         S: Clone + Send + Sync + 'static,
     {
         let path = required_path(params.path.as_deref())?;
-        let metadata = backend.stat(owner_id.as_str(), path).await?;
+        let metadata = backend.stat_for_raw_read(owner_id.as_str(), path).await?;
         if metadata.kind != VFS_ENTRY_KIND_FILE {
             return Err(VfsGatewayError::BadRequest(format!(
                 "vfs path {path} is not a file"
@@ -835,6 +838,8 @@ mod server_tests {
         leases: Vec<VfsLeaseAcquire>,
         releases: Vec<VfsLeaseReleaseRequest>,
         valid_tokens: HashSet<Uuid>,
+        stat_calls: usize,
+        raw_read_stat_calls: usize,
     }
 
     #[async_trait]
@@ -850,7 +855,30 @@ mod server_tests {
         }
 
         async fn stat(&self, _owner_id: &str, path: &str) -> VfsResult<VfsMetadata> {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
+            inner.stat_calls += 1;
+            if path == "dir" || inner.dirs.contains(path) {
+                return Ok(VfsMetadata {
+                    kind: VFS_ENTRY_KIND_DIRECTORY.to_string(),
+                    size_bytes: 0,
+                    content_hash: None,
+                    updated_at: None,
+                });
+            }
+            let Some(bytes) = inner.files.get(path) else {
+                return Err(VfsGatewayError::NotFound(path.to_string()));
+            };
+            Ok(VfsMetadata {
+                kind: VFS_ENTRY_KIND_FILE.to_string(),
+                size_bytes: bytes.len() as u64,
+                content_hash: None,
+                updated_at: None,
+            })
+        }
+
+        async fn stat_for_raw_read(&self, _owner_id: &str, path: &str) -> VfsResult<VfsMetadata> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.raw_read_stat_calls += 1;
             if path == "dir" || inner.dirs.contains(path) {
                 return Ok(VfsMetadata {
                     kind: VFS_ENTRY_KIND_DIRECTORY.to_string(),
@@ -1024,6 +1052,33 @@ mod server_tests {
         assert_eq!(raw.status(), StatusCode::OK);
         let body = to_bytes(raw.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn gateway_raw_read_uses_lightweight_stat_hook() {
+        let backend = MemoryBackend::default();
+        backend
+            .inner
+            .lock()
+            .unwrap()
+            .files
+            .insert("asset.bin".to_string(), Bytes::from_static(b"abcdef"));
+        let app = reson_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/reson/vfs/owner-1/file/raw?path=asset.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let state = backend.inner.lock().unwrap();
+        assert_eq!(state.stat_calls, 0);
+        assert_eq!(state.raw_read_stat_calls, 1);
     }
 
     #[tokio::test]

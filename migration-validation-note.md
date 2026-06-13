@@ -80,6 +80,58 @@ docker exec -i infra-postgres-1 psql -U nym -d nym -Atc \
 
 Result: `gcs=12 db=12`, diff empty.
 
+## 2026-06-13 Performance/Correctness Audit Addendum
+
+User concern: the migrated VFS/VMD boundary must not reinvent the optimized OtherYou VFS storage path. The old split had working performance characteristics around batch reads/writes, manifests, pack slots, zstd, and compressed pack range reads.
+
+Finding:
+
+- Reson owns only the generic VFS HTTP gateway, VMD/FUSE client behavior, VM lifecycle, and distributed control mechanics.
+- OtherYou still owns product semantics and optimized storage: auth, path aliasing, task/conversation write scopes, leases, mutation ledger, GCS adapter behavior, manifests, pack rows, zstd pack building, `read_many_async`, `write_bulk_bytes_atomic_async`, range reads, and subtree prefetch.
+- One regression was found and fixed: generic `/file/raw` originally called the backend's normal `stat`, but OtherYou's normal `stat` intentionally computes a content hash. The old `file/raw` route only used `stat_async` for kind/size and then read bytes. Because VMD FUSE already stats before reading, this accidentally added a hash/metadata cost to raw reads.
+
+Fix:
+
+- Reson `VfsGatewayBackend` now has a `stat_for_raw_read(...)` hook that defaults to `stat(...)`.
+- Generic raw reads call `stat_for_raw_read(...)`.
+- OtherYou overrides that hook with the old lightweight behavior: resolve path, `filesystem_core_service.stat_async`, no `hash_file_if_present_async`, then raw/range read.
+- `tree` and `stat` still return content hashes because those are correctness/conflict surfaces.
+
+Validation after the fix:
+
+```bash
+cargo test -p reson-sandbox --features vfs-server vfs:: -- --nocapture
+rustup run 1.90-aarch64-apple-darwin cargo test --manifest-path api/Cargo.toml routes::runtime_nymfs_internal -- --nocapture
+cargo test -p reson-sandbox distributed:: -- --nocapture
+cargo test -p reson-sandbox --test facade_contract control_gateway_failover_prefers_healthy_secondary_endpoint -- --nocapture
+cargo test -p reson-sandbox --test facade_contract continuity_rebinds_session_after_primary_vmd_loss -- --nocapture
+cargo check -p reson-sandbox --features vfs-server
+rustup run 1.90-aarch64-apple-darwin cargo check --manifest-path api/Cargo.toml
+rustup run 1.90-aarch64-apple-darwin cargo check -p vmd
+```
+
+Results:
+
+- Reson VFS tests passed, including `gateway_raw_read_uses_lightweight_stat_hook`.
+- OtherYou internal route tests passed.
+- Distributed unit tests passed.
+- Facade control-gateway failover and continuity rebind contract tests passed after rerunning outside the filesystem/network sandbox so test listeners could bind.
+- Compile checks passed for OtherYou API, `reson-sandbox`, and `vmd`.
+
+Live GCS/VMD validation evidence:
+
+- Local API ran with `NYM__RUNTIME__NYMFS_BACKEND=gcs` against bucket `reson-otheryou-vfs-vm-migration-20260605-b0f78571`.
+- Direct generic VFS route validation covered lease acquire/release, write/stat/full raw read/range raw read/rename/delete, legacy alias compatibility, and resource-key mismatch rejection.
+- A real corvidae VM mounted `/nym`, `/nym/vm/mounts/shared`, `/nym/vm/mounts/skills`, and `/nym/vm/mounts/task`.
+- Writing `live-vfs-from-vm-20260613` inside `/nym/vm/mounts/task/live-vfs.txt` produced durable OtherYou/GCS VFS metadata and digest sidecars.
+- The same file was stat/read through the generic `/v1/internal/reson/vfs/{owner_id}` API.
+- VM pause/resume was exercised through VMD; after resume, guest attach/read still returned `live-vfs-from-vm-20260613`.
+- Validation artifacts were deleted through the generic VFS route under a product write lease, workspace tree returned `[]`, the disposable VM was deleted, and remote VMD validation nodes were stopped.
+
+Known limit of this addendum:
+
+- The focused facade/distributed gates were rerun on the current branch. The full real-machinery distributed failover script was not rerun on corvidae during this addendum because corvidae's existing `~/SoftwareProjects/reson` checkout is an older layout without the current `reson-sandbox` tree/toolchain staged. The migration code touched only the generic VFS raw-read stat hook and OtherYou adapter override after the earlier real-machinery validation, so the fast HA/distributed regression gates are the evidence for this addendum.
+
 ## Prod Deploy Commands After Morning Verification
 
 No prod mutation has been performed for this migration.
