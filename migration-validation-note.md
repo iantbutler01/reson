@@ -7,7 +7,7 @@ Branches:
 - `reson`: `wip/reson-vfs-vmd-migration`
 - `OtherYou`: `ian/vmd-vfs-reson-migration`
 
-Current commits:
+Current commits at initial validation:
 
 - `reson`: `812bbb6 Harden VMD mount bootstrap`
 - `OtherYou`: `cbfb07f Wire OtherYou runtime VFS through Reson gateway`
@@ -52,41 +52,33 @@ Current commits:
   - corvidae VMD containers stopped
   - validation tasks for `MigrationVfs053050` were completed
   - no validation heartbeat schedules existed/enabled
+- Final staging GCS cleanup was completed with the local staging service account in isolated `.run/gcloud` config:
+  - deleted the two validation digest sidecar pack objects
+  - deleted the matching local DB `nym_fs_entries`, `nym_fs_file_versions`, `nym_fs_file_manifests`, and `nym_fs_packs` rows
+  - deleted one additional zero-reference validation pack object and DB pack row
 
-## Remaining Blocker
+## Final Cleanup Verification
 
-The goal is not fully complete yet because final staging GCS cleanup is blocked by expired non-interactive `gcloud` auth.
-
-Two generated digest sidecar files remain for the validation Nym:
-
-- `conversations/7ea465a8-7bb4-4692-9c6f-2acb8957940b/0001_assistant/mount/migration-validation-corvidae-active-task.digest-excerpt.md`
-- `conversations/7ea465a8-7bb4-4692-9c6f-2acb8957940b/0001_assistant/mount/migration-validation-corvidae-active-task.digest-ref.md`
-
-They each reference a one-ref staging pack:
-
-- `nymfs/packs/a072b89c-fb33-447a-915c-5db54877853c/fc3600f763c944c59d05429d9cd9f11b.pack`
-- `nymfs/packs/a072b89c-fb33-447a-915c-5db54877853c/d7333c0d2a8342048276ea0bbf310413.pack`
-
-The pack objects were not deleted because:
-
-```bash
-gcloud storage rm ...
-# ERROR: There was a problem refreshing your current auth tokens:
-# Reauthentication failed. cannot prompt during non-interactive execution.
-```
-
-Do not delete the DB metadata until the matching GCS objects are deleted or a product-owned cleanup path is available.
-
-## Final Cleanup After Auth Is Restored
-
-After `gcloud` auth is refreshed, delete only the two staging pack objects above, then delete the matching local staging metadata rows in one narrow transaction, and verify:
+Validation artifact DB count:
 
 ```bash
 docker exec -i infra-postgres-1 psql -U nym -d nym -Atc \
   "select count(*) from nym_fs_entries where nym_id = 'a072b89c-fb33-447a-915c-5db54877853c' and logical_path like '%migration-validation-corvidae-active-task%';"
 ```
 
-Expected result: `0`.
+Result: `0`.
+
+Validation pack parity:
+
+```bash
+CLOUDSDK_CONFIG=.run/gcloud gcloud storage ls \
+  gs://reson-otheryou-vfs-vm-migration-20260605-b0f78571/nymfs/packs/a072b89c-fb33-447a-915c-5db54877853c/
+
+docker exec -i infra-postgres-1 psql -U nym -d nym -Atc \
+  "select pack_key from nym_fs_packs where nym_id = 'a072b89c-fb33-447a-915c-5db54877853c' order by pack_key;"
+```
+
+Result: `gcs=12 db=12`, diff empty.
 
 ## Prod Deploy Commands After Morning Verification
 
