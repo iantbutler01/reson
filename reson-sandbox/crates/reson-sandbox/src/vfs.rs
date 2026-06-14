@@ -18,6 +18,9 @@ pub const RESON_VFS_OPERATION_HEADER: &str = "x-reson-vfs-operation";
 pub const RESON_VFS_REASON_HEADER: &str = "x-reson-vfs-reason";
 pub const RESON_VFS_RESOURCE_KEY_HEADER: &str = "x-reson-vfs-resource-key";
 pub const RESON_VFS_LOCK_OWNER_TOKEN_HEADER: &str = "x-reson-vfs-lock-owner-token";
+pub const RESON_VFS_PRECONDITION_FINGERPRINT_HEADER: &str = "x-reson-vfs-precondition-fingerprint";
+pub const RESON_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
+    "x-reson-vfs-precondition-secondary-fingerprint";
 
 pub const VFS_COMPONENT_VM_RUNTIME: &str = "vm_runtime";
 pub const VFS_ENTRY_KIND_FILE: &str = "file";
@@ -48,6 +51,144 @@ pub struct VfsMetadata {
     pub size_bytes: u64,
     pub content_hash: Option<String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsMetadataManyRequest {
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsMetadataManyResponse {
+    pub entries: Vec<Option<VfsMetadata>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsDeleteMetadataResponse {
+    pub previous: Option<VfsMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsRenameMetadataResponse {
+    pub previous: Option<VfsMetadata>,
+    pub current: Option<VfsMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsReadManyRequest {
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsReadManyResponse {
+    pub entries: Vec<Option<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsListDirOptions {
+    #[serde(default)]
+    pub name_like: Option<String>,
+    #[serde(default)]
+    pub name_not_like: Option<String>,
+    #[serde(default)]
+    pub entry_kind: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsObjectState {
+    pub size_bytes: u64,
+    pub pack_key: String,
+    pub pack_slot_offset: i64,
+    pub pack_slot_length: i64,
+    pub pack_slot_compression: i16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsSubtreeMetadataEntry {
+    pub path: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub content_hash: Option<String>,
+    pub token_count: Option<i32>,
+    pub version: Option<String>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub object_state: Option<VfsObjectState>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsSubtreeMetadataRequest {
+    pub prefix: String,
+    #[serde(default)]
+    pub include_object_state: bool,
+    #[serde(default)]
+    pub include_token_count: bool,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsSubtreeMetadataResponse {
+    pub entries: Vec<VfsSubtreeMetadataEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsPrefetchSubtreeRequest {
+    pub prefix: String,
+    #[serde(default)]
+    pub include_small_file_bytes: bool,
+    #[serde(default)]
+    pub max_entries: Option<i64>,
+    #[serde(default)]
+    pub max_pack_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsPrefetchFileBytes {
+    pub path: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsPrefetchSubtreeResponse {
+    pub warmed_file_bytes: Vec<VfsPrefetchFileBytes>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsWritePrecondition {
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub secondary_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsWriteManyItem {
+    pub path: String,
+    pub body: Vec<u8>,
+    #[serde(default)]
+    pub precondition: Option<VfsWritePrecondition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsWriteManyBody {
+    pub writes: Vec<VfsWriteManyItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsWriteManyResult {
+    pub path: String,
+    pub content_hash: String,
+    pub previous_hash: Option<String>,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VfsWriteManyResponse {
+    pub results: Vec<VfsWriteManyResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -109,11 +250,20 @@ pub struct VfsWriteRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VfsWriteManyRequest {
+    pub owner_id: String,
+    pub writes: Vec<VfsWriteManyItem>,
+    pub headers: VfsWriteHeaders,
+    pub scope: VfsWriteScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VfsNamespaceMutationRequest {
     pub owner_id: String,
     pub path: String,
     pub headers: VfsWriteHeaders,
     pub scope: VfsWriteScope,
+    pub precondition: Option<VfsWritePrecondition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,14 +390,21 @@ mod server {
 
     use super::{
         DEFAULT_VFS_BODY_LIMIT_BYTES, RESON_VFS_COMPONENT_HEADER,
-        RESON_VFS_LOCK_OWNER_TOKEN_HEADER, RESON_VFS_OPERATION_HEADER, RESON_VFS_REASON_HEADER,
+        RESON_VFS_LOCK_OWNER_TOKEN_HEADER, RESON_VFS_OPERATION_HEADER,
+        RESON_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        RESON_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, RESON_VFS_REASON_HEADER,
         RESON_VFS_RESOURCE_KEY_HEADER, RESON_VFS_ROUTE_PREFIX, RESON_VFS_RUN_ID_HEADER,
         RESON_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VFS_ENTRY_KIND_FILE,
         VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_UNLINK,
-        VFS_OPERATION_WRITE_THROUGH, VfsDirEntry, VfsGatewayError, VfsHeaderAliases,
-        VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant, VfsLeaseReleaseRequest,
-        VfsMetadata, VfsNamespaceMutationRequest, VfsReadRange, VfsRenameRequest, VfsResult,
-        VfsWriteHeaders, VfsWriteRequest, VfsWriteScope, parse_vfs_range_header,
+        VFS_OPERATION_WRITE_THROUGH, VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError,
+        VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
+        VfsLeaseReleaseRequest, VfsListDirOptions, VfsMetadata, VfsMetadataManyRequest,
+        VfsMetadataManyResponse, VfsNamespaceMutationRequest, VfsPrefetchSubtreeRequest,
+        VfsPrefetchSubtreeResponse, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
+        VfsRenameMetadataResponse, VfsRenameRequest, VfsResult, VfsSubtreeMetadataEntry,
+        VfsSubtreeMetadataRequest, VfsSubtreeMetadataResponse, VfsWriteHeaders, VfsWriteManyBody,
+        VfsWriteManyRequest, VfsWriteManyResponse, VfsWriteManyResult, VfsWritePrecondition,
+        VfsWriteRequest, VfsWriteScope, parse_vfs_range_header,
     };
 
     #[async_trait]
@@ -261,7 +418,49 @@ mod server {
         }
 
         async fn list_dir(&self, owner_id: &str, path: &str) -> VfsResult<Vec<VfsDirEntry>>;
+        async fn list_dir_with_options(
+            &self,
+            owner_id: &str,
+            path: &str,
+            options: VfsListDirOptions,
+        ) -> VfsResult<Vec<VfsDirEntry>> {
+            let entries = self.list_dir(owner_id, path).await?;
+            Ok(filter_dir_entries(entries, &options))
+        }
         async fn stat(&self, owner_id: &str, path: &str) -> VfsResult<VfsMetadata>;
+        async fn metadata_many(
+            &self,
+            owner_id: &str,
+            paths: &[String],
+        ) -> VfsResult<Vec<Option<VfsMetadata>>> {
+            let mut entries = Vec::with_capacity(paths.len());
+            for path in paths {
+                match self.stat(owner_id, path).await {
+                    Ok(metadata) => entries.push(Some(metadata)),
+                    Err(VfsGatewayError::NotFound(_)) => entries.push(None),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(entries)
+        }
+        async fn list_subtree_file_metadata(
+            &self,
+            _owner_id: &str,
+            _request: VfsSubtreeMetadataRequest,
+        ) -> VfsResult<Vec<VfsSubtreeMetadataEntry>> {
+            Err(VfsGatewayError::BadRequest(
+                "gateway backend does not support subtree metadata".to_string(),
+            ))
+        }
+        async fn prefetch_subtree(
+            &self,
+            _owner_id: &str,
+            _request: VfsPrefetchSubtreeRequest,
+        ) -> VfsResult<VfsPrefetchSubtreeResponse> {
+            Ok(VfsPrefetchSubtreeResponse {
+                warmed_file_bytes: Vec::new(),
+            })
+        }
         async fn stat_for_raw_read(&self, owner_id: &str, path: &str) -> VfsResult<VfsMetadata> {
             self.stat(owner_id, path).await
         }
@@ -271,12 +470,52 @@ mod server {
             path: &str,
             range: Option<VfsReadRange>,
         ) -> VfsResult<Bytes>;
+        async fn read_many(
+            &self,
+            owner_id: &str,
+            paths: &[String],
+        ) -> VfsResult<Vec<Option<Bytes>>> {
+            let mut entries = Vec::with_capacity(paths.len());
+            for path in paths {
+                match self.read_file(owner_id, path, None).await {
+                    Ok(bytes) => entries.push(Some(bytes)),
+                    Err(VfsGatewayError::NotFound(_)) => entries.push(None),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(entries)
+        }
         async fn derive_write_scope(&self, owner_id: &str, path: &str) -> VfsResult<VfsWriteScope>;
         async fn write_file(&self, request: VfsWriteRequest) -> VfsResult<()>;
+        async fn write_many_atomic(
+            &self,
+            _request: VfsWriteManyRequest,
+        ) -> VfsResult<Vec<VfsWriteManyResult>> {
+            Err(VfsGatewayError::BadRequest(
+                "gateway backend does not support atomic write_many".to_string(),
+            ))
+        }
         async fn delete_file(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
+        async fn delete_file_with_metadata(
+            &self,
+            request: VfsNamespaceMutationRequest,
+        ) -> VfsResult<VfsDeleteMetadataResponse> {
+            self.delete_file(request).await?;
+            Ok(VfsDeleteMetadataResponse { previous: None })
+        }
         async fn mkdir(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
         async fn rmdir(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()>;
         async fn rename(&self, request: VfsRenameRequest) -> VfsResult<()>;
+        async fn rename_with_metadata(
+            &self,
+            request: VfsRenameRequest,
+        ) -> VfsResult<VfsRenameMetadataResponse> {
+            self.rename(request).await?;
+            Ok(VfsRenameMetadataResponse {
+                previous: None,
+                current: None,
+            })
+        }
         async fn acquire_lease(&self, request: VfsLeaseAcquire) -> VfsResult<VfsLeaseGrant>;
         async fn release_lease(
             &self,
@@ -313,6 +552,26 @@ mod server {
                 get(get_stat::<S, B>),
             )
             .route(
+                &format!("{prefix}/{{owner_id}}/metadata-many"),
+                post(post_metadata_many::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/read-many"),
+                post(post_read_many::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/subtree-metadata"),
+                post(post_subtree_metadata::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/prefetch-subtree"),
+                post(post_prefetch_subtree::<S, B>),
+            )
+            .route(
+                &format!("{prefix}/{{owner_id}}/write-many"),
+                post(post_write_many::<S, B>),
+            )
+            .route(
                 &format!("{prefix}/{{owner_id}}/file"),
                 put(put_file::<S, B>).delete(delete_file::<S, B>),
             )
@@ -332,14 +591,38 @@ mod server {
     }
 
     #[derive(Debug, Deserialize)]
+    struct TreeQuery {
+        path: Option<String>,
+        name_like: Option<String>,
+        name_not_like: Option<String>,
+        entry_kind: Option<String>,
+        limit: Option<i64>,
+        order: Option<String>,
+    }
+
+    impl TreeQuery {
+        fn options(&self) -> VfsListDirOptions {
+            VfsListDirOptions {
+                name_like: self.name_like.clone(),
+                name_not_like: self.name_not_like.clone(),
+                entry_kind: self.entry_kind.clone(),
+                limit: self.limit,
+                order: self.order.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
     struct PathQuery {
         path: Option<String>,
+        return_metadata: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
     struct RenameQuery {
         from: String,
         to: String,
+        return_metadata: Option<bool>,
     }
 
     #[derive(Serialize)]
@@ -370,14 +653,17 @@ mod server {
     async fn get_tree<S, B>(
         State(backend): State<B>,
         Path(owner_id): Path<String>,
-        Query(params): Query<PathQuery>,
+        Query(params): Query<TreeQuery>,
     ) -> VfsResult<Json<Vec<VfsDirEntry>>>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
     {
         let path = params.path.as_deref().unwrap_or_default();
-        backend.list_dir(owner_id.as_str(), path).await.map(Json)
+        backend
+            .list_dir_with_options(owner_id.as_str(), path, params.options())
+            .await
+            .map(Json)
     }
 
     async fn get_stat<S, B>(
@@ -391,6 +677,116 @@ mod server {
     {
         let path = params.path.as_deref().unwrap_or_default();
         backend.stat(owner_id.as_str(), path).await.map(Json)
+    }
+
+    async fn post_metadata_many<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        Json(body): Json<VfsMetadataManyRequest>,
+    ) -> VfsResult<Json<VfsMetadataManyResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        let entries = backend
+            .metadata_many(owner_id.as_str(), body.paths.as_slice())
+            .await?;
+        Ok(Json(VfsMetadataManyResponse { entries }))
+    }
+
+    async fn post_read_many<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        Json(body): Json<VfsReadManyRequest>,
+    ) -> VfsResult<Json<VfsReadManyResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        let entries = backend
+            .read_many(owner_id.as_str(), body.paths.as_slice())
+            .await?
+            .into_iter()
+            .map(|entry| entry.map(|bytes| bytes.to_vec()))
+            .collect();
+        Ok(Json(VfsReadManyResponse { entries }))
+    }
+
+    async fn post_subtree_metadata<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        Json(body): Json<VfsSubtreeMetadataRequest>,
+    ) -> VfsResult<Json<VfsSubtreeMetadataResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        let entries = backend
+            .list_subtree_file_metadata(owner_id.as_str(), body)
+            .await?;
+        Ok(Json(VfsSubtreeMetadataResponse { entries }))
+    }
+
+    async fn post_prefetch_subtree<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        Json(body): Json<VfsPrefetchSubtreeRequest>,
+    ) -> VfsResult<Json<VfsPrefetchSubtreeResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        backend
+            .prefetch_subtree(owner_id.as_str(), body)
+            .await
+            .map(Json)
+    }
+
+    async fn post_write_many<S, B>(
+        State(backend): State<B>,
+        Path(owner_id): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<VfsWriteManyBody>,
+    ) -> VfsResult<Json<VfsWriteManyResponse>>
+    where
+        B: VfsGatewayBackend + FromRef<S>,
+        S: Clone + Send + Sync + 'static,
+    {
+        if body.writes.is_empty() {
+            return Ok(Json(VfsWriteManyResponse {
+                results: Vec::new(),
+            }));
+        }
+        let first_path = required_path(Some(body.writes[0].path.as_str()))?;
+        let first_scope = backend
+            .derive_write_scope(owner_id.as_str(), first_path)
+            .await?;
+        for write in body.writes.iter().skip(1) {
+            let path = required_path(Some(write.path.as_str()))?;
+            let scope = backend.derive_write_scope(owner_id.as_str(), path).await?;
+            if scope.resource_key != first_scope.resource_key {
+                return Err(VfsGatewayError::Conflict(
+                    backend.cross_scope_rename_message(),
+                ));
+            }
+        }
+        let aliases = backend.header_aliases();
+        let write_headers = parse_write_headers(
+            &headers,
+            &aliases,
+            first_scope.default_surface_kind.as_str(),
+            VFS_OPERATION_WRITE_THROUGH,
+        )?;
+        validate_declared_resource_key(&headers, &aliases, first_scope.resource_key.as_str())?;
+        let results = backend
+            .write_many_atomic(VfsWriteManyRequest {
+                owner_id,
+                writes: body.writes,
+                headers: write_headers,
+                scope: first_scope,
+            })
+            .await?;
+        Ok(Json(VfsWriteManyResponse { results }))
     }
 
     async fn get_file_raw<S, B>(
@@ -482,7 +878,7 @@ mod server {
         Path(owner_id): Path<String>,
         Query(params): Query<PathQuery>,
         headers: HeaderMap,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -495,8 +891,13 @@ mod server {
             VFS_OPERATION_UNLINK,
         )
         .await?;
-        backend.delete_file(request).await?;
-        Ok(StatusCode::NO_CONTENT)
+        if params.return_metadata.unwrap_or(false) {
+            let response = backend.delete_file_with_metadata(request).await?;
+            Ok((StatusCode::OK, Json(response)).into_response())
+        } else {
+            backend.delete_file(request).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
 
     async fn put_dir<S, B>(
@@ -568,6 +969,20 @@ mod server {
             path: path.to_string(),
             headers: write_headers,
             scope,
+            precondition: parse_write_precondition_headers(&headers),
+        })
+    }
+
+    fn parse_write_precondition_headers(headers: &HeaderMap) -> Option<VfsWritePrecondition> {
+        let fingerprint = header_value(headers, RESON_VFS_PRECONDITION_FINGERPRINT_HEADER, &[]);
+        let secondary_fingerprint = header_value(
+            headers,
+            RESON_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER,
+            &[],
+        );
+        (fingerprint.is_some() || secondary_fingerprint.is_some()).then_some(VfsWritePrecondition {
+            fingerprint,
+            secondary_fingerprint,
         })
     }
 
@@ -576,7 +991,7 @@ mod server {
         Path(owner_id): Path<String>,
         Query(params): Query<RenameQuery>,
         headers: HeaderMap,
-    ) -> VfsResult<StatusCode>
+    ) -> VfsResult<Response>
     where
         B: VfsGatewayBackend + FromRef<S>,
         S: Clone + Send + Sync + 'static,
@@ -600,16 +1015,21 @@ mod server {
             VFS_OPERATION_RENAME,
         )?;
         validate_declared_resource_key(&headers, &aliases, from_scope.resource_key.as_str())?;
-        backend
-            .rename(VfsRenameRequest {
-                owner_id,
-                from: params.from,
-                to: params.to,
-                headers: write_headers,
-                scope: from_scope,
-            })
-            .await?;
-        Ok(StatusCode::NO_CONTENT)
+        let return_metadata = params.return_metadata.unwrap_or(false);
+        let request = VfsRenameRequest {
+            owner_id,
+            from: params.from,
+            to: params.to,
+            headers: write_headers,
+            scope: from_scope,
+        };
+        if return_metadata {
+            let response = backend.rename_with_metadata(request).await?;
+            Ok((StatusCode::OK, Json(response)).into_response())
+        } else {
+            backend.rename(request).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
 
     async fn post_lease<S, B>(
@@ -653,6 +1073,61 @@ mod server {
     {
         backend.release_lease(owner_id.as_str(), body).await?;
         Ok(StatusCode::NO_CONTENT)
+    }
+
+    fn filter_dir_entries(
+        mut entries: Vec<VfsDirEntry>,
+        options: &VfsListDirOptions,
+    ) -> Vec<VfsDirEntry> {
+        if let Some(kind) = options.entry_kind.as_deref() {
+            entries.retain(|entry| entry.kind == kind);
+        }
+        if let Some(pattern) = options.name_like.as_deref() {
+            entries.retain(|entry| sql_like_match(pattern, &entry.name));
+        }
+        if let Some(pattern) = options.name_not_like.as_deref() {
+            entries.retain(|entry| !sql_like_match(pattern, &entry.name));
+        }
+        match options.order.as_deref().unwrap_or("kind_then_name") {
+            "name_asc" => entries.sort_by(|a, b| a.name.cmp(&b.name)),
+            "name_desc" => entries.sort_by(|a, b| b.name.cmp(&a.name)),
+            "updated_desc" => entries.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.name.cmp(&b.name))
+            }),
+            _ => entries.sort_by(|a, b| {
+                let a_kind = if a.kind == VFS_ENTRY_KIND_FILE { 1 } else { 0 };
+                let b_kind = if b.kind == VFS_ENTRY_KIND_FILE { 1 } else { 0 };
+                a_kind.cmp(&b_kind).then_with(|| a.name.cmp(&b.name))
+            }),
+        }
+        if let Some(limit) = options.limit {
+            entries.truncate(limit.max(0) as usize);
+        }
+        entries
+    }
+
+    fn sql_like_match(pattern: &str, value: &str) -> bool {
+        fn inner(pattern: &[char], value: &[char]) -> bool {
+            match pattern.split_first() {
+                None => value.is_empty(),
+                Some(('%', rest)) => {
+                    inner(rest, value) || (!value.is_empty() && inner(pattern, &value[1..]))
+                }
+                Some(('_', rest)) => !value.is_empty() && inner(rest, &value[1..]),
+                Some((expected, rest)) => {
+                    value.split_first().is_some_and(|(actual, value_rest)| {
+                        actual == expected && inner(rest, value_rest)
+                    })
+                }
+            }
+        }
+
+        inner(
+            &pattern.chars().collect::<Vec<_>>(),
+            &value.chars().collect::<Vec<_>>(),
+        )
     }
 
     fn parse_write_headers(
@@ -814,11 +1289,14 @@ mod server_tests {
 
     use super::{
         RESON_VFS_LOCK_OWNER_TOKEN_HEADER, RESON_VFS_OPERATION_HEADER,
-        RESON_VFS_RESOURCE_KEY_HEADER, VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE,
-        VFS_OPERATION_SETATTR_SIZE, VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend,
-        VfsGatewayError, VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
-        VfsNamespaceMutationRequest, VfsReadRange, VfsRenameRequest, VfsResult, VfsWriteRequest,
-        VfsWriteScope, reson_vfs_routes,
+        RESON_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        RESON_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, RESON_VFS_RESOURCE_KEY_HEADER,
+        VFS_ENTRY_KIND_DIRECTORY, VFS_ENTRY_KIND_FILE, VFS_OPERATION_SETATTR_SIZE,
+        VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry, VfsGatewayBackend, VfsGatewayError,
+        VfsLeaseAcquire, VfsLeaseGrant, VfsLeaseReleaseRequest, VfsMetadata,
+        VfsMetadataManyResponse, VfsNamespaceMutationRequest, VfsReadManyResponse, VfsReadRange,
+        VfsRenameRequest, VfsResult, VfsWriteManyRequest, VfsWriteManyResponse, VfsWriteManyResult,
+        VfsWriteRequest, VfsWriteScope, reson_vfs_routes,
     };
 
     #[derive(Clone, Default)]
@@ -831,6 +1309,7 @@ mod server_tests {
         files: HashMap<String, Bytes>,
         dirs: HashSet<String>,
         writes: Vec<VfsWriteRequest>,
+        write_many: Vec<VfsWriteManyRequest>,
         deletes: Vec<VfsNamespaceMutationRequest>,
         mkdirs: Vec<VfsNamespaceMutationRequest>,
         rmdirs: Vec<VfsNamespaceMutationRequest>,
@@ -944,6 +1423,29 @@ mod server_tests {
                 .insert(request.path.clone(), request.body.clone());
             inner.writes.push(request);
             Ok(())
+        }
+
+        async fn write_many_atomic(
+            &self,
+            request: VfsWriteManyRequest,
+        ) -> VfsResult<Vec<VfsWriteManyResult>> {
+            let mut inner = self.inner.lock().unwrap();
+            let mut results = Vec::with_capacity(request.writes.len());
+            for write in &request.writes {
+                let previous = inner.files.get(write.path.as_str()).cloned();
+                inner
+                    .files
+                    .insert(write.path.clone(), Bytes::from(write.body.clone()));
+                let content_hash = format!("hash:{}", write.path);
+                results.push(VfsWriteManyResult {
+                    path: write.path.clone(),
+                    previous_hash: previous.map(|_| format!("old:{}", write.path)),
+                    changed: true,
+                    content_hash,
+                });
+            }
+            inner.write_many.push(request);
+            Ok(results)
         }
 
         async fn delete_file(&self, request: VfsNamespaceMutationRequest) -> VfsResult<()> {
@@ -1082,6 +1584,150 @@ mod server_tests {
     }
 
     #[tokio::test]
+    async fn gateway_metadata_many_preserves_order_and_missing_entries() {
+        let backend = MemoryBackend::default();
+        backend
+            .inner
+            .lock()
+            .unwrap()
+            .files
+            .insert("asset.bin".to_string(), Bytes::from_static(b"abcdef"));
+        let app = reson_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reson/vfs/owner-1/metadata-many")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "paths": ["asset.bin", "missing.bin", "dir"],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: VfsMetadataManyResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.entries.len(), 3);
+        assert_eq!(response.entries[0].as_ref().unwrap().size_bytes, 6);
+        assert!(response.entries[1].is_none());
+        assert_eq!(
+            response.entries[2].as_ref().unwrap().kind,
+            VFS_ENTRY_KIND_DIRECTORY
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_read_many_preserves_order_and_missing_entries() {
+        let backend = MemoryBackend::default();
+        let mut inner = backend.inner.lock().unwrap();
+        inner
+            .files
+            .insert("first.txt".to_string(), Bytes::from_static(b"one"));
+        inner
+            .files
+            .insert("second.txt".to_string(), Bytes::from_static(b"two"));
+        drop(inner);
+        let app = reson_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reson/vfs/owner-1/read-many")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "paths": ["first.txt", "missing.txt", "second.txt"],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: VfsReadManyResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            response.entries,
+            vec![Some(b"one".to_vec()), None, Some(b"two".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_write_many_forwards_one_atomic_request() {
+        let owner_token = Uuid::new_v4();
+        let backend = MemoryBackend::default();
+        let app = reson_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reson/vfs/owner-1/write-many")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(RESON_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                    .header(RESON_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "writes": [
+                                {
+                                    "path": "first.txt",
+                                    "body": [111, 110, 101],
+                                    "precondition": {
+                                        "fingerprint": "version-1",
+                                        "secondary_fingerprint": "secondary-1"
+                                    }
+                                },
+                                {"path": "second.txt", "body": [116, 119, 111]},
+                            ],
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let response: VfsWriteManyResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].content_hash, "hash:first.txt");
+        let inner = backend.inner.lock().unwrap();
+        assert_eq!(inner.write_many.len(), 1);
+        assert_eq!(
+            inner.write_many[0].writes[0]
+                .precondition
+                .as_ref()
+                .unwrap()
+                .fingerprint
+                .as_deref(),
+            Some("version-1")
+        );
+        assert_eq!(
+            inner.write_many[0].writes[0]
+                .precondition
+                .as_ref()
+                .unwrap()
+                .secondary_fingerprint
+                .as_deref(),
+            Some("secondary-1")
+        );
+        assert!(inner.write_many[0].writes[1].precondition.is_none());
+        assert_eq!(inner.files.get("first.txt").unwrap().as_ref(), b"one");
+        assert_eq!(inner.files.get("second.txt").unwrap().as_ref(), b"two");
+    }
+
+    #[tokio::test]
     async fn gateway_range_reads_emit_partial_content() {
         let backend = MemoryBackend::default();
         backend
@@ -1143,17 +1789,22 @@ mod server_tests {
                 "",
             ),
         ] {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(RESON_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                .header(RESON_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string());
+            if method == "DELETE" && uri.contains("/file?") {
+                builder = builder
+                    .header(RESON_VFS_PRECONDITION_FINGERPRINT_HEADER, "version-new")
+                    .header(
+                        RESON_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER,
+                        "secondary-new",
+                    );
+            }
             let response = app
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(uri)
-                        .header(RESON_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                        .header(RESON_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
+                .oneshot(builder.body(Body::from(body)).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1164,6 +1815,76 @@ mod server_tests {
         assert_eq!(inner.deletes.len(), 1);
         assert_eq!(inner.mkdirs.len(), 1);
         assert_eq!(inner.rmdirs.len(), 1);
+        assert_eq!(inner.renames.len(), 1);
+        let delete_precondition = inner.deletes[0]
+            .precondition
+            .as_ref()
+            .expect("delete precondition");
+        assert_eq!(
+            delete_precondition.fingerprint.as_deref(),
+            Some("version-new")
+        );
+        assert_eq!(
+            delete_precondition.secondary_fingerprint.as_deref(),
+            Some("secondary-new")
+        );
+        assert!(inner.files.contains_key("renamed.txt"));
+    }
+
+    #[tokio::test]
+    async fn gateway_namespace_metadata_mutations_return_json_when_requested() {
+        let owner_token = Uuid::new_v4();
+        let backend = MemoryBackend::default();
+        backend
+            .inner
+            .lock()
+            .unwrap()
+            .files
+            .insert("old.txt".to_string(), Bytes::from_static(b"rename-source"));
+        let app = reson_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/internal/reson/vfs/owner-1/file?path=gone.txt&return_metadata=true")
+                    .header(RESON_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                    .header(RESON_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        let delete_body = to_bytes(delete_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&delete_body[..], br#"{"previous":null}"#);
+
+        let rename_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/internal/reson/vfs/owner-1/rename?from=old.txt&to=renamed.txt&return_metadata=true",
+                    )
+                    .header(RESON_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
+                    .header(RESON_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rename_response.status(), StatusCode::OK);
+        let rename_body = to_bytes(rename_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&rename_body[..], br#"{"previous":null,"current":null}"#);
+
+        let inner = backend.inner.lock().unwrap();
+        assert_eq!(inner.deletes.len(), 1);
         assert_eq!(inner.renames.len(), 1);
         assert!(inner.files.contains_key("renamed.txt"));
     }
