@@ -8,13 +8,14 @@ mod resource;
 mod types;
 
 pub use bridge::{
-    methods as bridge_methods, AppInfo, HostContext, McpUiAppCapabilities, MessageParams,
-    OpenLinkParams, RequestDisplayModeParams, RequestDisplayModeResult, ResourceTeardownParams,
+    AppInfo, HostContext, McpUiAppCapabilities, MessageParams, OpenLinkParams,
+    RequestDisplayModeParams, RequestDisplayModeResult, ResourceTeardownParams,
     SandboxResourceReadyParams, SizeChangedParams, ToolCancelledParams, ToolInputParams,
     ToolResultParams, UiInitializeParams, UiInitializeResult, UpdateModelContextParams,
+    methods as bridge_methods,
 };
 pub use resource::UiResourceRegistry;
 pub use types::{
-    ui_uri, DisplayMode, UiPermissions, UiResource, UiResourceCsp, UiResourceMeta, UiToolMeta,
-    Visibility, EXTENSION_ID, MCP_APP_MIME_TYPE, UI_SCHEME,
+    DisplayMode, EXTENSION_ID, MCP_APP_MIME_TYPE, UI_SCHEME, UiPermissions, UiResource,
+    UiResourceCsp, UiResourceMeta, UiToolMeta, Visibility, ui_uri,
 };

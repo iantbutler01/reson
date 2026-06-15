@@ -337,8 +337,9 @@ impl StreamIterator {
                     > = Arc::new(RwLock::new(HashMap::new()));
                     let call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>> =
                         Arc::new(RwLock::new(None));
-                    let accumulators =
-                        Arc::new(RwLock::new(chevalier_agentic::runtime::Accumulators::default()));
+                    let accumulators = Arc::new(RwLock::new(
+                        chevalier_agentic::runtime::Accumulators::default(),
+                    ));
 
                     let rust_tool_order: Arc<RwLock<Vec<String>>> =
                         Arc::new(RwLock::new(Vec::new()));
@@ -789,7 +790,9 @@ impl Runtime {
                 for item in hist.iter() {
                     // Try to convert each item
                     if let Ok(msg) = item.extract::<ChatMessage>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::Chat(msg.into()));
+                        messages.push(chevalier_agentic::utils::ConversationMessage::Chat(
+                            msg.into(),
+                        ));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
                         messages.push(chevalier_agentic::utils::ConversationMessage::ToolResult(
                             tr.into(),
@@ -964,7 +967,9 @@ impl Runtime {
                 let mut messages = Vec::new();
                 for item in hist.iter() {
                     if let Ok(msg) = item.extract::<ChatMessage>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::Chat(msg.into()));
+                        messages.push(chevalier_agentic::utils::ConversationMessage::Chat(
+                            msg.into(),
+                        ));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
                         messages.push(chevalier_agentic::utils::ConversationMessage::ToolResult(
                             tr.into(),

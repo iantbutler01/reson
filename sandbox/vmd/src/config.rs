@@ -220,7 +220,8 @@ impl NetworkServicesConfig {
         }
         self.coredns_threat_hosts_path = self.coredns_threat_hosts_path.trim().to_string();
         if self.coredns_threat_hosts_path.is_empty() {
-            self.coredns_threat_hosts_path = "/opt/chevalier/network/threat-domains.hosts".to_string();
+            self.coredns_threat_hosts_path =
+                "/opt/chevalier/network/threat-domains.hosts".to_string();
         }
         self.public_ingress_bind_addr = normalize_optional_socket_addr(
             self.public_ingress_bind_addr.take(),
@@ -1462,7 +1463,10 @@ mod tests {
         );
 
         unsafe {
-            env::set_var("CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN", "primary-token");
+            env::set_var(
+                "CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN",
+                "primary-token",
+            );
         }
         assert_eq!(
             default_vfs_internal_service_token_from_env().as_deref(),
@@ -1524,7 +1528,10 @@ mod tests {
         );
 
         unsafe {
-            env::set_var("CHEVALIER_SANDBOX_ETCD_PREFIX", "/chevalier-sandbox-otheryou");
+            env::set_var(
+                "CHEVALIER_SANDBOX_ETCD_PREFIX",
+                "/chevalier-sandbox-otheryou",
+            );
         }
         assert_eq!(
             default_control_bus_from_env()

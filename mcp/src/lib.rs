@@ -41,5 +41,5 @@ pub use error::{Error, Result};
 pub use transport::WebSocketTransport;
 
 // Re-export commonly used rmcp types
-pub use rmcp::model::{CallToolResult, Content, Tool as McpTool};
 pub use rmcp::ErrorData;
+pub use rmcp::model::{CallToolResult, Content, Tool as McpTool};

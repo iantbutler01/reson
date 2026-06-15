@@ -5,7 +5,7 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, FnArg, ItemFn, Lit, Pat, PatType, Token};
+use syn::{FnArg, ItemFn, Lit, Pat, PatType, Token, parse_macro_input};
 
 // Helper struct to parse macro attributes
 struct AgenticArgs {
@@ -125,11 +125,11 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
     for param in input_fn.sig.inputs.iter() {
         match param {
             FnArg::Typed(PatType { pat, .. }) => {
-                if let Pat::Ident(pat_ident) = pat.as_ref() {
-                    if pat_ident.ident == "runtime" {
-                        has_runtime = true;
-                        continue; // Skip runtime param - we'll inject it
-                    }
+                if let Pat::Ident(pat_ident) = pat.as_ref()
+                    && pat_ident.ident == "runtime"
+                {
+                    has_runtime = true;
+                    continue; // Skip runtime param - we'll inject it
                 }
                 other_params.push(param.clone());
             }
@@ -507,10 +507,10 @@ fn convert_to_snake_case(s: &str) -> String {
 
 // Helper to check if a type is Option<T>
 fn is_option_type(ty: &syn::Type) -> bool {
-    if let syn::Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            return segment.ident == "Option";
-        }
+    if let syn::Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return segment.ident == "Option";
     }
     false
 }
@@ -519,14 +519,12 @@ fn is_option_type(ty: &syn::Type) -> bool {
 fn extract_doc_comments(attrs: &[syn::Attribute]) -> String {
     let mut docs = Vec::new();
     for attr in attrs {
-        if attr.path().is_ident("doc") {
-            if let syn::Meta::NameValue(meta) = &attr.meta {
-                if let syn::Expr::Lit(expr_lit) = &meta.value {
-                    if let syn::Lit::Str(lit_str) = &expr_lit.lit {
-                        docs.push(lit_str.value().trim().to_string());
-                    }
-                }
-            }
+        if attr.path().is_ident("doc")
+            && let syn::Meta::NameValue(meta) = &attr.meta
+            && let syn::Expr::Lit(expr_lit) = &meta.value
+            && let syn::Lit::Str(lit_str) = &expr_lit.lit
+        {
+            docs.push(lit_str.value().trim().to_string());
         }
     }
     docs.join(" ")
@@ -534,32 +532,31 @@ fn extract_doc_comments(attrs: &[syn::Attribute]) -> String {
 
 // Helper to get JSON schema type from Rust type
 fn get_json_type(ty: &syn::Type) -> String {
-    if let syn::Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            let ident = segment.ident.to_string();
+    if let syn::Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        let ident = segment.ident.to_string();
 
-            // Handle Option<T> - extract inner type
-            if ident == "Option" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                        return get_json_type(inner_ty);
-                    }
-                }
-            }
-
-            // Map Rust types to JSON schema types
-            return match ident.as_str() {
-                "String" | "str" => "string",
-                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-                | "u128" | "usize" => "integer",
-                "f32" | "f64" => "number",
-                "bool" => "boolean",
-                "Vec" => "array",
-                "HashMap" | "BTreeMap" => "object",
-                _ => "object", // Default for custom types
-            }
-            .to_string();
+        // Handle Option<T> - extract inner type
+        if ident == "Option"
+            && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+            && let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first()
+        {
+            return get_json_type(inner_ty);
         }
+
+        // Map Rust types to JSON schema types
+        return match ident.as_str() {
+            "String" | "str" => "string",
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+            | "u128" | "usize" => "integer",
+            "f32" | "f64" => "number",
+            "bool" => "boolean",
+            "Vec" => "array",
+            "HashMap" | "BTreeMap" => "object",
+            _ => "object", // Default for custom types
+        }
+        .to_string();
     }
     "object".to_string()
 }
@@ -574,38 +571,38 @@ enum ArrayItemType {
 
 /// Get the inner type of Vec<T> or Option<Vec<T>>
 fn get_array_item_type(ty: &syn::Type) -> Option<ArrayItemType> {
-    if let syn::Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            let ident = segment.ident.to_string();
+    if let syn::Type::Path(type_path) = ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        let ident = segment.ident.to_string();
 
-            // Handle Option<Vec<T>> - extract Vec<T> first
-            if ident == "Option" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                        return get_array_item_type(inner_ty);
-                    }
+        // Handle Option<Vec<T>> - extract Vec<T> first
+        if ident == "Option"
+            && let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+            && let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first()
+        {
+            return get_array_item_type(inner_ty);
+        }
+
+        // Handle Vec<T> - extract T
+        if ident == "Vec" {
+            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments
+                && let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first()
+            {
+                let json_type = get_json_type(inner_ty);
+                // Primitive types just need "type": "string" etc
+                if matches!(
+                    json_type.as_str(),
+                    "string" | "integer" | "number" | "boolean"
+                ) {
+                    return Some(ArrayItemType::Primitive(json_type));
                 }
+                // Complex types need full schema from T::schema()
+                return Some(ArrayItemType::Complex(inner_ty.clone()));
             }
 
-            // Handle Vec<T> - extract T
-            if ident == "Vec" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                        let json_type = get_json_type(inner_ty);
-                        // Primitive types just need "type": "string" etc
-                        if matches!(
-                            json_type.as_str(),
-                            "string" | "integer" | "number" | "boolean"
-                        ) {
-                            return Some(ArrayItemType::Primitive(json_type));
-                        }
-                        // Complex types need full schema from T::schema()
-                        return Some(ArrayItemType::Complex(inner_ty.clone()));
-                    }
-                }
-                // Default to string if we can't determine the inner type
-                return Some(ArrayItemType::Primitive("string".to_string()));
-            }
+            // Default to string if we can't determine the inner type
+            return Some(ArrayItemType::Primitive("string".to_string()));
         }
     }
     None

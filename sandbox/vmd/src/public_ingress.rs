@@ -390,7 +390,7 @@ async fn proxy_request(route: ResolvedIngressRoute, req: Request) -> Result<Resp
         copy_response_headers(headers_mut, &headers);
     }
     response
-        .body(Body::from(response_body))
+        .body(response_body)
         .context("build public ingress response")
 }
 

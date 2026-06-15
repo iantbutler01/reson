@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::StreamExt;
 use chevalier_agentic::error::{Error as ChevalierError, Result as ChevalierResult};
 use chevalier_agentic::runtime::{RunParams, Runtime, ToolFunction};
 use chevalier_agentic::types::{AssistantResponse, ChatMessage, ResponsePart, ToolResult};
@@ -28,7 +27,8 @@ use chevalier_sandbox::{
     DistributedControlConfig, ExecEvent, ExecHandle, ExecInput, ExecOptions, Sandbox,
     SandboxConfig, SandboxError, Session, SessionOptions,
 };
-use serde_json::{json, Value};
+use futures::StreamExt;
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -395,7 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg = SandboxConfig::default();
     cfg.connect_timeout = Duration::from_secs(20);
     cfg.daemon_start_timeout = Duration::from_secs(120);
-    if std::env::var("CHEVALIER_SANDBOX_DISTRIBUTED").ok().as_deref() == Some("1") {
+    if std::env::var("CHEVALIER_SANDBOX_DISTRIBUTED")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let etcd_endpoints = std::env::var("CHEVALIER_SANDBOX_ETCD_ENDPOINTS")
             .unwrap_or_else(|_| "http://127.0.0.1:2379".to_string())
             .split(',')
@@ -425,7 +429,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(1),
             nats_dead_letter_subject: std::env::var("CHEVALIER_SANDBOX_NATS_DEAD_LETTER_SUBJECT")
                 .unwrap_or_else(|_| format!("{subject_prefix}.dlq.commands")),
-            required_storage_profile: std::env::var("CHEVALIER_SANDBOX_REQUIRED_STORAGE_PROFILE").ok(),
+            required_storage_profile: std::env::var("CHEVALIER_SANDBOX_REQUIRED_STORAGE_PROFILE")
+                .ok(),
             ..DistributedControlConfig::default()
         };
         cfg.distributed_control = Some(dist_cfg);

@@ -18,11 +18,11 @@ use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, ProviderConfig, StreamChunk,
     TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, validate_image_input_supported,
 };
 
 /// Anthropic API client
@@ -128,20 +128,18 @@ impl AnthropicClient {
         //    can ever match. Stamping the message before it puts the breakpoint
         //    at the end of the SHARED prefix — the documented placement — and
         //    lets the volatile tail ride after the breakpoint uncached.
-        if let Some(ProviderConfig::Anthropic(provider_config)) = config.provider_config.as_ref() {
-            if let Some(marker) = provider_config.automatic_prompt_caching.as_ref() {
-                let target_index = formatted_messages.len().saturating_sub(2);
-                if let Some(blocks) = formatted_messages
-                    .get_mut(target_index)
-                    .and_then(|msg| msg.get_mut("content"))
-                    .and_then(|content| content.as_array_mut())
-                {
-                    if let Some(last_block) = blocks.last_mut() {
-                        if last_block.get("cache_control").is_none() {
-                            last_block["cache_control"] = marker.anthropic_cache_control();
-                        }
-                    }
-                }
+        if let Some(ProviderConfig::Anthropic(provider_config)) = config.provider_config.as_ref()
+            && let Some(marker) = provider_config.automatic_prompt_caching.as_ref()
+        {
+            let target_index = formatted_messages.len().saturating_sub(2);
+            if let Some(blocks) = formatted_messages
+                .get_mut(target_index)
+                .and_then(|msg| msg.get_mut("content"))
+                .and_then(|content| content.as_array_mut())
+                && let Some(last_block) = blocks.last_mut()
+                && last_block.get("cache_control").is_none()
+            {
+                last_block["cache_control"] = marker.anthropic_cache_control();
             }
         }
 
@@ -170,29 +168,25 @@ impl AnthropicClient {
         }
 
         // Add tools if provided
-        if let Some(ref tools) = config.tools {
-            if !tools.is_empty() {
-                let mut normalized_tools = self.normalized_tools(tools);
-                if let Some(ProviderConfig::Anthropic(provider_config)) =
-                    config.provider_config.as_ref()
-                {
-                    if let Some(marker) = provider_config.tool_definitions_cache_breakpoint.as_ref()
-                    {
-                        if let Some(last_tool) = normalized_tools.last_mut() {
-                            if last_tool.get("cache_control").is_none() {
-                                last_tool["cache_control"] = marker.anthropic_cache_control();
-                            }
-                        }
-                    }
-                }
-
-                request["tools"] = serde_json::json!(normalized_tools);
-                // Enable parallel tool calling via tool_choice
-                request["tool_choice"] = serde_json::json!({
-                    "type": "auto",
-                    "disable_parallel_tool_use": false
-                });
+        if let Some(ref tools) = config.tools
+            && !tools.is_empty()
+        {
+            let mut normalized_tools = self.normalized_tools(tools);
+            if let Some(ProviderConfig::Anthropic(provider_config)) =
+                config.provider_config.as_ref()
+                && let Some(marker) = provider_config.tool_definitions_cache_breakpoint.as_ref()
+                && let Some(last_tool) = normalized_tools.last_mut()
+                && last_tool.get("cache_control").is_none()
+            {
+                last_tool["cache_control"] = marker.anthropic_cache_control();
             }
+
+            request["tools"] = serde_json::json!(normalized_tools);
+            // Enable parallel tool calling via tool_choice
+            request["tool_choice"] = serde_json::json!({
+                "type": "auto",
+                "disable_parallel_tool_use": false
+            });
         }
 
         // Add thinking if configured. Legacy budgeted extended thinking takes
@@ -281,18 +275,18 @@ impl AnthropicClient {
     /// Skips empty strings to avoid Anthropic's "text content blocks must be non-empty" error
     fn wrap_string_content(&self, mut messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         for msg in messages.iter_mut() {
-            if let Some(content) = msg.get("content") {
-                if let Some(text) = content.as_str() {
-                    if !text.is_empty() {
-                        msg["content"] = serde_json::json!([{
-                            "type": "text",
-                            "text": text
-                        }]);
-                    } else {
-                        // Empty content - convert to empty array
-                        // This can happen for assistant messages that only have tool calls
-                        msg["content"] = serde_json::json!([]);
-                    }
+            if let Some(content) = msg.get("content")
+                && let Some(text) = content.as_str()
+            {
+                if !text.is_empty() {
+                    msg["content"] = serde_json::json!([{
+                        "type": "text",
+                        "text": text
+                    }]);
+                } else {
+                    // Empty content - convert to empty array
+                    // This can happen for assistant messages that only have tool calls
+                    msg["content"] = serde_json::json!([]);
                 }
             }
         }
@@ -306,21 +300,21 @@ impl AnthropicClient {
             for block in blocks {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Text {
-                                    text: text.to_string(),
-                                });
-                            }
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            response.push_output(ResponsePart::Text {
+                                text: text.to_string(),
+                            });
                         }
                     }
                     Some("thinking") => {
-                        if let Some(text) = block["thinking"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Reasoning {
-                                    text: text.to_string(),
-                                });
-                            }
+                        if let Some(text) = block["thinking"].as_str()
+                            && !text.is_empty()
+                        {
+                            response.push_output(ResponsePart::Reasoning {
+                                text: text.to_string(),
+                            });
                         }
                         if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
                             response.push_output(ResponsePart::Signature {
@@ -479,7 +473,7 @@ impl InferenceClient for AnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
+        use crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk};
         use crate::utils::parse_sse_stream;
 
         let use_structured_outputs = config.output_schema.is_some();
@@ -850,11 +844,13 @@ mod tests {
             "ephemeral"
         );
         let trailing_blocks = body["messages"][1]["content"].as_array().unwrap();
-        assert!(trailing_blocks
-            .last()
-            .unwrap()
-            .get("cache_control")
-            .is_none());
+        assert!(
+            trailing_blocks
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .is_none()
+        );
     }
 
     #[test]

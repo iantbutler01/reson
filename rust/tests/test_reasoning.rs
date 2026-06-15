@@ -6,13 +6,13 @@
 //! - integration_tests/test_reasoning_segments.py
 //! - integration_tests/test_reasoning_stream.py
 
-use futures::StreamExt;
 use chevalier_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
 use chevalier_agentic::types::{ChatMessage, ReasoningSegment};
 use chevalier_agentic::utils::ConversationMessage;
+use futures::StreamExt;
 use std::env;
 
 // ============================================================================

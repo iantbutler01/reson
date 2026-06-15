@@ -130,24 +130,24 @@ pub fn parse_openai_responses_event(
 
     match event_type {
         "response.content_part.delta" => {
-            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
-                if !delta.is_empty() {
-                    chunks.push(StreamChunk::Content(delta.to_string()));
-                }
+            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str())
+                && !delta.is_empty()
+            {
+                chunks.push(StreamChunk::Content(delta.to_string()));
             }
         }
         "response.output_text.delta" => {
-            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
-                if !delta.is_empty() {
-                    chunks.push(StreamChunk::Content(delta.to_string()));
-                }
+            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str())
+                && !delta.is_empty()
+            {
+                chunks.push(StreamChunk::Content(delta.to_string()));
             }
         }
         "response.reasoning.delta" => {
-            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
-                if !delta.is_empty() {
-                    chunks.push(StreamChunk::Reasoning(delta.to_string()));
-                }
+            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str())
+                && !delta.is_empty()
+            {
+                chunks.push(StreamChunk::Reasoning(delta.to_string()));
             }
         }
         "response.output_item.added" if has_tools => {
@@ -155,17 +155,17 @@ pub fn parse_openai_responses_event(
                 .get("output_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
-            if let Some(item) = event_json.get("item") {
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("id").and_then(|v| v.as_str()));
-                    let name = item.get("name").and_then(|v| v.as_str());
-                    accumulator.start_tool(output_index, call_id, name);
-                    if let Some(partial) = accumulator.tool_partial(output_index) {
-                        chunks.push(StreamChunk::ToolCallPartial(partial));
-                    }
+            if let Some(item) = event_json.get("item")
+                && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+            {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("id").and_then(|v| v.as_str()));
+                let name = item.get("name").and_then(|v| v.as_str());
+                accumulator.start_tool(output_index, call_id, name);
+                if let Some(partial) = accumulator.tool_partial(output_index) {
+                    chunks.push(StreamChunk::ToolCallPartial(partial));
                 }
             }
         }
@@ -189,10 +189,10 @@ pub fn parse_openai_responses_event(
             if let Some(args) = event_json.get("arguments").and_then(|v| v.as_str()) {
                 accumulator.set_args(output_index, args);
             }
-            if accumulator.has_name(output_index) {
-                if let Some(completed) = accumulator.complete_tool(output_index) {
-                    chunks.push(StreamChunk::ToolCallComplete(completed));
-                }
+            if accumulator.has_name(output_index)
+                && let Some(completed) = accumulator.complete_tool(output_index)
+            {
+                chunks.push(StreamChunk::ToolCallComplete(completed));
             }
         }
         "response.output_item.done" if has_tools => {
@@ -200,43 +200,43 @@ pub fn parse_openai_responses_event(
                 .get("output_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
-            if let Some(item) = event_json.get("item") {
-                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("id").and_then(|v| v.as_str()));
-                    let name = item.get("name").and_then(|v| v.as_str());
-                    accumulator.start_tool(output_index, call_id, name);
-                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                        accumulator.set_args(output_index, args);
-                    }
-                    if let Some(completed) = accumulator.complete_tool(output_index) {
-                        chunks.push(StreamChunk::ToolCallComplete(completed));
-                    }
+            if let Some(item) = event_json.get("item")
+                && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+            {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("id").and_then(|v| v.as_str()));
+                let name = item.get("name").and_then(|v| v.as_str());
+                accumulator.start_tool(output_index, call_id, name);
+                if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                    accumulator.set_args(output_index, args);
+                }
+                if let Some(completed) = accumulator.complete_tool(output_index) {
+                    chunks.push(StreamChunk::ToolCallComplete(completed));
                 }
             }
         }
         "response.done" => {
-            if let Some(response) = event_json.get("response") {
-                if let Some(usage) = response.get("usage") {
-                    chunks.push(StreamChunk::Usage {
-                        input_tokens: usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        output_tokens: usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        cached_tokens: usage
-                            .get("input_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        cache_write_input_tokens: 0,
-                    });
-                }
+            if let Some(response) = event_json.get("response")
+                && let Some(usage) = response.get("usage")
+            {
+                chunks.push(StreamChunk::Usage {
+                    input_tokens: usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    output_tokens: usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    cached_tokens: usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    cache_write_input_tokens: 0,
+                });
             }
         }
         _ => {}

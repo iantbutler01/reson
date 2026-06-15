@@ -1581,8 +1581,10 @@ mod tests {
             !Provider::OpenRouter.supports_image_input("qwen/qwen2.5-vl-72b-instruct@vision=maybe")
         );
         assert!(!Provider::OpenAI.supports_image_input("gpt-4o@vision=false"));
-        assert!(!Provider::OpenRouter
-            .supports_image_input("qwen/qwen2.5-vl-72b-instruct@image_input=true"));
+        assert!(
+            !Provider::OpenRouter
+                .supports_image_input("qwen/qwen2.5-vl-72b-instruct@image_input=true")
+        );
 
         let capabilities = Provider::OpenRouter.capabilities_for_model("custom/model@vision=true");
         assert!(capabilities.image_input);

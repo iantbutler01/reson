@@ -2,9 +2,10 @@
 
 use chevalier_mcp::WebSocketTransport;
 use rmcp::{
+    RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, RoleServer, ServerHandler, ServiceExt,
+    schemars, tool, tool_handler, tool_router,
 };
 use serde_json::json;
 

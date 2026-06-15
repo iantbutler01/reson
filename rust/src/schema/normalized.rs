@@ -258,7 +258,7 @@ impl ToolParametersSchema {
                     return Err(Error::NonRetryable(format!(
                         "Unsupported additionalProperties schema: {}",
                         other
-                    )))
+                    )));
                 }
             });
         }

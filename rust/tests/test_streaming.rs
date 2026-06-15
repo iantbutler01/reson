@@ -5,13 +5,13 @@
 //! - integration_tests/test_native_streaming_tools.py
 //! - integration_tests/test_reasoning_stream.py
 
-use futures::StreamExt;
 use chevalier_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
 use chevalier_agentic::types::{ChatMessage, ToolCall};
 use chevalier_agentic::utils::ConversationMessage;
+use futures::StreamExt;
 use std::env;
 
 // ============================================================================

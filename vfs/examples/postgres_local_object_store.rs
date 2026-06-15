@@ -19,7 +19,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     use bytes::Bytes;
     use chevalier_vfs::{
-        OptimizedVfsStorage, index::VfsIndexScope,
+        OptimizedVfsStorage,
+        index::VfsIndexScope,
         object_storage::{ObjectBackedVfsStorage, ObjectBackedVfsStorageConfig},
         object_store::LocalObjectStoreClient,
         postgres_index::PostgresVfsManifestIndex,

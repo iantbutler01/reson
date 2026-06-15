@@ -78,13 +78,14 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
                 })
             });
 
-        if let Some((name, description, mut parameters, strict)) = extracted {
-            if !name.is_empty() && !parameters.is_null() {
-                fix_output_schema_for_provider(&mut parameters, provider);
-                *tool = generator.generate_schema(&name, &description, parameters);
-                apply_tool_strict_for_provider(tool, provider, strict);
-                return;
-            }
+        if let Some((name, description, mut parameters, strict)) = extracted
+            && !name.is_empty()
+            && !parameters.is_null()
+        {
+            fix_output_schema_for_provider(&mut parameters, provider);
+            *tool = generator.generate_schema(&name, &description, parameters);
+            apply_tool_strict_for_provider(tool, provider, strict);
+            return;
         }
     }
 
@@ -313,14 +314,14 @@ fn inline_refs_recursive(schema: &mut Value, defs: &Value) {
                     .strip_prefix("#/$defs/")
                     .or_else(|| ref_path.strip_prefix("#/definitions/"));
 
-                if let Some(name) = def_name {
-                    if let Some(def) = defs.get(name) {
-                        // Replace the entire object with the definition
-                        *schema = def.clone();
-                        // Recurse into the inlined definition
-                        inline_refs_recursive(schema, defs);
-                        return;
-                    }
+                if let Some(name) = def_name
+                    && let Some(def) = defs.get(name)
+                {
+                    // Replace the entire object with the definition
+                    *schema = def.clone();
+                    // Recurse into the inlined definition
+                    inline_refs_recursive(schema, defs);
+                    return;
                 }
             }
 
@@ -818,14 +819,12 @@ mod tests {
                 "provider={provider}"
             );
             assert_eq!(
-                schema["properties"]["config"]["properties"]["limits"]["properties"]["soft"]
-                    ["type"],
+                schema["properties"]["config"]["properties"]["limits"]["properties"]["soft"]["type"],
                 serde_json::json!(["integer", "null"]),
                 "provider={provider}"
             );
             assert_eq!(
-                schema["properties"]["config"]["properties"]["limits"]["properties"]["hard"]
-                    ["type"],
+                schema["properties"]["config"]["properties"]["limits"]["properties"]["hard"]["type"],
                 "integer",
                 "provider={provider}"
             );

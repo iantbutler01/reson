@@ -273,28 +273,18 @@ impl Default for SessionOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum SharedMountAvailability {
+    #[default]
     NodeLocal,
     SharedStorage,
 }
 
-impl Default for SharedMountAvailability {
-    fn default() -> Self {
-        Self::NodeLocal
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum SharedMountContinuity {
+    #[default]
     RestartSameNode,
     RestoreCrossNode,
-}
-
-impl Default for SharedMountContinuity {
-    fn default() -> Self {
-        Self::RestartSameNode
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -538,6 +528,7 @@ impl ForwardHandle {
         };
         let released = registration.is_some();
 
+        #[allow(unused_mut)]
         if let Some(mut registration) = registration {
             registration
                 .multiplexer
@@ -565,19 +556,20 @@ impl Drop for ForwardHandle {
         if let Ok(mut guard) = self.registration.try_lock() {
             let registration = guard.take();
             drop(guard);
-            if let Some(mut registration) = registration {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        registration
-                            .multiplexer
-                            .unregister(registration.host_port)
-                            .await;
-                        #[cfg(feature = "distributed-control")]
-                        if let Some(port_lease) = registration.port_lease.take() {
-                            port_lease.shutdown().await;
-                        }
-                    });
-                }
+            #[allow(unused_mut)]
+            if let Some(mut registration) = registration
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                handle.spawn(async move {
+                    registration
+                        .multiplexer
+                        .unregister(registration.host_port)
+                        .await;
+                    #[cfg(feature = "distributed-control")]
+                    if let Some(port_lease) = registration.port_lease.take() {
+                        port_lease.shutdown().await;
+                    }
+                });
             }
         }
     }
@@ -708,6 +700,7 @@ struct PortproxyClientAccess {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RebindRestorePolicy {
     RequireTierBRestoreMarker,
+    #[allow(dead_code)]
     AllowLiveReclaimWithoutRestoreMarker,
 }
 
@@ -777,6 +770,7 @@ impl Session {
         Ok(resolved_endpoint)
     }
 
+    #[allow(dead_code)]
     async fn resolve_session_endpoint_for_active_stream(&self) -> Result<String> {
         let current_endpoint = self.current_node_endpoint().await;
         let expected_fence = self.ownership_fence().await;
@@ -1913,7 +1907,6 @@ impl Session {
                 }),
             )
             .await?;
-
         let handle = ForwardHandle {
             guest_port,
             host_port,
@@ -1962,6 +1955,8 @@ impl Session {
                 }),
             )
             .await?;
+        #[cfg(not(feature = "distributed-control"))]
+        let _ = &ownership_fence;
 
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
         let response = client
@@ -2446,12 +2441,12 @@ impl Sandbox {
         }
 
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-            if let Some(route) = control.get_session_route(session_id).await? {
-                return self
-                    .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
-                    .await;
-            }
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend
+            && let Some(route) = control.get_session_route(session_id).await?
+        {
+            return self
+                .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
+                .await;
         }
 
         Ok(())
@@ -3001,10 +2996,10 @@ impl Sandbox {
         #[cfg(not(feature = "distributed-control"))]
         let _ = session_id;
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-            if let Some(route) = control.get_session_route(session_id).await? {
-                return Ok((route.tenant_id, route.workspace_id));
-            }
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend
+            && let Some(route) = control.get_session_route(session_id).await?
+        {
+            return Ok((route.tenant_id, route.workspace_id));
         }
         Ok(("default".to_string(), "default".to_string()))
     }
@@ -3016,15 +3011,14 @@ impl Sandbox {
     ) -> Result<bool> {
         let node_endpoint = normalize_endpoint(node_endpoint)?;
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
-            if let Some(route_endpoint) = control
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend
+            && let Some(route_endpoint) = control
                 .get_session_route(session_id)
                 .await?
                 .map(|route| route.endpoint)
                 .filter(|endpoint| !endpoint.trim().is_empty())
-            {
-                return Ok(normalize_endpoint(&route_endpoint)? != node_endpoint);
-            }
+        {
+            return Ok(normalize_endpoint(&route_endpoint)? != node_endpoint);
         }
 
         #[cfg(not(feature = "distributed-control"))]
@@ -3140,6 +3134,7 @@ impl Sandbox {
         .await
     }
 
+    #[allow(dead_code)]
     async fn resolve_session_endpoint_for_active_stream(
         &self,
         session_id: &str,
@@ -3350,7 +3345,10 @@ impl Sandbox {
                 }
             }
 
+            #[cfg(feature = "distributed-control")]
             let mut next_fence = None;
+            #[cfg(not(feature = "distributed-control"))]
+            let next_fence = None;
             #[cfg(feature = "distributed-control")]
             if let ControlBackend::Distributed(_control) = &self.inner.control_backend {
                 let (tenant_id, workspace_id) = self.current_session_scope(session_id).await?;
@@ -3368,6 +3366,8 @@ impl Sandbox {
                     )
                     .await?;
             }
+            #[cfg(not(feature = "distributed-control"))]
+            let _ = &running_vm;
 
             let mut ready = self.inner.ready_vm_rpc.lock().await;
             ready.remove(&ready_key(from_endpoint, vm_id));
@@ -3405,6 +3405,8 @@ impl Sandbox {
             } else {
                 let _ = restore_snapshot_id;
             }
+            #[cfg(not(feature = "distributed-control"))]
+            let _ = &restore_snapshot_id;
 
             return Ok(Some((candidate, next_fence)));
         }
@@ -3976,10 +3978,11 @@ fn endpoint_host(endpoint: &str) -> Result<String> {
         )));
     }
 
-    if let Some((host, _port)) = authority.rsplit_once(':') {
-        if !host.is_empty() && !host.contains(':') {
-            return Ok(normalize_dial_host(host).to_string());
-        }
+    if let Some((host, _port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        return Ok(normalize_dial_host(host).to_string());
     }
 
     Ok(normalize_dial_host(authority).to_string())

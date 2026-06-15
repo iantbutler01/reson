@@ -8,12 +8,12 @@
 //! 3. Uploading videos via Google File API
 //! 4. Multi-turn conversation with tools and video context
 
+use chevalier_agentic::Tool;
 use chevalier_agentic::agentic;
 use chevalier_agentic::providers::{FileState, GoogleGenAIClient};
 use chevalier_agentic::runtime::{RunParams, ToolFunction};
 use chevalier_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
 use chevalier_agentic::utils::ConversationMessage;
-use chevalier_agentic::Tool;
 use serde::{Deserialize, Serialize};
 use std::env;
 

@@ -4,7 +4,6 @@
 //! Mirrors Python tests from:
 //! - integration_tests/test_parallel_tool_calling.py
 
-use futures::StreamExt;
 use chevalier_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
@@ -12,6 +11,7 @@ use chevalier_agentic::providers::{
 use chevalier_agentic::schema::get_schema_generator;
 use chevalier_agentic::types::{ChatMessage, ToolCall, ToolResult};
 use chevalier_agentic::utils::ConversationMessage;
+use futures::StreamExt;
 use std::env;
 
 /// Convert an Anthropic-format tool schema to the given provider format

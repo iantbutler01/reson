@@ -12,8 +12,8 @@ use chevalier_agentic::providers::{
 };
 use chevalier_agentic::types::ChatMessage;
 use chevalier_agentic::utils::ConversationMessage;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn get_anthropic_key() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY").ok()

@@ -184,10 +184,10 @@ impl OptimizedVfsStorage for LocalVfsStorage {
             let Some(metadata) = self.metadata_for_abs(&entry.path())? else {
                 continue;
             };
-            if let Some(kind) = filter.entry_kind {
-                if metadata.kind != kind {
-                    continue;
-                }
+            if let Some(kind) = filter.entry_kind
+                && metadata.kind != kind
+            {
+                continue;
             }
             entries.push(metadata);
         }
@@ -227,15 +227,15 @@ impl OptimizedVfsStorage for LocalVfsStorage {
                 }
                 continue;
             }
-            if metadata.is_file() {
-                if let Some(file_metadata) = self.metadata_for_abs(&path)? {
-                    out.push(file_metadata);
-                }
+            if metadata.is_file()
+                && let Some(file_metadata) = self.metadata_for_abs(&path)?
+            {
+                out.push(file_metadata);
             }
-            if let Some(limit) = options.limit {
-                if out.len() >= limit.max(0) as usize {
-                    break;
-                }
+            if let Some(limit) = options.limit
+                && out.len() >= limit.max(0) as usize
+            {
+                break;
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -511,15 +511,15 @@ fn modified_at(metadata: &fs::Metadata) -> Option<DateTime<Utc>> {
 }
 
 fn filter_name(name: &str, filter: &VfsStorageDirListFilter) -> bool {
-    if let Some(pattern) = filter.name_like.as_deref() {
-        if !sql_like_match(pattern, name) {
-            return false;
-        }
+    if let Some(pattern) = filter.name_like.as_deref()
+        && !sql_like_match(pattern, name)
+    {
+        return false;
     }
-    if let Some(pattern) = filter.name_not_like.as_deref() {
-        if sql_like_match(pattern, name) {
-            return false;
-        }
+    if let Some(pattern) = filter.name_not_like.as_deref()
+        && sql_like_match(pattern, name)
+    {
+        return false;
     }
     true
 }

@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use chevalier_mcp::server::McpServerBuilder;
 use chevalier_mcp::{CallToolResult, Content, ErrorData};
+use futures::future::BoxFuture;
 use serde_json::Value;
 
 use crate::error::{Error, Result};
@@ -19,7 +19,7 @@ pub use chevalier_mcp::server::ServerTransport;
 // Re-export apps types when the mcp-apps feature is enabled
 #[cfg(feature = "mcp-apps")]
 pub use chevalier_mcp::apps::{
-    ui_uri, DisplayMode, UiPermissions, UiResource, UiResourceCsp, UiResourceMeta, Visibility,
+    DisplayMode, UiPermissions, UiResource, UiResourceCsp, UiResourceMeta, Visibility, ui_uri,
 };
 
 /// An MCP server that exposes agentic functions and tools to MCP clients.

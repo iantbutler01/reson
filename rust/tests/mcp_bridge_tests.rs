@@ -715,7 +715,9 @@ async fn test_tool_returning_error_content() {
     let addr = "127.0.0.1:19222";
     tokio::spawn(async move {
         server
-            .serve(chevalier_mcp::server::ServerTransport::WebSocket(addr.into()))
+            .serve(chevalier_mcp::server::ServerTransport::WebSocket(
+                addr.into(),
+            ))
             .await
             .unwrap();
     });
@@ -750,7 +752,9 @@ async fn test_tool_with_no_parameters() {
     let addr = "127.0.0.1:19223";
     tokio::spawn(async move {
         server
-            .serve(chevalier_mcp::server::ServerTransport::WebSocket(addr.into()))
+            .serve(chevalier_mcp::server::ServerTransport::WebSocket(
+                addr.into(),
+            ))
             .await
             .unwrap();
     });
@@ -792,7 +796,9 @@ async fn test_tool_returning_multiple_content_blocks() {
     let addr = "127.0.0.1:19224";
     tokio::spawn(async move {
         server
-            .serve(chevalier_mcp::server::ServerTransport::WebSocket(addr.into()))
+            .serve(chevalier_mcp::server::ServerTransport::WebSocket(
+                addr.into(),
+            ))
             .await
             .unwrap();
     });
@@ -939,11 +945,9 @@ fn get_google_key() -> Option<String> {
 fn require_first_tool_call(
     response: &AssistantResponse,
 ) -> chevalier_agentic::error::Result<&ToolCall> {
-    response
-        .tool_calls()
-        .into_iter()
-        .next()
-        .ok_or_else(|| chevalier_agentic::error::Error::NonRetryable("Missing tool call".to_string()))
+    response.tool_calls().into_iter().next().ok_or_else(|| {
+        chevalier_agentic::error::Error::NonRetryable("Missing tool call".to_string())
+    })
 }
 
 fn require_tool_call_id(response: &AssistantResponse) -> chevalier_agentic::error::Result<String> {

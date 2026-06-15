@@ -6,9 +6,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{Stream, StreamExt};
-use chevalier_sandbox::proto::bracket::portproxy::v1::port_proxy_server::{PortProxy, PortProxyServer};
-use chevalier_sandbox::proto::bracket::portproxy::v1::shell_exec_server::{ShellExec, ShellExecServer};
+use chevalier_sandbox::proto::bracket::portproxy::v1::port_proxy_server::{
+    PortProxy, PortProxyServer,
+};
+use chevalier_sandbox::proto::bracket::portproxy::v1::shell_exec_server::{
+    ShellExec, ShellExecServer,
+};
 use chevalier_sandbox::proto::bracket::portproxy::v1::{
     DeletePathRequest, DirectoryEntry, ExecRequest, ExecResponse, InteractiveShellRequest,
     InteractiveShellResponse, ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest,
@@ -31,6 +34,7 @@ use chevalier_sandbox::{
     SessionOptions, SharedMount, SharedMountAvailability, SharedMountContinuity, ShellEvent,
     ShellInput, WarmPoolProfile,
 };
+use futures::{Stream, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::{sleep, timeout};

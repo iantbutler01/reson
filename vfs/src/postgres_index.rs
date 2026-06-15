@@ -585,12 +585,12 @@ impl VfsManifestIndex for PostgresVfsManifestIndex {
                 "vfs path {logical_path} is not a file"
             )));
         };
-        if let Some(expected_current_version) = expected_current_version {
-            if previous.entry.current_version.as_deref() != Some(expected_current_version) {
-                return Err(VfsStorageError::Conflict(format!(
-                    "vfs write precondition failed for {logical_path}"
-                )));
-            }
+        if let Some(expected_current_version) = expected_current_version
+            && previous.entry.current_version.as_deref() != Some(expected_current_version)
+        {
+            return Err(VfsStorageError::Conflict(format!(
+                "vfs write precondition failed for {logical_path}"
+            )));
         }
         let mut tx = self.pool.begin().await.map_err(internal)?;
         let pack_keys = sqlx::query_scalar::<_, String>(

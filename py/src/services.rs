@@ -1,8 +1,8 @@
 //! Services module - inference_clients and related types
 
+use chevalier_agentic::utils::ConversationMessage;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
-use chevalier_agentic::utils::ConversationMessage;
 
 use crate::types::{ChatMessage, ReasoningSegment, ToolCall, ToolResult};
 
@@ -43,7 +43,9 @@ impl From<InferenceProvider> for chevalier_agentic::types::Provider {
     fn from(provider: InferenceProvider) -> Self {
         match provider {
             InferenceProvider::OPENAI => chevalier_agentic::types::Provider::OpenAI,
-            InferenceProvider::OPENAI_RESPONSES => chevalier_agentic::types::Provider::OpenAIResponses,
+            InferenceProvider::OPENAI_RESPONSES => {
+                chevalier_agentic::types::Provider::OpenAIResponses
+            }
             InferenceProvider::ANTHROPIC => chevalier_agentic::types::Provider::Anthropic,
             InferenceProvider::GOOGLE_GENAI => chevalier_agentic::types::Provider::GoogleGenAI,
             InferenceProvider::OPENROUTER => chevalier_agentic::types::Provider::OpenRouter,
@@ -51,7 +53,9 @@ impl From<InferenceProvider> for chevalier_agentic::types::Provider {
                 chevalier_agentic::types::Provider::OpenRouterResponses
             }
             InferenceProvider::BEDROCK => chevalier_agentic::types::Provider::Bedrock,
-            InferenceProvider::GOOGLE_ANTHROPIC => chevalier_agentic::types::Provider::GoogleAnthropic,
+            InferenceProvider::GOOGLE_ANTHROPIC => {
+                chevalier_agentic::types::Provider::GoogleAnthropic
+            }
         }
     }
 }
@@ -60,7 +64,9 @@ impl From<chevalier_agentic::types::Provider> for InferenceProvider {
     fn from(provider: chevalier_agentic::types::Provider) -> Self {
         match provider {
             chevalier_agentic::types::Provider::OpenAI => InferenceProvider::OPENAI,
-            chevalier_agentic::types::Provider::OpenAIResponses => InferenceProvider::OPENAI_RESPONSES,
+            chevalier_agentic::types::Provider::OpenAIResponses => {
+                InferenceProvider::OPENAI_RESPONSES
+            }
             chevalier_agentic::types::Provider::Anthropic => InferenceProvider::ANTHROPIC,
             chevalier_agentic::types::Provider::GoogleGenAI => InferenceProvider::GOOGLE_GENAI,
             chevalier_agentic::types::Provider::OpenRouter => InferenceProvider::OPENROUTER,
@@ -68,7 +74,9 @@ impl From<chevalier_agentic::types::Provider> for InferenceProvider {
                 InferenceProvider::OPENROUTER_RESPONSES
             }
             chevalier_agentic::types::Provider::Bedrock => InferenceProvider::BEDROCK,
-            chevalier_agentic::types::Provider::GoogleAnthropic => InferenceProvider::GOOGLE_ANTHROPIC,
+            chevalier_agentic::types::Provider::GoogleAnthropic => {
+                InferenceProvider::GOOGLE_ANTHROPIC
+            }
         }
     }
 }

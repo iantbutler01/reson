@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::model::{Annotated, Meta, RawResource, ReadResourceResult, Resource, ResourceContents};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::Url;
 
-use super::types::{UiResource, UiResourceMeta, MCP_APP_MIME_TYPE};
+use super::types::{MCP_APP_MIME_TYPE, UiResource, UiResourceMeta};
 
 /// Registry of UI resources available to MCP hosts.
 ///

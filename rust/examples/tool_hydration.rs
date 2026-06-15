@@ -8,10 +8,10 @@
 //! OPENROUTER_API_KEY=xxx cargo run --example tool_hydration
 //! ```
 
-use futures::future::BoxFuture;
 use chevalier_agentic::agentic;
 use chevalier_agentic::error::Result;
 use chevalier_agentic::parsers::{Deserializable, FieldDescription};
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 #[allow(clippy::too_many_arguments)]

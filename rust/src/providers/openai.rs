@@ -16,12 +16,12 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str,
-    validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, parse_json_value_strict_str,
+    validate_image_input_supported,
 };
 
 /// OpenAI API client (also serves as base for OpenRouter)
@@ -97,20 +97,20 @@ impl OAIClient {
     fn extract_response(&self, message: &serde_json::Value) -> Result<AssistantResponse> {
         let mut response = AssistantResponse::default();
 
-        if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
-            if !content.is_empty() {
-                response.push_output(ResponsePart::Text {
-                    text: content.to_string(),
-                });
-            }
+        if let Some(content) = message.get("content").and_then(|v| v.as_str())
+            && !content.is_empty()
+        {
+            response.push_output(ResponsePart::Text {
+                text: content.to_string(),
+            });
         }
 
-        if let Some(reasoning) = message.get("reasoning").and_then(|r| r.as_str()) {
-            if !reasoning.is_empty() {
-                response.push_output(ResponsePart::Reasoning {
-                    text: reasoning.to_string(),
-                });
-            }
+        if let Some(reasoning) = message.get("reasoning").and_then(|r| r.as_str())
+            && !reasoning.is_empty()
+        {
+            response.push_output(ResponsePart::Reasoning {
+                text: reasoning.to_string(),
+            });
         }
 
         if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array()) {
@@ -173,10 +173,10 @@ impl OAIClient {
             "stream": stream,
         });
 
-        if matches!(self.provider, Provider::OpenAI) {
-            if let Some(retention) = config.prompt_cache_retention {
-                request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
-            }
+        if matches!(self.provider, Provider::OpenAI)
+            && let Some(retention) = config.prompt_cache_retention
+        {
+            request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
         }
 
         // Add stream_options for usage tracking when streaming
@@ -185,11 +185,11 @@ impl OAIClient {
         }
 
         // Add tools if provided
-        if let Some(ref tools) = config.tools {
-            if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.normalized_tools(tools));
-                request["tool_choice"] = serde_json::json!("auto");
-            }
+        if let Some(ref tools) = config.tools
+            && !tools.is_empty()
+        {
+            request["tools"] = serde_json::json!(self.normalized_tools(tools));
+            request["tool_choice"] = serde_json::json!("auto");
         }
 
         // Add reasoning if configured (client-level, then config-level fallback)
@@ -392,7 +392,7 @@ impl InferenceClient for OAIClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::openai_streaming::{parse_openai_chunk, OpenAIToolAccumulator};
+        use crate::providers::openai_streaming::{OpenAIToolAccumulator, parse_openai_chunk};
         use crate::utils::parse_sse_stream;
 
         let request_body = self.build_request_body(messages, config, true)?;

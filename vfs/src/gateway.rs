@@ -435,7 +435,7 @@ impl OptimizedVfsStorage for GatewayVfsStorage {
         let mut changed_paths = Vec::new();
         let mut changed_indexes = Vec::new();
         let mut out = Vec::with_capacity(requests.len());
-        for (index, (request, metadata)) in requests.iter().zip(metadata.into_iter()).enumerate() {
+        for (index, (request, metadata)) in requests.iter().zip(metadata).enumerate() {
             match metadata {
                 Some(metadata) if metadata.content_hash == request.known_content_hash => {
                     out.push(VfsStorageReadIfChangedResult {

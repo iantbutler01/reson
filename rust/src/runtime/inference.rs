@@ -466,10 +466,10 @@ pub fn create_inference_client(
         }
         "google-gemini" | "google-genai" | "gemini" => {
             let mut client = GoogleGenAIClient::new(key, model_name);
-            if let Some(r) = reasoning {
-                if let Ok(budget) = r.parse::<u32>() {
-                    client = client.with_thinking_budget(budget);
-                }
+            if let Some(r) = reasoning
+                && let Ok(budget) = r.parse::<u32>()
+            {
+                client = client.with_thinking_budget(budget);
             }
             Box::new(client)
         }

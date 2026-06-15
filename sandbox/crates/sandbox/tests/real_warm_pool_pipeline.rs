@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull;
 use async_nats::jetstream::{self};
-use futures::StreamExt;
 use chevalier_sandbox::proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use chevalier_sandbox::proto::vmd::v1::{
     CreateVmRequest, DeleteVmRequest, Metadata, ResourceSpec, VmSource, VmSourceType,
@@ -17,6 +16,7 @@ use chevalier_sandbox::proto::vmd::v1::{
 use chevalier_sandbox::{
     DistributedControlConfig, Sandbox, SandboxConfig, SessionOptions, WarmPoolProfile,
 };
+use futures::StreamExt;
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
@@ -94,8 +94,8 @@ fn ensure_seeded_base_image(data_dir: &Path, image: &str, arch: &str) {
     if target.exists() {
         fs::remove_file(&target).expect("remove stale seeded base image");
     }
-    let qemu_img =
-        optional_env("CHEVALIER_SANDBOX_REAL_QEMU_IMG_BIN").unwrap_or_else(|| "qemu-img".to_string());
+    let qemu_img = optional_env("CHEVALIER_SANDBOX_REAL_QEMU_IMG_BIN")
+        .unwrap_or_else(|| "qemu-img".to_string());
     let status = Command::new(qemu_img)
         .args([
             "create",

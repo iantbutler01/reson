@@ -362,7 +362,7 @@ impl GcsObjectStoreClient {
                 keys.len()
             )));
         }
-        for (key, status) in keys.iter().zip(statuses.into_iter()) {
+        for (key, status) in keys.iter().zip(statuses) {
             if matches!(status, 200..=299 | 404) {
                 continue;
             }

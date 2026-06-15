@@ -597,9 +597,8 @@ pub async fn start_incoming_migration_from_file(
     ram_format: &str,
     opts: &BackgroundSnapshotOptions,
 ) -> Result<()> {
-    match ram_format {
-        RAM_SNAPSHOT_FORMAT_MAPPED => configure_mapped_incoming_restore(monitor, opts).await?,
-        _ => {}
+    if ram_format == RAM_SNAPSHOT_FORMAT_MAPPED {
+        configure_mapped_incoming_restore(monitor, opts).await?;
     }
 
     let migrate_uri = format!("file:{}", ram_path.display());

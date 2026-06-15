@@ -1,7 +1,9 @@
-use chevalier_agentic::types::{MediaPart, MediaSource, MediaSourceKind, MultimodalMessage, Provider};
+use chevalier_agentic::types::{
+    MediaPart, MediaSource, MediaSourceKind, MultimodalMessage, Provider,
+};
 use chevalier_agentic::utils::{
-    convert_messages_to_provider_format, convert_messages_to_responses_input,
-    validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, convert_messages_to_responses_input,
+    validate_image_input_supported,
 };
 
 const TINY_PNG: &str =

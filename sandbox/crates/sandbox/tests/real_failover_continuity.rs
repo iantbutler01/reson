@@ -8,13 +8,13 @@ use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull;
 use async_nats::jetstream::{self};
-use etcd_client::{Client as EtcdClient, GetOptions};
-use futures::{Stream, StreamExt};
 use chevalier_sandbox::{
     DistributedControlConfig, ExecEvent, ExecHandle, ExecOptions, Sandbox, SandboxConfig,
     SandboxError, Session, SessionOptions,
     proto::vmd::v1::{ListVMsRequest, vmd_service_client::VmdServiceClient},
 };
+use etcd_client::{Client as EtcdClient, GetOptions};
+use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
@@ -59,7 +59,9 @@ fn failover_sandbox_config(secondary_endpoint: String) -> SandboxConfig {
         daemon_start_timeout: Duration::from_secs(30),
         portproxy_ready_timeout: Duration::from_secs(180),
         control_gateway_endpoints: vec![secondary_endpoint],
-        endpoint_overrides: parse_endpoint_overrides_env("CHEVALIER_SANDBOX_REAL_ENDPOINT_OVERRIDES"),
+        endpoint_overrides: parse_endpoint_overrides_env(
+            "CHEVALIER_SANDBOX_REAL_ENDPOINT_OVERRIDES",
+        ),
         auth_token: optional_env("CHEVALIER_SANDBOX_REAL_AUTH_TOKEN"),
         ..SandboxConfig::default()
     };

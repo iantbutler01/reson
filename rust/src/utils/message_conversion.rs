@@ -9,7 +9,7 @@ use crate::types::{
     MultimodalMessage, Provider, ReasoningSegment, ResponsePart, ToolCall, ToolResult,
     VideoMetadata,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Message type that can appear in conversation history
@@ -255,10 +255,10 @@ fn media_part_to_openai_format(part: &MediaPart) -> Value {
                     }
                 }),
             };
-            if let Some(d) = detail {
-                if let Some(obj) = img.get_mut("image_url") {
-                    obj["detail"] = json!(d);
-                }
+            if let Some(d) = detail
+                && let Some(obj) = img.get_mut("image_url")
+            {
+                obj["detail"] = json!(d);
             }
             img
         }
@@ -432,10 +432,10 @@ fn tool_call_to_provider_part(tool_call: &ToolCall, provider: Provider) -> Value
             });
             if let Some(ref signature) = tool_call.signature {
                 part["thoughtSignature"] = json!(signature);
-            } else if let Some(ref obj) = tool_call.tool_obj {
-                if let Some(signature) = obj.get("thoughtSignature") {
-                    part["thoughtSignature"] = signature.clone();
-                }
+            } else if let Some(ref obj) = tool_call.tool_obj
+                && let Some(signature) = obj.get("thoughtSignature")
+            {
+                part["thoughtSignature"] = signature.clone();
             }
             part
         }

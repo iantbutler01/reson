@@ -3,11 +3,11 @@
 //! Run with: ANTHROPIC_API_KEY=xxx cargo test --test test_native_tools -- --nocapture --ignored
 //! Or: OPENROUTER_API_KEY=xxx cargo test --test test_native_tools -- --nocapture --ignored
 
-use futures::future::BoxFuture;
 use chevalier_agentic::agentic;
 use chevalier_agentic::error::Result;
 use chevalier_agentic::parsers::Deserializable;
 use chevalier_agentic::types::ToolResult;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 #[allow(clippy::too_many_arguments)]
@@ -60,7 +60,10 @@ fn default_max_results() -> i32 {
 impl Deserializable for SearchQuery {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!("Failed to parse SearchQuery: {}", e))
+            chevalier_agentic::error::Error::NonRetryable(format!(
+                "Failed to parse SearchQuery: {}",
+                e
+            ))
         })
     }
 
@@ -185,11 +188,7 @@ fn multiply_numbers(op: MathOperation) -> BoxFuture<'static, Result<String>> {
 fn factorial(input: FactorialInput) -> BoxFuture<'static, Result<String>> {
     Box::pin(async move {
         fn calc_factorial(n: i32) -> i32 {
-            if n <= 1 {
-                1
-            } else {
-                n * calc_factorial(n - 1)
-            }
+            if n <= 1 { 1 } else { n * calc_factorial(n - 1) }
         }
 
         Ok(calc_factorial(input.n).to_string())
@@ -242,7 +241,8 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
             ));
         }
 
-        history.push(chevalier_agentic::utils::ConversationMessage::AssistantResponse(result.clone()));
+        history
+            .push(chevalier_agentic::utils::ConversationMessage::AssistantResponse(result.clone()));
 
         for tool_call in tool_calls {
             println!("🔧 Native turn {}: {}", turn_count, tool_call.tool_name);

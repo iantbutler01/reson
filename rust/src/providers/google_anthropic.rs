@@ -22,12 +22,12 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, ChatRole, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_provider_format, parse_json_value_strict_str,
-    validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_provider_format, parse_json_value_strict_str,
+    validate_image_input_supported,
 };
 
 /// Google Anthropic (Vertex AI with Claude) client
@@ -457,7 +457,7 @@ impl InferenceClient for GoogleAnthropicClient {
         messages: &[ConversationMessage],
         config: &GenerationConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
-        use crate::providers::anthropic_streaming::{parse_anthropic_chunk, ToolCallAccumulator};
+        use crate::providers::anthropic_streaming::{ToolCallAccumulator, parse_anthropic_chunk};
         use crate::utils::parse_sse_stream;
 
         let request_body = self.build_request_body(messages, config, true)?;

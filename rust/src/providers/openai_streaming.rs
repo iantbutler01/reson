@@ -143,85 +143,81 @@ pub fn parse_openai_chunk(
     };
 
     // Handle content
-    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-        if !content.is_empty() {
-            chunks.push(StreamChunk::Content(content.to_string()));
-        }
+    if let Some(content) = delta.get("content").and_then(|c| c.as_str())
+        && !content.is_empty()
+    {
+        chunks.push(StreamChunk::Content(content.to_string()));
     }
 
     // Handle reasoning (o-series models)
-    if let Some(reasoning) = delta.get("reasoning").and_then(|r| r.as_str()) {
-        if !reasoning.is_empty() {
-            chunks.push(StreamChunk::Reasoning(reasoning.to_string()));
-        }
+    if let Some(reasoning) = delta.get("reasoning").and_then(|r| r.as_str())
+        && !reasoning.is_empty()
+    {
+        chunks.push(StreamChunk::Reasoning(reasoning.to_string()));
     }
 
     // Handle signature
-    if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
-        if !signature.is_empty() {
-            chunks.push(StreamChunk::Signature(signature.to_string()));
-        }
+    if let Some(signature) = delta.get("signature").and_then(|s| s.as_str())
+        && !signature.is_empty()
+    {
+        chunks.push(StreamChunk::Signature(signature.to_string()));
     }
 
     // Handle tool calls (only if tools were provided)
-    if has_tools {
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
-            for tool_call in tool_calls {
-                let index = tool_call["index"].as_u64().unwrap_or(0) as usize;
+    if has_tools && let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+        for tool_call in tool_calls {
+            let index = tool_call["index"].as_u64().unwrap_or(0) as usize;
 
-                // Extract delta fields
-                let id = tool_call.get("id").and_then(|i| i.as_str());
-                let name = tool_call
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str());
-                let args = tool_call
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                    .unwrap_or("");
+            // Extract delta fields
+            let id = tool_call.get("id").and_then(|i| i.as_str());
+            let name = tool_call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str());
+            let args = tool_call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
 
-                // Check if this is a new tool (index changed from previous)
-                let was_ready = accumulator.is_tool_ready(index);
+            // Check if this is a new tool (index changed from previous)
+            let was_ready = accumulator.is_tool_ready(index);
 
-                // Update accumulator
+            // Update accumulator
+            accumulator.update_tool(index, id, name, args);
+
+            // If we had a complete tool at this index before, emit completion
+            // This happens when index changes (parallel tool support)
+            if was_ready && (id.is_some() || name.is_some()) {
+                // New tool starting at same index = previous tool complete
+                if let Some(completed) = accumulator.complete_tool(index) {
+                    chunks.push(StreamChunk::ToolCallComplete(completed));
+                }
+                // Re-add the new tool
                 accumulator.update_tool(index, id, name, args);
+            }
 
-                // If we had a complete tool at this index before, emit completion
-                // This happens when index changes (parallel tool support)
-                if was_ready && (id.is_some() || name.is_some()) {
-                    // New tool starting at same index = previous tool complete
-                    if let Some(completed) = accumulator.complete_tool(index) {
-                        chunks.push(StreamChunk::ToolCallComplete(completed));
-                    }
-                    // Re-add the new tool
-                    accumulator.update_tool(index, id, name, args);
-                }
-
-                // Emit partial tool state for UI updates
-                if let Some(partial) = accumulator.tool_partial(index) {
-                    chunks.push(StreamChunk::ToolCallPartial(partial));
-                }
+            // Emit partial tool state for UI updates
+            if let Some(partial) = accumulator.tool_partial(index) {
+                chunks.push(StreamChunk::ToolCallPartial(partial));
             }
         }
     }
 
     // Check for finish_reason to complete any remaining tools
-    if has_tools {
-        if let Some(finish_reason) = chunk_json
+    if has_tools
+        && let Some(finish_reason) = chunk_json
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("finish_reason"))
             .and_then(|fr| fr.as_str())
-        {
-            if finish_reason == "tool_calls" || finish_reason == "stop" {
-                // Complete all remaining tools
-                let indices: Vec<usize> = accumulator.current_tool_calls.keys().copied().collect();
-                for index in indices {
-                    if let Some(completed) = accumulator.complete_tool(index) {
-                        chunks.push(StreamChunk::ToolCallComplete(completed));
-                    }
-                }
+        && (finish_reason == "tool_calls" || finish_reason == "stop")
+    {
+        // Complete all remaining tools
+        let indices: Vec<usize> = accumulator.current_tool_calls.keys().copied().collect();
+        for index in indices {
+            if let Some(completed) = accumulator.complete_tool(index) {
+                chunks.push(StreamChunk::ToolCallComplete(completed));
             }
         }
     }

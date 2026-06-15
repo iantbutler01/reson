@@ -164,10 +164,12 @@ mod tests {
         let result = registry.register(tool2);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("already registered"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already registered")
+        );
     }
 
     #[test]

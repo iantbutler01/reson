@@ -4,7 +4,6 @@
 //! Mirrors Python tests from:
 //! - integration_tests/test_tool_call_format_validation.py
 
-use futures::StreamExt;
 use chevalier_agentic::prelude::*;
 use chevalier_agentic::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
@@ -12,6 +11,7 @@ use chevalier_agentic::providers::{
 };
 use chevalier_agentic::schema::get_schema_generator;
 use chevalier_agentic::utils::ConversationMessage;
+use futures::StreamExt;
 use std::env;
 
 /// Convert an Anthropic-format tool schema to the given provider format

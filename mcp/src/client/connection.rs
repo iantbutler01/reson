@@ -3,13 +3,13 @@
 #[cfg(feature = "apps")]
 use rmcp::model::ExtensionCapabilities;
 use rmcp::{
+    ClientHandler, RoleClient, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResult, ClientInfo, Implementation, ListResourcesResult,
         ListToolsResult, ReadResourceRequestParams, ReadResourceResult, ServerInfo,
     },
     service::RunningService,
     transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
-    ClientHandler, RoleClient, ServiceExt,
 };
 use serde_json::Value;
 use tokio::process::Command;

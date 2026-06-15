@@ -3,8 +3,8 @@
 //! These tests demonstrate that the #[agentic], #[tool], and #[deserializable]
 //! macros compile and generate correct code.
 
-use chevalier_agentic::parsers::Deserializable as DeserializableTrait;
 use chevalier_agentic::Deserializable;
+use chevalier_agentic::parsers::Deserializable as DeserializableTrait;
 use serde::{Deserialize, Serialize};
 
 #[test]
@@ -128,8 +128,8 @@ fn test_tool_macro_snake_case_conversion() {
 
 #[test]
 fn test_tool_macro_with_schema_generator() {
-    use chevalier_agentic::schema::AnthropicSchemaGenerator;
     use chevalier_agentic::Tool;
+    use chevalier_agentic::schema::AnthropicSchemaGenerator;
     use serde::{Deserialize, Serialize};
 
     /// Get current weather for a location

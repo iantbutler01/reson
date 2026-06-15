@@ -18,7 +18,8 @@ pub const CHEVALIER_VFS_OPERATION_HEADER: &str = "x-chevalier-vfs-operation";
 pub const CHEVALIER_VFS_REASON_HEADER: &str = "x-chevalier-vfs-reason";
 pub const CHEVALIER_VFS_RESOURCE_KEY_HEADER: &str = "x-chevalier-vfs-resource-key";
 pub const CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER: &str = "x-chevalier-vfs-lock-owner-token";
-pub const CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER: &str = "x-chevalier-vfs-precondition-fingerprint";
+pub const CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER: &str =
+    "x-chevalier-vfs-precondition-fingerprint";
 pub const CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER: &str =
     "x-chevalier-vfs-precondition-secondary-fingerprint";
 
@@ -389,15 +390,14 @@ mod server {
     use uuid::Uuid;
 
     use super::{
-        DEFAULT_VFS_BODY_LIMIT_BYTES, CHEVALIER_VFS_COMPONENT_HEADER,
-        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
-        CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
+        CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+        CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER,
         CHEVALIER_VFS_PRECONDITION_SECONDARY_FINGERPRINT_HEADER, CHEVALIER_VFS_REASON_HEADER,
         CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_ROUTE_PREFIX, CHEVALIER_VFS_RUN_ID_HEADER,
-        CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VFS_ENTRY_KIND_FILE,
-        VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_UNLINK,
-        VFS_OPERATION_WRITE_THROUGH, VfsDeleteMetadataResponse, VfsDirEntry, VfsGatewayError,
-        VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
+        CHEVALIER_VFS_SURFACE_KIND_HEADER, DEFAULT_VFS_BODY_LIMIT_BYTES, VFS_COMPONENT_VM_RUNTIME,
+        VFS_ENTRY_KIND_FILE, VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR,
+        VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VfsDeleteMetadataResponse, VfsDirEntry,
+        VfsGatewayError, VfsHeaderAliases, VfsLeaseAcquire, VfsLeaseAcquireRequest, VfsLeaseGrant,
         VfsLeaseReleaseRequest, VfsListDirOptions, VfsMetadata, VfsMetadataManyRequest,
         VfsMetadataManyResponse, VfsNamespaceMutationRequest, VfsPrefetchSubtreeRequest,
         VfsPrefetchSubtreeResponse, VfsReadManyRequest, VfsReadManyResponse, VfsReadRange,
@@ -1137,7 +1137,11 @@ mod server {
         default_operation: &str,
     ) -> VfsResult<VfsWriteHeaders> {
         Ok(VfsWriteHeaders {
-            run_id: parse_optional_uuid_header(headers, CHEVALIER_VFS_RUN_ID_HEADER, &aliases.run_id)?,
+            run_id: parse_optional_uuid_header(
+                headers,
+                CHEVALIER_VFS_RUN_ID_HEADER,
+                &aliases.run_id,
+            )?,
             component: header_value(headers, CHEVALIER_VFS_COMPONENT_HEADER, &aliases.component)
                 .unwrap_or_else(|| VFS_COMPONENT_VM_RUNTIME.to_string()),
             surface_kind: header_value(
@@ -1565,7 +1569,8 @@ mod server_tests {
             .unwrap()
             .files
             .insert("asset.bin".to_string(), Bytes::from_static(b"abcdef"));
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(
@@ -1666,7 +1671,8 @@ mod server_tests {
     async fn gateway_write_many_forwards_one_atomic_request() {
         let owner_token = Uuid::new_v4();
         let backend = MemoryBackend::default();
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(
@@ -1675,7 +1681,10 @@ mod server_tests {
                     .uri("/internal/chevalier/vfs/owner-1/write-many")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({
                             "writes": [
@@ -1768,7 +1777,8 @@ mod server_tests {
             .unwrap()
             .files
             .insert("old.txt".to_string(), Bytes::from_static(b"rename-source"));
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         for (method, uri, body) in [
             (
@@ -1782,7 +1792,11 @@ mod server_tests {
                 "/internal/chevalier/vfs/owner-1/file?path=new.txt",
                 "",
             ),
-            ("DELETE", "/internal/chevalier/vfs/owner-1/dir?path=folder", ""),
+            (
+                "DELETE",
+                "/internal/chevalier/vfs/owner-1/dir?path=folder",
+                "",
+            ),
             (
                 "POST",
                 "/internal/chevalier/vfs/owner-1/rename?from=old.txt&to=renamed.txt",
@@ -1793,7 +1807,10 @@ mod server_tests {
                 .method(method)
                 .uri(uri)
                 .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string());
+                .header(
+                    CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                    owner_token.to_string(),
+                );
             if method == "DELETE" && uri.contains("/file?") {
                 builder = builder
                     .header(CHEVALIER_VFS_PRECONDITION_FINGERPRINT_HEADER, "version-new")
@@ -1841,7 +1858,8 @@ mod server_tests {
             .unwrap()
             .files
             .insert("old.txt".to_string(), Bytes::from_static(b"rename-source"));
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let delete_response = app
             .clone()
@@ -1850,7 +1868,10 @@ mod server_tests {
                     .method("DELETE")
                     .uri("/internal/chevalier/vfs/owner-1/file?path=gone.txt&return_metadata=true")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1893,7 +1914,8 @@ mod server_tests {
     async fn gateway_rejects_resource_key_mismatch_before_write() {
         let owner_token = Uuid::new_v4();
         let backend = MemoryBackend::default();
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(
@@ -1901,7 +1923,10 @@ mod server_tests {
                     .method("PUT")
                     .uri("/internal/chevalier/vfs/owner-1/file?path=asset.bin")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "wrong")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .body(Body::from("new"))
                     .unwrap(),
             )
@@ -1916,7 +1941,8 @@ mod server_tests {
     async fn gateway_forwards_setattr_size_operation_header() {
         let owner_token = Uuid::new_v4();
         let backend = MemoryBackend::default();
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(
@@ -1924,7 +1950,10 @@ mod server_tests {
                     .method("PUT")
                     .uri("/internal/chevalier/vfs/owner-1/file?path=truncated.txt")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .header(CHEVALIER_VFS_OPERATION_HEADER, VFS_OPERATION_SETATTR_SIZE)
                     .body(Body::from("shrunk"))
                     .unwrap(),
@@ -1943,7 +1972,8 @@ mod server_tests {
     #[tokio::test]
     async fn gateway_rejects_missing_owner_token_before_write() {
         let backend = MemoryBackend::default();
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(
@@ -1965,7 +1995,8 @@ mod server_tests {
     async fn gateway_surfaces_read_only_and_stale_lease_rejections() {
         let owner_token = Uuid::new_v4();
         let backend = MemoryBackend::default();
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let readonly = app
             .clone()
@@ -1974,7 +2005,10 @@ mod server_tests {
                     .method("PUT")
                     .uri("/internal/chevalier/vfs/owner-1/file?path=readonly/file.txt")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .body(Body::from("new"))
                     .unwrap(),
             )
@@ -1988,7 +2022,10 @@ mod server_tests {
                     .method("PUT")
                     .uri("/internal/chevalier/vfs/owner-1/file?path=stale.txt")
                     .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, "owner:owner-1:workspace")
-                    .header(CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, owner_token.to_string())
+                    .header(
+                        CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+                        owner_token.to_string(),
+                    )
                     .body(Body::from("new"))
                     .unwrap(),
             )
@@ -2001,7 +2038,8 @@ mod server_tests {
     #[tokio::test]
     async fn gateway_lease_round_trip_uses_backend_scope() {
         let backend = MemoryBackend::default();
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(
@@ -2033,7 +2071,8 @@ mod server_tests {
             .unwrap()
             .valid_tokens
             .insert(owner_token);
-        let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
+        let app =
+            chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend.clone());
 
         let response = app
             .oneshot(

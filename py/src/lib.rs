@@ -69,7 +69,10 @@ fn create_services_submodule(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Make them importable
     let sys_modules = m.py().import("sys")?.getattr("modules")?;
     sys_modules.set_item("chevalier.services", services_module)?;
-    sys_modules.set_item("chevalier.services.inference_clients", inference_clients_module)?;
+    sys_modules.set_item(
+        "chevalier.services.inference_clients",
+        inference_clients_module,
+    )?;
 
     Ok(())
 }

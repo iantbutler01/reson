@@ -2730,7 +2730,7 @@ impl Manager {
         // guest back to the running state of the snapshot moment. Keep the one-shot
         // incoming-pointer cleanup in the same owned task as launch so RPC cancellation
         // cannot leave future restarts pinned to this RAM file.
-        let result = match tokio::spawn(async move {
+        match tokio::spawn(async move {
             let result = Self::start_vm_inner(cfg, host_arch, start_vm, launch_vm_id).await;
             {
                 let mut inner = clear_vm.lock().await;
@@ -2747,9 +2747,7 @@ impl Manager {
             Err(err) => Err(ManagerError::Other(anyhow!(
                 "restore_snapshot launch task failed: {err}"
             ))),
-        };
-
-        result
+        }
     }
 
     async fn create_from_docker(
@@ -3330,11 +3328,7 @@ fn build_qemu_args(
         None => qemu_user_netdev(meta)?,
     };
 
-    let mut args = Vec::new();
-    args.push("-machine".to_string());
-    args.push(machine);
-    args.push("-cpu".to_string());
-    args.push(cpu);
+    let mut args = vec!["-machine".to_string(), machine, "-cpu".to_string(), cpu];
     if guest_arch == ARCH_AMD64 {
         // @dive: The KVM VAPIC/TPR option ROM is a legacy optimization for old
         //        32-bit Windows guests. Our Linux guests do not need it, and its
@@ -3655,10 +3649,7 @@ fn normalize_shared_mounts(
 }
 
 fn normalize_mount_availability(raw: SharedMountAvailability) -> SharedMountAvailability {
-    match raw {
-        SharedMountAvailability::SharedStorage => SharedMountAvailability::SharedStorage,
-        SharedMountAvailability::NodeLocal => SharedMountAvailability::NodeLocal,
-    }
+    raw
 }
 
 fn normalize_mount_continuity(
@@ -4812,7 +4803,10 @@ mod tests {
             .insert(parent_id.clone(), parent_vm);
 
         let mut child_meta_extra = HashMap::new();
-        child_meta_extra.insert("chevalier.session_id".to_string(), "child-session".to_string());
+        child_meta_extra.insert(
+            "chevalier.session_id".to_string(),
+            "child-session".to_string(),
+        );
         let (parent_after, child_after, fork_id) = manager
             .fork_vm(
                 &parent_id,
@@ -5551,7 +5545,8 @@ mod tests {
             metadata: HashMap::new(),
             snapshots: Vec::new(),
             shared_mounts: Vec::new(),
-            boot_incoming_ram_path: "/srv/chevalier/vms/vm-incoming/snapshots/snap-abc.ram".to_string(),
+            boot_incoming_ram_path: "/srv/chevalier/vms/vm-incoming/snapshots/snap-abc.ram"
+                .to_string(),
             started_at: None,
         };
         let args = build_qemu_args(

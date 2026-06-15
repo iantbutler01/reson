@@ -184,10 +184,10 @@ impl NativeToolParser {
 
     /// Extract tool name from OpenAI-style tool call delta format
     pub fn extract_tool_name(&self, tool_call_data: &serde_json::Value) -> String {
-        if let Some(function) = tool_call_data.get("function") {
-            if let Some(name) = function.get("name") {
-                return name.as_str().unwrap_or("").to_string();
-            }
+        if let Some(function) = tool_call_data.get("function")
+            && let Some(name) = function.get("name")
+        {
+            return name.as_str().unwrap_or("").to_string();
         }
         String::new()
     }
@@ -202,10 +202,10 @@ impl NativeToolParser {
 
     /// Extract arguments JSON from OpenAI-style tool call delta format
     pub fn extract_arguments(&self, tool_call_data: &serde_json::Value) -> String {
-        if let Some(function) = tool_call_data.get("function") {
-            if let Some(args) = function.get("arguments") {
-                return args.as_str().unwrap_or("{}").to_string();
-            }
+        if let Some(function) = tool_call_data.get("function")
+            && let Some(args) = function.get("arguments")
+        {
+            return args.as_str().unwrap_or("{}").to_string();
         }
         "{}".to_string()
     }

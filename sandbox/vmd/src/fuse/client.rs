@@ -1,13 +1,14 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{Client, StatusCode, header};
 use chevalier_sandbox::vfs::{
-    CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER, CHEVALIER_VFS_OPERATION_HEADER,
-    CHEVALIER_VFS_RESOURCE_KEY_HEADER, CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME,
-    VfsDirEntry as RemoteDirEntry, VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant,
-    VfsLeaseReleaseRequest, VfsMetadata as RemoteMetadata, scoped_vfs_path,
+    CHEVALIER_VFS_COMPONENT_HEADER, CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
+    CHEVALIER_VFS_OPERATION_HEADER, CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+    CHEVALIER_VFS_SURFACE_KIND_HEADER, VFS_COMPONENT_VM_RUNTIME, VfsDirEntry as RemoteDirEntry,
+    VfsLeaseAcquireRequest, VfsLeaseGrant as LeaseGrant, VfsLeaseReleaseRequest,
+    VfsMetadata as RemoteMetadata, scoped_vfs_path,
 };
+use reqwest::{Client, StatusCode, header};
 
 #[derive(Clone, Debug)]
 pub struct RemoteVfsClient {
@@ -124,7 +125,10 @@ impl RemoteVfsClient {
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
                 .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
                 .header(
                     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                     lease.owner_token.to_string(),
@@ -149,7 +153,10 @@ impl RemoteVfsClient {
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
                 .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
                 .header(
                     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                     lease.owner_token.to_string(),
@@ -173,7 +180,10 @@ impl RemoteVfsClient {
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
                 .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
                 .header(
                     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                     lease.owner_token.to_string(),
@@ -197,7 +207,10 @@ impl RemoteVfsClient {
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
                 .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
                 .header(
                     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                     lease.owner_token.to_string(),
@@ -222,7 +235,10 @@ impl RemoteVfsClient {
                 .header(CHEVALIER_VFS_COMPONENT_HEADER, VFS_COMPONENT_VM_RUNTIME)
                 .header(CHEVALIER_VFS_SURFACE_KIND_HEADER, surface_kind)
                 .header(CHEVALIER_VFS_OPERATION_HEADER, operation)
-                .header(CHEVALIER_VFS_RESOURCE_KEY_HEADER, lease.resource_key.as_str())
+                .header(
+                    CHEVALIER_VFS_RESOURCE_KEY_HEADER,
+                    lease.resource_key.as_str(),
+                )
                 .header(
                     CHEVALIER_VFS_LOCK_OWNER_TOKEN_HEADER,
                     lease.owner_token.to_string(),

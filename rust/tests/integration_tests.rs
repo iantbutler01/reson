@@ -9,6 +9,7 @@
 //! Run with: cargo test --test integration_tests -- --ignored
 //! Or specific test: cargo test --test integration_tests test_anthropic_simple -- --ignored
 
+use chevalier_agentic::Tool;
 use chevalier_agentic::agentic;
 use chevalier_agentic::providers::{
     AnthropicClient, AnthropicProviderConfig, GenerationConfig, GoogleGenAIClient, InferenceClient,
@@ -23,7 +24,6 @@ use chevalier_agentic::types::{
     TokenUsage, ToolCall, ToolResult,
 };
 use chevalier_agentic::utils::ConversationMessage;
-use chevalier_agentic::Tool;
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -313,7 +313,10 @@ fn require_i64_field<T: ToolCallCarrier>(
     let value = value.first_tool_call_value()?;
     if let Some(raw) = value.get(field) {
         return parse_i64_value(raw).ok_or_else(|| {
-            chevalier_agentic::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
+            chevalier_agentic::error::Error::NonRetryable(format!(
+                "Invalid '{}' value: {}",
+                field, raw
+            ))
         });
     }
 
@@ -326,7 +329,9 @@ fn require_i64_field<T: ToolCallCarrier>(
     })
 }
 
-fn require_tool_call_id<T: ToolCallCarrier>(tool_call: &T) -> chevalier_agentic::error::Result<String> {
+fn require_tool_call_id<T: ToolCallCarrier>(
+    tool_call: &T,
+) -> chevalier_agentic::error::Result<String> {
     let tool_call = tool_call.first_tool_call_value()?;
     let id = tool_call
         .get("id")
@@ -1186,10 +1191,10 @@ async fn test_anthropic_runtime_system_message_cache_marker_live() {
     let api_key = get_anthropic_key().expect("ANTHROPIC_API_KEY not set");
     let mut runtime = Runtime::new();
     runtime
-        .set_system_messages(vec![ChatMessage::system(long_cacheable_text(
-            "runtime-system-1h",
-        ))
-        .with_cache_marker(CacheMarker::Ephemeral1h)])
+        .set_system_messages(vec![
+            ChatMessage::system(long_cacheable_text("runtime-system-1h"))
+                .with_cache_marker(CacheMarker::Ephemeral1h),
+        ])
         .await;
 
     let params = RunParams {
@@ -1635,7 +1640,7 @@ async fn test_openrouter_with_tools() {
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_openrouter_with_tools_streaming() {
     use futures::StreamExt;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     let mut last_error = None;
 
@@ -2099,8 +2104,8 @@ async fn test_google_anthropic_with_tools() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_streaming() {
-    use futures::StreamExt;
     use chevalier_agentic::providers::GoogleAnthropicClient;
+    use futures::StreamExt;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -2146,8 +2151,8 @@ async fn test_google_anthropic_streaming() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_streaming_with_tools() {
-    use futures::StreamExt;
     use chevalier_agentic::providers::GoogleAnthropicClient;
+    use futures::StreamExt;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 

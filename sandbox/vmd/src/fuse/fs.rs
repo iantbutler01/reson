@@ -5,16 +5,16 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use fuser::{
-    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-};
 use chevalier_sandbox::vfs::{
     VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SETATTR_SIZE,
     VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED,
     VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry, VfsLeaseGrant as LeaseGrant,
     VfsMetadata as RemoteMetadata,
+};
+use fuser::{
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, InitFlags, KernelConfig, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;

@@ -152,7 +152,7 @@ impl ChatMessage {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid role: {}",
                     role_str
-                )))
+                )));
             }
         };
         let content: String = data.get_item("content")?.unwrap().extract()?;

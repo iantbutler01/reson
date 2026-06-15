@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rmcp::{
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::router::tool::{ToolRoute, ToolRouter},
     handler::server::tool::ToolCallContext,
     model::{
@@ -17,9 +18,8 @@ use rmcp::{
     },
     service::RequestContext,
     transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
-    ErrorData, RoleServer, ServerHandler, ServiceExt,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -196,6 +196,7 @@ impl McpServer {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         #[cfg(feature = "apps")]
@@ -454,17 +455,15 @@ impl McpServerBuilder {
             .as_ref()
             .expect("visibility must be called after with_tool");
 
-        if let Some(route) = self.tool_router.map.get_mut(tool_name.as_str()) {
-            if let Some(meta) = &mut route.attr.meta {
-                if let Some(ui_value) = meta.0.get_mut("ui") {
-                    if let Some(obj) = ui_value.as_object_mut() {
-                        obj.insert(
-                            "visibility".to_string(),
-                            serde_json::to_value(&visibility).unwrap_or_default(),
-                        );
-                    }
-                }
-            }
+        if let Some(route) = self.tool_router.map.get_mut(tool_name.as_str())
+            && let Some(meta) = &mut route.attr.meta
+            && let Some(ui_value) = meta.0.get_mut("ui")
+            && let Some(obj) = ui_value.as_object_mut()
+        {
+            obj.insert(
+                "visibility".to_string(),
+                serde_json::to_value(&visibility).unwrap_or_default(),
+            );
         }
         self
     }

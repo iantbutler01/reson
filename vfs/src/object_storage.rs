@@ -356,7 +356,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                 manifest.pack_slot.pack_slot_length,
             ));
         }
-        let pack_results = stream::iter(packs.into_iter())
+        let pack_results = stream::iter(packs)
             .map(|(pack_key, slots)| async move {
                 let range_start = slots
                     .iter()
@@ -682,7 +682,7 @@ impl OptimizedVfsStorage for ObjectBackedVfsStorage {
                     .then_some(manifest.pack_slot.pack_key.clone())
             })
             .collect::<Vec<_>>();
-        let fetch_results = stream::iter(unique_pack_keys.into_iter())
+        let fetch_results = stream::iter(unique_pack_keys)
             .map(|pack_key| async move {
                 self.store
                     .get_object_async(&pack_key)

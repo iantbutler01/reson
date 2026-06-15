@@ -16,15 +16,15 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::schema::fix_tool_schema_for_provider;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    convert_messages_to_responses_input, parse_json_value_strict_str, parse_sse_stream,
-    validate_image_input_supported, ConversationMessage,
+    ConversationMessage, convert_messages_to_responses_input, parse_json_value_strict_str,
+    parse_sse_stream, validate_image_input_supported,
 };
 
-use super::openai_responses_streaming::{parse_openai_responses_event, ResponsesToolAccumulator};
+use super::openai_responses_streaming::{ResponsesToolAccumulator, parse_openai_responses_event};
 
 /// OpenAI Responses API client (also serves as base for OpenRouter Responses)
 pub struct OpenAIResponsesClient {
@@ -145,23 +145,23 @@ impl OpenAIResponsesClient {
             "stream": stream,
         });
 
-        if matches!(self.provider, Provider::OpenAIResponses) {
-            if let Some(retention) = config.prompt_cache_retention {
-                request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
-            }
+        if matches!(self.provider, Provider::OpenAIResponses)
+            && let Some(retention) = config.prompt_cache_retention
+        {
+            request["prompt_cache_retention"] = serde_json::json!(retention.as_str());
         }
 
-        if let Some(instructions) = instructions {
-            if !instructions.is_empty() {
-                request["instructions"] = serde_json::json!(instructions);
-            }
+        if let Some(instructions) = instructions
+            && !instructions.is_empty()
+        {
+            request["instructions"] = serde_json::json!(instructions);
         }
 
-        if let Some(ref tools) = config.tools {
-            if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.normalized_tools(tools));
-                request["tool_choice"] = serde_json::json!("auto");
-            }
+        if let Some(ref tools) = config.tools
+            && !tools.is_empty()
+        {
+            request["tools"] = serde_json::json!(self.normalized_tools(tools));
+            request["tool_choice"] = serde_json::json!("auto");
         }
 
         if let Some(ref reasoning) = self.reasoning {
@@ -221,14 +221,12 @@ impl OpenAIResponsesClient {
                         if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
                             for part in parts {
                                 if part.get("type").and_then(|v| v.as_str()) == Some("output_text")
+                                    && let Some(text) = part.get("text").and_then(|v| v.as_str())
+                                    && !text.is_empty()
                                 {
-                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                        if !text.is_empty() {
-                                            response.push_output(ResponsePart::Text {
-                                                text: text.to_string(),
-                                            });
-                                        }
-                                    }
+                                    response.push_output(ResponsePart::Text {
+                                        text: text.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -243,22 +241,22 @@ impl OpenAIResponsesClient {
                                         });
                                     }
                                 }
-                            } else if let Some(text) = summary.as_str() {
-                                if !text.is_empty() {
-                                    response.push_output(ResponsePart::Reasoning {
-                                        text: text.to_string(),
-                                    });
-                                }
+                            } else if let Some(text) = summary.as_str()
+                                && !text.is_empty()
+                            {
+                                response.push_output(ResponsePart::Reasoning {
+                                    text: text.to_string(),
+                                });
                             }
                         }
                         if let Some(parts) = item.get("content").and_then(|v| v.as_array()) {
                             for part in parts {
-                                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                    if !text.is_empty() {
-                                        response.push_output(ResponsePart::Reasoning {
-                                            text: text.to_string(),
-                                        });
-                                    }
+                                if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                                    && !text.is_empty()
+                                {
+                                    response.push_output(ResponsePart::Reasoning {
+                                        text: text.to_string(),
+                                    });
                                 }
                             }
                         }

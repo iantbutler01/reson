@@ -126,7 +126,7 @@ impl VfsPackCompactor {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let fetched_packs = stream::iter(unique_pack_keys.into_iter())
+        let fetched_packs = stream::iter(unique_pack_keys)
             .map(|pack_key| {
                 let blobs = self.blobs.clone();
                 async move {
@@ -246,7 +246,7 @@ impl VfsPackCompactor {
             })
             .collect::<Vec<_>>();
 
-        let delete_results = stream::iter(candidates.into_iter())
+        let delete_results = stream::iter(candidates)
             .map(|pack| {
                 let index = self.index.clone();
                 let blobs = self.blobs.clone();

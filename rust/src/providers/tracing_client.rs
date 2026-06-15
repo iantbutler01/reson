@@ -20,8 +20,8 @@
 use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -59,11 +59,11 @@ impl FallbackState {
     }
 
     fn try_reset(&mut self) -> bool {
-        if let Some(activated) = self.activated_at {
-            if activated.elapsed() >= FALLBACK_DURATION {
-                self.activated_at = None;
-                return true;
-            }
+        if let Some(activated) = self.activated_at
+            && activated.elapsed() >= FALLBACK_DURATION
+        {
+            self.activated_at = None;
+            return true;
         }
         false
     }
@@ -152,10 +152,10 @@ impl TracingInferenceClient {
         }
 
         // Check if we should use fallback
-        if state.should_use_fallback() {
-            if let Some(ref fallback) = self.fallback_client {
-                return fallback.as_ref();
-            }
+        if state.should_use_fallback()
+            && let Some(ref fallback) = self.fallback_client
+        {
+            return fallback.as_ref();
         }
 
         self.primary_client.as_ref()
@@ -296,10 +296,10 @@ impl TracingInferenceClient {
                     usage.cache_write_input_tokens = *cache_write_input_tokens;
                     let cost = CostInfo::from_usage(&usage, &model);
 
-                    if let Some(ref store) = cost_store {
-                        if let Err(e) = store.record_cost(&model, &cost).await {
-                            log::warn!("Failed to record streaming cost: {}", e);
-                        }
+                    if let Some(ref store) = cost_store
+                        && let Err(e) = store.record_cost(&model, &cost).await
+                    {
+                        log::warn!("Failed to record streaming cost: {}", e);
                     }
 
                     log::debug!(

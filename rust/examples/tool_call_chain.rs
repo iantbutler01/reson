@@ -8,7 +8,7 @@
 
 use chevalier_agentic::types::{ChatMessage, ToolCall, ToolResult};
 use chevalier_agentic::utils::ConversationMessage;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Tool Call Chain Example ===\n");

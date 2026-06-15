@@ -1029,14 +1029,18 @@ mod tests {
         assert_eq!(schemas.len(), 1);
 
         let weather_schema = schemas.get("get_weather").unwrap();
-        assert!(weather_schema
-            .fields
-            .iter()
-            .any(|f| f.name == "location" && f.required));
-        assert!(weather_schema
-            .fields
-            .iter()
-            .any(|f| f.name == "unit" && !f.required));
+        assert!(
+            weather_schema
+                .fields
+                .iter()
+                .any(|f| f.name == "location" && f.required)
+        );
+        assert!(
+            weather_schema
+                .fields
+                .iter()
+                .any(|f| f.name == "unit" && !f.required)
+        );
         assert_eq!(
             weather_schema.parameters.to_json_schema()["properties"]["location"]["type"],
             "string"

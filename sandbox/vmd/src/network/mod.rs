@@ -655,11 +655,11 @@ fn network_runtime_component(config: &Config) -> String {
 fn sanitize_network_runtime_component(raw: &str) -> String {
     let mut out: String = raw
         .chars()
-        .filter_map(|ch| {
+        .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                Some(ch)
+                ch
             } else {
-                Some('_')
+                '_'
             }
         })
         .collect();

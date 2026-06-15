@@ -41,7 +41,11 @@ async fn sandbox_smoke_session_and_fork_when_enabled() {
     if std::env::var("CHEVALIER_SANDBOX_SMOKE").ok().as_deref() != Some("1") {
         return;
     }
-    if std::env::var("CHEVALIER_SANDBOX_SMOKE_FORK").ok().as_deref() != Some("1") {
+    if std::env::var("CHEVALIER_SANDBOX_SMOKE_FORK")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         return;
     }
 

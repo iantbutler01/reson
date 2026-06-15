@@ -3,9 +3,9 @@
 //! This example demonstrates how Chevalier's NativeToolParser dynamically constructs
 //! tool objects from JSON using a type registry, similar to Python's runtime type lookup.
 
-use futures::future::BoxFuture;
 use chevalier_agentic::parsers::{Deserializable, FieldDescription};
 use chevalier_agentic::runtime::Runtime;
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 /// Example tool: Chat message
@@ -111,15 +111,16 @@ async fn main() -> chevalier_agentic::error::Result<()> {
     // In Rust:   runtime.tool::<Chat, _>(handle_chat, Some("Chat"))
 
     // Handlers now receive typed structs directly (not ParsedTool)
-    let chat_handler = |chat: Chat| -> BoxFuture<'static, chevalier_agentic::error::Result<String>> {
-        Box::pin(async move {
-            println!(
-                "📨 Chat handler called: {} -> {}",
-                chat.recipient, chat.message
-            );
-            Ok(format!("Sent message to {}", chat.recipient))
-        })
-    };
+    let chat_handler =
+        |chat: Chat| -> BoxFuture<'static, chevalier_agentic::error::Result<String>> {
+            Box::pin(async move {
+                println!(
+                    "📨 Chat handler called: {} -> {}",
+                    chat.recipient, chat.message
+                );
+                Ok(format!("Sent message to {}", chat.recipient))
+            })
+        };
 
     runtime.tool::<Chat, _>(chat_handler, Some("Chat")).await?;
 

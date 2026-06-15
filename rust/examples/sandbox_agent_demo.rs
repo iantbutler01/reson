@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::StreamExt;
 use chevalier_sandbox::{
     ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox, SandboxConfig, SandboxError, Session,
     SessionOptions,
 };
+use futures::StreamExt;
 
 fn unix_secs() -> u64 {
     SystemTime::now()

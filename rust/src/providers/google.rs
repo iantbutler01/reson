@@ -25,12 +25,12 @@ use crate::error::{Error, Result};
 use crate::providers::{
     GenerationConfig, GenerationResponse, InferenceClient, StreamChunk, TraceCallback,
 };
-use crate::retry::{retry_with_backoff, RetryConfig};
+use crate::retry::{RetryConfig, retry_with_backoff};
 use crate::types::ChatRole;
 use crate::types::{AssistantResponse, Provider, ResponsePart, TokenUsage, ToolCall};
 use crate::utils::{
-    media_part_to_google_format, validate_image_input_supported, ConversationMessage,
-    JsonStreamAccumulator,
+    ConversationMessage, JsonStreamAccumulator, media_part_to_google_format,
+    validate_image_input_supported,
 };
 
 #[cfg(feature = "google-adc")]
@@ -402,18 +402,16 @@ fn parse_google_stream_value(
                             {
                                 chunks.push(Ok(StreamChunk::ToolCallComplete(tool_call)));
                             }
-                        } else if func_call.get("name").is_some()
+                        } else if (func_call.get("name").is_some()
                             || func_call.get("partialArgs").is_some()
                             || func_call
                                 .get("willContinue")
                                 .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                        {
-                            if let Some(partial) =
+                                .unwrap_or(false))
+                            && let Some(partial) =
                                 accumulator.update_partial(candidate_index, part_index, func_call)
-                            {
-                                chunks.push(Ok(StreamChunk::ToolCallPartial(partial)));
-                            }
+                        {
+                            chunks.push(Ok(StreamChunk::ToolCallPartial(partial)));
                         }
                     } else if part
                         .get("thought")
@@ -913,15 +911,15 @@ impl GoogleGenAIClient {
         }
 
         // Add tools if provided (Google format)
-        if let Some(ref tools) = config.tools {
-            if !tools.is_empty() {
-                // Check if tools are already in Google format or need conversion
-                let google_tools = self.convert_tools_to_google_format(tools)?;
-                request["tools"] = google_tools;
-                if stream {
-                    request["toolConfig"]["functionCallingConfig"]["streamFunctionCallArguments"] =
-                        serde_json::json!(true);
-                }
+        if let Some(ref tools) = config.tools
+            && !tools.is_empty()
+        {
+            // Check if tools are already in Google format or need conversion
+            let google_tools = self.convert_tools_to_google_format(tools)?;
+            request["tools"] = google_tools;
+            if stream {
+                request["toolConfig"]["functionCallingConfig"]["streamFunctionCallArguments"] =
+                    serde_json::json!(true);
             }
         }
 
@@ -947,10 +945,10 @@ impl GoogleGenAIClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<String>, &'a [ConversationMessage])> {
-        if let Some(ConversationMessage::Chat(first)) = messages.first() {
-            if first.role == ChatRole::System {
-                return Ok((Some(first.content.clone()), &messages[1..]));
-            }
+        if let Some(ConversationMessage::Chat(first)) = messages.first()
+            && first.role == ChatRole::System
+        {
+            return Ok((Some(first.content.clone()), &messages[1..]));
         }
         Ok((None, messages))
     }
@@ -1034,10 +1032,10 @@ impl GoogleGenAIClient {
                     // Include thoughtSignature if available (required by Google for multi-turn)
                     if let Some(ref signature) = tool_call.signature {
                         part["thoughtSignature"] = serde_json::json!(signature);
-                    } else if let Some(ref obj) = tool_call.tool_obj {
-                        if let Some(sig) = obj.get("thoughtSignature") {
-                            part["thoughtSignature"] = sig.clone();
-                        }
+                    } else if let Some(ref obj) = tool_call.tool_obj
+                        && let Some(sig) = obj.get("thoughtSignature")
+                    {
+                        part["thoughtSignature"] = sig.clone();
                     }
                     contents.push(serde_json::json!({
                         "role": "model",
@@ -1140,53 +1138,47 @@ impl GoogleGenAIClient {
     /// Extract canonical assistant response from Gemini candidates.
     fn extract_response(&self, candidates: &serde_json::Value) -> Result<AssistantResponse> {
         let mut response = AssistantResponse::default();
-        if let Some(first) = candidates.as_array().and_then(|a| a.first()) {
-            if let Some(parts) = first["content"]["parts"].as_array() {
-                for part in parts {
-                    if let Some(func_call) = part.get("functionCall") {
-                        let mut call = ToolCall::from_provider_format(
-                            serde_json::json!({ "functionCall": func_call }),
-                            Provider::GoogleGenAI,
-                        )?;
-                        if let Some(signature) =
-                            part.get("thoughtSignature").and_then(|v| v.as_str())
-                        {
-                            call.signature = Some(signature.to_string());
-                        }
-                        response.push_output(ResponsePart::Tool { call });
-                        if let Some(signature) =
-                            part.get("thoughtSignature").and_then(|v| v.as_str())
-                        {
-                            response.push_output(ResponsePart::Signature {
-                                value: signature.to_string(),
-                            });
-                        }
-                    } else if part
-                        .get("thought")
-                        .and_then(|t| t.as_bool())
-                        .unwrap_or(false)
-                    {
-                        if let Some(text) = part["text"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Reasoning {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                        if let Some(signature) =
-                            part.get("thoughtSignature").and_then(|v| v.as_str())
-                        {
-                            response.push_output(ResponsePart::Signature {
-                                value: signature.to_string(),
-                            });
-                        }
-                    } else if let Some(text) = part["text"].as_str() {
-                        if !text.is_empty() {
-                            response.push_output(ResponsePart::Text {
-                                text: text.to_string(),
-                            });
-                        }
+        if let Some(first) = candidates.as_array().and_then(|a| a.first())
+            && let Some(parts) = first["content"]["parts"].as_array()
+        {
+            for part in parts {
+                if let Some(func_call) = part.get("functionCall") {
+                    let mut call = ToolCall::from_provider_format(
+                        serde_json::json!({ "functionCall": func_call }),
+                        Provider::GoogleGenAI,
+                    )?;
+                    if let Some(signature) = part.get("thoughtSignature").and_then(|v| v.as_str()) {
+                        call.signature = Some(signature.to_string());
                     }
+                    response.push_output(ResponsePart::Tool { call });
+                    if let Some(signature) = part.get("thoughtSignature").and_then(|v| v.as_str()) {
+                        response.push_output(ResponsePart::Signature {
+                            value: signature.to_string(),
+                        });
+                    }
+                } else if part
+                    .get("thought")
+                    .and_then(|t| t.as_bool())
+                    .unwrap_or(false)
+                {
+                    if let Some(text) = part["text"].as_str()
+                        && !text.is_empty()
+                    {
+                        response.push_output(ResponsePart::Reasoning {
+                            text: text.to_string(),
+                        });
+                    }
+                    if let Some(signature) = part.get("thoughtSignature").and_then(|v| v.as_str()) {
+                        response.push_output(ResponsePart::Signature {
+                            value: signature.to_string(),
+                        });
+                    }
+                } else if let Some(text) = part["text"].as_str()
+                    && !text.is_empty()
+                {
+                    response.push_output(ResponsePart::Text {
+                        text: text.to_string(),
+                    });
                 }
             }
         }

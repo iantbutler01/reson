@@ -5,7 +5,7 @@
 // @dive-rel: Exercised only when the `apps` feature is enabled via Cargo required-features gating.
 // @dive-rel: Verifies server-side UI metadata wiring implemented under src/apps and src/server/handler.rs.
 
-use chevalier_mcp::apps::{UiResource, UiResourceCsp, UiToolMeta, Visibility, MCP_APP_MIME_TYPE};
+use chevalier_mcp::apps::{MCP_APP_MIME_TYPE, UiResource, UiResourceCsp, UiToolMeta, Visibility};
 use chevalier_mcp::server::{McpServer, ServerTransport};
 use rmcp::model::{CallToolResult, Content};
 use serde_json::json;

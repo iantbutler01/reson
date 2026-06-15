@@ -9,12 +9,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_nats::jetstream::consumer::pull;
 use async_nats::jetstream::{self};
-use etcd_client::{Client as EtcdClient, GetOptions};
-use futures::StreamExt;
 use chevalier_sandbox::{
     DistributedControlConfig, ExecEvent, ExecOptions, Sandbox, SandboxConfig, SandboxError,
     SessionOptions,
 };
+use etcd_client::{Client as EtcdClient, GetOptions};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;

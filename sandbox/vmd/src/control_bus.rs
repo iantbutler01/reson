@@ -1705,7 +1705,7 @@ async fn handle_exec_run_command(
     }
     let portproxy_auth = portproxy_auth_header_from_metadata(&vm.metadata)?;
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
-    if let Err(error) = wait_for_guest_exec_ready_or_mark_vm_error(
+    wait_for_guest_exec_ready_or_mark_vm_error(
         manager,
         payload.vm_id.as_str(),
         endpoint.as_str(),
@@ -1713,10 +1713,7 @@ async fn handle_exec_run_command(
         ready_timeout,
         "wait for guest exec readiness before exec.run",
     )
-    .await
-    {
-        return Err(error);
-    }
+    .await?;
     drop(_vm_readiness_guard);
     let mut client = ShellExecClient::connect(endpoint)
         .await
@@ -1864,6 +1861,7 @@ async fn publish_exec_run_error_result(
     skip(envelope, config, manager, active_exec_streams, vm_snapshot_state, jetstream),
     fields(command_id = %envelope.command_id, command_type = %envelope.command_type, node_id = %node_id)
 )]
+#[allow(clippy::too_many_arguments)]
 async fn handle_exec_stream_start_command(
     envelope: &CommandEnvelope,
     config: &ControlBusConfig,
@@ -2211,7 +2209,10 @@ async fn handle_exec_stream_start_command(
         }
     };
     info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T5 after_daemon_connect");
-    let daemon_name = format!("chevalier-exec-stream-{}", sanitize_subject_token(&stream_id));
+    let daemon_name = format!(
+        "chevalier-exec-stream-{}",
+        sanitize_subject_token(&stream_id)
+    );
     if !resume_only {
         let shell = payload
             .shell
