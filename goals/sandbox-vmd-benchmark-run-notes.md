@@ -9,20 +9,20 @@ the same setup.
   longer show the ~20s tail in the live OtherYou product path when callers use
   `ExecOptions::close_stdin_on_start`.
 - Changed files from the current pass:
-  - `reson-sandbox/vmd/src/control_bus.rs`
-  - `reson-sandbox/crates/reson-sandbox/src/lib.rs`
-  - `reson-sandbox/portproxy/src/main.rs`
-  - `reson-sandbox/portproxy/src/services.rs`
-  - `reson-sandbox/portproxy/bin/portproxy-linux-amd64`
-  - `reson-sandbox/portproxy/bin/portproxy-linux-arm64`
+  - `sandbox/vmd/src/control_bus.rs`
+  - `sandbox/crates/sandbox/src/lib.rs`
+  - `sandbox/portproxy/src/main.rs`
+  - `sandbox/portproxy/src/services.rs`
+  - `sandbox/portproxy/bin/portproxy-linux-amd64`
+  - `sandbox/portproxy/bin/portproxy-linux-arm64`
 - Local checks passed:
   - `cargo fmt -p vmd`
   - `cargo test -p vmd vm_readiness_cache -- --nocapture`
   - `cargo check -p vmd`
-  - `cargo fmt -p reson-sandbox -p portproxy`
-  - `cargo check -p reson-sandbox`
+  - `cargo fmt -p chevalier-sandbox -p portproxy`
+  - `cargo check -p chevalier-sandbox`
   - `cargo test -p portproxy -- --nocapture`
-- Remote image `reson-vmd:otheryou-migration-test` was rebuilt on `corvidae`
+- Remote image `chevalier-vmd:otheryou-migration-test` was rebuilt on `corvidae`
   after rebuilding the linux guest portproxy binaries.
 - Live product-style validation hits the perf target after adding explicit
   one-shot stdin closure for product computer exec.
@@ -57,11 +57,11 @@ rsync -az \
   --exclude .run \
   --exclude .integration-artifacts \
   --exclude .git \
-  ../reson/reson-sandbox/ \
-  crow@corvidae:/home/crow/reson-sandbox-migration-test/
+  ../chevalier/sandbox/ \
+  crow@corvidae:/home/crow/chevalier-sandbox-migration-test/
 
 ssh crow@corvidae \
-  'cd /home/crow/reson-sandbox-migration-test && docker build --build-arg D2VM_SOURCE_IMAGE=reson-d2vm:otheryou-test -f Dockerfile.vmd-gke -t reson-vmd:otheryou-migration-test .'
+  'cd /home/crow/chevalier-sandbox-migration-test && docker build --build-arg D2VM_SOURCE_IMAGE=chevalier-d2vm:otheryou-test -f Dockerfile.vmd-gke -t chevalier-vmd:otheryou-migration-test .'
 ```
 
 ## Exec-Throughput Benchmark
@@ -149,10 +149,10 @@ Additional focused backend-mode checks:
 - HA c4 initially failed before connect with
   `workspace admission budget exhausted (used=65, limit=64)`.
   Purging local and remote integration control-plane containers was not enough:
-  remote etcd still had 65 `/reson-sandbox/sessions/` routes because stale
+  remote etcd still had 65 `/sandbox/sessions/` routes because stale
   remote VM data was re-registering old sessions on VMD startup.
 - Quarantined corvidae test VM data under
-  `/home/crow/reson-sandbox-migration-test/.run/quarantine-20260614T231434Z`,
+  `/home/crow/chevalier-sandbox-migration-test/.run/quarantine-20260614T231434Z`,
   purged remote etcd/NATS, then reran HA c4.
 - HA c4 clean output dir:
   `/Users/crow/SoftwareProjects/OtherYou/.run/computer-bench/oneshot-stdin-ha-clean-20260614T231505Z`
@@ -162,7 +162,7 @@ Additional focused backend-mode checks:
 
 Checks after this patch:
 
-- `cargo check -p reson-sandbox`
+- `cargo check -p chevalier-sandbox`
 - `rustup run 1.90-aarch64-apple-darwin cargo check --bin computer_exec_bench`
 - `rustup run 1.90-aarch64-apple-darwin cargo check` in `OtherYou/api`
 - `cargo test -p portproxy -- --nocapture` passed unsandboxed. The sandboxed
@@ -171,11 +171,11 @@ Checks after this patch:
 Cleanup after this run:
 
 - `ops/computer/remote_vmd_box.sh status --host corvidae` showed both
-  `reson-vmd-corvidae-node1` and `reson-vmd-corvidae-node2` exited.
+  `chevalier-vmd-corvidae-node1` and `chevalier-vmd-corvidae-node2` exited.
 - Local process check showed no leftover benchmark/API helper processes beyond
   the `ps | rg` check itself.
 - After the final HA check, quarantined the new remote HA test VM data under
-  `/home/crow/reson-sandbox-migration-test/.run/quarantine-20260614T231745Z`
+  `/home/crow/chevalier-sandbox-migration-test/.run/quarantine-20260614T231745Z`
   and purged both remote and local integration control planes.
 
 ## Previous Bad Live Result
@@ -188,7 +188,7 @@ Output dir:
 
 Observed after the portproxy output-ordering fix, after removing the failed
 client channel-cache patch, and after caching `GuestRpcAccess` in
-`reson-sandbox`:
+`chevalier-sandbox`:
 
 - c1: 16/16 success, p95 about 399ms.
 - c4: 16/16 success, p50 about 143ms, p95 about 5.1s, max about 19.8s.
@@ -205,6 +205,6 @@ Direct guest portproxy isolation against one manually-created VM was fast:
 
 Current conclusion: the guest portproxy and direct corvidae VM RPC path are not
 the ~20s tail source. The tail was above direct portproxy: the
-`reson-sandbox` `Session::exec` one-shot/stdin request-stream path kept stdin
+`chevalier-sandbox` `Session::exec` one-shot/stdin request-stream path kept stdin
 open for product one-shot commands. Re-running VMD setup without changing that
 layer was wasted time.

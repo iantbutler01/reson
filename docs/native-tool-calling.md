@@ -7,8 +7,8 @@ Native tool calling enables you to use provider-native APIs for improved perform
 Add `native_tools=True` to your decorator:
 
 ```python
-from reson import agentic, Runtime
-from reson.types import Deserializable
+from chevalier import agentic, Runtime
+from chevalier.types import Deserializable
 
 class WeatherQuery(Deserializable):
     location: str

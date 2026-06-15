@@ -1,4 +1,4 @@
-# Python wheel builds and PyPI release for reson-py
+# Python wheel builds and PyPI release for py
 # Based on maturin generate-ci, adapted for monorepo structure
 name: Python Release
 
@@ -29,7 +29,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: reson-py
+          working-directory: py
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -38,7 +38,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
-          path: reson-py/dist
+          path: py/dist
 
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
@@ -57,7 +57,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: reson-py
+          working-directory: py
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -66,7 +66,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
-          path: reson-py/dist
+          path: py/dist
 
   windows:
     runs-on: windows-latest
@@ -78,7 +78,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: reson-py
+          working-directory: py
           target: x64
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -86,7 +86,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-x64
-          path: reson-py/dist
+          path: py/dist
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
@@ -105,7 +105,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: reson-py
+          working-directory: py
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -113,7 +113,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
-          path: reson-py/dist
+          path: py/dist
 
   sdist:
     runs-on: ubuntu-latest
@@ -122,14 +122,14 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: reson-py
+          working-directory: py
           command: sdist
           args: --out dist
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
           name: wheels-sdist
-          path: reson-py/dist
+          path: py/dist
 
   release:
     name: Release to PyPI

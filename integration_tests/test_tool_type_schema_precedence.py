@@ -3,10 +3,10 @@ from typing import List, Dict, Optional, Union as TypingUnion
 
 import pytest
 
-from reson.reson import Runtime
-from reson.stores import MemoryStore
-from reson.utils.schema_generators import get_schema_generator
-from reson.types import Deserializable
+from chevalier.chevalier import Runtime
+from chevalier.stores import MemoryStore
+from chevalier.utils.schema_generators import get_schema_generator
+from chevalier.types import Deserializable
 
 
 # Auxiliary classes to exercise named union aliases and nesting

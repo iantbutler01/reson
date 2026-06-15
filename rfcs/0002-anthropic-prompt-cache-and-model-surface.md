@@ -8,7 +8,7 @@ Three related changes to the Anthropic provider path, all driven by empirical fi
 3. **Adaptive thinking and `output_config` support** (`effort`, structured-output `format`), replacing the deprecated top-level `output_format` and closing the gap where non-numeric `@reasoning=` values were silently dropped.
 
 ## Background
-Anthropic prompt caching is a strict prefix match over `tools → system → messages`. Cache writes cost 1.25×–2× input price; reads cost 0.1×. Three defects made reson-driven agent loops pay the write premium on nearly every call:
+Anthropic prompt caching is a strict prefix match over `tools → system → messages`. Cache writes cost 1.25×–2× input price; reads cost 0.1×. Three defects made chevalier-driven agent loops pay the write premium on nearly every call:
 
 - **The top-level `cache_control` field produced unreadable history entries.** In a multi-turn loop, every turn re-wrote its byte-identical message history (`cache_write` ≈ 27–43K tokens/turn) while `cache_read` stayed pinned at the system prefix. Per-segment byte fingerprinting located the cause: `Runtime::run` appends `prompt`/`default_prompt` as the final user message of every request. That message is not part of durable history — its bytes vanish from the next request — so any cache entry keyed through the end of the request can never be matched again.
 - **Alphabetical tool serialization resorts the prefix root.** Tool definitions are the first bytes of the cacheable prefix. Sorting by name means a tool added mid-session (agentic tool re-selection) splices into the middle of the tools array and invalidates every cached prefix from the insertion point onward. Registration order makes additions append-only.

@@ -1,0 +1,21 @@
+[package]
+name = "chevalier-durable"
+version = "0.1.0"
+edition = "2024"
+authors = ["Chevalier Contributors"]
+description = "Durable execution primitives for agentic runtimes"
+license = "Apache-2.0"
+repository = "https://github.com/iantbutler01/chevalier"
+homepage = "https://github.com/iantbutler01/chevalier"
+documentation = "https://docs.rs/chevalier-durable"
+readme = "README.md"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+[lints.rust]
+warnings = "deny"

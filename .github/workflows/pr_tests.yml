@@ -6,7 +6,7 @@ on:
     branches: [main]
 
 jobs:
-  # Rust tests for reson-rust crate
+  # Rust tests for rust crate
   rust-test:
     name: Rust Tests
     runs-on: ubuntu-latest
@@ -22,12 +22,12 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            reson-rust/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('reson-rust/**/Cargo.lock') }}
+            rust/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.lock') }}
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run tests
-        working-directory: reson-rust
+        working-directory: rust
         run: cargo test --all-features
 
   rust-clippy:
@@ -47,12 +47,12 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            reson-rust/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('reson-rust/**/Cargo.lock') }}
+            rust/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust/**/Cargo.lock') }}
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run clippy
-        working-directory: reson-rust
+        working-directory: rust
         run: cargo clippy --all-features -- -D warnings
 
   rust-fmt:
@@ -65,7 +65,7 @@ jobs:
         with:
           components: rustfmt
       - name: Check formatting
-        working-directory: reson-rust
+        working-directory: rust
         run: cargo fmt --all -- --check
 
   # Python build test (just verify it compiles)
@@ -84,7 +84,7 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build Python package
-        working-directory: reson-py
+        working-directory: py
         run: maturin build --release
 
   # Python integration tests (requires API keys)
@@ -107,7 +107,7 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Build and install package
-        working-directory: reson-py
+        working-directory: py
         run: |
           source ../.venv/bin/activate
           maturin develop --release

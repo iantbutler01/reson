@@ -6,7 +6,7 @@ All features described in this spec have been implemented and tested.
 
 ## Overview
 
-This spec covers wiring up two related features in reson-py that exist in skeleton form but aren't functional:
+This spec covers wiring up two related features in py that exist in skeleton form but aren't functional:
 
 1. **Tool Call Hydration**: When LLM returns a tool call, instantiate the registered `tool_type` class (Pydantic or Deserializable) from the JSON args before calling the tool function ✅ **DONE**
 2. **Structured Outputs via `output_type`**: When user specifies `output_type`, use native provider structured output APIs to get typed responses ✅ **DONE**
@@ -55,7 +55,7 @@ runtime.tool(get_weather, tool_type=WeatherQuery)
 
 ### Implementation
 
-#### File: `reson-py/src/runtime.rs`
+#### File: `py/src/runtime.rs`
 
 Modify `execute_tool()` (around line 373):
 
@@ -145,7 +145,7 @@ The hydration should support:
    - Detection: `hasattr(type, "model_validate")` (V2) or `hasattr(type, "parse_obj")` (V1)
    - Instantiation: `type.model_validate(args_dict)` or `type.parse_obj(args_dict)`
 
-2. **Deserializable** (reson's own base class)
+2. **Deserializable** (chevalier's own base class)
    - Detection: `issubclass(type, Deserializable)` or just fallback
    - Instantiation: `type(**args_dict)`
 
@@ -161,7 +161,7 @@ The hydration should support:
 Add a Python helper that Rust can call:
 
 ```python
-# reson/utils/hydration.py
+# chevalier/utils/hydration.py
 def hydrate_tool_args(tool_type, args_dict):
     """Instantiate a tool type from args dict."""
     import dataclasses
@@ -229,7 +229,7 @@ Reuse existing schema generation from tool registration:
 ```rust
 fn generate_output_schema(py: Python, output_type: &PyObject) -> PyResult<serde_json::Value> {
     // Use existing schema generator infrastructure
-    let schema_gen = py.import("reson.utils.schema_generators")?;
+    let schema_gen = py.import("chevalier.utils.schema_generators")?;
     let schema = schema_gen.call_method1("generate_type_schema", (output_type,))?;
     pythonize::depythonize(&schema)
 }
@@ -237,7 +237,7 @@ fn generate_output_schema(py: Python, output_type: &PyObject) -> PyResult<serde_
 
 #### Step 2: Modify Provider Requests
 
-In `reson-rust/src/providers/` for each provider:
+In `rust/src/providers/` for each provider:
 
 **OpenAI/OpenRouter** (`oai.rs`):
 ```rust
@@ -339,29 +339,29 @@ fn run(
 
 ## Part 3: Files to Modify
 
-### reson-py/src/runtime.rs
+### py/src/runtime.rs
 - [x] `execute_tool()`: Add tool type lookup and hydration ✅ DONE (lines 469-569)
 - [x] `run()`: Wire up `output_type` schema generation and response parsing ✅ DONE (lines 621-716)
 - [x] `run_stream()`: Same for streaming ✅ DONE (lines 760-768)
 - [x] Remove underscore from `_output_type` parameters ✅ DONE
 
-### reson-rust/src/runtime/inference.rs
+### rust/src/runtime/inference.rs
 - [x] `call_llm()`: Accept output schema, pass to provider ✅ DONE (lines 379-437)
 - [x] `call_llm_stream()`: Same for streaming ✅ DONE (lines 529-588)
 - [x] Remove underscore from `_output_type` parameters ✅ DONE
 
-### reson-rust/src/providers/*.rs
+### rust/src/providers/*.rs
 - [x] `anthropic.rs`: Add `output_format` + beta header for structured outputs ✅ DONE (lines 122-128, 221-226)
 - [x] `oai.rs`: Add `response_format` with JSON schema ✅ DONE (lines 156-167)
 - [x] `google.rs`: Add `response_schema` to generation config ✅ DONE (lines 545-549)
 - [x] `openrouter.rs`: Pass through to underlying provider ✅ (delegates to OAIClient)
 - [x] `bedrock.rs`: Add structured output support ✅ DONE (lines 139-146)
 
-### reson-py/src/types.rs
+### py/src/types.rs
 - [x] Keep `Deserializable` class ✅ Already present
 
-### New file: reson/utils/hydration.py (optional)
-- Not needed - hydration is implemented in Rust (reson-py/src/runtime.rs)
+### New file: chevalier/utils/hydration.py (optional)
+- Not needed - hydration is implemented in Rust (py/src/runtime.rs)
 
 ---
 
@@ -369,13 +369,13 @@ fn run(
 
 These are gasp/XML parsing files that were copied but aren't needed:
 
-- [ ] `reson-py/parser.rs` - XML stream parser
-- [ ] `reson-py/python_types.rs` - Type introspection for XML
-- [ ] `reson-py/type_string_parser.rs` - Parse type strings like "list[str]"
-- [ ] `reson-py/lib-gasp-py.rs` - gasp Python module definition
+- [ ] `py/parser.rs` - XML stream parser
+- [ ] `py/python_types.rs` - Type introspection for XML
+- [ ] `py/type_string_parser.rs` - Parse type strings like "list[str]"
+- [ ] `py/lib-gasp-py.rs` - gasp Python module definition
 
 **Keep:**
-- `reson-py/deserializable.py` - Python Deserializable base class (useful for tool types)
+- `py/deserializable.py` - Python Deserializable base class (useful for tool types)
 
 ---
 
@@ -386,12 +386,12 @@ These are gasp/XML parsing files that were copied but aren't needed:
 - [ ] Document that `output_type` uses native provider APIs
 - [ ] Document `tool_type` parameter for typed tool arguments
 
-### reson-py/README.md
+### py/README.md
 - [ ] Add section on Deserializable vs Pydantic for tool types
 - [ ] Document structured output support per provider
 - [ ] Remove any XML/gasp references
 
-### reson-rust/README.md
+### rust/README.md
 - [ ] Document `#[derive(Tool)]` and `#[derive(Deserializable)]` macros
 - [ ] Show Rust structured output examples
 

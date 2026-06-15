@@ -10,9 +10,9 @@ import asyncio
 import pytest
 import os
 from typing import List, Dict, Union
-from reson import agentic, Runtime
-from reson.types import Deserializable, ToolCall, ToolResult, ChatMessage
-from reson.services.inference_clients import InferenceProvider, ChatRole
+from chevalier import agentic, Runtime
+from chevalier.types import Deserializable, ToolCall, ToolResult, ChatMessage
+from chevalier.services.inference_clients import InferenceProvider, ChatRole
 
 
 class WeatherQuery(Deserializable):
@@ -497,7 +497,7 @@ async def main():
 
 def test_toolcall_message_conversion_integration():
     """Test that ToolCall objects integrate properly with message conversion."""
-    from reson.services.inference_clients import InferenceClient
+    from chevalier.services.inference_clients import InferenceClient
 
     class TestClient(InferenceClient):
         def __init__(self, provider):

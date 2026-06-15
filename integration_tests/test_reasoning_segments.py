@@ -1,8 +1,8 @@
 import asyncio
 import pytest
 import os
-from reson import agentic_generator, Runtime
-from reson.types import ReasoningSegment
+from chevalier import agentic_generator, Runtime
+from chevalier.types import ReasoningSegment
 
 
 models_to_test = [
@@ -61,7 +61,7 @@ async def test_reasoning_segments_across_providers(model: str):
 @pytest.mark.asyncio
 async def test_reasoning_segment_provider_formats():
     """Test ReasoningSegment provider format conversion."""
-    from reson.services.inference_clients import InferenceProvider
+    from chevalier.services.inference_clients import InferenceProvider
 
     # Test basic ReasoningSegment creation and format conversion
     segment = ReasoningSegment(

@@ -14,20 +14,20 @@ Sequential tool emission pattern means existing single-tool data structures work
 Minimal changes to existing files for maximum backwards compatibility.
 
 **Files to modify:**
-- `reson/reson.py` - Remove early return logic in `_call_llm()` and `_call_llm_stream()`
+- `chevalier/chevalier.py` - Remove early return logic in `_call_llm()` and `_call_llm_stream()`
 - `integration_tests/test_parallel_tool_calling.py` - New comprehensive parallel test suite
 
 **No changes needed:**
-- `reson/services/inference_clients.py` - Current streaming accumulation works correctly
-- `reson/utils/parsers/native_tool_parser.py` - Current parsing works correctly
+- `chevalier/services/inference_clients.py` - Current streaming accumulation works correctly
+- `chevalier/utils/parsers/native_tool_parser.py` - Current parsing works correctly
 - All existing test files - Maintain 100% backwards compatibility
 
 ## [Functions]
 Minimal function modifications to enable parallel flow.
 
 **Modified functions:**
-- `_call_llm()` in `reson/reson.py` - Remove `return tool_calls[0], None, None` limitation
-- `_call_llm_stream()` in `reson/reson.py` - Ensure all tools flow through streaming
+- `_call_llm()` in `chevalier/chevalier.py` - Remove `return tool_calls[0], None, None` limitation
+- `_call_llm_stream()` in `chevalier/chevalier.py` - Ensure all tools flow through streaming
 
 **No new functions needed:**
 - Existing `execute_tool()` works for each tool

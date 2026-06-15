@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 from pydantic import BaseModel
 
-from reson.reson import agentic, Runtime
+from chevalier.chevalier import agentic, Runtime
 
 
 # =============================================================================

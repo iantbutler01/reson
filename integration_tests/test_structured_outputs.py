@@ -14,8 +14,8 @@ import os
 import pytest
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from reson import Runtime
-from reson.types import Deserializable
+from chevalier import Runtime
+from chevalier.types import Deserializable
 
 
 # ============================================================================

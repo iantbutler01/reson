@@ -6,7 +6,7 @@ import asyncio
 from pydantic import BaseModel
 from typing import Callable
 
-from reson.reson import agentic, Runtime
+from chevalier.chevalier import agentic, Runtime
 
 
 def get_fact(topic: str) -> str:

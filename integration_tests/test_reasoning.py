@@ -1,8 +1,8 @@
 import asyncio
 import pytest
 import os
-from reson import agentic, Runtime
-from reson.stores import MemoryStore
+from chevalier import agentic, Runtime
+from chevalier.stores import MemoryStore
 
 
 @pytest.mark.asyncio

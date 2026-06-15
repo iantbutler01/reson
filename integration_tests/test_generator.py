@@ -9,7 +9,7 @@ import asyncio
 from typing import AsyncGenerator, Dict, Any, List
 from pydantic import BaseModel
 
-from reson.reson import agentic_generator, Runtime
+from chevalier.chevalier import agentic_generator, Runtime
 
 
 class DataItem(BaseModel):

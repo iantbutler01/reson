@@ -1,19 +1,19 @@
-# RFC: MCP Support for Reson
+# RFC: MCP Support for Chevalier
 
-> **Note**: This RFC should be saved to `reson/rfcs/mcp-support.md` after approval
+> **Note**: This RFC should be saved to `chevalier/rfcs/mcp-support.md` after approval
 
 ## Summary
 
-Add MCP (Model Context Protocol) support to reson via a new `reson-mcp` crate that:
+Add MCP (Model Context Protocol) support to chevalier via a new `chevalier-mcp` crate that:
 1. Uses `rmcp` for core MCP protocol (client + server)
 2. Implements **MCP Apps extension (SEP-1865)** in Rust - first Rust implementation
-3. Integrates with reson's Runtime for seamless tool bridging
+3. Integrates with chevalier's Runtime for seamless tool bridging
 
 ## Motivation
 
-MCP is becoming the standard for connecting AI agents to external tools and data. The MCP Apps extension (SEP-1865, Status: Stable 2026-01-26) enables interactive HTML UIs embedded in conversations. Supporting MCP allows reson agents to:
+MCP is becoming the standard for connecting AI agents to external tools and data. The MCP Apps extension (SEP-1865, Status: Stable 2026-01-26) enables interactive HTML UIs embedded in conversations. Supporting MCP allows chevalier agents to:
 - **As Client**: Consume any MCP server (filesystem, databases, GitHub, etc.)
-- **As Server**: Expose reson agents to MCP hosts (Claude Desktop, ChatGPT, VS Code)
+- **As Server**: Expose chevalier agents to MCP hosts (Claude Desktop, ChatGPT, VS Code)
 - **With Apps**: Return interactive UIs from tool calls
 
 ## Completed Work
@@ -78,7 +78,7 @@ The spec requires tools to be pre-associated with UI resources via `_meta.ui.res
 3. Write tests
 4. Build and verify
 
-### Phase 2: Reson Integration (DEFERRED)
+### Phase 2: Chevalier Integration (DEFERRED)
 After all MCP phases complete.
 
 ### Phase 5: Python Bindings (DEFERRED)
@@ -86,7 +86,7 @@ After all MCP phases complete.
 ## Key Files
 
 ```
-reson-mcp/
+mcp/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs
@@ -113,9 +113,9 @@ reson-mcp/
 
 ## Decisions Made
 
-- **Structure**: Sibling directory to reson-rust (like reson-py)
+- **Structure**: Sibling directory to rust (like py)
 - **Priority**: Client-first implementation
-- **License**: Apache-2.0 (consistent with reson)
+- **License**: Apache-2.0 (consistent with chevalier)
 - **Dependency**: Re-export rmcp types, don't vendor
 - **WebSocket**: Implement ourselves using `tokio-tungstenite` (rmcp doesn't provide it)
 - **Server API**: Single `serve(ServerTransport)` method, not individual serve_stdio/serve_http/etc

@@ -1,7 +1,7 @@
 import asyncio
 from typing import List, Dict
 from pydantic import BaseModel
-from reson.reson import agentic, Runtime # Assuming reson.reson is accessible
+from chevalier.chevalier import agentic, Runtime # Assuming chevalier.chevalier is accessible
 
 # 1. Define a Pydantic model for the expected output
 class AnalysisResult(BaseModel):
@@ -70,7 +70,7 @@ async def main():
         print(f"An error occurred: {type(e).__name__} - {e}")
         print(f"--------------------------")
         print("Troubleshooting tips:")
-        print("1. Ensure the 'reson' library is correctly installed and accessible in your PYTHONPATH.")
+        print("1. Ensure the 'chevalier' library is correctly installed and accessible in your PYTHONPATH.")
         print("2. Make sure you have set the OPENROUTER_KEY environment variable if using OpenRouter.")
         print("3. Check your internet connection and that the model 'openrouter:perplexity/pplx-7b-online' is available.")
         print("4. Review the console for any specific error messages from the LLM or parsing stages.")

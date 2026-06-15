@@ -9,7 +9,7 @@ import asyncio
 from typing import List, Callable
 from pydantic import BaseModel
 
-from reson.reson import agentic, Runtime
+from chevalier.chevalier import agentic, Runtime
 
 
 class SearchResult(BaseModel):

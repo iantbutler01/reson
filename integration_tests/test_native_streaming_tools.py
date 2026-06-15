@@ -5,8 +5,8 @@ import asyncio
 import pytest
 import os
 from typing import AsyncGenerator
-from reson import agentic_generator, Runtime
-from reson.types import Deserializable
+from chevalier import agentic_generator, Runtime
+from chevalier.types import Deserializable
 
 
 class CalculationQuery(Deserializable):

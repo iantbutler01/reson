@@ -1,4 +1,4 @@
-# Reson Rust Rewrite - Comprehensive Specification
+# Chevalier Rust Rewrite - Comprehensive Specification
 
 **Version:** 1.0
 **Date:** 2025-10-06
@@ -32,7 +32,7 @@
 
 ## Executive Summary
 
-This document specifies the complete rewrite of the **reson** Python framework (~11K LOC) in Rust. Reson is a production-grade LLM agent framework that provides:
+This document specifies the complete rewrite of the **chevalier** Python framework (~11K LOC) in Rust. Chevalier is a production-grade LLM agent framework that provides:
 
 [THOUGHT we likely can't do decorators in rust right? Im fine with a different approach like moving it all to the runtime 'object' that users can 'instantiate' in whatever but only if we need to, do you think the macro approach will be feasible I like the idea a lot but I don't want to fight super hard to preserve it if its not a great fit break it down for me]
 - **Decorator-based API** for defining agents as async functions
@@ -131,7 +131,7 @@ The Rust rewrite will preserve all functionality while gaining:
 ## Module Structure
 
 ```
-reson/
+chevalier/
 ├── Cargo.toml
 ├── README.md
 ├── MIGRATION_GUIDE.md
@@ -187,7 +187,7 @@ reson/
 │       ├── streaming.rs            # SSE parsing helpers
 │       └── utf8.rs                 # UTF-8 boundary handling
 │
-├── reson-macros/                   # Proc macro crate
+├── chevalier-macros/                   # Proc macro crate
 │   ├── Cargo.toml
 │   └── src/
 │       └── lib.rs                  # #[agentic], #[tool] macros
@@ -1678,7 +1678,7 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #fn_vis async fn #fn_name(#fn_inputs) #fn_output {
             // Initialize runtime
-            let runtime = ::reson_rust::Runtime::builder()
+            let runtime = ::chevalier_agentic::Runtime::builder()
                 .model(#(attrs.model))
                 .store(#(attrs.store))
                 .return_type::<#return_type>()
@@ -1695,7 +1695,7 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // Validate runtime was used
             if !runtime.was_used().await {
-                return Err(::reson_rust::Error::RuntimeNotUsed);
+                return Err(::chevalier_agentic::Error::RuntimeNotUsed);
             }
 
             result
@@ -1723,7 +1723,7 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
     // Generate Tool implementation
     let expanded = quote! {
         #[async_trait]
-        impl ::reson_rust::Tool for #name {
+        impl ::chevalier_agentic::Tool for #name {
             fn tool_name(&self) -> &str {
                 stringify!(#name)
             }
@@ -1737,11 +1737,11 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
                 &self.tool_use_id
             }
 
-            async fn execute(&self, runtime: &::reson_rust::Runtime) -> ::reson_rust::Result<String> {
+            async fn execute(&self, runtime: &::chevalier_agentic::Runtime) -> ::chevalier_agentic::Result<String> {
                 self.execute_impl(runtime).await
             }
 
-            fn schema(&self, generator: &dyn ::reson_rust::SchemaGenerator) -> serde_json::Value {
+            fn schema(&self, generator: &dyn ::chevalier_agentic::SchemaGenerator) -> serde_json::Value {
                 generator.generate_schema::<Self>()
             }
         }
@@ -1760,19 +1760,19 @@ pub fn derive_deserializable(input: TokenStream) -> TokenStream {
     let name = &input.ident;
 
     let expanded = quote! {
-        impl ::reson_rust::Deserializable for #name {
-            fn from_partial(partial: serde_json::Value) -> ::reson_rust::Result<Self> {
+        impl ::chevalier_agentic::Deserializable for #name {
+            fn from_partial(partial: serde_json::Value) -> ::chevalier_agentic::Result<Self> {
                 // Generate partial construction logic
                 // Handle missing fields with defaults
                 Ok(serde_json::from_value(partial)?)
             }
 
-            fn validate_complete(&self) -> ::reson_rust::Result<()> {
+            fn validate_complete(&self) -> ::chevalier_agentic::Result<()> {
                 // Check all required fields are present
                 Ok(())
             }
 
-            fn field_descriptions() -> Vec<::reson_rust::FieldDescription> {
+            fn field_descriptions() -> Vec<::chevalier_agentic::FieldDescription> {
                 // Extract from field doc comments
                 vec![]
             }
@@ -2010,7 +2010,7 @@ syn = { version = "2.0", features = ["full"] }
 ### Basic Usage
 
 ```rust
-use reson_rust::{agentic, Runtime, Deserializable};
+use chevalier_agentic::{agentic, Runtime, Deserializable};
 
 #[derive(Deserializable, Serialize, Deserialize)]
 struct Person {
@@ -2284,7 +2284,7 @@ async fn conversational_agent(message: String, runtime: Runtime) -> Result<Strin
 
 ## Conclusion
 
-This specification provides a comprehensive roadmap for rewriting reson in Rust. The architecture preserves all functionality while leveraging Rust's strengths:
+This specification provides a comprehensive roadmap for rewriting chevalier in Rust. The architecture preserves all functionality while leveraging Rust's strengths:
 
 - **Type safety**: Compile-time guarantees prevent runtime errors
 - **Performance**: Zero-copy parsing, efficient async runtime

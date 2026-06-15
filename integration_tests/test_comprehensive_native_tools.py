@@ -5,10 +5,10 @@ import asyncio
 import pytest
 import os
 from typing import List, Dict, Union
-from reson import agentic, Runtime
-from reson.types import Deserializable
-from reson.stores import MemoryStore
-from reson.services.inference_clients import ChatMessage, ChatRole, ToolResult
+from chevalier import agentic, Runtime
+from chevalier.types import Deserializable
+from chevalier.stores import MemoryStore
+from chevalier.services.inference_clients import ChatMessage, ChatRole, ToolResult
 
 
 class SearchQuery(Deserializable):

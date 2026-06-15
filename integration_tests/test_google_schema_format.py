@@ -12,7 +12,7 @@ from google import genai
 async def test_schema_with_real_client():
     """Test schemas by actually using them with the Google GenAI client."""
 
-    # Use VertexAI setup like in reson project
+    # Use VertexAI setup like in chevalier project
     creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not creds_path:
         print("❌ No GOOGLE_APPLICATION_CREDENTIALS found")
@@ -113,7 +113,7 @@ async def test_schema_with_real_client():
     # Test 3: Our current broken approach - to see exact error
     print("\n🧪 Test 3: What our generator currently produces")
     try:
-        from reson.utils.schema_generators import get_schema_generator
+        from chevalier.utils.schema_generators import get_schema_generator
 
         def dummy_tool(location: str) -> str:
             """Get weather for location."""

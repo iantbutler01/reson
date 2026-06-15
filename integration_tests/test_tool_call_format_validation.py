@@ -5,9 +5,9 @@ import asyncio
 import pytest
 import os
 from typing import AsyncGenerator, List, Dict, Any
-from reson import agentic_generator, Runtime
-from reson.types import Deserializable
-from reson.stores import MemoryStore
+from chevalier import agentic_generator, Runtime
+from chevalier.types import Deserializable
+from chevalier.stores import MemoryStore
 
 
 class SearchQuery(Deserializable):
@@ -615,7 +615,7 @@ async def test_multi_turn_toolresult_conversation():
                     tool_output = await runtime.execute_tool(content)
                     yield f"🎯 Turn {turn_num} tool result: {tool_output}"
 
-                    from reson.types import ToolResult
+                    from chevalier.types import ToolResult
 
                     tool_result_obj = ToolResult.create((content, str(tool_output)))
                     tool_results_created.append(tool_result_obj)
@@ -638,7 +638,7 @@ async def test_multi_turn_toolresult_conversation():
         yield f"   - History length: {len(conversation_history)}"
 
         # Validate all ToolResults
-        from reson.services.inference_clients import ToolResult
+        from chevalier.services.inference_clients import ToolResult
 
         for i, tr in enumerate(tool_results_created):
             yield f"   - Turn {i+1} ToolResult: {type(tr).__name__}"

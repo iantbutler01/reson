@@ -109,9 +109,9 @@ def parse_tool_complete(self, tool_name: str, complete_json: str) -> ParserResul
 - **Pattern consistency**: Uses existing OutputParser interface
 
 ## Implementation Files
-- `reson/reson.py` - Enhanced `Runtime.tool()` method, tool type storage
-- `reson/utils/parsers/native_tool_parser.py` - New NativeToolParser class
-- `reson/utils/parsers/__init__.py` - Export new parser
+- `chevalier/chevalier.py` - Enhanced `Runtime.tool()` method, tool type storage
+- `chevalier/utils/parsers/native_tool_parser.py` - New NativeToolParser class
+- `chevalier/utils/parsers/__init__.py` - Export new parser
 - `integration_tests/test_native_tool_deserializable.py` - Test the feature
 
 ## Test Validation

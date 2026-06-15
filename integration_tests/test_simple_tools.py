@@ -8,7 +8,7 @@ import asyncio
 from pydantic import BaseModel
 from typing import Union, Callable
 
-from reson.reson import agentic, Runtime
+from chevalier.chevalier import agentic, Runtime
 
 
 class CalculationResult(BaseModel):

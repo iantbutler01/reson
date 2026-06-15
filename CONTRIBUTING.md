@@ -1,11 +1,11 @@
-# Contributing to Reson
+# Contributing to Chevalier
 
-Thanks for your interest in contributing to Reson! This document outlines the process for contributing.
+Thanks for your interest in contributing to Chevalier! This document outlines the process for contributing.
 
 ## Getting Started
 
 1. **Fork the repository** and clone your fork
-2. Set up your development environment (see READMEs in `reson-rust/` and `reson-py/`)
+2. Set up your development environment (see READMEs in `rust/` and `py/`)
 3. Create a feature branch from `main`
 
 ## Requirements for Contributions
@@ -30,12 +30,12 @@ export GOOGLE_GEMINI_API_KEY=your_key
 export OPENROUTER_API_KEY=your_key
 
 # Python integration tests
-cd reson
+cd chevalier
 source .venv/bin/activate
 pytest integration_tests/ -v
 
 # Rust tests
-cd reson-rust
+cd rust
 cargo test --features full
 ```
 
@@ -44,7 +44,7 @@ cargo test --features full
 All code must pass linting and be properly formatted before it can be merged:
 
 ```bash
-cd reson-rust
+cd rust
 
 # Rust - clippy with warnings as errors
 cargo clippy --all-features -- -D warnings
@@ -71,7 +71,7 @@ cargo fmt --all -- --check
 
 ## A Note on Direction
 
-PRs are welcome and appreciated! That said, if a contribution doesn't align with the project's direction, it doesn't mean the work isn't valued - it's just a matter of fit. Reson has a specific vision (agents as functions, minimal abstractions, native provider APIs), and contributions should move in that direction.
+PRs are welcome and appreciated! That said, if a contribution doesn't align with the project's direction, it doesn't mean the work isn't valued - it's just a matter of fit. Chevalier has a specific vision (agents as functions, minimal abstractions, native provider APIs), and contributions should move in that direction.
 
 If you're unsure whether something aligns, feel free to open an issue first to discuss.
 

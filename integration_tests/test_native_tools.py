@@ -2,10 +2,10 @@
 
 import pytest
 from typing import Dict
-from reson import agentic, Runtime
-from reson.types import Deserializable
-from reson.utils.schema_generators import supports_native_tools
-from reson.stores import MemoryStore
+from chevalier import agentic, Runtime
+from chevalier.types import Deserializable
+from chevalier.utils.schema_generators import supports_native_tools
+from chevalier.stores import MemoryStore
 
 
 class Calculator(Deserializable):
@@ -90,7 +90,7 @@ class TestNativeToolsIntegration:
 
     def test_schema_generation_integration(self):
         """Test that schema generation works with registered tools."""
-        from reson.reson import _generate_native_tool_schemas
+        from chevalier.chevalier import _generate_native_tool_schemas
 
         tools = {"calculate": calculate, "simple_greeting": simple_greeting}
 

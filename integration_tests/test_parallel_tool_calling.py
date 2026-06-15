@@ -6,9 +6,9 @@ import os
 import pytest
 from typing import AsyncGenerator, List, Dict
 from dataclasses import dataclass
-from reson import agentic, agentic_generator, Runtime
-from reson.types import Deserializable
-from reson.stores import MemoryStore
+from chevalier import agentic, agentic_generator, Runtime
+from chevalier.types import Deserializable
+from chevalier.stores import MemoryStore
 from pydantic import BaseModel
 
 
