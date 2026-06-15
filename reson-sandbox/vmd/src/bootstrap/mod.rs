@@ -173,6 +173,7 @@ After=network.target
 Type=simple
 Environment=RUST_LOG=trace
 EnvironmentFile=-/etc/reson/portproxy.env
+ExecStartPre=/usr/local/sbin/reson-apply-tap-network.sh
 ExecStartPre=/bin/sh -c 'echo "portproxy.service preflight: $(date -Iseconds) starting /usr/sbin/portproxy --server"'
 ExecStart=/usr/sbin/portproxy --server
 Restart=on-failure
@@ -450,7 +451,15 @@ log "bootstrap init complete"
 
 fn build_network_setup_script(network: Option<&NetworkConfig>) -> String {
     let Some(network) = network else {
-        return r#"log "managed tap network disabled""#.to_string();
+        return r#"log "managed tap network disabled"
+mkdir -p /usr/local/sbin
+cat <<'EOF' >/usr/local/sbin/reson-apply-tap-network.sh
+#!/bin/bash
+set -euo pipefail
+exit 0
+EOF
+chmod 0755 /usr/local/sbin/reson-apply-tap-network.sh"#
+            .to_string();
     };
     let mac = shell_escape(&network.mac_address.to_ascii_lowercase());
     let address_cidr = shell_escape(&network.address_cidr);
@@ -492,6 +501,69 @@ TAP_DNS=$TAP_DNS
 EOF
 chmod 0644 /etc/reson/tap-network.env
 
+cat <<'EOF' >/usr/local/sbin/reson-apply-tap-network.sh
+#!/bin/bash
+set -euo pipefail
+
+CONFIG=/etc/reson/tap-network.env
+if [ ! -s "$CONFIG" ]; then
+  exit 0
+fi
+
+set -a
+. "$CONFIG"
+set +a
+
+log() {{
+  if command -v systemd-cat >/dev/null 2>&1; then
+    printf 'reson-tap-network: %s %s\n' "$(date -Iseconds)" "$*" | systemd-cat -t reson-tap-network || true
+  else
+    printf 'reson-tap-network: %s %s\n' "$(date -Iseconds)" "$*" || true
+  fi
+}}
+
+if command -v sysctl >/dev/null 2>&1; then
+  sysctl -w net.ipv6.conf.all.disable_ipv6=1 || true
+  sysctl -w net.ipv6.conf.default.disable_ipv6=1 || true
+fi
+
+TAP_IFACE_VALUE="${{TAP_IFACE:-}}"
+if ip link show reson0 >/dev/null 2>&1; then
+  TAP_IFACE_VALUE=reson0
+fi
+if [ -z "$TAP_IFACE_VALUE" ] || ! ip link show "$TAP_IFACE_VALUE" >/dev/null 2>&1; then
+  TAP_IFACE_VALUE=""
+  for path in /sys/class/net/*; do
+    [ -e "$path/address" ] || continue
+    if [ "$(tr '[:upper:]' '[:lower:]' < "$path/address")" = "$TAP_MAC" ]; then
+      TAP_IFACE_VALUE="$(basename "$path")"
+      break
+    fi
+  done
+fi
+if [ -z "$TAP_IFACE_VALUE" ]; then
+  log "managed tap interface not found for mac=$TAP_MAC"
+  ip link || true
+  exit 55
+fi
+
+ip link set "$TAP_IFACE_VALUE" up || true
+ip -4 addr flush dev "$TAP_IFACE_VALUE" || true
+ip addr add "$TAP_ADDRESS_CIDR" dev "$TAP_IFACE_VALUE"
+ip route replace default via "$TAP_GATEWAY" dev "$TAP_IFACE_VALUE"
+printf 'nameserver %s\noptions edns0 trust-ad\n' "$TAP_DNS" >/etc/resolv.conf || true
+cat <<ENV >/etc/reson/tap-network.env
+TAP_IFACE=$TAP_IFACE_VALUE
+TAP_MAC=$TAP_MAC
+TAP_ADDRESS_CIDR=$TAP_ADDRESS_CIDR
+TAP_GATEWAY=$TAP_GATEWAY
+TAP_DNS=$TAP_DNS
+ENV
+chmod 0644 /etc/reson/tap-network.env
+log "configured iface=$TAP_IFACE_VALUE address=$TAP_ADDRESS_CIDR gateway=$TAP_GATEWAY"
+EOF
+chmod 0755 /usr/local/sbin/reson-apply-tap-network.sh
+
 if command -v netplan >/dev/null 2>&1; then
   mkdir -p /etc/netplan
   mkdir -p /etc/reson/disabled-netplan
@@ -529,14 +601,7 @@ EOF
   netplan apply || true
 fi
 
-if ip link show reson0 >/dev/null 2>&1; then
-  TAP_IFACE=reson0
-fi
-ip link set "$TAP_IFACE" up || true
-ip addr flush dev "$TAP_IFACE" || true
-ip addr add "$TAP_ADDRESS_CIDR" dev "$TAP_IFACE"
-ip route replace default via "$TAP_GATEWAY" dev "$TAP_IFACE"
-printf 'nameserver %s\noptions edns0 trust-ad\n' "$TAP_DNS" >/etc/resolv.conf || true"#
+/usr/local/sbin/reson-apply-tap-network.sh"#
     )
 }
 
@@ -1164,6 +1229,19 @@ mod tests {
         assert!(script.contains("net.ipv6.conf.all.disable_ipv6=1"));
         assert!(script.contains("disabling inherited netplan config"));
         assert!(script.contains("chmod 0600 /etc/netplan/90-reson-tap.yaml"));
+        assert!(script.contains("ExecStartPre=/usr/local/sbin/reson-apply-tap-network.sh"));
+        assert!(script.contains("cat <<'EOF' >/usr/local/sbin/reson-apply-tap-network.sh"));
+        assert!(script.contains("ip -4 addr flush dev \"$TAP_IFACE_VALUE\""));
+        assert!(script.contains("log \"configured iface=$TAP_IFACE_VALUE"));
+    }
+
+    #[test]
+    fn init_script_installs_noop_tap_repair_when_network_absent() {
+        let script = build_init_script("vm-test", None, None, None);
+        assert!(script.contains("log \"managed tap network disabled\""));
+        assert!(script.contains("ExecStartPre=/usr/local/sbin/reson-apply-tap-network.sh"));
+        assert!(script.contains("cat <<'EOF' >/usr/local/sbin/reson-apply-tap-network.sh"));
+        assert!(script.contains("exit 0"));
     }
 
     #[test]

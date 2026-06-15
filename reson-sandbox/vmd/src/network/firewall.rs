@@ -333,6 +333,29 @@ pub fn install(config: &Config) -> Result<FirewallHandle> {
     })
 }
 
+pub fn qemu_firewall_ready(config: &Config) -> Result<bool> {
+    if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 {
+        return Ok(true);
+    }
+    if !chain_exists()? || !account_chain_exists()? {
+        return Ok(false);
+    }
+    if guest_dns_redirect_addr(config).is_some() && !dns_redirect_chain_exists()? {
+        return Ok(false);
+    }
+    if !output_jump_exists(config.qemu_process.run_as_uid)?
+        || !account_output_jump_exists(config.qemu_process.run_as_uid)?
+    {
+        return Ok(false);
+    }
+    if guest_dns_redirect_addr(config).is_some()
+        && !dns_redirect_output_jump_exists(config.qemu_process.run_as_uid)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 impl ServiceProcessFirewallHandle {
     pub fn shutdown(self) {
         if let Err(err) = remove_service_private_egress_rules(
@@ -376,25 +399,38 @@ impl PreparedServiceCgroup {
 }
 
 pub fn prepare_service_process_cgroup(service: &str) -> Result<Option<PreparedServiceCgroup>> {
+    prepare_process_cgroup(service, "reson-services", service)
+}
+
+pub fn prepare_vm_process_cgroup(vm_id: &str) -> Result<Option<PreparedServiceCgroup>> {
+    prepare_process_cgroup(vm_id, "reson-vms", vm_id)
+}
+
+fn prepare_process_cgroup(
+    label: &str,
+    namespace: &str,
+    component: &str,
+) -> Result<Option<PreparedServiceCgroup>> {
     if !cfg!(target_os = "linux") || unsafe { libc::geteuid() } != 0 {
         return Ok(None);
     }
     let parent = cgroup_path_for_pid_allow_root(std::process::id())
-        .context("service process cgroup requires vmd cgroup path")?;
-    let service_component = sanitize_cgroup_component(service);
+        .context("child process cgroup requires vmd cgroup path")?;
+    let namespace = sanitize_cgroup_component(namespace);
+    let process_component = sanitize_cgroup_component(component);
     let suffix = unique_cgroup_suffix();
     let cgroup_path = join_cgroup_paths(
         &parent,
-        &format!("reson-services/{service_component}-{suffix}"),
+        &format!("{namespace}/{process_component}-{suffix}"),
     );
     let cgroup_dir = cgroup_fs_path(&cgroup_path)?;
     fs::create_dir_all(&cgroup_dir)
-        .with_context(|| format!("create service cgroup {}", cgroup_dir.display()))?;
+        .with_context(|| format!("create child process cgroup {}", cgroup_dir.display()))?;
     let cgroup_procs_path = cgroup_dir.join("cgroup.procs");
     fs::metadata(&cgroup_procs_path)
-        .with_context(|| format!("stat service cgroup.procs {}", cgroup_procs_path.display()))?;
+        .with_context(|| format!("stat child cgroup.procs {}", cgroup_procs_path.display()))?;
     Ok(Some(PreparedServiceCgroup {
-        service: service.to_string(),
+        service: label.to_string(),
         cgroup_path,
         cgroup_dir,
         cgroup_procs_path,
@@ -1146,6 +1182,26 @@ fn ensure_output_jump(qemu_uid: u32) -> Result<()> {
     .context("install qemu firewall OUTPUT jump")
 }
 
+fn output_jump_exists(qemu_uid: u32) -> Result<bool> {
+    let uid = qemu_uid.to_string();
+    let status = Command::new("iptables")
+        .args([
+            "-t",
+            FILTER_TABLE,
+            "-C",
+            "OUTPUT",
+            "-m",
+            "owner",
+            "--uid-owner",
+            uid.as_str(),
+            "-j",
+            CHAIN_NAME,
+        ])
+        .status()
+        .context("check qemu firewall OUTPUT jump")?;
+    Ok(status.success())
+}
+
 fn ensure_account_output_jump(qemu_uid: u32) -> Result<()> {
     let uid = qemu_uid.to_string();
     let check_args = [
@@ -1183,6 +1239,26 @@ fn ensure_account_output_jump(qemu_uid: u32) -> Result<()> {
         ACCOUNT_CHAIN_NAME,
     ])
     .context("install qemu accounting OUTPUT jump")
+}
+
+fn account_output_jump_exists(qemu_uid: u32) -> Result<bool> {
+    let uid = qemu_uid.to_string();
+    let status = Command::new("iptables")
+        .args([
+            "-t",
+            FILTER_TABLE,
+            "-C",
+            "OUTPUT",
+            "-m",
+            "owner",
+            "--uid-owner",
+            uid.as_str(),
+            "-j",
+            ACCOUNT_CHAIN_NAME,
+        ])
+        .status()
+        .context("check qemu accounting OUTPUT jump")?;
+    Ok(status.success())
 }
 
 fn ensure_dns_redirect_output_jump(qemu_uid: u32) -> Result<()> {
@@ -1232,6 +1308,35 @@ fn ensure_dns_redirect_output_jump(qemu_uid: u32) -> Result<()> {
         .with_context(|| format!("install qemu dns redirect OUTPUT jump for {protocol}"))?;
     }
     Ok(())
+}
+
+fn dns_redirect_output_jump_exists(qemu_uid: u32) -> Result<bool> {
+    let uid = qemu_uid.to_string();
+    for protocol in ["udp", "tcp"] {
+        let status = Command::new("iptables")
+            .args([
+                "-t",
+                NAT_TABLE,
+                "-C",
+                "OUTPUT",
+                "-m",
+                "owner",
+                "--uid-owner",
+                uid.as_str(),
+                "-p",
+                protocol,
+                "--dport",
+                "53",
+                "-j",
+                DNS_REDIRECT_CHAIN_NAME,
+            ])
+            .status()
+            .with_context(|| format!("check qemu dns redirect OUTPUT jump for {protocol}"))?;
+        if !status.success() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn remove_output_jump(qemu_uid: u32) -> Result<()> {

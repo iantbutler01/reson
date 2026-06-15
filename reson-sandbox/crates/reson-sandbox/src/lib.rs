@@ -321,6 +321,7 @@ pub struct ExecOptions {
     pub timeout_secs: Option<i32>,
     pub detach: bool,
     pub shell: Option<String>,
+    pub close_stdin_on_start: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -668,7 +669,7 @@ struct SandboxInner {
     control_backend: ControlBackend,
     auth_header: Option<MetadataValue<Ascii>>,
     managed_daemon: Mutex<Option<ManagedDaemon>>,
-    ready_vm_rpc: Mutex<HashMap<String, i32>>,
+    ready_vm_rpc: Mutex<HashMap<String, GuestRpcAccess>>,
     node_multiplexers: Mutex<HashMap<String, Arc<NodePortMultiplexer>>>,
     warm_pool_ready: Mutex<HashSet<String>>,
 }
@@ -885,6 +886,11 @@ impl Session {
                 .map_err(|_| {
                     SandboxError::InvalidResponse("failed to enqueue exec start".into())
                 })?;
+            let close_stdin_on_start = opts.close_stdin_on_start;
+            let mut req_tx_for_stdin = Some(req_tx);
+            if close_stdin_on_start {
+                drop(req_tx_for_stdin.take());
+            }
 
             let exec_result = tokio::time::timeout(
                 self.sandbox.inner.cfg.connect_timeout,
@@ -933,42 +939,64 @@ impl Session {
             let (input_tx, mut input_rx) = mpsc::channel(64);
             let (event_tx, event_rx) = mpsc::channel(128);
 
-            let req_tx_for_input = req_tx.clone();
             let event_tx_input = event_tx.clone();
-            tokio::spawn(async move {
-                let req_tx = req_tx_for_input;
-                while let Some(input) = input_rx.recv().await {
-                    match input {
-                        ExecInput::Data(data) => {
-                            if req_tx
-                                .send(ExecRequest {
-                                    request: Some(exec_request::Request::StdinData(data)),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
+            if let Some(req_tx) = req_tx_for_stdin {
+                tokio::spawn(async move {
+                    while let Some(input) = input_rx.recv().await {
+                        match input {
+                            ExecInput::Data(data) => {
+                                if req_tx
+                                    .send(ExecRequest {
+                                        request: Some(exec_request::Request::StdinData(data)),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            ExecInput::Eof => break,
+                            ExecInput::Signal(sig) => {
+                                let _ = event_tx_input
+                                    .send(Err(SandboxError::Unsupported(format!(
+                                        "exec signal forwarding not supported by portproxy API: {sig}"
+                                    ))))
+                                    .await;
+                            }
+                            ExecInput::Resize { cols, rows } => {
+                                let _ = event_tx_input
+                                    .send(Err(SandboxError::Unsupported(format!(
+                                        "exec resize not supported by portproxy API: {cols}x{rows}"
+                                    ))))
+                                    .await;
                             }
                         }
-                        ExecInput::Eof => break,
-                        ExecInput::Signal(sig) => {
-                            let _ = event_tx_input
-                                .send(Err(SandboxError::Unsupported(format!(
-                                    "exec signal forwarding not supported by portproxy API: {sig}"
-                                ))))
-                                .await;
-                        }
-                        ExecInput::Resize { cols, rows } => {
-                            let _ = event_tx_input
-                                .send(Err(SandboxError::Unsupported(format!(
-                                    "exec resize not supported by portproxy API: {cols}x{rows}"
-                                ))))
-                                .await;
+                    }
+                    drop(req_tx);
+                });
+            } else {
+                tokio::spawn(async move {
+                    while let Some(input) = input_rx.recv().await {
+                        match input {
+                            ExecInput::Data(_) | ExecInput::Eof => {}
+                            ExecInput::Signal(sig) => {
+                                let _ = event_tx_input
+                                    .send(Err(SandboxError::Unsupported(format!(
+                                        "exec signal forwarding not supported by portproxy API: {sig}"
+                                    ))))
+                                    .await;
+                            }
+                            ExecInput::Resize { cols, rows } => {
+                                let _ = event_tx_input
+                                    .send(Err(SandboxError::Unsupported(format!(
+                                        "exec resize not supported by portproxy API: {cols}x{rows}"
+                                    ))))
+                                    .await;
+                            }
                         }
                     }
-                }
-                drop(req_tx);
-            });
+                });
+            }
 
             let event_tx_stream = event_tx.clone();
             tokio::spawn(async move {
@@ -2378,6 +2406,27 @@ impl Sandbox {
         Ok(session)
     }
 
+    pub async fn find_vm_by_id_including_endpoint(
+        &self,
+        vm_id: &str,
+        endpoint: &str,
+    ) -> Result<Option<(Vm, String)>> {
+        let mut endpoints = self.candidate_endpoints().await?;
+        if !endpoint.trim().is_empty() {
+            endpoints.push(normalize_endpoint(endpoint)?);
+        }
+        endpoints.sort();
+        endpoints.dedup();
+
+        for endpoint in endpoints {
+            if let Some(vm) = self.find_vm_by_id_on_endpoint(vm_id, &endpoint).await? {
+                return Ok(Some((vm, endpoint)));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub async fn discard_session_by_id(&self, session_id: &str) -> Result<()> {
         let expected_fence = self.current_session_fence(session_id).await?;
         if let Some((vm, node_endpoint)) = self.find_vm_by_session_id(session_id).await? {
@@ -3015,6 +3064,14 @@ impl Sandbox {
         endpoint: &str,
         expected_fence: Option<&str>,
     ) -> Result<(String, GuestRpcAccess, Option<String>)> {
+        let normalized_endpoint = normalize_endpoint(endpoint)?;
+        if let Some(access) = self
+            .cached_guest_rpc_access(vm_id, &normalized_endpoint)
+            .await
+        {
+            return Ok((normalized_endpoint, access, None));
+        }
+
         let (resolved_endpoint, next_fence) = self
             .resolve_session_endpoint(session_id, vm_id, endpoint, expected_fence)
             .await?;
@@ -3554,6 +3611,10 @@ impl Sandbox {
         vm_id: &str,
         endpoint: &str,
     ) -> Result<GuestRpcAccess> {
+        if let Some(access) = self.cached_guest_rpc_access(vm_id, endpoint).await {
+            return Ok(access);
+        }
+
         let mut vm = self.ensure_vm_running(vm_id, endpoint).await?;
         let mut access = self.guest_rpc_access_from_vm(&vm, endpoint)?;
 
@@ -3588,6 +3649,12 @@ impl Sandbox {
         })
     }
 
+    async fn cached_guest_rpc_access(&self, vm_id: &str, endpoint: &str) -> Option<GuestRpcAccess> {
+        let cache_key = ready_key(endpoint, vm_id);
+        let ready = self.inner.ready_vm_rpc.lock().await;
+        ready.get(&cache_key).cloned()
+    }
+
     async fn ensure_portproxy_ready(
         &self,
         vm_id: &str,
@@ -3597,22 +3664,15 @@ impl Sandbox {
         let cache_key = ready_key(endpoint, vm_id);
         let cached_ready = {
             let ready = self.inner.ready_vm_rpc.lock().await;
-            ready.get(&cache_key).copied() == Some(access.rpc_port)
+            ready
+                .get(&cache_key)
+                .map(|cached| {
+                    cached.rpc_port == access.rpc_port && cached.endpoint == access.endpoint
+                })
+                .unwrap_or(false)
         };
         if cached_ready {
-            // @dive: Cached readiness must be validated with a full probe RPC so broken streams after failover don't loop on stale cache.
-            if probe_shell_exec_ready(
-                access.endpoint.as_str(),
-                self.inner.cfg.connect_timeout,
-                access.auth_header.as_ref(),
-            )
-            .await
-            {
-                return Ok(());
-            }
-            // @dive: Guest RPC readiness cache is invalidated on failed full probe so failover/rebind logic can recover.
-            let mut ready = self.inner.ready_vm_rpc.lock().await;
-            ready.remove(&cache_key);
+            return Ok(());
         }
 
         let start = Instant::now();
@@ -3633,7 +3693,7 @@ impl Sandbox {
                 }
 
                 let mut ready = self.inner.ready_vm_rpc.lock().await;
-                ready.insert(cache_key.clone(), access.rpc_port);
+                ready.insert(cache_key.clone(), access.clone());
                 return Ok(());
             }
             consecutive_successes = 0;

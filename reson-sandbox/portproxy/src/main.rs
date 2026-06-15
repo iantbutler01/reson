@@ -242,9 +242,9 @@ async fn reap_zombies(tracker: ChildTracker) {
 fn reap_available_children(tracker: &ChildTracker) {
     use nix::errno::Errno;
 
-    loop {
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => break,
+    for tracked_pid in tracker.snapshot() {
+        match waitpid(Pid::from_raw(tracked_pid), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => continue,
             Ok(WaitStatus::Exited(pid, status)) => {
                 if tracker.record_exit(pid.as_raw(), ChildExit::Exited(status)) {
                     info!("Reaped tracked pid {} with status {}", pid, status);
@@ -260,10 +260,10 @@ fn reap_available_children(tracker: &ChildTracker) {
                 }
             }
             Ok(_) => continue,
-            Err(Errno::ECHILD) => break,
+            Err(Errno::ECHILD) => continue,
             Err(err) => {
                 warn!("waitpid failed: {}", err);
-                break;
+                continue;
             }
         }
     }

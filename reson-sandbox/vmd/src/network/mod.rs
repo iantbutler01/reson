@@ -7,6 +7,7 @@ pub mod tap;
 mod vm_counters;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -25,6 +26,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
+pub(crate) use firewall::PreparedServiceCgroup as ProcessCgroup;
 use vm_counters::{VmCounters, VmProxyLimitSnapshot};
 pub use vm_counters::{VmProxyAccessEvent, VmProxyActivitySnapshot};
 
@@ -188,10 +190,7 @@ pub async fn start(config: &Config) -> Result<Option<NetworkServicesHandle>> {
         .get_or_init(|| Arc::new(tokio::sync::Mutex::new(None)))
         .clone();
     let mut guard = controller.lock().await;
-    let access_log_path = Path::new(&config.data_dir)
-        .join("_network")
-        .join("envoy")
-        .join("access.log");
+    let access_log_path = envoy_runtime_paths(config).access_log_path;
     *guard = Some(NetworkController {
         config: config.clone(),
         firewall,
@@ -224,7 +223,7 @@ async fn start_coredns(config: &Config) -> Result<ManagedProcessHandle> {
             )
         })?;
 
-    let work_dir = Path::new(&config.data_dir).join("_network").join("coredns");
+    let work_dir = network_service_work_dir(config).join("coredns");
     tokio::fs::create_dir_all(&work_dir)
         .await
         .with_context(|| format!("create coredns work dir {}", work_dir.display()))?;
@@ -438,7 +437,10 @@ async fn start_envoy(
 }
 
 #[cfg(target_os = "linux")]
-fn configure_child_cgroup(command: &mut Command, cgroup_procs_path: &Path) -> Result<()> {
+pub(crate) fn configure_child_cgroup(
+    command: &mut Command,
+    cgroup_procs_path: &Path,
+) -> Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -503,7 +505,10 @@ fn encode_pid_line(mut pid: u64, buf: &mut [u8; 32]) -> usize {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn configure_child_cgroup(_command: &mut Command, _cgroup_procs_path: &Path) -> Result<()> {
+pub(crate) fn configure_child_cgroup(
+    _command: &mut Command,
+    _cgroup_procs_path: &Path,
+) -> Result<()> {
     Ok(())
 }
 
@@ -604,12 +609,66 @@ fn envoy_runtime_config(
 }
 
 fn envoy_runtime_paths(config: &Config) -> EnvoyRuntimePaths {
-    let work_dir = Path::new(&config.data_dir).join("_network").join("envoy");
+    let work_dir = network_service_work_dir(config).join("envoy");
     EnvoyRuntimePaths {
         config_path: work_dir.join("envoy.json"),
         access_log_path: work_dir.join("access.log"),
         process_log_path: work_dir.join("process.log"),
         work_dir,
+    }
+}
+
+fn network_service_work_dir(config: &Config) -> PathBuf {
+    if config.ha_mode {
+        return network_runtime_root()
+            .join("_network")
+            .join(network_runtime_component(config));
+    }
+    Path::new(&config.data_dir).join("_network")
+}
+
+fn network_runtime_root() -> PathBuf {
+    env::var("RESON_SANDBOX_RUNTIME_DIR")
+        .or_else(|_| env::var("BRACKET_SANDBOX_RUNTIME_DIR"))
+        .map(|raw| raw.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/reson-vmd"))
+}
+
+fn network_runtime_component(config: &Config) -> String {
+    let raw = config
+        .node_registry
+        .as_ref()
+        .map(|registry| registry.node_id.as_str())
+        .or_else(|| {
+            config
+                .control_bus
+                .as_ref()
+                .map(|control| control.node_id.as_str())
+        })
+        .unwrap_or(config.listen_address.as_str());
+    sanitize_network_runtime_component(raw)
+}
+
+fn sanitize_network_runtime_component(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                Some(ch)
+            } else {
+                Some('_')
+            }
+        })
+        .collect();
+    out.truncate(96);
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "vmd".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1136,9 +1195,14 @@ pub async fn register_vm_proxy_policy(
             byte_deltas: VecDeque::new(),
         });
     if !listen_addr.ip().is_unspecified() {
+        ensure_qemu_firewall_ready_locked(state)?;
         firewall::allow_proxy_listener(listen_addr)?;
     }
     Ok(())
+}
+
+pub(crate) fn prepare_vm_process_cgroup(vm_id: &str) -> Result<Option<ProcessCgroup>> {
+    firewall::prepare_vm_process_cgroup(vm_id)
 }
 
 pub async fn register_vm_process(vm_id: &str, pid: u32) -> Result<()> {
@@ -1157,6 +1221,7 @@ pub async fn register_vm_process(vm_id: &str, pid: u32) -> Result<()> {
     {
         bail!("network guardrails are required in ha mode but qemu firewall is not installed");
     }
+    ensure_qemu_firewall_ready_locked(state)?;
     let cgroup_path = firewall::cgroup_path_for_pid(pid);
     if state.config.ha_mode && cgroup_path.is_none() {
         bail!("network guardrails are required in ha mode but qemu cgroup path is unavailable");
@@ -1191,6 +1256,44 @@ pub async fn register_vm_process(vm_id: &str, pid: u32) -> Result<()> {
     }
     entry.cgroup_path = cgroup_path;
     firewall::install_vm_counter_rules(vm_id, pid, entry.cgroup_path.as_deref())?;
+    Ok(())
+}
+
+fn ensure_qemu_firewall_ready_locked(state: &mut NetworkController) -> Result<()> {
+    if !state
+        .firewall
+        .as_ref()
+        .is_some_and(firewall::FirewallHandle::is_installed)
+    {
+        return Ok(());
+    }
+    if firewall::qemu_firewall_ready(&state.config)? {
+        return Ok(());
+    }
+
+    warn!("qemu firewall chains are missing or detached; reinstalling daemon firewall rules");
+    state.firewall = Some(firewall::install(&state.config).context("repair qemu guest firewall")?);
+    for listener in state.vm_proxy_policies.values() {
+        if !listener.listen_addr.ip().is_unspecified() {
+            firewall::allow_proxy_listener(listener.listen_addr)?;
+        }
+    }
+    let now = Utc::now();
+    for (vm_id, guardrail) in &mut state.vm_guardrails {
+        let Some(pid) = guardrail.pid else {
+            continue;
+        };
+        firewall::install_vm_counter_rules(vm_id, pid, guardrail.cgroup_path.as_deref())?;
+        if guardrail
+            .blocked_until
+            .as_ref()
+            .is_some_and(|blocked_until| *blocked_until > now)
+        {
+            firewall::block_vm_process(vm_id, pid, guardrail.cgroup_path.as_deref())?;
+        } else {
+            guardrail.blocked_until = None;
+        }
+    }
     Ok(())
 }
 
@@ -1363,6 +1466,22 @@ mod tests {
         config.guest_network.dns_server = None;
         config.guest_network.http_proxy_upstream_addr = Some("127.0.0.1:3128".to_string());
         assert!(needs_coredns(&config));
+    }
+
+    #[test]
+    fn ha_network_runtime_paths_are_node_local_not_shared_data() {
+        let mut config = Config::default();
+        config.ha_mode = true;
+        config.listen_address = "0.0.0.0:8052".to_string();
+        config.data_dir = "/mnt/shared/reson-vmd".to_string();
+        config.node_registry = None;
+        config.control_bus = None;
+
+        let paths = envoy_runtime_paths(&config);
+
+        assert!(!paths.work_dir.starts_with(&config.data_dir));
+        assert!(paths.work_dir.ends_with("envoy"));
+        assert!(paths.work_dir.to_string_lossy().contains("0.0.0.0_8052"));
     }
 
     #[test]

@@ -2069,9 +2069,61 @@ impl Manager {
         cmd.args(&args);
         cmd.current_dir(&vm_dir);
         cmd.stdin(std::process::Stdio::null());
+        let mut qemu_cgroup = if cfg.ha_mode {
+            match network::prepare_vm_process_cgroup(id) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    if let Some(handle) = tap_network_handle.take() {
+                        handle.shutdown().await;
+                    }
+                    if vm_proxy_upstream_addr.is_some() {
+                        let _ = network::unregister_vm_proxy_policy(id).await;
+                    }
+                    for handle in &virtiofsd_handles {
+                        virt::terminate_virtiofsd(handle);
+                    }
+                    for handle in &fuse_handles {
+                        let _ = fuse::unmount_fuse(handle).await;
+                    }
+                    mark_vm_state(&vm, VmState::Error).await;
+                    return Err(ManagerError::Other(err));
+                }
+            }
+        } else {
+            None
+        };
+        if qemu_cgroup.is_some() {
+            let cgroup_procs_path = qemu_cgroup
+                .as_ref()
+                .expect("checked qemu cgroup presence")
+                .cgroup_procs_path()
+                .to_path_buf();
+            if let Err(err) = network::configure_child_cgroup(&mut cmd, &cgroup_procs_path) {
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
+                mark_vm_state(&vm, VmState::Error).await;
+                return Err(ManagerError::Other(err));
+            }
+        }
         if let Err(err) =
             configure_qemu_process_identity(&mut cmd, vm_dir.as_path(), runtime_dir.as_path(), &cfg)
         {
+            if let Some(cgroup) = qemu_cgroup.take() {
+                cgroup.cleanup();
+            }
             if let Some(handle) = tap_network_handle.take() {
                 handle.shutdown().await;
             }
@@ -2096,6 +2148,9 @@ impl Manager {
         {
             Ok(file) => file,
             Err(err) => {
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
                 if let Some(handle) = tap_network_handle.take() {
                     handle.shutdown().await;
                 }
@@ -2118,6 +2173,9 @@ impl Manager {
         {
             Ok(file) => file,
             Err(err) => {
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
                 if let Some(handle) = tap_network_handle.take() {
                     handle.shutdown().await;
                 }
@@ -2144,6 +2202,9 @@ impl Manager {
         {
             Ok(child) => child,
             Err(err) => {
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
                 if let Some(handle) = tap_network_handle.take() {
                     handle.shutdown().await;
                 }
@@ -2177,13 +2238,17 @@ impl Manager {
                     for handle in &fuse_handles {
                         let _ = fuse::unmount_fuse(handle).await;
                     }
-                    return Err(abort_launch(vm.clone(), child, &log_path, err).await);
+                    let err = abort_launch(vm.clone(), child, &log_path, err).await;
+                    if let Some(cgroup) = qemu_cgroup.take() {
+                        cgroup.cleanup();
+                    }
+                    return Err(err);
                 }
             };
         let booting_from_incoming = !meta_snapshot.boot_incoming_ram_path.is_empty();
         if booting_from_incoming {
             let ram_format = boot_incoming_ram_format(&meta_snapshot);
-            virt::start_incoming_migration_from_file(
+            if let Err(err) = virt::start_incoming_migration_from_file(
                 &monitor,
                 Path::new(&meta_snapshot.boot_incoming_ram_path),
                 ram_format,
@@ -2195,8 +2260,25 @@ impl Manager {
                     "start incoming VM restore from {}",
                     meta_snapshot.boot_incoming_ram_path
                 )
-            })
-            .map_err(ManagerError::Other)?;
+            }) {
+                if let Some(handle) = tap_network_handle.take() {
+                    handle.shutdown().await;
+                }
+                if vm_proxy_upstream_addr.is_some() {
+                    let _ = network::unregister_vm_proxy_policy(id).await;
+                }
+                for handle in &virtiofsd_handles {
+                    virt::terminate_virtiofsd(handle);
+                }
+                for handle in &fuse_handles {
+                    let _ = fuse::unmount_fuse(handle).await;
+                }
+                let err = abort_launch(vm.clone(), child, &log_path, err).await;
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
+                return Err(err);
+            }
         }
         // Cooled/restarted VMs can spend longer in QMP pre-running states while
         // restoring disk/memory and reconnecting shared mounts. When booting from a
@@ -2226,7 +2308,11 @@ impl Manager {
             for handle in &fuse_handles {
                 let _ = fuse::unmount_fuse(handle).await;
             }
-            return Err(abort_launch(vm.clone(), child, &log_path, err).await);
+            let err = abort_launch(vm.clone(), child, &log_path, err).await;
+            if let Some(cgroup) = qemu_cgroup.take() {
+                cgroup.cleanup();
+            }
+            return Err(err);
         }
 
         let child_pid = child.id();
@@ -2272,6 +2358,9 @@ impl Manager {
                     if cfg.ha_mode {
                         let _ = child.start_kill();
                         let _ = child.wait().await;
+                        if let Some(cgroup) = qemu_cgroup.take() {
+                            cgroup.cleanup();
+                        }
                         if let Some(handle) = tap_network_handle.take() {
                             handle.shutdown().await;
                         }
@@ -2290,6 +2379,9 @@ impl Manager {
             None if cfg.ha_mode => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+                if let Some(cgroup) = qemu_cgroup.take() {
+                    cgroup.cleanup();
+                }
                 if let Some(handle) = tap_network_handle.take() {
                     handle.shutdown().await;
                 }
@@ -2305,7 +2397,7 @@ impl Manager {
             None => {}
         }
 
-        spawn_exit_task(vm.clone(), child, log_path, child_pid);
+        spawn_exit_task(vm.clone(), child, log_path, child_pid, qemu_cgroup.take());
         info!(vm_id = %id, "VM started");
         let meta = vm.lock().await.metadata.clone();
         Ok(meta)
@@ -2329,12 +2421,31 @@ impl Manager {
             };
 
         if matches!(state, VmState::Paused) {
-            virt::cont(&monitor).await.map_err(ManagerError::Other)?;
+            if let Err(err) = virt::cont(&monitor).await {
+                warn!(
+                    vm_id = %id,
+                    error = %err,
+                    "failed to resume paused vm for graceful stop; forcing stop"
+                );
+                return self.force_stop_vm(id).await;
+            }
         }
-        virt::system_powerdown(&monitor)
-            .await
-            .map_err(ManagerError::Other)?;
-        wait_for_exit(&vm, Duration::from_secs(60)).await?;
+        if let Err(err) = virt::system_powerdown(&monitor).await {
+            warn!(
+                vm_id = %id,
+                error = %err,
+                "failed to request graceful vm powerdown; forcing stop"
+            );
+            return self.force_stop_vm(id).await;
+        }
+        if let Err(err) = wait_for_exit(&vm, Duration::from_secs(10)).await {
+            warn!(
+                vm_id = %id,
+                error = %err,
+                "graceful vm stop timed out; forcing stop"
+            );
+            return self.force_stop_vm(id).await;
+        }
 
         let meta = vm.lock().await.metadata.clone();
         Ok(meta)
@@ -3762,7 +3873,13 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf, expected_pid: Option<u32>) {
+fn spawn_exit_task(
+    vm: Arc<Vm>,
+    mut child: Child,
+    log_path: PathBuf,
+    expected_pid: Option<u32>,
+    qemu_cgroup: Option<network::ProcessCgroup>,
+) {
     tokio::spawn(async move {
         let wait_result = child.wait().await;
         let tail = read_log_tail(&log_path, 8192);
@@ -3792,6 +3909,9 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf, expected_pi
                 current_pid = ?current_pid,
                 "stale VM exit task observed; preserving newer runtime state"
             );
+            if let Some(cgroup) = qemu_cgroup {
+                cgroup.cleanup();
+            }
             return;
         }
         inner.runtime.monitor = None;
@@ -3855,6 +3975,9 @@ fn spawn_exit_task(vm: Arc<Vm>, mut child: Child, log_path: PathBuf, expected_pi
                 error = %err,
                 "failed to unregister vm proxy policy after exit"
             );
+        }
+        if let Some(cgroup) = qemu_cgroup {
+            cgroup.cleanup();
         }
     });
 }

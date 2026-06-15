@@ -1,8 +1,10 @@
 // @dive-file: Implements gRPC PortProxy, ShellExec, and DaemonManager services used inside guest VMs.
 // @dive-rel: Uses portproxy/src/daemon.rs to provide named daemon exec streams that can be reattached.
 // @dive-rel: Conforms to proto/bracket/portproxy/v1/portproxy.proto service contracts.
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -12,11 +14,12 @@ use tokio::fs;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
-use crate::child_tracker::{ChildExit, ChildTracker};
+use crate::child_tracker::ChildTracker;
 use crate::daemon::{DaemonError, DaemonRegistry, OutputKind, build_command_builder};
 use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManager;
 use crate::pb::bracket::portproxy::v1::port_proxy_server::PortProxy;
@@ -153,18 +156,16 @@ impl ShellExec for ShellExecService {
                 return Err(Status::internal("missing stderr handle"));
             }
         };
-        let mut child_exit = self.tracker.register(pid);
-
         let timeout = start.timeout.map(|secs| Duration::from_secs(secs as u64));
 
         let (tx, rx) = mpsc::channel(32);
 
-        spawn_reader(stdout, tx.clone(), |data| ExecResponse {
+        let stdout_reader = spawn_reader(stdout, tx.clone(), |data| ExecResponse {
             response: Some(
                 crate::pb::bracket::portproxy::v1::exec_response::Response::StdoutData(data),
             ),
         });
-        spawn_reader(stderr, tx.clone(), |data| ExecResponse {
+        let stderr_reader = spawn_reader(stderr, tx.clone(), |data| ExecResponse {
             response: Some(
                 crate::pb::bracket::portproxy::v1::exec_response::Response::StderrData(data),
             ),
@@ -199,12 +200,16 @@ impl ShellExec for ShellExecService {
 
         tokio::spawn(async move {
             if let Some(duration) = timeout {
-                match tokio::time::timeout(duration, child_exit.wait()).await {
-                    Ok(Ok(exit)) => finalize_exec_exit(pid, tx, exit).await,
+                match tokio::time::timeout(duration, child.wait()).await {
+                    Ok(Ok(exit)) => {
+                        drain_exec_readers(stdout_reader, stderr_reader).await;
+                        finalize_exec_status(pid, tx, exit).await;
+                    }
                     Ok(Err(err)) => finalize_exec_wait_error(pid, tx, err).await,
                     Err(_) => {
                         debug!("command timed out, killing process group for pid {pid}");
                         kill_process_group_or_child(pid, &mut child);
+                        drain_exec_readers(stdout_reader, stderr_reader).await;
                         let _ = tx
                             .send(Ok(ExecResponse {
                                 response: Some(
@@ -215,14 +220,16 @@ impl ShellExec for ShellExecService {
                             }))
                             .await;
 
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), child_exit.wait()).await;
+                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
                         finalize_exec_with_code(pid, tx, 124).await;
                     }
                 }
             } else {
-                match child_exit.wait().await {
-                    Ok(exit) => finalize_exec_exit(pid, tx, exit).await,
+                match child.wait().await {
+                    Ok(exit) => {
+                        drain_exec_readers(stdout_reader, stderr_reader).await;
+                        finalize_exec_status(pid, tx, exit).await;
+                    }
                     Err(err) => finalize_exec_wait_error(pid, tx, err).await,
                 }
             }
@@ -938,7 +945,11 @@ async fn read_file_bounded(path: &PathBuf) -> io::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn spawn_reader<R, F>(mut reader: R, tx: mpsc::Sender<Result<ExecResponse, Status>>, build: F)
+fn spawn_reader<R, F>(
+    mut reader: R,
+    tx: mpsc::Sender<Result<ExecResponse, Status>>,
+    build: F,
+) -> JoinHandle<()>
 where
     R: io::AsyncRead + Send + std::marker::Unpin + 'static,
     F: Fn(Vec<u8>) -> ExecResponse + Send + Sync + 'static,
@@ -959,15 +970,21 @@ where
                 }
             }
         }
-    });
+    })
 }
 
-async fn finalize_exec_exit(
+async fn drain_exec_readers(stdout_reader: JoinHandle<()>, stderr_reader: JoinHandle<()>) {
+    let _ = stdout_reader.await;
+    let _ = stderr_reader.await;
+}
+
+async fn finalize_exec_status(
     pid: i32,
     tx: mpsc::Sender<Result<ExecResponse, Status>>,
-    exit: ChildExit,
+    status: ExitStatus,
 ) {
-    finalize_exec_with_code(pid, tx, exit.protocol_code()).await;
+    let code = status.code().or_else(|| status.signal()).unwrap_or(-1);
+    finalize_exec_with_code(pid, tx, code).await;
 }
 
 async fn finalize_exec_wait_error(
@@ -1023,9 +1040,88 @@ mod tests {
     use crate::daemon::DaemonRegistry;
     use crate::pb::bracket::portproxy::v1::daemon_manager_client::DaemonManagerClient;
     use crate::pb::bracket::portproxy::v1::daemon_manager_server::DaemonManagerServer;
+    use crate::pb::bracket::portproxy::v1::shell_exec_client::ShellExecClient;
+    use crate::pb::bracket::portproxy::v1::shell_exec_server::ShellExecServer;
     use crate::pb::bracket::portproxy::v1::{
         AttachDaemonStart, attach_daemon_request, attach_daemon_response,
     };
+
+    #[tokio::test]
+    async fn exec_command_finishes_when_client_closes_stream_after_start() {
+        let tracker = ChildTracker::new();
+        spawn_test_child_reaper(tracker.clone());
+        let service = ShellExecService::new(tracker);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener has local addr");
+        let incoming = stream::unfold(listener, |listener| async {
+            Some((listener.accept().await.map(|(stream, _)| stream), listener))
+        });
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ShellExecServer::new(service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("test shell exec server should run");
+        });
+
+        let mut client = ShellExecClient::connect(format!("http://{addr}"))
+            .await
+            .expect("client should connect");
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(ExecRequest {
+            request: Some(
+                crate::pb::bracket::portproxy::v1::exec_request::Request::Start(ExecStart {
+                    args: vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        "cat >/dev/null; printf stdin-closed-ok".to_string(),
+                    ],
+                    env: HashMap::new(),
+                    timeout: Some(2),
+                    detach: false,
+                }),
+            ),
+        })
+        .await
+        .expect("start frame should enqueue");
+        drop(tx);
+
+        let mut stream = client
+            .exec(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect("exec should start")
+            .into_inner();
+
+        let mut stdout = Vec::new();
+        let mut exit_code = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(3), stream.message())
+                .await
+                .expect("exec stream should not hang")
+                .expect("exec stream should not error");
+            let Some(frame) = next else { break };
+            match frame.response {
+                Some(crate::pb::bracket::portproxy::v1::exec_response::Response::StdoutData(
+                    bytes,
+                )) => {
+                    stdout.extend(bytes);
+                }
+                Some(crate::pb::bracket::portproxy::v1::exec_response::Response::ExitCode(
+                    code,
+                )) => {
+                    exit_code = Some(code);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(String::from_utf8_lossy(&stdout), "stdin-closed-ok");
+        assert_eq!(exit_code, Some(0));
+    }
 
     #[tokio::test]
     async fn attach_daemon_fast_command_returns_exit_code_after_late_attach() {

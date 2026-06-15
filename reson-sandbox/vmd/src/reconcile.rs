@@ -18,7 +18,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::config::{ControlBusConfig, NodeRegistryConfig};
-use crate::state::Manager;
+use crate::state::{Manager, VmState};
 
 const META_SESSION_ID: &str = "reson.session_id";
 const DEFAULT_SESSION_SHARD_COUNT: u8 = 16;
@@ -310,11 +310,18 @@ async fn reconcile_once(
 async fn collect_local_sessions(manager: &Manager) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for vm in manager.list().await {
+        if !should_publish_session_route(vm.state) {
+            continue;
+        }
         if let Some(session_id) = vm.metadata.get(META_SESSION_ID) {
             out.insert(session_id.clone(), vm.id.clone());
         }
     }
     out
+}
+
+fn should_publish_session_route(state: VmState) -> bool {
+    matches!(state, VmState::Running)
 }
 
 fn reconcile_checkpoint_key(config: &ReconcileConfig) -> String {
@@ -557,6 +564,15 @@ fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_routes_are_only_published_for_running_vms() {
+        assert!(should_publish_session_route(VmState::Running));
+        assert!(!should_publish_session_route(VmState::Creating));
+        assert!(!should_publish_session_route(VmState::Stopped));
+        assert!(!should_publish_session_route(VmState::Paused));
+        assert!(!should_publish_session_route(VmState::Error));
+    }
 
     #[test]
     fn reconcile_plan_upserts_missing_and_deletes_stale() {

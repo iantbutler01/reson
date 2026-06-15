@@ -268,6 +268,7 @@ impl DistributedControlPlane {
     }
 
     pub(crate) async fn get_session_route(&self, session_id: &str) -> Result<Option<SessionRoute>> {
+        let started = tokio::time::Instant::now();
         let route_key = self.session_key(session_id);
         let legacy_route_key = self.legacy_session_key(session_id);
         let fence_key = self.session_fence_key(session_id);
@@ -283,7 +284,14 @@ impl DistributedControlPlane {
                 ))
             })?;
         }
+        let route_get_ms = started.elapsed().as_millis() as u64;
         let Some(kv) = response.kvs().first() else {
+            tracing::info!(
+                session_id = %session_id,
+                route_get_ms,
+                total_ms = started.elapsed().as_millis() as u64,
+                "distributed.get_session_route miss"
+            );
             return Ok(None);
         };
         let mut route = decode_session_route(kv.value())?;
@@ -304,6 +312,13 @@ impl DistributedControlPlane {
                 }
             }
         }
+        tracing::info!(
+            session_id = %session_id,
+            route_get_ms,
+            fence_get_ms = started.elapsed().as_millis() as u64 - route_get_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            "distributed.get_session_route ok"
+        );
         Ok(Some(route))
     }
 
@@ -1096,12 +1111,21 @@ impl DistributedControlPlane {
             }
 
             if let Ok(stream) = jetstream.get_stream(stream_name).await {
+                let delete_started = tokio::time::Instant::now();
                 if let Err(err) = stream.delete_consumer(&cleanup_consumer_name).await {
                     tracing::warn!(
                         error = %err,
                         consumer = %cleanup_consumer_name,
                         stream_id = %stream_id,
                         "failed to delete distributed exec stream consumer"
+                    );
+                } else {
+                    tracing::info!(
+                        consumer = %cleanup_consumer_name,
+                        stream_id = %stream_id,
+                        delete_consumer_ms = delete_started.elapsed().as_millis() as u64,
+                        total_ms = subscribe_loop_started.elapsed().as_millis() as u64,
+                        "SUBSCRIBE_T4 delete_consumer_done"
                     );
                 }
             }

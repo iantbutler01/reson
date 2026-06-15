@@ -301,6 +301,7 @@ After=network.target
 Type=simple
 Environment=RUST_LOG=trace
 EnvironmentFile=-/etc/reson/portproxy.env
+ExecStartPre=-/usr/local/sbin/reson-apply-tap-network.sh
 ExecStart=/usr/sbin/portproxy --server
 Restart=on-failure
 RestartSec=2

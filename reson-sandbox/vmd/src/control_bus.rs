@@ -35,7 +35,7 @@ use crate::proto::bracket::portproxy::v1::{
     ExecResponse, ExecStart, attach_daemon_request, attach_daemon_response, exec_request,
     exec_response,
 };
-use crate::state::{Manager, PendingSnapshot, SnapshotParams, UpdateVmParams, VmState};
+use crate::state::{Manager, PendingSnapshot, SnapshotParams, UpdateVmParams, VmMetadata, VmState};
 
 const META_EXEC_RESTORE_SNAPSHOT_ID: &str = "reson.execution_restore_snapshot_id";
 const META_EXEC_RESTORE_SNAPSHOT_NAME: &str = "reson.execution_restore_snapshot_name";
@@ -51,6 +51,7 @@ const GUEST_EXEC_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const WARM_GUEST_EXEC_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNNING_VM_COLD_GUEST_EXEC_GRACE: Duration = Duration::from_secs(90);
 const GUEST_EXEC_READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const VM_READY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 // @dive: Skip refreshing the execution-restore marker if we already refreshed within
 // this window. Bounds tier-B snapshot IOPS on shared RWX storage when an agent fires
 // many small commands in close succession; older marker remains valid as resume target.
@@ -444,6 +445,20 @@ struct DistributedCommandInFlightGuard {
 #[derive(Clone, Debug)]
 struct VmReadinessState {
     locks: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<Mutex<()>>>>>,
+    ready: std::sync::Arc<Mutex<HashMap<String, VmReadyCacheEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+struct VmReadyCacheEntry {
+    fingerprint: VmReadyFingerprint,
+    verified_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VmReadyFingerprint {
+    started_at_unix_ms: i64,
+    rpc_port: i32,
+    portproxy_auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +476,7 @@ impl VmReadinessState {
     fn new() -> Self {
         Self {
             locks: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            ready: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -488,6 +504,42 @@ impl VmReadinessState {
                     timeout.as_secs()
                 )
             })
+    }
+
+    async fn is_ready(&self, vm_id: &str, fingerprint: &VmReadyFingerprint) -> bool {
+        let now = Instant::now();
+        let mut guard = self.ready.lock().await;
+        guard.retain(|_, entry| now.duration_since(entry.verified_at) < VM_READY_CACHE_TTL);
+        guard
+            .get(vm_id)
+            .is_some_and(|entry| entry.fingerprint == *fingerprint)
+    }
+
+    async fn mark_ready(&self, vm_id: &str, fingerprint: VmReadyFingerprint) {
+        let mut guard = self.ready.lock().await;
+        guard.insert(
+            vm_id.to_string(),
+            VmReadyCacheEntry {
+                fingerprint,
+                verified_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn clear_ready(&self, vm_id: &str) {
+        let mut guard = self.ready.lock().await;
+        guard.remove(vm_id);
+    }
+}
+
+impl VmReadyFingerprint {
+    fn from_metadata(metadata: &VmMetadata) -> Option<Self> {
+        let started_at_unix_ms = metadata.started_at.map(|value| value.timestamp_millis())?;
+        Some(Self {
+            started_at_unix_ms,
+            rpc_port: metadata.network.rpc_port,
+            portproxy_auth_token: metadata.metadata.get(META_PORTPROXY_AUTH_TOKEN).cloned(),
+        })
     }
 }
 
@@ -684,6 +736,29 @@ async fn guest_exec_ready_timeout_for_start(manager: &Manager, vm_id: &str) -> D
             }
         }
         Ok(_) | Err(_) => GUEST_EXEC_READY_TIMEOUT,
+    }
+}
+
+async fn cached_ready_running_vm(
+    manager: &Manager,
+    vm_readiness_state: &VmReadinessState,
+    vm_id: &str,
+    resume_only: bool,
+) -> Option<VmMetadata> {
+    if resume_only {
+        return None;
+    }
+    let Ok((metadata, runtime)) = manager.get_with_runtime(vm_id).await else {
+        return None;
+    };
+    if runtime.state != VmState::Running || metadata.state == VmState::Error {
+        return None;
+    }
+    let fingerprint = VmReadyFingerprint::from_metadata(&metadata)?;
+    if vm_readiness_state.is_ready(vm_id, &fingerprint).await {
+        Some(metadata)
+    } else {
+        None
     }
 }
 
@@ -1860,49 +1935,71 @@ async fn handle_exec_stream_start_command(
     let exec_activity_lease = vm_exec_activity_state.begin(vm_id.as_str());
     let mut ready_timeout =
         guest_exec_ready_timeout_for_start(manager.as_ref(), payload.vm_id.as_str()).await;
-    let vm_readiness_guard = match vm_readiness_state
-        .lock_with_timeout(
-            payload.vm_id.as_str(),
-            readiness_gate_wait_timeout(ready_timeout),
+    let cached_ready_vm = cached_ready_running_vm(
+        manager.as_ref(),
+        vm_readiness_state,
+        payload.vm_id.as_str(),
+        resume_only,
+    )
+    .await;
+    let cached_ready_used = cached_ready_vm.is_some();
+    if cached_ready_used {
+        info!(
+            stream_id = %stream_id,
+            vm_id = %vm_id,
+            elapsed_ms = handler_start.elapsed().as_millis() as u64,
+            "STREAMSTART_T2A cached_ready_vm"
+        );
+    }
+    let vm_readiness_guard = if cached_ready_used {
+        None
+    } else {
+        Some(
+            match vm_readiness_state
+                .lock_with_timeout(
+                    payload.vm_id.as_str(),
+                    readiness_gate_wait_timeout(ready_timeout),
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let error_text = error.to_string();
+                    spawn_mark_vm_guest_exec_unhealthy(
+                        std::sync::Arc::clone(manager),
+                        payload.vm_id.clone(),
+                        error_text.clone(),
+                    );
+                    sequence = sequence.saturating_add(1);
+                    publish_exec_stream_event(
+                        config,
+                        jetstream,
+                        ExecStreamEvent {
+                            cluster_id: cluster_id.clone(),
+                            logical_stream_id: logical_stream_id.clone(),
+                            stream_id: stream_id.clone(),
+                            event_seq: sequence,
+                            event_id: next_stream_event_id(cluster_id.as_str()),
+                            producer_epoch,
+                            command_id: command_id.clone(),
+                            session_id: session_id.clone(),
+                            vm_id: vm_id.clone(),
+                            kind: "error".to_string(),
+                            data: Vec::new(),
+                            exit_code: None,
+                            timed_out: false,
+                            error: Some(error_text),
+                            sequence,
+                            emitted_by_node_id: node_id.to_string(),
+                            emitted_at_unix_ms: unix_millis(),
+                        },
+                    )
+                    .await?;
+                    drop(exec_activity_lease);
+                    return Ok(());
+                }
+            },
         )
-        .await
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            let error_text = error.to_string();
-            spawn_mark_vm_guest_exec_unhealthy(
-                std::sync::Arc::clone(manager),
-                payload.vm_id.clone(),
-                error_text.clone(),
-            );
-            sequence = sequence.saturating_add(1);
-            publish_exec_stream_event(
-                config,
-                jetstream,
-                ExecStreamEvent {
-                    cluster_id: cluster_id.clone(),
-                    logical_stream_id: logical_stream_id.clone(),
-                    stream_id: stream_id.clone(),
-                    event_seq: sequence,
-                    event_id: next_stream_event_id(cluster_id.as_str()),
-                    producer_epoch,
-                    command_id: command_id.clone(),
-                    session_id: session_id.clone(),
-                    vm_id: vm_id.clone(),
-                    kind: "error".to_string(),
-                    data: Vec::new(),
-                    exit_code: None,
-                    timed_out: false,
-                    error: Some(error_text),
-                    sequence,
-                    emitted_by_node_id: node_id.to_string(),
-                    emitted_at_unix_ms: unix_millis(),
-                },
-            )
-            .await?;
-            drop(exec_activity_lease);
-            return Ok(());
-        }
     };
     if let Err(error) = fail_if_vm_already_error(
         manager.as_ref(),
@@ -1940,7 +2037,9 @@ async fn handle_exec_stream_start_command(
         return Ok(());
     }
 
-    let mut vm = if resume_only {
+    let mut vm = if let Some(vm) = cached_ready_vm {
+        vm
+    } else if resume_only {
         manager
             .start_vm_for_exec_stream_resume(payload.vm_id.as_str())
             .await
@@ -2030,72 +2129,87 @@ async fn handle_exec_stream_start_command(
     }
     let portproxy_auth = portproxy_auth_header_from_metadata(&vm_metadata)?;
     let endpoint = format!("http://127.0.0.1:{rpc_port}");
-    if let Err(error) = wait_for_guest_exec_ready_or_mark_vm_error(
-        manager.as_ref(),
-        payload.vm_id.as_str(),
-        endpoint.as_str(),
-        portproxy_auth.as_ref(),
-        ready_timeout,
-        "wait for guest exec readiness before exec.stream.start",
-    )
-    .await
-    {
-        let error_text = error.to_string();
-        sequence = sequence.saturating_add(1);
-        publish_exec_stream_event(
-            config,
-            jetstream,
-            ExecStreamEvent {
-                cluster_id: cluster_id.clone(),
-                logical_stream_id: logical_stream_id.clone(),
-                stream_id: stream_id.clone(),
-                event_seq: sequence,
-                event_id: next_stream_event_id(cluster_id.as_str()),
-                producer_epoch,
-                command_id: command_id.clone(),
-                session_id: session_id.clone(),
-                vm_id: vm_id.clone(),
-                kind: "error".to_string(),
-                data: Vec::new(),
-                exit_code: None,
-                timed_out: false,
-                error: Some(error_text),
-                sequence,
-                emitted_by_node_id: node_id.to_string(),
-                emitted_at_unix_ms: unix_millis(),
-            },
+    if vm_readiness_guard.is_some() {
+        if let Err(error) = wait_for_guest_exec_ready_or_mark_vm_error(
+            manager.as_ref(),
+            payload.vm_id.as_str(),
+            endpoint.as_str(),
+            portproxy_auth.as_ref(),
+            ready_timeout,
+            "wait for guest exec readiness before exec.stream.start",
         )
-        .await?;
-        return Ok(());
-    }
-    let expected_portproxy_sha =
-        portproxy::binary_sha256_hex(vm.architecture.as_str()).context("hash bundled portproxy")?;
-    let bundled_portproxy =
-        portproxy::binary(vm.architecture.as_str()).context("load bundled portproxy")?;
-    let upgraded_portproxy = ensure_guest_portproxy_binary(
-        endpoint.as_str(),
-        portproxy_auth.as_ref(),
-        vm_metadata
-            .get(META_PORTPROXY_AUTH_TOKEN)
-            .map(String::as_str),
-        expected_portproxy_sha.as_str(),
-        bundled_portproxy.as_slice(),
-    )
-    .await
-    .context("ensure guest portproxy binary matches bundled runtime")?;
-    if upgraded_portproxy {
-        info!(
-            stream_id = %stream_id,
-            vm_id = %vm_id,
-            expected_sha256 = %expected_portproxy_sha,
-            "upgraded guest portproxy binary before exec stream"
-        );
+        .await
+        {
+            let error_text = error.to_string();
+            sequence = sequence.saturating_add(1);
+            publish_exec_stream_event(
+                config,
+                jetstream,
+                ExecStreamEvent {
+                    cluster_id: cluster_id.clone(),
+                    logical_stream_id: logical_stream_id.clone(),
+                    stream_id: stream_id.clone(),
+                    event_seq: sequence,
+                    event_id: next_stream_event_id(cluster_id.as_str()),
+                    producer_epoch,
+                    command_id: command_id.clone(),
+                    session_id: session_id.clone(),
+                    vm_id: vm_id.clone(),
+                    kind: "error".to_string(),
+                    data: Vec::new(),
+                    exit_code: None,
+                    timed_out: false,
+                    error: Some(error_text),
+                    sequence,
+                    emitted_by_node_id: node_id.to_string(),
+                    emitted_at_unix_ms: unix_millis(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        let expected_portproxy_sha = portproxy::binary_sha256_hex(vm.architecture.as_str())
+            .context("hash bundled portproxy")?;
+        let bundled_portproxy =
+            portproxy::binary(vm.architecture.as_str()).context("load bundled portproxy")?;
+        let upgraded_portproxy = ensure_guest_portproxy_binary(
+            endpoint.as_str(),
+            portproxy_auth.as_ref(),
+            vm_metadata
+                .get(META_PORTPROXY_AUTH_TOKEN)
+                .map(String::as_str),
+            expected_portproxy_sha.as_str(),
+            bundled_portproxy.as_slice(),
+        )
+        .await
+        .context("ensure guest portproxy binary matches bundled runtime")?;
+        if upgraded_portproxy {
+            info!(
+                stream_id = %stream_id,
+                vm_id = %vm_id,
+                expected_sha256 = %expected_portproxy_sha,
+                "upgraded guest portproxy binary before exec stream"
+            );
+        }
+        if !resume_only {
+            if let Some(fingerprint) = VmReadyFingerprint::from_metadata(&vm) {
+                vm_readiness_state
+                    .mark_ready(payload.vm_id.as_str(), fingerprint)
+                    .await;
+            }
+        }
     }
     drop(vm_readiness_guard);
     info!(stream_id = %stream_id, endpoint = %endpoint, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T4 before_daemon_connect");
-    let mut daemon_client = DaemonManagerClient::connect(endpoint.clone())
-        .await
-        .context("connect daemon manager client for exec.stream.start")?;
+    let mut daemon_client = match DaemonManagerClient::connect(endpoint.clone()).await {
+        Ok(client) => client,
+        Err(error) => {
+            if cached_ready_used {
+                vm_readiness_state.clear_ready(payload.vm_id.as_str()).await;
+            }
+            return Err(error).context("connect daemon manager client for exec.stream.start");
+        }
+    };
     info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T5 after_daemon_connect");
     let daemon_name = format!("reson-exec-stream-{}", sanitize_subject_token(&stream_id));
     if !resume_only {
@@ -2103,7 +2217,7 @@ async fn handle_exec_stream_start_command(
             .shell
             .clone()
             .unwrap_or_else(|| "/bin/sh".to_string());
-        daemon_client
+        if let Err(error) = daemon_client
             .exec_daemon(request_with_portproxy_auth(
                 ExecDaemonRequest {
                     name: daemon_name.clone(),
@@ -2115,7 +2229,12 @@ async fn handle_exec_stream_start_command(
                 portproxy_auth.as_ref(),
             ))
             .await
-            .context("invoke daemon manager for exec.stream.start")?;
+        {
+            if cached_ready_used {
+                vm_readiness_state.clear_ready(payload.vm_id.as_str()).await;
+            }
+            return Err(error).context("invoke daemon manager for exec.stream.start");
+        }
         info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T6 after_exec_daemon_rpc");
     }
 
@@ -2136,9 +2255,15 @@ async fn handle_exec_stream_start_command(
     };
     let (response, req_tx) = loop {
         info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T7 before_attach_connect");
-        let mut attach_client = DaemonManagerClient::connect(endpoint.clone())
-            .await
-            .context("connect daemon manager client for exec.stream attach")?;
+        let mut attach_client = match DaemonManagerClient::connect(endpoint.clone()).await {
+            Ok(client) => client,
+            Err(error) => {
+                if cached_ready_used {
+                    vm_readiness_state.clear_ready(payload.vm_id.as_str()).await;
+                }
+                return Err(error).context("connect daemon manager client for exec.stream attach");
+            }
+        };
         info!(stream_id = %stream_id, elapsed_ms = handler_start.elapsed().as_millis() as u64, "STREAMSTART_T8 after_attach_connect");
         let (req_tx, req_rx) = mpsc::channel(64);
         req_tx
@@ -2208,6 +2333,9 @@ async fn handle_exec_stream_start_command(
                     grpc_message = %status.message(),
                     "STREAMSTART attach_daemon RPC failed"
                 );
+                if cached_ready_used {
+                    vm_readiness_state.clear_ready(payload.vm_id.as_str()).await;
+                }
                 return Err(anyhow!(
                     "invoke daemon attach for exec.stream.start: {status}"
                 ));
@@ -3745,6 +3873,45 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer guest-token")
         );
+    }
+
+    #[tokio::test]
+    async fn vm_readiness_cache_requires_same_running_instance() {
+        let state = VmReadinessState::new();
+        let fingerprint = VmReadyFingerprint {
+            started_at_unix_ms: 1000,
+            rpc_port: 4242,
+            portproxy_auth_token: Some("token-a".to_string()),
+        };
+
+        assert!(!state.is_ready("vm-1", &fingerprint).await);
+        state.mark_ready("vm-1", fingerprint.clone()).await;
+        assert!(state.is_ready("vm-1", &fingerprint).await);
+        assert!(
+            !state
+                .is_ready(
+                    "vm-1",
+                    &VmReadyFingerprint {
+                        started_at_unix_ms: 2000,
+                        ..fingerprint.clone()
+                    }
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_readiness_cache_can_be_cleared_after_transport_failure() {
+        let state = VmReadinessState::new();
+        let fingerprint = VmReadyFingerprint {
+            started_at_unix_ms: 1000,
+            rpc_port: 4242,
+            portproxy_auth_token: None,
+        };
+
+        state.mark_ready("vm-1", fingerprint.clone()).await;
+        state.clear_ready("vm-1").await;
+        assert!(!state.is_ready("vm-1", &fingerprint).await);
     }
 
     #[test]
