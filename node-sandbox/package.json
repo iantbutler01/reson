@@ -1,0 +1,29 @@
+{
+  "name": "chevalier-sandbox",
+  "version": "0.0.0",
+  "description": "Sandbox (microVM) client bindings for Chevalier.",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "chevalier-sandbox",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "engines": {
+    "node": ">= 12.22.0"
+  },
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.7.2"
+  }
+}

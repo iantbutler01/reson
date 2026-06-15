@@ -1,0 +1,55 @@
+name: chevalier-node
+
+on:
+  push:
+    paths: ["node/**", ".github/workflows/chevalier-node.yml"]
+  pull_request:
+    paths: ["node/**"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: node
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm install
+      - run: npm run build:native:debug && npm run build:ts
+      - run: npm test
+
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { host: macos-latest, target: aarch64-apple-darwin }
+          - { host: macos-latest, target: x86_64-apple-darwin }
+          - { host: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { host: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { host: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: ${{ matrix.target }} }
+      - run: npm install
+      - name: Build native addon
+        run: npx napi build --platform --release --target ${{ matrix.target }} --js native.js --dts native.d.ts
+      - name: Build TS
+        run: npm run build:ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node/*.node
+
+  # publish: gather artifacts + `napi prepublish` to create the per-platform
+  # optionalDependencies packages, then `npm publish`. Wired up at release time.

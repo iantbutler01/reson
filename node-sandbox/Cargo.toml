@@ -1,0 +1,30 @@
+[package]
+name = "chevalier-node-sandbox"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Node-API (TypeScript) bindings for the Chevalier sandbox client."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt", "serde-json"] }
+napi-derive = "3"
+
+# Sandbox CLIENT only (connects to an external vmd). Isolated from the core
+# binding so codex's in-progress provider work can't break the core build.
+chevalier-sandbox = { path = "../sandbox/crates/sandbox", default-features = false, features = ["client"] }
+
+tokio = { version = "1", features = ["sync"] }
+futures = "0.3"
+serde = "1"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = "symbols"

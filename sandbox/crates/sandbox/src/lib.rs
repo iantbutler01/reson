@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "distributed-control")]
 mod distributed;
+mod opencomputer;
 pub mod slo;
 pub mod vfs;
 pub mod vm;
@@ -194,8 +195,131 @@ impl WarmPoolProfile {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub enum SandboxProviderConfig {
+    #[default]
+    Chevalier,
+    OpenComputer(OpenComputerBackendConfig),
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct OpenComputerBackendConfig {
+    pub api_url: String,
+    pub api_key: String,
+    pub template_id: String,
+    pub timeout_secs: u64,
+    pub default_cpu_count: Option<u32>,
+    pub default_memory_mb: Option<u32>,
+    pub default_disk_mb: Option<u32>,
+    pub burst: Option<bool>,
+    pub secret_store: Option<String>,
+    pub mounts: Vec<OpenComputerMountConfig>,
+    pub shared_mounts: HashMap<String, OpenComputerMountConfig>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct OpenComputerMountConfig {
+    pub path: String,
+    pub remote: String,
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub creds: HashMap<String, String>,
+    pub rclone_config: Option<String>,
+    pub read_only: Option<bool>,
+    #[serde(default)]
+    pub mount_options: Vec<String>,
+}
+
+impl Default for OpenComputerBackendConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://app.opencomputer.dev".to_string(),
+            api_key: String::new(),
+            template_id: "base".to_string(),
+            timeout_secs: 0,
+            default_cpu_count: None,
+            default_memory_mb: None,
+            default_disk_mb: None,
+            burst: None,
+            secret_store: None,
+            mounts: Vec::new(),
+            shared_mounts: HashMap::new(),
+        }
+    }
+}
+
+impl OpenComputerMountConfig {
+    pub fn rclone(
+        path: impl Into<String>,
+        remote: impl Into<String>,
+        backend: impl Into<String>,
+        creds: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            remote: remote.into(),
+            backend: Some(backend.into()),
+            creds,
+            rclone_config: None,
+            read_only: None,
+            mount_options: Vec::new(),
+        }
+    }
+
+    pub fn with_rclone_config(
+        path: impl Into<String>,
+        remote: impl Into<String>,
+        rclone_config: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            remote: remote.into(),
+            backend: None,
+            creds: HashMap::new(),
+            rclone_config: Some(rclone_config.into()),
+            read_only: None,
+            mount_options: Vec::new(),
+        }
+    }
+}
+
+impl OpenComputerBackendConfig {
+    pub fn from_env() -> Result<Self> {
+        let mut cfg = Self {
+            api_url: std::env::var("OPENCOMPUTER_API_URL")
+                .unwrap_or_else(|_| "https://app.opencomputer.dev".to_string()),
+            api_key: std::env::var("OPENCOMPUTER_API_KEY").unwrap_or_default(),
+            ..Self::default()
+        };
+        if let Ok(template_id) = std::env::var("OPENCOMPUTER_TEMPLATE_ID") {
+            cfg.template_id = template_id;
+        }
+        if let Ok(timeout) = std::env::var("OPENCOMPUTER_SANDBOX_TIMEOUT_SECS") {
+            cfg.timeout_secs = timeout.parse().map_err(|err| {
+                SandboxError::InvalidConfig(format!(
+                    "invalid OPENCOMPUTER_SANDBOX_TIMEOUT_SECS: {err}"
+                ))
+            })?;
+        }
+        if let Ok(mounts_json) = std::env::var("OPENCOMPUTER_MOUNTS_JSON") {
+            cfg.mounts = serde_json::from_str(&mounts_json).map_err(|err| {
+                SandboxError::InvalidConfig(format!("invalid OPENCOMPUTER_MOUNTS_JSON: {err}"))
+            })?;
+        }
+        if let Ok(shared_mounts_json) = std::env::var("OPENCOMPUTER_SHARED_MOUNTS_JSON") {
+            cfg.shared_mounts = serde_json::from_str(&shared_mounts_json).map_err(|err| {
+                SandboxError::InvalidConfig(format!(
+                    "invalid OPENCOMPUTER_SHARED_MOUNTS_JSON: {err}"
+                ))
+            })?;
+        }
+        Ok(cfg)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
+    pub provider: SandboxProviderConfig,
     pub endpoint: String,
     pub control_gateway_endpoints: Vec<String>,
     pub endpoint_overrides: HashMap<String, String>,
@@ -221,6 +345,7 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
+            provider: SandboxProviderConfig::default(),
             endpoint: "http://127.0.0.1:8052".to_string(),
             control_gateway_endpoints: Vec::new(),
             endpoint_overrides: HashMap::new(),
@@ -672,6 +797,7 @@ struct SandboxInner {
 
 enum ControlBackend {
     Direct,
+    OpenComputer(opencomputer::OpenComputerControl),
     #[cfg(feature = "distributed-control")]
     Distributed(distributed::DistributedControlPlane),
 }
@@ -683,6 +809,7 @@ pub struct Session {
     vm_id: String,
     node_endpoint: Arc<Mutex<String>>,
     ownership_fence: Arc<Mutex<Option<String>>>,
+    shared_mounts: Arc<Vec<SharedMount>>,
 }
 
 #[derive(Clone)]
@@ -715,6 +842,24 @@ impl RebindRestorePolicy {
 }
 
 impl Session {
+    pub(crate) fn new_with_backend(
+        sandbox: Sandbox,
+        session_id: String,
+        vm_id: String,
+        node_endpoint: String,
+        ownership_fence: Option<String>,
+        shared_mounts: Vec<SharedMount>,
+    ) -> Self {
+        Self {
+            sandbox,
+            session_id,
+            vm_id,
+            node_endpoint: Arc::new(Mutex::new(node_endpoint)),
+            ownership_fence: Arc::new(Mutex::new(ownership_fence)),
+            shared_mounts: Arc::new(shared_mounts),
+        }
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -726,6 +871,12 @@ impl Session {
     // @dive: Exposes the currently resolved owner endpoint so higher-level integrations can
     // persist the real routed node instead of pinning follow-up control-plane calls to a gateway.
     pub async fn resolved_endpoint(&self) -> Result<String> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Ok(self.current_node_endpoint().await);
+        }
         self.resolve_session_endpoint().await
     }
 
@@ -820,6 +971,10 @@ impl Session {
     }
 
     pub async fn exec(&self, command: &str, opts: ExecOptions) -> Result<ExecHandle> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.exec(&self.vm_id, command, opts).await;
+        }
+
         #[cfg(feature = "distributed-control")]
         if let ControlBackend::Distributed(control) = &self.sandbox.inner.control_backend {
             // @dive: Distributed mode keeps the facade API stable by routing exec via control commands/events instead of direct guest RPC sockets.
@@ -1656,6 +1811,10 @@ impl Session {
     }
 
     pub async fn shell(&self, opts: ShellOptions) -> Result<ShellHandle> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.shell(&self.vm_id, opts).await;
+        }
+
         let started = Instant::now();
         let access = self.ensure_session_rpc_access().await?;
         let mut client = ShellExecClient::connect(access.endpoint).await?;
@@ -1760,6 +1919,10 @@ impl Session {
     }
 
     pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.read_file(&self.vm_id, path).await;
+        }
+
         let endpoint = self.resolve_session_endpoint().await?;
         let mut access = self
             .sandbox
@@ -1779,6 +1942,10 @@ impl Session {
     }
 
     pub async fn write_file(&self, path: &str, data: Vec<u8>) -> Result<()> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.write_file(&self.vm_id, path, data).await;
+        }
+
         let endpoint = self.resolve_session_endpoint().await?;
         let mut access = self
             .sandbox
@@ -1802,6 +1969,10 @@ impl Session {
         &self,
         path: &str,
     ) -> Result<Vec<proto::bracket::portproxy::v1::DirectoryEntry>> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.list_dir(&self.vm_id, path).await;
+        }
+
         let endpoint = self.resolve_session_endpoint().await?;
         let mut access = self
             .sandbox
@@ -1821,6 +1992,10 @@ impl Session {
     }
 
     pub async fn delete_path(&self, path: &str) -> Result<()> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.delete_path(&self.vm_id, path).await;
+        }
+
         let endpoint = self.resolve_session_endpoint().await?;
         let mut access = self
             .sandbox
@@ -1839,6 +2014,18 @@ impl Session {
     }
 
     pub async fn forward_port(&self, guest_port: u16) -> Result<ForwardHandle> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            let sandbox = control.get_sandbox(&self.vm_id).await?;
+            let preview = sandbox.preview_domain(guest_port).ok_or_else(|| {
+                SandboxError::Unsupported(
+                    "OpenComputer did not return a preview domain for this sandbox".to_string(),
+                )
+            })?;
+            return Err(SandboxError::Unsupported(format!(
+                "OpenComputer exposes guest port {guest_port} at https://{preview}; the current ForwardHandle API returns local host ports only"
+            )));
+        }
+
         let started = Instant::now();
         let node_endpoint = self.resolve_session_endpoint().await?;
         let vm = self
@@ -1930,6 +2117,10 @@ impl Session {
     }
 
     pub async fn fork(&self, opts: ForkOptions) -> Result<ForkResult> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.fork(self.sandbox.clone(), self, opts).await;
+        }
+
         let auto_start_child = opts.auto_start_child;
         let node_endpoint = self.resolve_session_endpoint().await?;
         let child_session_id = Uuid::new_v4().to_string();
@@ -2005,6 +2196,7 @@ impl Session {
             vm_id: child_vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(child_fence)),
+            shared_mounts: self.shared_mounts.clone(),
         };
 
         Ok(ForkResult {
@@ -2020,6 +2212,10 @@ impl Session {
     }
 
     pub async fn discard(self) -> Result<()> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            return control.delete_sandbox(&self.vm_id).await;
+        }
+
         let ownership_fence = self.ownership_fence().await;
         let node_endpoint = self.current_node_endpoint().await;
         self.sandbox
@@ -2085,6 +2281,49 @@ impl Sandbox {
 
     pub async fn session(&self, opts: SessionOptions) -> Result<Session> {
         let started = Instant::now();
+        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+            let mut metadata = opts.metadata;
+            metadata
+                .entry("workspace_id".to_string())
+                .or_insert_with(|| "default".to_string());
+            metadata
+                .entry("tenant_id".to_string())
+                .or_insert_with(|| "default".to_string());
+            if let Some(requested_session_id) = opts.session_id {
+                metadata.insert(
+                    "chevalier.requested_session_id".to_string(),
+                    requested_session_id,
+                );
+            }
+            if let Some(name) = opts.name.as_deref().filter(|name| !name.trim().is_empty()) {
+                metadata.insert("chevalier.name".to_string(), name.to_string());
+            }
+            metadata.insert(META_TIER_B_ELIGIBLE.to_string(), "false".to_string());
+            metadata.insert(
+                META_EXECUTION_FIDELITY_REQUIREMENT.to_string(),
+                "provider-managed".to_string(),
+            );
+            let sandbox = control
+                .create_sandbox(
+                    opts.image,
+                    opts.resources,
+                    metadata,
+                    None,
+                    opts.shared_mounts.as_slice(),
+                )
+                .await?;
+            let session = Session::new_with_backend(
+                self.clone(),
+                sandbox.sandbox_id.clone(),
+                sandbox.sandbox_id,
+                control.api_url().to_string(),
+                None,
+                opts.shared_mounts,
+            );
+            log_slo_observation("session.create.opencomputer", started.elapsed(), "ok");
+            return Ok(session);
+        }
+
         let session_id = opts
             .session_id
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -2179,6 +2418,7 @@ impl Sandbox {
                 vm_id: vm.id,
                 node_endpoint: Arc::new(Mutex::new(node_endpoint)),
                 ownership_fence: Arc::new(Mutex::new(next_fence)),
+                shared_mounts: Arc::new(Vec::new()),
             };
             log_slo_observation("session.attach", started.elapsed(), "ok");
             return Ok(session);
@@ -2205,6 +2445,7 @@ impl Sandbox {
                 .unwrap_or_default()
         });
 
+        let session_shared_mounts = opts.shared_mounts.clone();
         let request = CreateVmRequest {
             name,
             source: Some(VmSource {
@@ -2311,6 +2552,7 @@ impl Sandbox {
             vm_id: vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(next_fence)),
+            shared_mounts: Arc::new(session_shared_mounts),
         };
 
         if warm_pool_hit {
@@ -2338,6 +2580,23 @@ impl Sandbox {
 
     pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
         let started = Instant::now();
+        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+            let sandbox = control.get_sandbox(session_id).await?;
+            control
+                .ensure_configured_mounts(&sandbox.sandbox_id, &[])
+                .await?;
+            let session = Session::new_with_backend(
+                self.clone(),
+                sandbox.sandbox_id.clone(),
+                sandbox.sandbox_id,
+                control.api_url().to_string(),
+                None,
+                Vec::new(),
+            );
+            log_slo_observation("session.attach.opencomputer", started.elapsed(), "ok");
+            return Ok(session);
+        }
+
         let (vm, node_endpoint) = self
             .find_vm_by_session_id(session_id)
             .await?
@@ -2401,6 +2660,7 @@ impl Sandbox {
             vm_id: vm.id,
             node_endpoint: Arc::new(Mutex::new(node_endpoint)),
             ownership_fence: Arc::new(Mutex::new(next_fence)),
+            shared_mounts: Arc::new(Vec::new()),
         };
         log_slo_observation("session.attach", started.elapsed(), "ok");
         Ok(session)
@@ -2428,6 +2688,10 @@ impl Sandbox {
     }
 
     pub async fn discard_session_by_id(&self, session_id: &str) -> Result<()> {
+        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+            return control.delete_sandbox(session_id).await;
+        }
+
         let expected_fence = self.current_session_fence(session_id).await?;
         if let Some((vm, node_endpoint)) = self.find_vm_by_session_id(session_id).await? {
             return self
@@ -2453,6 +2717,10 @@ impl Sandbox {
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+            return control.list_sessions().await;
+        }
+
         let mut sessions = Vec::new();
         let mut seen = HashSet::new();
         for endpoint in self.candidate_endpoints().await? {
@@ -2492,6 +2760,12 @@ impl Sandbox {
     }
 
     async fn build_control_backend(config: &SandboxConfig) -> Result<ControlBackend> {
+        if let SandboxProviderConfig::OpenComputer(opencomputer_config) = &config.provider {
+            return Ok(ControlBackend::OpenComputer(
+                opencomputer::OpenComputerControl::new(opencomputer_config.clone())?,
+            ));
+        }
+
         if let Some(dist_cfg) = config.distributed_control.clone() {
             #[cfg(feature = "distributed-control")]
             {
@@ -2540,6 +2814,7 @@ impl Sandbox {
 
     async fn ensure_daemon_ready(&self) -> Result<()> {
         match &self.inner.control_backend {
+            ControlBackend::OpenComputer(_) => Ok(()),
             ControlBackend::Direct => {
                 let mut last_health_err: Option<String> = None;
                 for endpoint in self.candidate_endpoints().await? {
@@ -2596,6 +2871,10 @@ impl Sandbox {
     }
 
     async fn prewarm_warm_pool_profiles_with_mode(&self, force: bool) -> Result<()> {
+        if let ControlBackend::OpenComputer(_) = &self.inner.control_backend {
+            return Ok(());
+        }
+
         if !force && !self.inner.cfg.prewarm_on_start {
             return Ok(());
         }
@@ -3521,7 +3800,7 @@ impl Sandbox {
                     }
                 }
             }
-            ControlBackend::Direct => {}
+            ControlBackend::Direct | ControlBackend::OpenComputer(_) => {}
         }
 
         for endpoint in self.candidate_endpoints().await? {
