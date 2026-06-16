@@ -66,3 +66,11 @@ test("schema-only tool registers (no handler)", async () => {
   const schemas = await rt.getToolSchemas();
   assert.ok(schemas.some((s) => s.name === "search"));
 });
+
+test("dispose() releases registered tools (breaks handler↔runtime cycle)", async () => {
+  const rt = new Runtime();
+  await rt.tool({ name: "x", schema: { type: "object", properties: {} }, handler: async () => "y" });
+  assert.strictEqual((await rt.getToolSchemas()).length, 1);
+  await rt.dispose();
+  assert.strictEqual((await rt.getToolSchemas()).length, 0);
+});

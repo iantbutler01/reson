@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chevalier_sandbox::{
     ExecEvent, ExecOptions, OpenComputerBackendConfig, Sandbox, SandboxConfig,
@@ -63,13 +63,31 @@ async fn opencomputer_live_facade_smoke() {
     };
 
     let sandbox = Sandbox::new(config).await.expect("opencomputer sandbox");
+    let requested_session_id = format!(
+        "chevalier-opencomputer-live-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis()
+    );
     let session = sandbox
         .session(SessionOptions {
+            session_id: Some(requested_session_id.clone()),
             name: Some("chevalier-opencomputer-live".to_string()),
             ..SessionOptions::default()
         })
         .await
         .expect("opencomputer session");
+    assert_eq!(session.session_id(), requested_session_id);
+    let provider_session_id = session.vm_id().to_string();
+    assert_ne!(provider_session_id, requested_session_id);
+
+    let session = sandbox
+        .attach_session(&requested_session_id)
+        .await
+        .expect("attach by requested session id");
+    assert_eq!(session.session_id(), requested_session_id);
+    assert_eq!(session.vm_id(), provider_session_id);
 
     let exec_output = timeout(
         Duration::from_secs(60),
@@ -107,5 +125,8 @@ async fn opencomputer_live_facade_smoke() {
     .expect("shell timeout");
     assert!(shell_output.contains("shell-ok"));
 
-    session.discard().await.expect("discard session");
+    sandbox
+        .discard_session_by_id(&requested_session_id)
+        .await
+        .expect("discard by requested session id");
 }

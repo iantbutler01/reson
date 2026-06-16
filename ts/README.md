@@ -123,7 +123,7 @@ const bytes = await vfs.read("notes/hello.txt");
 
 ## Sandbox
 
-MicroVM sandboxes live in the separate **[`chevalier-sandbox`](../node-sandbox)**
+MicroVM sandboxes live in the separate **[`chevalier-sandbox`](../ts-sandbox)**
 package (it pulls in a gRPC client). It connects to an external `vmd` daemon:
 
 ```ts

@@ -793,6 +793,7 @@ struct SandboxInner {
     ready_vm_rpc: Mutex<HashMap<String, GuestRpcAccess>>,
     node_multiplexers: Mutex<HashMap<String, Arc<NodePortMultiplexer>>>,
     warm_pool_ready: Mutex<HashSet<String>>,
+    opencomputer_session_aliases: Mutex<HashMap<String, String>>,
 }
 
 enum ControlBackend {
@@ -2213,7 +2214,11 @@ impl Session {
 
     pub async fn discard(self) -> Result<()> {
         if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
-            return control.delete_sandbox(&self.vm_id).await;
+            control.delete_sandbox(&self.vm_id).await?;
+            self.sandbox
+                .clear_opencomputer_session_aliases(&self.session_id, &self.vm_id)
+                .await;
+            return Ok(());
         }
 
         let ownership_fence = self.ownership_fence().await;
@@ -2257,6 +2262,7 @@ impl Sandbox {
                 ready_vm_rpc: Mutex::new(HashMap::new()),
                 node_multiplexers: Mutex::new(HashMap::new()),
                 warm_pool_ready: Mutex::new(HashSet::new()),
+                opencomputer_session_aliases: Mutex::new(HashMap::new()),
             }),
         };
 
@@ -2282,6 +2288,7 @@ impl Sandbox {
     pub async fn session(&self, opts: SessionOptions) -> Result<Session> {
         let started = Instant::now();
         if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
+            let requested_session_id = opts.session_id;
             let mut metadata = opts.metadata;
             metadata
                 .entry("workspace_id".to_string())
@@ -2289,10 +2296,10 @@ impl Sandbox {
             metadata
                 .entry("tenant_id".to_string())
                 .or_insert_with(|| "default".to_string());
-            if let Some(requested_session_id) = opts.session_id {
+            if let Some(requested_session_id) = requested_session_id.as_deref() {
                 metadata.insert(
                     "chevalier.requested_session_id".to_string(),
-                    requested_session_id,
+                    requested_session_id.to_string(),
                 );
             }
             if let Some(name) = opts.name.as_deref().filter(|name| !name.trim().is_empty()) {
@@ -2312,9 +2319,13 @@ impl Sandbox {
                     opts.shared_mounts.as_slice(),
                 )
                 .await?;
+            let logical_session_id =
+                requested_session_id.unwrap_or_else(|| sandbox.sandbox_id.clone());
+            self.bind_opencomputer_session_alias(&logical_session_id, &sandbox.sandbox_id)
+                .await;
             let session = Session::new_with_backend(
                 self.clone(),
-                sandbox.sandbox_id.clone(),
+                logical_session_id,
                 sandbox.sandbox_id,
                 control.api_url().to_string(),
                 None,
@@ -2581,13 +2592,14 @@ impl Sandbox {
     pub async fn attach_session(&self, session_id: &str) -> Result<Session> {
         let started = Instant::now();
         if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
-            let sandbox = control.get_sandbox(session_id).await?;
+            let provider_session_id = self.opencomputer_provider_session_id(session_id).await;
+            let sandbox = control.get_sandbox(&provider_session_id).await?;
             control
                 .ensure_configured_mounts(&sandbox.sandbox_id, &[])
                 .await?;
             let session = Session::new_with_backend(
                 self.clone(),
-                sandbox.sandbox_id.clone(),
+                session_id.to_string(),
                 sandbox.sandbox_id,
                 control.api_url().to_string(),
                 None,
@@ -2689,7 +2701,11 @@ impl Sandbox {
 
     pub async fn discard_session_by_id(&self, session_id: &str) -> Result<()> {
         if let ControlBackend::OpenComputer(control) = &self.inner.control_backend {
-            return control.delete_sandbox(session_id).await;
+            let provider_session_id = self.opencomputer_provider_session_id(session_id).await;
+            control.delete_sandbox(&provider_session_id).await?;
+            self.clear_opencomputer_session_aliases(session_id, &provider_session_id)
+                .await;
+            return Ok(());
         }
 
         let expected_fence = self.current_session_fence(session_id).await?;
@@ -2784,6 +2800,37 @@ impl Sandbox {
         }
 
         Ok(ControlBackend::Direct)
+    }
+
+    async fn bind_opencomputer_session_alias(&self, logical_session_id: &str, provider_id: &str) {
+        if logical_session_id == provider_id {
+            return;
+        }
+        self.inner
+            .opencomputer_session_aliases
+            .lock()
+            .await
+            .insert(logical_session_id.to_string(), provider_id.to_string());
+    }
+
+    async fn opencomputer_provider_session_id(&self, session_id: &str) -> String {
+        self.inner
+            .opencomputer_session_aliases
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| session_id.to_string())
+    }
+
+    async fn clear_opencomputer_session_aliases(
+        &self,
+        logical_session_id: &str,
+        provider_id: &str,
+    ) {
+        let mut aliases = self.inner.opencomputer_session_aliases.lock().await;
+        aliases.remove(logical_session_id);
+        aliases.retain(|_, mapped_provider_id| mapped_provider_id != provider_id);
     }
 
     async fn vmd_client_for_endpoint(
@@ -4656,6 +4703,43 @@ mod tests {
                 .get("authorization")
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer guest-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn opencomputer_session_alias_resolves_and_clears_requested_ids() {
+        let sandbox = Sandbox {
+            inner: Arc::new(SandboxInner {
+                cfg: SandboxConfig::default(),
+                control_backend: ControlBackend::Direct,
+                auth_header: None,
+                #[cfg(feature = "host")]
+                managed_daemon: Mutex::new(None),
+                ready_vm_rpc: Mutex::new(HashMap::new()),
+                node_multiplexers: Mutex::new(HashMap::new()),
+                warm_pool_ready: Mutex::new(HashSet::new()),
+                opencomputer_session_aliases: Mutex::new(HashMap::new()),
+            }),
+        };
+
+        sandbox
+            .bind_opencomputer_session_alias("requested-session", "provider-session")
+            .await;
+        assert_eq!(
+            sandbox
+                .opencomputer_provider_session_id("requested-session")
+                .await,
+            "provider-session"
+        );
+
+        sandbox
+            .clear_opencomputer_session_aliases("requested-session", "provider-session")
+            .await;
+        assert_eq!(
+            sandbox
+                .opencomputer_provider_session_id("requested-session")
+                .await,
+            "requested-session"
         );
     }
 }

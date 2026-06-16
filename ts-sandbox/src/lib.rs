@@ -76,8 +76,10 @@ impl ExecHandle {
     }
     #[napi]
     pub async fn resize(&self, cols: u32, rows: u32) -> napi::Result<()> {
+        // Saturate rather than silently truncate (a terminal never exceeds u16).
+        let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
         self.input
-            .send(ExecInput::Resize { cols: cols as u16, rows: rows as u16 })
+            .send(ExecInput::Resize { cols: clamp(cols), rows: clamp(rows) })
             .await
             .map_err(|_| napi::Error::from_reason("exec stdin closed"))
     }

@@ -21,9 +21,17 @@ use crate::stream::{StreamEvent, StreamHandle};
 use crate::types::{RunResult, ToolSchemaJs};
 
 /// JS tool handler: receives the parsed JSON args (CalleeHandled=false → JS sees
-/// just the value), returns a `Promise<string>`.
-type ToolHandler =
-    ThreadsafeFunction<serde_json::Value, Promise<String>, serde_json::Value, napi::Status, false>;
+/// just the value), returns a `Promise<string>`. `Weak=true` so a stored handler
+/// does not keep the Node event loop alive (the awaited run()/executeToolCall
+/// promise keeps it alive while in use).
+type ToolHandler = ThreadsafeFunction<
+    serde_json::Value,
+    Promise<String>,
+    serde_json::Value,
+    napi::Status,
+    false,
+    true,
+>;
 
 /// Options for constructing a `Runtime`.
 #[napi(object)]
@@ -207,17 +215,21 @@ impl Runtime {
         use futures::StreamExt;
         let inner = self.inner.clone();
         let params = options.into_params();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, String>>(64);
-        tokio::spawn(async move {
+        // Unbounded so the driver never parks on `send` waiting for the consumer.
+        // It drains the engine stream to completion (or until aborted) and only
+        // then releases the owned runtime lock — so a mid-stream `executeToolCall`
+        // blocks at most until the stream ends, never permanently. `close()`
+        // aborts the task to release the lock + provider request immediately.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<StreamEvent, String>>();
+        let task = tokio::spawn(async move {
             // `guard` must outlive `stream` (the engine's `impl Stream` return
-            // captures the guard's lifetime under Rust 2024 rules). Named bindings
-            // with reverse drop order (stream before guard) keep the borrow valid.
+            // captures the guard's lifetime under Rust 2024 rules).
             let mut guard = inner.lock_owned().await;
             let result = guard.run_stream(params).await;
             let mut stream = match result {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tx.send(Err(format_error(&e))).await;
+                    let _ = tx.send(Err(format_error(&e)));
                     return;
                 }
             };
@@ -226,13 +238,14 @@ impl Runtime {
                     Ok(ev) => Ok(StreamEvent::from(ev)),
                     Err(e) => Err(format_error(&e)),
                 };
-                if tx.send(msg).await.is_err() {
+                if tx.send(msg).is_err() {
                     break; // consumer dropped the handle
                 }
             }
         });
         Ok(StreamHandle {
             rx: Arc::new(Mutex::new(rx)),
+            abort: task.abort_handle(),
         })
     }
 
@@ -315,5 +328,17 @@ impl Runtime {
             .mcp_as(uri, &label)
             .await
             .map_err(to_napi)
+    }
+
+    /// Release all registered tools, dropping their JS handler references. Call
+    /// this when done with a Runtime whose tool handlers capture the Runtime
+    /// itself (otherwise the napi_ref ↔ JS closure cycle prevents GC). Idempotent.
+    #[napi]
+    pub async fn dispose(&self) {
+        let guard = self.inner.lock().await;
+        let names: Vec<String> = guard.get_tool_schemas().await.into_keys().collect();
+        for name in names {
+            guard.unregister_tool(&name).await;
+        }
     }
 }

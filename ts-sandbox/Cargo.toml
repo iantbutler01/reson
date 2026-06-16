@@ -1,5 +1,5 @@
 [package]
-name = "chevalier-node-sandbox"
+name = "chevalier-ts-sandbox"
 version = "0.0.0"
 edition = "2021"
 license = "Apache-2.0"

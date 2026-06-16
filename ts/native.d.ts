@@ -83,11 +83,18 @@ export declare class Runtime {
   mcp(uri: string): Promise<void>
   /** Like `mcp`, but namespaces the registered tools as `{label}_{tool}`. */
   mcpAs(uri: string, label: string): Promise<void>
+  /**
+   * Release all registered tools, dropping their JS handler references. Call
+   * this when done with a Runtime whose tool handlers capture the Runtime
+   * itself (otherwise the napi_ref ↔ JS closure cycle prevents GC). Idempotent.
+   */
+  dispose(): Promise<void>
 }
 
 /**
- * Async cursor over a streaming run. Call `next()` until it returns `null`.
- * The TS layer wraps this with `Symbol.asyncIterator` for `for await`.
+ * Async cursor over a streaming run. Call `next()` until it returns `null`, or
+ * `close()` to cancel early. The TS layer wraps this as an async iterator and
+ * calls `close()` in a `finally`.
  */
 export declare class StreamHandle {
   /**
@@ -95,6 +102,11 @@ export declare class StreamHandle {
    * underlying run errored.
    */
   next(): Promise<StreamEvent | null>
+  /**
+   * Cancel the stream: aborts the driving task, releasing the runtime lock and
+   * the provider request. Idempotent.
+   */
+  close(): void
 }
 
 /**
@@ -110,10 +122,10 @@ export declare class VfsStorage {
   read(path: string): Promise<Buffer>
   /** Write a file; returns the write result (JSON: content hash, changed, …). */
   write(path: string, data: Buffer): Promise<any>
-  /** Stat a path; returns metadata JSON or null. */
-  stat(path: string): Promise<any | null>
-  /** List a directory's entries with metadata (JSON array). */
-  listDir(path: string): Promise<Array<any>>
+  /** Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null. */
+  stat(path: string): Promise<VfsMetadata | null>
+  /** List a directory's entries with typed metadata. */
+  listDir(path: string): Promise<Array<VfsMetadata>>
   /** Create a directory. */
   mkdir(path: string): Promise<void>
   /** Delete a file; returns the delete result (JSON). */
@@ -255,3 +267,30 @@ export interface ToolSchemaJs {
 
 /** The chevalier-node binding version. */
 export declare function version(): string
+
+/**
+ * File/dir metadata. `sizeBytes` is a `bigint` so it never loses precision at
+ * the FFI boundary (JS `number` only holds integers up to 2^53).
+ */
+export interface VfsMetadata {
+  path: string
+  /** `"File"` or `"Directory"`. */
+  kind: string
+  sizeBytes: bigint
+  contentHash?: string
+  tokenCount?: number
+  version?: string
+  /** RFC 3339 timestamp. */
+  updatedAt?: string
+  objectState?: VfsObjectState
+}
+
+/** Pack-slot location for an object-backed file. */
+export interface VfsObjectState {
+  /** `bigint` — exact size, lossless above 2^53. */
+  sizeBytes: bigint
+  packKey: string
+  packSlotOffset: bigint
+  packSlotLength: bigint
+  packSlotCompression: number
+}

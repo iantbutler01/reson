@@ -59,7 +59,7 @@ impl OpenComputerControl {
         envs: Option<HashMap<String, String>>,
         shared_mounts: &[SharedMount],
     ) -> Result<OpenComputerSandbox> {
-        let resources = resources.unwrap_or_default();
+        let resource_fields = resolve_resource_fields(resources.as_ref(), &self.cfg);
         let body = CreateSandboxBody {
             template_id: Some(
                 template_id
@@ -71,19 +71,9 @@ impl OpenComputerControl {
             envs,
             metadata: (!metadata.is_empty()).then_some(metadata),
             burst: self.cfg.burst,
-            cpu_count: self
-                .cfg
-                .default_cpu_count
-                .or_else(|| u32::try_from(resources.vcpu).ok()),
-            memory_mb: self
-                .cfg
-                .default_memory_mb
-                .or_else(|| u32::try_from(resources.memory_mb).ok()),
-            disk_mb: self.cfg.default_disk_mb.or_else(|| {
-                u32::try_from(resources.disk_gb)
-                    .ok()
-                    .and_then(|gb| gb.checked_mul(1024))
-            }),
+            cpu_count: resource_fields.cpu_count,
+            memory_mb: resource_fields.memory_mb,
+            disk_mb: resource_fields.disk_mb,
             secret_store: self.cfg.secret_store.clone(),
         };
         let response = self
@@ -633,6 +623,48 @@ struct CreateSandboxBody {
     secret_store: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ResourceFields {
+    cpu_count: Option<u32>,
+    memory_mb: Option<u32>,
+    disk_mb: Option<u32>,
+}
+
+fn resolve_resource_fields(
+    resources: Option<&crate::ResourceLimits>,
+    cfg: &OpenComputerBackendConfig,
+) -> ResourceFields {
+    let fallback = crate::ResourceLimits::default();
+    let fallback = Some(&fallback);
+    ResourceFields {
+        cpu_count: resource_vcpu(resources)
+            .or(cfg.default_cpu_count)
+            .or_else(|| resource_vcpu(fallback)),
+        memory_mb: resource_memory_mb(resources)
+            .or(cfg.default_memory_mb)
+            .or_else(|| resource_memory_mb(fallback)),
+        disk_mb: resource_disk_mb(resources)
+            .or(cfg.default_disk_mb)
+            .or_else(|| resource_disk_mb(fallback)),
+    }
+}
+
+fn resource_vcpu(resources: Option<&crate::ResourceLimits>) -> Option<u32> {
+    resources.and_then(|resources| u32::try_from(resources.vcpu).ok())
+}
+
+fn resource_memory_mb(resources: Option<&crate::ResourceLimits>) -> Option<u32> {
+    resources.and_then(|resources| u32::try_from(resources.memory_mb).ok())
+}
+
+fn resource_disk_mb(resources: Option<&crate::ResourceLimits>) -> Option<u32> {
+    resources.and_then(|resources| {
+        u32::try_from(resources.disk_gb)
+            .ok()
+            .and_then(|gb| gb.checked_mul(1024))
+    })
+}
+
 #[derive(Serialize)]
 struct CreateFromCheckpointBody {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -818,7 +850,7 @@ async fn opencomputer_response_error(response: reqwest::Response) -> SandboxErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SharedMountAvailability, SharedMountContinuity};
+    use crate::{ResourceLimits, SharedMountAvailability, SharedMountContinuity};
     use serde_json::json;
 
     #[test]
@@ -843,6 +875,61 @@ mod tests {
             exec_event_from_ws_frame(&[0x03, 0, 0, 0, 7]),
             Some(ExecEvent::Exit(7))
         ));
+    }
+
+    #[test]
+    fn explicit_session_resources_override_opencomputer_defaults() {
+        let cfg = OpenComputerBackendConfig {
+            default_cpu_count: Some(8),
+            default_memory_mb: Some(16_384),
+            default_disk_mb: Some(80 * 1024),
+            ..OpenComputerBackendConfig::default()
+        };
+        let resources = ResourceLimits {
+            vcpu: 1,
+            memory_mb: 512,
+            disk_gb: 2,
+        };
+
+        assert_eq!(
+            resolve_resource_fields(Some(&resources), &cfg),
+            ResourceFields {
+                cpu_count: Some(1),
+                memory_mb: Some(512),
+                disk_mb: Some(2 * 1024)
+            }
+        );
+    }
+
+    #[test]
+    fn opencomputer_defaults_apply_when_session_resources_are_absent() {
+        let cfg = OpenComputerBackendConfig {
+            default_cpu_count: Some(8),
+            default_memory_mb: Some(16_384),
+            default_disk_mb: Some(80 * 1024),
+            ..OpenComputerBackendConfig::default()
+        };
+
+        assert_eq!(
+            resolve_resource_fields(None, &cfg),
+            ResourceFields {
+                cpu_count: Some(8),
+                memory_mb: Some(16_384),
+                disk_mb: Some(80 * 1024)
+            }
+        );
+    }
+
+    #[test]
+    fn crate_resource_defaults_apply_without_opencomputer_overrides() {
+        assert_eq!(
+            resolve_resource_fields(None, &OpenComputerBackendConfig::default()),
+            ResourceFields {
+                cpu_count: Some(2),
+                memory_mb: Some(2048),
+                disk_mb: Some(10 * 1024)
+            }
+        );
     }
 
     #[test]

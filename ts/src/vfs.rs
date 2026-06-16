@@ -8,8 +8,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chevalier_vfs::gateway::{GatewayVfsStorage, GatewayVfsStorageConfig};
 use chevalier_vfs::local::LocalVfsStorage;
-use chevalier_vfs::{OptimizedVfsStorage, VfsStorageError};
-use napi::bindgen_prelude::Buffer;
+use chevalier_vfs::{
+    OptimizedVfsStorage, VfsStorageEntryKind, VfsStorageError, VfsStorageMetadata,
+    VfsStorageObjectState,
+};
+use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
 
 fn vfs_err(e: VfsStorageError) -> napi::Error {
@@ -19,6 +22,64 @@ fn vfs_err(e: VfsStorageError) -> napi::Error {
 fn to_json<T: serde::Serialize>(v: T) -> napi::Result<serde_json::Value> {
     serde_json::to_value(v)
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("serialize: {e}")))
+}
+
+/// Pack-slot location for an object-backed file.
+#[napi(object)]
+pub struct VfsObjectState {
+    /// `bigint` — exact size, lossless above 2^53.
+    pub size_bytes: BigInt,
+    pub pack_key: String,
+    pub pack_slot_offset: BigInt,
+    pub pack_slot_length: BigInt,
+    pub pack_slot_compression: i32,
+}
+
+impl From<VfsStorageObjectState> for VfsObjectState {
+    fn from(o: VfsStorageObjectState) -> Self {
+        Self {
+            size_bytes: BigInt::from(o.size_bytes),
+            pack_key: o.pack_key,
+            pack_slot_offset: BigInt::from(o.pack_slot_offset),
+            pack_slot_length: BigInt::from(o.pack_slot_length),
+            pack_slot_compression: o.pack_slot_compression as i32,
+        }
+    }
+}
+
+/// File/dir metadata. `sizeBytes` is a `bigint` so it never loses precision at
+/// the FFI boundary (JS `number` only holds integers up to 2^53).
+#[napi(object)]
+pub struct VfsMetadata {
+    pub path: String,
+    /// `"File"` or `"Directory"`.
+    pub kind: String,
+    pub size_bytes: BigInt,
+    pub content_hash: Option<String>,
+    pub token_count: Option<i32>,
+    pub version: Option<String>,
+    /// RFC 3339 timestamp.
+    pub updated_at: Option<String>,
+    pub object_state: Option<VfsObjectState>,
+}
+
+impl From<VfsStorageMetadata> for VfsMetadata {
+    fn from(m: VfsStorageMetadata) -> Self {
+        Self {
+            path: m.path,
+            kind: match m.kind {
+                VfsStorageEntryKind::File => "File",
+                VfsStorageEntryKind::Directory => "Directory",
+            }
+            .to_string(),
+            size_bytes: BigInt::from(m.size_bytes),
+            content_hash: m.content_hash,
+            token_count: m.token_count,
+            version: m.version,
+            updated_at: m.updated_at.map(|d| d.to_rfc3339()),
+            object_state: m.object_state.map(VfsObjectState::from),
+        }
+    }
 }
 
 /// Options for the HTTP gateway backend.
@@ -87,24 +148,26 @@ impl VfsStorage {
         to_json(r)
     }
 
-    /// Stat a path; returns metadata JSON or null.
+    /// Stat a path; returns typed metadata (`sizeBytes` is a `bigint`) or null.
     #[napi]
-    pub async fn stat(&self, path: String) -> napi::Result<Option<serde_json::Value>> {
-        match self.inner.stat(&path).await.map_err(vfs_err)? {
-            Some(m) => Ok(Some(to_json(m)?)),
-            None => Ok(None),
-        }
+    pub async fn stat(&self, path: String) -> napi::Result<Option<VfsMetadata>> {
+        Ok(self
+            .inner
+            .stat(&path)
+            .await
+            .map_err(vfs_err)?
+            .map(VfsMetadata::from))
     }
 
-    /// List a directory's entries with metadata (JSON array).
+    /// List a directory's entries with typed metadata.
     #[napi]
-    pub async fn list_dir(&self, path: String) -> napi::Result<Vec<serde_json::Value>> {
+    pub async fn list_dir(&self, path: String) -> napi::Result<Vec<VfsMetadata>> {
         let items = self
             .inner
             .list_dir_with_metadata(&path, Default::default())
             .await
             .map_err(vfs_err)?;
-        items.into_iter().map(to_json).collect()
+        Ok(items.into_iter().map(VfsMetadata::from).collect())
     }
 
     /// Create a directory.

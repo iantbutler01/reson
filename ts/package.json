@@ -3,12 +3,14 @@
   "version": "0.0.0",
   "description": "TypeScript bindings for Chevalier — agents are just functions.",
   "license": "Apache-2.0",
+  "type": "commonjs",
   "main": "index.js",
   "types": "index.d.ts",
   "exports": {
     ".": {
       "types": "./index.d.ts",
-      "default": "./index.js"
+      "import": "./index.mjs",
+      "require": "./index.js"
     }
   },
   "napi": {
@@ -22,10 +24,11 @@
     ]
   },
   "engines": {
-    "node": ">= 12.22.0"
+    "node": ">= 18"
   },
   "files": [
     "index.js",
+    "index.mjs",
     "index.d.ts",
     "native.js",
     "native.d.ts",
@@ -39,10 +42,10 @@
     "test": "node --test --test-force-exit"
   },
   "dependencies": {
-    "zod-to-json-schema": "^3.23.0"
+    "zod-to-json-schema": "^3.24.0"
   },
   "peerDependencies": {
-    "zod": "^3.23.0"
+    "zod": ">=3.23.0"
   },
   "peerDependenciesMeta": {
     "zod": {

@@ -14,8 +14,15 @@ use napi_derive::napi;
 use tokio::sync::Mutex;
 
 /// JS MCP tool handler: receives parsed JSON args, returns `Promise<string>`.
-type ServerToolHandler =
-    ThreadsafeFunction<serde_json::Value, Promise<String>, serde_json::Value, napi::Status, false>;
+/// `Weak=true` so a registered handler doesn't keep the event loop alive.
+type ServerToolHandler = ThreadsafeFunction<
+    serde_json::Value,
+    Promise<String>,
+    serde_json::Value,
+    napi::Status,
+    false,
+    true,
+>;
 
 fn mcp_err(e: chevalier_mcp::Error) -> napi::Error {
     napi::Error::new(napi::Status::GenericFailure, format!("MCP: {e}"))

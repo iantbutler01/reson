@@ -3,7 +3,7 @@
 MicroVM **sandbox client** bindings for Chevalier. This is a thin, typed
 [napi-rs](https://napi.rs) wrapper over the Rust sandbox client; it connects to
 an external `vmd` daemon over gRPC and **never spawns one**. Kept separate from
-the core [`chevalier`](../node) package because it pulls in a gRPC stack.
+the core [`chevalier`](../ts) package because it pulls in a gRPC stack.
 
 ```bash
 npm install chevalier-sandbox

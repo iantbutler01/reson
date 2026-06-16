@@ -1,7 +1,8 @@
 "use strict";
 // Chevalier — TypeScript ergonomic layer over the native (napi-rs) bindings.
 // Adds: Zod-typed structured output, Zod tool schemas, `for await` streaming,
-// and the `agentic()` higher-order helper. Raw bindings live in ./native.js.
+// typed errors, and the `agentic()` higher-order helper. Raw bindings live in
+// ./native.js.
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -36,7 +37,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Runtime = exports.version = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
+exports.Runtime = exports.ChevalierError = exports.version = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
 exports.agentic = agentic;
 const native = __importStar(require("./native.js"));
 const zod_to_json_schema_1 = require("zod-to-json-schema");
@@ -45,14 +46,50 @@ Object.defineProperty(exports, "McpClient", { enumerable: true, get: function ()
 Object.defineProperty(exports, "McpServer", { enumerable: true, get: function () { return native_js_1.McpServer; } });
 Object.defineProperty(exports, "VfsStorage", { enumerable: true, get: function () { return native_js_1.VfsStorage; } });
 Object.defineProperty(exports, "version", { enumerable: true, get: function () { return native_js_1.version; } });
+/** Error thrown by Chevalier, carrying a machine-readable `code` and a
+ *  `retryable` hint parsed from the engine. */
+class ChevalierError extends Error {
+    constructor(message, code = "ERROR", retryable = false, output) {
+        super(message);
+        this.name = "ChevalierError";
+        this.code = code;
+        this.retryable = retryable;
+        this.output = output;
+    }
+}
+exports.ChevalierError = ChevalierError;
+// Native errors carry `[CODE retryable=bool] message`; lift that into ChevalierError.
+const ERR_PREFIX = /^\[([A-Z0-9_]+) retryable=(true|false)\]\s*([\s\S]*)$/;
+function toChevalierError(e) {
+    if (e instanceof ChevalierError)
+        return e;
+    if (e instanceof Error) {
+        const m = ERR_PREFIX.exec(e.message);
+        if (m)
+            return new ChevalierError(m[3], m[1], m[2] === "true");
+    }
+    return e;
+}
 function isZod(s) {
     return (!!s &&
         typeof s.parse === "function" &&
         typeof s.safeParse === "function");
 }
 function toJsonSchema(s) {
+    if (!isZod(s))
+        return s;
+    // Zod v4 ships a native converter; prefer it. Fall back to zod-to-json-schema (v3).
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const z = require("zod");
+        if (z && typeof z.toJSONSchema === "function")
+            return z.toJSONSchema(s);
+    }
+    catch {
+        /* zod not resolvable here (v3, or ESM-only) — fall through */
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return isZod(s) ? (0, zod_to_json_schema_1.zodToJsonSchema)(s) : s;
+    return (0, zod_to_json_schema_1.zodToJsonSchema)(s);
 }
 /** The Chevalier agent runtime. */
 class Runtime {
@@ -63,22 +100,52 @@ class Runtime {
     async run(args = {}) {
         const { output, ...rest } = args;
         const outputSchema = output ? toJsonSchema(output) : undefined;
-        const res = (await this.native.run({ ...rest, outputSchema }));
+        let res;
+        try {
+            res = (await this.native.run({ ...rest, outputSchema }));
+        }
+        catch (e) {
+            throw toChevalierError(e);
+        }
         if (output && isZod(output)) {
-            res.value = output.parse(JSON.parse(res.text));
+            res.value = decodeOutput(output, res.text);
         }
         return res;
     }
-    /** Streaming inference as an async iterator: `for await (const ev of rt.runStream(...))`. */
+    /** Streaming inference as an async iterator: `for await (const ev of rt.runStream(...))`.
+     *  When `output` is given, the `complete` event carries a decoded `value`.
+     *  Always closes the underlying stream on exit (including early `break`). */
     async *runStream(args = {}) {
         const { output, ...rest } = args;
         const outputSchema = output ? toJsonSchema(output) : undefined;
         const handle = await this.native.runStream({ ...rest, outputSchema });
-        for (;;) {
-            const ev = await handle.next();
-            if (ev == null)
-                return;
-            yield ev;
+        let text = "";
+        try {
+            for (;;) {
+                let ev;
+                try {
+                    ev = await handle.next();
+                }
+                catch (e) {
+                    throw toChevalierError(e);
+                }
+                if (ev == null)
+                    return;
+                if (ev.type === "content" && ev.text)
+                    text += ev.text;
+                if (ev.type === "complete" && output && isZod(output)) {
+                    try {
+                        ev.value = output.parse(JSON.parse(text));
+                    }
+                    catch {
+                        /* leave value unset; don't abort the stream on decode failure */
+                    }
+                }
+                yield ev;
+            }
+        }
+        finally {
+            handle.close();
         }
     }
     /** Register a tool. With `handler`, the engine runs it on `executeToolCall`;
@@ -87,14 +154,22 @@ class Runtime {
         const schema = toJsonSchema(def.schema);
         if (def.handler) {
             const h = def.handler;
-            await this.native.tool(def.name, def.description ?? "", schema, async (a) => String(await h(a)));
+            await this.native.tool(def.name, def.description ?? "", schema, async (a) => {
+                const r = await h(a);
+                return typeof r === "string" ? r : JSON.stringify(r);
+            });
         }
         else {
             await this.native.registerToolSchema(def.name, def.description ?? "", schema);
         }
     }
-    executeToolCall(toolName, args) {
-        return this.native.executeToolCall(toolName, args);
+    async executeToolCall(toolName, args) {
+        try {
+            return await this.native.executeToolCall(toolName, args);
+        }
+        catch (e) {
+            throw toChevalierError(e);
+        }
     }
     getToolSchemas() {
         return this.native.getToolSchemas();
@@ -125,8 +200,27 @@ class Runtime {
     mcpAs(uri, label) {
         return this.native.mcpAs(uri, label);
     }
+    /** Release tool handlers so the Runtime can be GC'd. Important when a tool
+     *  handler captures the Runtime (the napi_ref ↔ closure cycle otherwise leaks
+     *  it). Call when done with a short-lived (e.g. per-request) Runtime. */
+    dispose() {
+        return this.native.dispose();
+    }
 }
 exports.Runtime = Runtime;
+/** Parse `text` as JSON and validate against `schema`, throwing a typed
+ *  ChevalierError (code `OUTPUT_PARSE`) on malformed/empty JSON instead of a
+ *  bare SyntaxError. Zod validation errors propagate as ZodError. */
+function decodeOutput(schema, text) {
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        throw new ChevalierError(`model did not return valid JSON for structured output (got ${text.length} char(s))`, "OUTPUT_PARSE", false, text);
+    }
+    return schema.parse(parsed);
+}
 /** "An agent is just a function." Wraps a function so a fresh `Runtime` is
  *  created per call and passed as the last argument. */
 function agentic(config, fn) {

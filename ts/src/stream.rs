@@ -1,16 +1,27 @@
 //! Streaming: a `StreamHandle` that yields engine `ResponseStreamEvent`s as a
 //! JS-friendly discriminated union. The Rust stream is driven by a spawned task
 //! that owns the runtime lock guard + the stream together (avoiding a
-//! self-referential struct), forwarding events over an mpsc channel.
+//! self-referential struct), forwarding events over an *unbounded* channel so
+//! the driver never parks waiting for the consumer (which would pin the runtime
+//! lock). `close()` aborts the driver to release the lock + provider request
+//! promptly.
 
 use std::sync::Arc;
 
 use chevalier_agentic::types::{ResponsePart, ResponseStreamEvent};
 use napi_derive::napi;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 
 use crate::types::ToolCallJs;
+
+/// Serialize a value, or fall back to an `_serialization_error` marker so a
+/// payload is never silently dropped to `null`.
+pub(crate) fn to_value_or_marker<T: serde::Serialize>(v: T) -> serde_json::Value {
+    serde_json::to_value(v)
+        .unwrap_or_else(|e| serde_json::json!({ "_serialization_error": e.to_string() }))
+}
 
 /// A single streamed event. Discriminated by `type`:
 /// `content` | `reasoning` | `signature` | `toolCall` | `toolPartial` | `usage` | `complete`.
@@ -58,22 +69,24 @@ impl From<ResponseStreamEvent> for StreamEvent {
                 ..base("toolPartial")
             },
             ResponseStreamEvent::Usage(u) => StreamEvent {
-                data: serde_json::to_value(u).ok(),
+                data: Some(to_value_or_marker(u)),
                 ..base("usage")
             },
             ResponseStreamEvent::Complete(r) => StreamEvent {
-                data: serde_json::to_value(r).ok(),
+                data: Some(to_value_or_marker(r)),
                 ..base("complete")
             },
         }
     }
 }
 
-/// Async cursor over a streaming run. Call `next()` until it returns `null`.
-/// The TS layer wraps this with `Symbol.asyncIterator` for `for await`.
+/// Async cursor over a streaming run. Call `next()` until it returns `null`, or
+/// `close()` to cancel early. The TS layer wraps this as an async iterator and
+/// calls `close()` in a `finally`.
 #[napi]
 pub struct StreamHandle {
-    pub(crate) rx: Arc<Mutex<Receiver<Result<StreamEvent, String>>>>,
+    pub(crate) rx: Arc<Mutex<UnboundedReceiver<Result<StreamEvent, String>>>>,
+    pub(crate) abort: AbortHandle,
 }
 
 #[napi]
@@ -89,5 +102,22 @@ impl StreamHandle {
             Some(Err(msg)) => Err(napi::Error::new(napi::Status::GenericFailure, msg)),
             None => Ok(None),
         }
+    }
+
+    /// Cancel the stream: aborts the driving task, releasing the runtime lock and
+    /// the provider request. Idempotent.
+    #[napi]
+    pub fn close(&self) {
+        self.abort.abort();
+    }
+}
+
+impl Drop for StreamHandle {
+    /// Safety net: if the handle is dropped/GC'd without `close()` (e.g. an
+    /// abandoned iterator, or a stalled provider where the channel-close wouldn't
+    /// be observed), abort the driver so the runtime lock + provider connection
+    /// are released immediately rather than lingering.
+    fn drop(&mut self) {
+        self.abort.abort();
     }
 }

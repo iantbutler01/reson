@@ -63,13 +63,12 @@ fn role_from(s: &str) -> ChatRole {
 }
 
 /// Build a `ChatMessage` from a message (used for system-message prefixes).
+/// Honors every role, including `tool` (which previously fell through to user).
 pub fn to_chat_message(m: &Message) -> ChatMessage {
     let content = m.content.clone().unwrap_or_default();
-    match role_from(m.role.as_deref().unwrap_or("user")) {
-        ChatRole::System => ChatMessage::system(content),
-        ChatRole::Assistant => ChatMessage::assistant(content),
-        _ => ChatMessage::user(content),
-    }
+    let mut msg = ChatMessage::user(content);
+    msg.role = role_from(m.role.as_deref().unwrap_or("user"));
+    msg
 }
 
 /// Build a `ConversationMessage` (history item) from a message.
@@ -97,7 +96,9 @@ pub fn to_conversation_message(m: &Message) -> ConversationMessage {
                 .as_ref()
                 .map(|ps| ps.iter().map(to_media_part).collect())
                 .unwrap_or_default();
-            ConversationMessage::Multimodal(MultimodalMessage::user(parts))
+            let mut mm = MultimodalMessage::user(parts);
+            mm.role = role_from(m.role.as_deref().unwrap_or("user"));
+            ConversationMessage::Multimodal(mm)
         }
         _ => ConversationMessage::Chat(to_chat_message(m)),
     }

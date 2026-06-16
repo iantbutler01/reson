@@ -16,11 +16,13 @@ pub fn error_code(e: &EngineError) -> &'static str {
         EngineError::ToolNotFound(_) => "TOOL_NOT_FOUND",
         EngineError::Network(_) => "NETWORK",
         EngineError::Json(_) => "JSON",
+        EngineError::Utf8(_) | EngineError::FromUtf8(_) => "UTF8",
         EngineError::Io(_) => "IO",
         EngineError::InvalidProvider(_) => "INVALID_PROVIDER",
         EngineError::MissingApiKey(_) => "MISSING_API_KEY",
         EngineError::RuntimeNotUsed => "RUNTIME_NOT_USED",
-        _ => "ERROR",
+        // No catch-all: a new engine Error variant becomes a compile error here
+        // (forcing an explicit code) rather than silently mapping to "ERROR".
     }
 }
 
