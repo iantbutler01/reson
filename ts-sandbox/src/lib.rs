@@ -36,10 +36,26 @@ pub struct ExecEventJs {
 impl From<ExecEvent> for ExecEventJs {
     fn from(e: ExecEvent) -> Self {
         match e {
-            ExecEvent::Stdout(b) => ExecEventJs { kind: "stdout".into(), data: Some(Buffer::from(b)), code: None },
-            ExecEvent::Stderr(b) => ExecEventJs { kind: "stderr".into(), data: Some(Buffer::from(b)), code: None },
-            ExecEvent::Exit(c) => ExecEventJs { kind: "exit".into(), data: None, code: Some(c) },
-            ExecEvent::Timeout => ExecEventJs { kind: "timeout".into(), data: None, code: None },
+            ExecEvent::Stdout(b) => ExecEventJs {
+                kind: "stdout".into(),
+                data: Some(Buffer::from(b)),
+                code: None,
+            },
+            ExecEvent::Stderr(b) => ExecEventJs {
+                kind: "stderr".into(),
+                data: Some(Buffer::from(b)),
+                code: None,
+            },
+            ExecEvent::Exit(c) => ExecEventJs {
+                kind: "exit".into(),
+                data: None,
+                code: Some(c),
+            },
+            ExecEvent::Timeout => ExecEventJs {
+                kind: "timeout".into(),
+                data: None,
+                code: None,
+            },
         }
     }
 }
@@ -79,7 +95,10 @@ impl ExecHandle {
         // Saturate rather than silently truncate (a terminal never exceeds u16).
         let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
         self.input
-            .send(ExecInput::Resize { cols: clamp(cols), rows: clamp(rows) })
+            .send(ExecInput::Resize {
+                cols: clamp(cols),
+                rows: clamp(rows),
+            })
             .await
             .map_err(|_| napi::Error::from_reason("exec stdin closed"))
     }
@@ -127,6 +146,7 @@ pub struct SessionOpts {
     pub architecture: Option<String>,
     pub metadata: Option<HashMap<String, String>>,
     pub auto_start: Option<bool>,
+    pub egress_allowlist: Option<Vec<String>>,
 }
 
 impl From<SessionOpts> for SessionOptions {
@@ -138,6 +158,7 @@ impl From<SessionOpts> for SessionOptions {
             architecture: o.architecture,
             metadata: o.metadata.unwrap_or_default(),
             auto_start: o.auto_start.unwrap_or(true),
+            egress_allowlist: o.egress_allowlist,
             ..Default::default()
         }
     }
@@ -181,7 +202,11 @@ impl Session {
 
     /// Start a command; returns a bidirectional `ExecHandle`.
     #[napi]
-    pub async fn exec(&self, command: String, options: Option<ExecOpts>) -> napi::Result<ExecHandle> {
+    pub async fn exec(
+        &self,
+        command: String,
+        options: Option<ExecOpts>,
+    ) -> napi::Result<ExecHandle> {
         let opts = options.map(Into::into).unwrap_or_default();
         let h = self.inner.exec(&command, opts).await.map_err(sb_err)?;
         Ok(ExecHandle {
@@ -200,7 +225,10 @@ impl Session {
     /// Write a file to the guest.
     #[napi]
     pub async fn write_file(&self, path: String, data: Buffer) -> napi::Result<()> {
-        self.inner.write_file(&path, data.to_vec()).await.map_err(sb_err)
+        self.inner
+            .write_file(&path, data.to_vec())
+            .await
+            .map_err(sb_err)
     }
 
     /// Fork this session (CoW); returns the child session.
@@ -254,7 +282,9 @@ impl Sandbox {
                 cfg.default_image = img;
             }
         }
-        let sb = EngineSandbox::connect(endpoint, cfg).await.map_err(sb_err)?;
+        let sb = EngineSandbox::connect(endpoint, cfg)
+            .await
+            .map_err(sb_err)?;
         Ok(Sandbox { inner: sb })
     }
 
@@ -269,7 +299,11 @@ impl Sandbox {
     /// Attach to an existing session by id.
     #[napi]
     pub async fn attach_session(&self, session_id: String) -> napi::Result<Session> {
-        let s = self.inner.attach_session(&session_id).await.map_err(sb_err)?;
+        let s = self
+            .inner
+            .attach_session(&session_id)
+            .await
+            .map_err(sb_err)?;
         Ok(Session { inner: s })
     }
 }

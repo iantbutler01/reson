@@ -213,6 +213,7 @@ pub struct OpenComputerBackendConfig {
     pub default_disk_mb: Option<u32>,
     pub burst: Option<bool>,
     pub secret_store: Option<String>,
+    pub egress_allowlist: Option<Vec<String>>,
     pub mounts: Vec<OpenComputerMountConfig>,
     pub shared_mounts: HashMap<String, OpenComputerMountConfig>,
 }
@@ -252,6 +253,7 @@ impl Default for OpenComputerBackendConfig {
             default_disk_mb: None,
             burst: None,
             secret_store: None,
+            egress_allowlist: None,
             mounts: Vec::new(),
             shared_mounts: HashMap::new(),
         }
@@ -351,6 +353,14 @@ impl OpenComputerBackendConfig {
                 ))
             })?;
         }
+        if let Ok(egress_allowlist_json) = std::env::var("OPENCOMPUTER_EGRESS_ALLOWLIST_JSON") {
+            cfg.egress_allowlist =
+                Some(serde_json::from_str(&egress_allowlist_json).map_err(|err| {
+                    SandboxError::InvalidConfig(format!(
+                        "invalid OPENCOMPUTER_EGRESS_ALLOWLIST_JSON: {err}"
+                    ))
+                })?);
+        }
         Ok(cfg)
     }
 }
@@ -419,6 +429,7 @@ pub struct SessionOptions {
     pub auto_start: bool,
     pub resources: Option<ResourceLimits>,
     pub shared_mounts: Vec<SharedMount>,
+    pub egress_allowlist: Option<Vec<String>>,
 }
 
 impl Default for SessionOptions {
@@ -432,6 +443,7 @@ impl Default for SessionOptions {
             auto_start: true,
             resources: None,
             shared_mounts: Vec::new(),
+            egress_allowlist: None,
         }
     }
 }
@@ -720,19 +732,19 @@ impl Drop for ForwardHandle {
             let registration = guard.take();
             drop(guard);
             #[allow(unused_mut)]
-            if let Some(mut registration) = registration {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        registration
-                            .multiplexer
-                            .unregister(registration.host_port)
-                            .await;
-                        #[cfg(feature = "distributed-control")]
-                        if let Some(port_lease) = registration.port_lease.take() {
-                            port_lease.shutdown().await;
-                        }
-                    });
-                }
+            if let Some(mut registration) = registration
+                && let Ok(handle) = tokio::runtime::Handle::try_current()
+            {
+                handle.spawn(async move {
+                    registration
+                        .multiplexer
+                        .unregister(registration.host_port)
+                        .await;
+                    #[cfg(feature = "distributed-control")]
+                    if let Some(port_lease) = registration.port_lease.take() {
+                        port_lease.shutdown().await;
+                    }
+                });
             }
         }
     }
@@ -2419,6 +2431,7 @@ impl Sandbox {
                     opts.resources,
                     metadata,
                     None,
+                    opts.egress_allowlist,
                     opts.shared_mounts.as_slice(),
                 )
                 .await?;
@@ -4408,10 +4421,11 @@ fn endpoint_host(endpoint: &str) -> Result<String> {
         )));
     }
 
-    if let Some((host, _port)) = authority.rsplit_once(':') {
-        if !host.is_empty() && !host.contains(':') {
-            return Ok(normalize_dial_host(host).to_string());
-        }
+    if let Some((host, _port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+    {
+        return Ok(normalize_dial_host(host).to_string());
     }
 
     Ok(normalize_dial_host(authority).to_string())

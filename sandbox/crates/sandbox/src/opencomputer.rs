@@ -57,6 +57,7 @@ impl OpenComputerControl {
         resources: Option<crate::ResourceLimits>,
         metadata: HashMap<String, String>,
         envs: Option<HashMap<String, String>>,
+        egress_allowlist: Option<Vec<String>>,
         shared_mounts: &[SharedMount],
     ) -> Result<OpenComputerSandbox> {
         let resource_fields = resolve_resource_fields(resources.as_ref(), &self.cfg);
@@ -75,6 +76,7 @@ impl OpenComputerControl {
             memory_mb: resource_fields.memory_mb,
             disk_mb: resource_fields.disk_mb,
             secret_store: self.cfg.secret_store.clone(),
+            egress_allowlist: egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone()),
         };
         let response = self
             .send(self.client.post(self.url("/sandboxes")).json(&body))
@@ -626,6 +628,8 @@ struct CreateSandboxBody {
     disk_mb: Option<u32>,
     #[serde(rename = "secretStore", skip_serializing_if = "Option::is_none")]
     secret_store: Option<String>,
+    #[serde(rename = "egressAllowlist", skip_serializing_if = "Option::is_none")]
+    egress_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1020,6 +1024,34 @@ mod tests {
                 memory_mb: Some(2048),
                 disk_mb: Some(10 * 1024)
             }
+        );
+    }
+
+    #[test]
+    fn create_sandbox_body_includes_egress_allowlist() {
+        let body = CreateSandboxBody {
+            template_id: Some("base".to_string()),
+            timeout: Some(0),
+            envs: None,
+            metadata: None,
+            burst: None,
+            cpu_count: None,
+            memory_mb: None,
+            disk_mb: None,
+            secret_store: None,
+            egress_allowlist: Some(vec![
+                "api.anthropic.com".to_string(),
+                "*.openai.com".to_string(),
+            ]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            json!({
+                "templateID": "base",
+                "timeout": 0,
+                "egressAllowlist": ["api.anthropic.com", "*.openai.com"],
+            })
         );
     }
 
