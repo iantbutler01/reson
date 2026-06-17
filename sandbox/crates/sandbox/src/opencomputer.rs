@@ -498,6 +498,7 @@ impl OpenComputerControl {
             if mount.read_only.is_none() {
                 mount.read_only = Some(shared.read_only);
             }
+            render_shared_mount_config(&mut mount, shared);
             mounts.push(mount);
         }
         Ok(mounts)
@@ -678,9 +679,18 @@ struct CreateFromCheckpointBody {
 #[derive(Serialize)]
 struct AddMountBody {
     path: String,
-    remote: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secrets: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     creds: Option<HashMap<String, String>>,
     #[serde(rename = "rcloneConfig", skip_serializing_if = "Option::is_none")]
@@ -700,30 +710,107 @@ impl AddMountBody {
                 "OpenComputer mount path must not be empty".to_string(),
             ));
         }
-        if config.remote.is_empty() {
+        let driver = config
+            .driver
+            .map(|driver| driver.trim().to_ascii_lowercase())
+            .filter(|driver| !driver.is_empty());
+        if !matches!(driver.as_deref(), None | Some("rclone") | Some("command")) {
+            return Err(SandboxError::InvalidConfig(format!(
+                "OpenComputer mount `{}` uses unsupported driver `{}`",
+                config.path,
+                driver.as_deref().unwrap_or_default()
+            )));
+        }
+        let command_driver = matches!(driver.as_deref(), Some("command"));
+        if command_driver && config.command.is_empty() {
+            return Err(SandboxError::InvalidConfig(format!(
+                "OpenComputer command mount `{}` requires command argv",
+                config.path
+            )));
+        }
+        if !command_driver && config.remote.is_empty() {
             return Err(SandboxError::InvalidConfig(format!(
                 "OpenComputer mount `{}` remote must not be empty",
                 config.path
             )));
         }
-        let backend = config
-            .backend
-            .map(|backend| backend.trim().to_ascii_lowercase())
-            .filter(|backend| !backend.is_empty());
-        let rclone_config = config
-            .rclone_config
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        let backend = if command_driver {
+            None
+        } else {
+            config
+                .backend
+                .map(|backend| backend.trim().to_ascii_lowercase())
+                .filter(|backend| !backend.is_empty())
+        };
+        let rclone_config = if command_driver {
+            None
+        } else {
+            config
+                .rclone_config
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
         Ok(Self {
             path: config.path,
-            remote: config.remote,
+            driver,
+            remote: (!command_driver).then_some(config.remote),
             backend,
-            creds: (!config.creds.is_empty()).then_some(config.creds),
+            command: config.command,
+            env: (!config.env.is_empty()).then_some(config.env),
+            secrets: (!config.secrets.is_empty()).then_some(config.secrets),
+            creds: (!command_driver && !config.creds.is_empty()).then_some(config.creds),
             rclone_config,
             read_only: config.read_only,
-            mount_options: config.mount_options,
+            mount_options: if command_driver {
+                Vec::new()
+            } else {
+                config.mount_options
+            },
         })
     }
+}
+
+fn render_shared_mount_config(config: &mut OpenComputerMountConfig, shared: &SharedMount) {
+    config.path = render_shared_mount_template(&config.path, shared);
+    config.remote = render_shared_mount_template(&config.remote, shared);
+    config.command = config
+        .command
+        .iter()
+        .map(|value| render_shared_mount_template(value, shared))
+        .collect();
+    config.env = config
+        .env
+        .iter()
+        .map(|(key, value)| {
+            (
+                render_shared_mount_template(key, shared),
+                render_shared_mount_template(value, shared),
+            )
+        })
+        .collect();
+    config.secrets = config
+        .secrets
+        .iter()
+        .map(|(key, value)| {
+            (
+                render_shared_mount_template(key, shared),
+                render_shared_mount_template(value, shared),
+            )
+        })
+        .collect();
+}
+
+fn render_shared_mount_template(template: &str, shared: &SharedMount) -> String {
+    template
+        .replace("{guest_path}", shared.guest_path.as_str())
+        .replace("{mount_tag}", shared.mount_tag.as_str())
+        .replace("{backend_profile}", shared.backend_profile.as_str())
+        .replace("{vfs_endpoint}", shared.vfs_endpoint.as_str())
+        .replace("{vfs_scope_path}", shared.vfs_scope_path.trim_matches('/'))
+        .replace(
+            "{read_only}",
+            if shared.read_only { "true" } else { "false" },
+        )
 }
 
 #[derive(Serialize)]
@@ -959,6 +1046,45 @@ mod tests {
     }
 
     #[test]
+    fn command_mount_body_matches_opencomputer_sdk_shape() {
+        let mut config = OpenComputerMountConfig::command(
+            " /mnt/data ",
+            [
+                "chevalier-vfs-fuse",
+                "--endpoint",
+                "https://api.example.test/vfs",
+                "{mountpoint}",
+            ],
+        );
+        config.env.insert("PLAIN".to_string(), "value".to_string());
+        config.secrets.insert(
+            "CHEVALIER_VFS_TOKEN".to_string(),
+            "secret-token".to_string(),
+        );
+        config.read_only = Some(true);
+        config.remote = "ignored-for-command".to_string();
+        config.backend = Some("ignored".to_string());
+
+        let body = AddMountBody::from_config(config).expect("mount body");
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            json!({
+                "path": "/mnt/data",
+                "driver": "command",
+                "command": [
+                    "chevalier-vfs-fuse",
+                    "--endpoint",
+                    "https://api.example.test/vfs",
+                    "{mountpoint}"
+                ],
+                "env": { "PLAIN": "value" },
+                "secrets": { "CHEVALIER_VFS_TOKEN": "secret-token" },
+                "readOnly": true
+            })
+        );
+    }
+
+    #[test]
     fn mount_config_deserializes_from_json_config() {
         let config: OpenComputerMountConfig = serde_json::from_value(json!({
             "path": "/nym/vm/mounts/task",
@@ -976,6 +1102,38 @@ mod tests {
         assert_eq!(config.backend.as_deref(), Some("gcs"));
         assert_eq!(config.read_only, Some(false));
         assert_eq!(config.mount_options, ["--dir-cache-time", "1m"]);
+    }
+
+    #[test]
+    fn command_mount_config_deserializes_from_json_config() {
+        let config: OpenComputerMountConfig = serde_json::from_value(json!({
+            "path": "",
+            "driver": "command",
+            "command": [
+                "chevalier-vfs-fuse",
+                "--endpoint",
+                "{vfs_endpoint}",
+                "--scope",
+                "{vfs_scope_path}",
+                "{mountpoint}"
+            ],
+            "env": { "CHEVALIER_VFS_SCOPE": "{vfs_scope_path}" },
+            "secrets": { "CHEVALIER_VFS_TOKEN": "token" },
+            "read_only": true
+        }))
+        .expect("mount config");
+
+        assert_eq!(config.driver.as_deref(), Some("command"));
+        assert!(config.remote.is_empty());
+        assert_eq!(
+            config.command.last().map(String::as_str),
+            Some("{mountpoint}")
+        );
+        assert_eq!(
+            config.env.get("CHEVALIER_VFS_SCOPE").map(String::as_str),
+            Some("{vfs_scope_path}")
+        );
+        assert_eq!(config.read_only, Some(true));
     }
 
     #[test]
@@ -1002,6 +1160,10 @@ mod tests {
                 path: String::new(),
                 remote: "gcs:nym-vfs/task".to_string(),
                 backend: Some("gcs".to_string()),
+                driver: None,
+                command: Vec::new(),
+                env: HashMap::new(),
+                secrets: HashMap::new(),
                 creds: HashMap::new(),
                 rclone_config: None,
                 read_only: None,
@@ -1032,6 +1194,84 @@ mod tests {
         assert_eq!(resolved[0].path, "/nym/vm/mounts/task");
         assert_eq!(resolved[0].remote, "gcs:nym-vfs/task");
         assert_eq!(resolved[0].read_only, Some(false));
+    }
+
+    #[test]
+    fn shared_command_mounts_render_vfs_placeholders() {
+        let mut shared_mounts = HashMap::new();
+        shared_mounts.insert(
+            "gcs-vfs-fuse".to_string(),
+            OpenComputerMountConfig::command(
+                "",
+                [
+                    "chevalier-vfs-fuse",
+                    "--endpoint",
+                    "{vfs_endpoint}",
+                    "--scope",
+                    "{vfs_scope_path}",
+                    "--tag",
+                    "{mount_tag}",
+                    "{mountpoint}",
+                ],
+            ),
+        );
+        let control = OpenComputerControl::new(OpenComputerBackendConfig {
+            api_key: "test-key".to_string(),
+            shared_mounts,
+            ..OpenComputerBackendConfig::default()
+        })
+        .expect("control");
+
+        let shared = SharedMount {
+            host_path: String::new(),
+            guest_path: "/nym/vm/mounts/task".to_string(),
+            mount_tag: "task".to_string(),
+            read_only: false,
+            availability: SharedMountAvailability::SharedStorage,
+            continuity: SharedMountContinuity::RestoreCrossNode,
+            backend_profile: "gcs-vfs-fuse".to_string(),
+            vfs_endpoint: "https://example.test/internal/chevalier/vfs/owner-1".to_string(),
+            vfs_scope_path: "/conversations/abc/0001_assistant/mount".to_string(),
+        };
+
+        let resolved = control.resolve_mounts(&[shared]).expect("mapped mount");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].path, "/nym/vm/mounts/task");
+        assert_eq!(resolved[0].read_only, Some(false));
+        assert_eq!(
+            resolved[0].command,
+            [
+                "chevalier-vfs-fuse",
+                "--endpoint",
+                "https://example.test/internal/chevalier/vfs/owner-1",
+                "--scope",
+                "conversations/abc/0001_assistant/mount",
+                "--tag",
+                "task",
+                "{mountpoint}"
+            ]
+        );
+
+        let body =
+            AddMountBody::from_config(resolved.into_iter().next().unwrap()).expect("command body");
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            json!({
+                "path": "/nym/vm/mounts/task",
+                "driver": "command",
+                "command": [
+                    "chevalier-vfs-fuse",
+                    "--endpoint",
+                    "https://example.test/internal/chevalier/vfs/owner-1",
+                    "--scope",
+                    "conversations/abc/0001_assistant/mount",
+                    "--tag",
+                    "task",
+                    "{mountpoint}"
+                ],
+                "readOnly": false
+            })
+        );
     }
 
     #[test]

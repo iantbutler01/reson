@@ -219,9 +219,19 @@ pub struct OpenComputerBackendConfig {
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct OpenComputerMountConfig {
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub driver: Option<String>,
+    #[serde(default)]
     pub remote: String,
     pub backend: Option<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub secrets: HashMap<String, String>,
     #[serde(default)]
     pub creds: HashMap<String, String>,
     pub rclone_config: Option<String>,
@@ -257,8 +267,12 @@ impl OpenComputerMountConfig {
     ) -> Self {
         Self {
             path: path.into(),
+            driver: None,
             remote: remote.into(),
             backend: Some(backend.into()),
+            command: Vec::new(),
+            env: HashMap::new(),
+            secrets: HashMap::new(),
             creds,
             rclone_config: None,
             read_only: None,
@@ -273,10 +287,34 @@ impl OpenComputerMountConfig {
     ) -> Self {
         Self {
             path: path.into(),
+            driver: None,
             remote: remote.into(),
             backend: None,
+            command: Vec::new(),
+            env: HashMap::new(),
+            secrets: HashMap::new(),
             creds: HashMap::new(),
             rclone_config: Some(rclone_config.into()),
+            read_only: None,
+            mount_options: Vec::new(),
+        }
+    }
+
+    pub fn command<I, S>(path: impl Into<String>, command: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            path: path.into(),
+            driver: Some("command".to_string()),
+            remote: String::new(),
+            backend: None,
+            command: command.into_iter().map(Into::into).collect(),
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            creds: HashMap::new(),
+            rclone_config: None,
             read_only: None,
             mount_options: Vec::new(),
         }
