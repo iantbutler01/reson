@@ -1418,6 +1418,7 @@ exit 2
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn run_d2vm_uses_public_converter_without_private_bootstrap_flag_by_default() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         clear_d2vm_env();
@@ -1434,6 +1435,7 @@ exit 2
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn run_d2vm_can_opt_into_legacy_include_bootstrap_flag() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         clear_d2vm_env();
@@ -1452,6 +1454,7 @@ exit 2
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn run_d2vm_passes_docker_api_version_to_converter_container() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         clear_d2vm_env();

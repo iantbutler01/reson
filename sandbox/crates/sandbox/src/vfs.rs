@@ -958,18 +958,18 @@ mod server {
         let scope = backend.derive_write_scope(owner_id.as_str(), path).await?;
         let aliases = backend.header_aliases();
         let write_headers = parse_write_headers(
-            &headers,
+            headers,
             &aliases,
             scope.default_surface_kind.as_str(),
             default_operation,
         )?;
-        validate_declared_resource_key(&headers, &aliases, scope.resource_key.as_str())?;
+        validate_declared_resource_key(headers, &aliases, scope.resource_key.as_str())?;
         Ok(VfsNamespaceMutationRequest {
             owner_id,
             path: path.to_string(),
             headers: write_headers,
             scope,
-            precondition: parse_write_precondition_headers(&headers),
+            precondition: parse_write_precondition_headers(headers),
         })
     }
 
@@ -1631,14 +1631,15 @@ mod server_tests {
     #[tokio::test]
     async fn gateway_read_many_preserves_order_and_missing_entries() {
         let backend = MemoryBackend::default();
-        let mut inner = backend.inner.lock().unwrap();
-        inner
-            .files
-            .insert("first.txt".to_string(), Bytes::from_static(b"one"));
-        inner
-            .files
-            .insert("second.txt".to_string(), Bytes::from_static(b"two"));
-        drop(inner);
+        {
+            let mut inner = backend.inner.lock().unwrap();
+            inner
+                .files
+                .insert("first.txt".to_string(), Bytes::from_static(b"one"));
+            inner
+                .files
+                .insert("second.txt".to_string(), Bytes::from_static(b"two"));
+        }
         let app = chevalier_vfs_routes::<MemoryBackend, MemoryBackend>().with_state(backend);
 
         let response = app

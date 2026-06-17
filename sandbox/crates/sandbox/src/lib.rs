@@ -682,19 +682,19 @@ impl Drop for ForwardHandle {
             let registration = guard.take();
             drop(guard);
             #[allow(unused_mut)]
-            if let Some(mut registration) = registration
-                && let Ok(handle) = tokio::runtime::Handle::try_current()
-            {
-                handle.spawn(async move {
-                    registration
-                        .multiplexer
-                        .unregister(registration.host_port)
-                        .await;
-                    #[cfg(feature = "distributed-control")]
-                    if let Some(port_lease) = registration.port_lease.take() {
-                        port_lease.shutdown().await;
-                    }
-                });
+            if let Some(mut registration) = registration {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        registration
+                            .multiplexer
+                            .unregister(registration.host_port)
+                            .await;
+                        #[cfg(feature = "distributed-control")]
+                        if let Some(port_lease) = registration.port_lease.take() {
+                            port_lease.shutdown().await;
+                        }
+                    });
+                }
             }
         }
     }
@@ -2721,12 +2721,12 @@ impl Sandbox {
         }
 
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend
-            && let Some(route) = control.get_session_route(session_id).await?
-        {
-            return self
-                .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
-                .await;
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route) = control.get_session_route(session_id).await? {
+                return self
+                    .clear_session_route(Some(session_id), &route.vm_id, expected_fence.as_deref())
+                    .await;
+            }
         }
 
         Ok(())
@@ -3322,10 +3322,10 @@ impl Sandbox {
         #[cfg(not(feature = "distributed-control"))]
         let _ = session_id;
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend
-            && let Some(route) = control.get_session_route(session_id).await?
-        {
-            return Ok((route.tenant_id, route.workspace_id));
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route) = control.get_session_route(session_id).await? {
+                return Ok((route.tenant_id, route.workspace_id));
+            }
         }
         Ok(("default".to_string(), "default".to_string()))
     }
@@ -3337,14 +3337,15 @@ impl Sandbox {
     ) -> Result<bool> {
         let node_endpoint = normalize_endpoint(node_endpoint)?;
         #[cfg(feature = "distributed-control")]
-        if let ControlBackend::Distributed(control) = &self.inner.control_backend
-            && let Some(route_endpoint) = control
+        if let ControlBackend::Distributed(control) = &self.inner.control_backend {
+            if let Some(route_endpoint) = control
                 .get_session_route(session_id)
                 .await?
                 .map(|route| route.endpoint)
                 .filter(|endpoint| !endpoint.trim().is_empty())
-        {
-            return Ok(normalize_endpoint(&route_endpoint)? != node_endpoint);
+            {
+                return Ok(normalize_endpoint(&route_endpoint)? != node_endpoint);
+            }
         }
 
         #[cfg(not(feature = "distributed-control"))]
@@ -4304,11 +4305,10 @@ fn endpoint_host(endpoint: &str) -> Result<String> {
         )));
     }
 
-    if let Some((host, _port)) = authority.rsplit_once(':')
-        && !host.is_empty()
-        && !host.contains(':')
-    {
-        return Ok(normalize_dial_host(host).to_string());
+    if let Some((host, _port)) = authority.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(':') {
+            return Ok(normalize_dial_host(host).to_string());
+        }
     }
 
     Ok(normalize_dial_host(authority).to_string())

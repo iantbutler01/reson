@@ -572,7 +572,18 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+impl RemoteFuseFs {
+    fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
+        if read_only {
+            InitFlags::empty()
+        } else {
+            InitFlags::FUSE_WRITEBACK_CACHE
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use fuser::InitFlags;
 
@@ -631,16 +642,6 @@ mod tests {
             content_hash_for_bytes(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-    }
-}
-
-impl RemoteFuseFs {
-    fn requested_init_capabilities_for(read_only: bool) -> InitFlags {
-        if read_only {
-            InitFlags::empty()
-        } else {
-            InitFlags::FUSE_WRITEBACK_CACHE
-        }
     }
 }
 

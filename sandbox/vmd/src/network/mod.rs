@@ -1457,7 +1457,6 @@ mod tests {
     #[test]
     fn coredns_only_runs_for_guest_dns_or_proxy_mode() {
         let mut config = Config::default();
-        config.guest_network = Default::default();
         assert!(!needs_coredns(&config));
 
         config.guest_network.dns_server = Some("10.0.2.3".to_string());
@@ -1470,12 +1469,14 @@ mod tests {
 
     #[test]
     fn ha_network_runtime_paths_are_node_local_not_shared_data() {
-        let mut config = Config::default();
-        config.ha_mode = true;
-        config.listen_address = "0.0.0.0:8052".to_string();
-        config.data_dir = "/mnt/shared/chevalier-vmd".to_string();
-        config.node_registry = None;
-        config.control_bus = None;
+        let config = Config {
+            ha_mode: true,
+            listen_address: "0.0.0.0:8052".to_string(),
+            data_dir: "/mnt/shared/chevalier-vmd".to_string(),
+            node_registry: None,
+            control_bus: None,
+            ..Config::default()
+        };
 
         let paths = envoy_runtime_paths(&config);
 

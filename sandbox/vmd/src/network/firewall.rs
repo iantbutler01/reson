@@ -1568,10 +1568,12 @@ mod tests {
 
     #[test]
     fn install_uses_qemu_uid_and_local_proxy_dns_endpoints() {
-        let mut cfg = Config::default();
-        cfg.qemu_process = QemuProcessConfig {
-            run_as_uid: 1000,
-            run_as_gid: 1000,
+        let mut cfg = Config {
+            qemu_process: QemuProcessConfig {
+                run_as_uid: 1000,
+                run_as_gid: 1000,
+            },
+            ..Config::default()
         };
         cfg.network_services.coredns_bind_addr = "127.0.0.53:53".to_string();
         cfg.guest_network.http_proxy_upstream_addr = Some("127.0.0.1:3128".to_string());
@@ -1635,7 +1637,6 @@ mod tests {
     #[test]
     fn private_webrtc_udp_carveout_is_disabled_in_ha_mode() {
         let mut cfg = Config::default();
-        cfg.ha_mode = false;
         assert!(allow_private_webrtc_udp(&cfg));
 
         cfg.ha_mode = true;

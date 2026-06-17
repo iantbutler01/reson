@@ -50,21 +50,21 @@ pub fn evaluate_slo(samples: &[SloSample], budgets: &[SloBudget]) -> Vec<String>
         // @dive: Unknown metrics are ignored so new emitters can roll out independently of budget-table updates.
         if let Some(budget) = budgets.iter().find(|budget| budget.metric == sample.metric) {
             // @dive: p95 and p99 are evaluated independently to preserve signal even when one percentile is absent.
-            if let (Some(observed), Some(limit)) = (sample.p95_ms, budget.p95_ms)
-                && observed > limit
-            {
-                violations.push(format!(
-                    "{} p95 exceeded: observed={}ms budget={}ms",
-                    sample.metric, observed, limit
-                ));
+            if let (Some(observed), Some(limit)) = (sample.p95_ms, budget.p95_ms) {
+                if observed > limit {
+                    violations.push(format!(
+                        "{} p95 exceeded: observed={}ms budget={}ms",
+                        sample.metric, observed, limit
+                    ));
+                }
             }
-            if let (Some(observed), Some(limit)) = (sample.p99_ms, budget.p99_ms)
-                && observed > limit
-            {
-                violations.push(format!(
-                    "{} p99 exceeded: observed={}ms budget={}ms",
-                    sample.metric, observed, limit
-                ));
+            if let (Some(observed), Some(limit)) = (sample.p99_ms, budget.p99_ms) {
+                if observed > limit {
+                    violations.push(format!(
+                        "{} p99 exceeded: observed={}ms budget={}ms",
+                        sample.metric, observed, limit
+                    ));
+                }
             }
         }
     }
