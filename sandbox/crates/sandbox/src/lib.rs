@@ -65,7 +65,7 @@ use proto::bracket::portproxy::v1::{
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
-    CreateVmRequest, ForkVmRequest, GetVmRequest, ListVMsRequest, Metadata,
+    CreateSnapshotRequest, CreateVmRequest, ForkVmRequest, GetVmRequest, ListVMsRequest, Metadata,
     PreDownloadVmImageRequest, ResourceSpec, RestoreSnapshotRequest, Vm, VmActionRequest, VmSource,
     VmSourceType,
 };
@@ -810,6 +810,11 @@ pub struct ForkResult {
     pub child_session_id: String,
     pub fork_id: String,
     pub child: Session,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionCheckpoint {
+    pub id: String,
 }
 
 #[derive(Clone)]
@@ -2153,6 +2158,66 @@ impl Session {
         };
         log_slo_observation("port.forward.establish", started.elapsed(), "ok");
         Ok(handle)
+    }
+
+    pub async fn provider_preview_url(&self, guest_port: u16) -> Result<String> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            let sandbox = control.get_sandbox(&self.vm_id).await?;
+            let preview = sandbox.preview_domain(guest_port).ok_or_else(|| {
+                SandboxError::Unsupported(
+                    "OpenComputer did not return a preview domain for this sandbox".to_string(),
+                )
+            })?;
+            return Ok(format!("https://{preview}"));
+        }
+
+        Err(SandboxError::Unsupported(
+            "provider preview URLs are only available for provider-managed sandboxes".to_string(),
+        ))
+    }
+
+    pub async fn checkpoint(&self, name: &str) -> Result<SessionCheckpoint> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            let checkpoint = control.create_checkpoint(&self.vm_id, name).await?;
+            return Ok(SessionCheckpoint { id: checkpoint.id });
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let snapshot = client
+            .create_snapshot(self.sandbox.request_with_auth(CreateSnapshotRequest {
+                vm_id: self.vm_id.clone(),
+                label: name.to_string(),
+                description: String::new(),
+            }))
+            .await?
+            .into_inner();
+        Ok(SessionCheckpoint { id: snapshot.id })
+    }
+
+    pub async fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<Session> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            let child = control
+                .create_from_checkpoint(
+                    checkpoint_id,
+                    HashMap::new(),
+                    self.shared_mounts.as_slice(),
+                )
+                .await?;
+            let restored_session_id = child.sandbox_id.clone();
+            return Ok(Session::new_with_backend(
+                self.sandbox.clone(),
+                restored_session_id,
+                child.sandbox_id,
+                control.api_url().to_string(),
+                None,
+                self.shared_mounts.as_ref().clone(),
+            ));
+        }
+
+        Err(SandboxError::Unsupported(
+            "restore_checkpoint is only available for provider-managed sandboxes".to_string(),
+        ))
     }
 
     pub async fn fork(&self, opts: ForkOptions) -> Result<ForkResult> {

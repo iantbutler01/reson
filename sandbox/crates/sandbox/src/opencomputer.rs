@@ -436,7 +436,11 @@ impl OpenComputerControl {
         })
     }
 
-    async fn create_checkpoint(&self, sandbox_id: &str, name: &str) -> Result<CheckpointInfo> {
+    pub(crate) async fn create_checkpoint(
+        &self,
+        sandbox_id: &str,
+        name: &str,
+    ) -> Result<CheckpointInfo> {
         let response = self
             .send(
                 self.client
@@ -447,7 +451,7 @@ impl OpenComputerControl {
         decode_json(response, "create checkpoint").await
     }
 
-    async fn create_from_checkpoint(
+    pub(crate) async fn create_from_checkpoint(
         &self,
         checkpoint_id: &str,
         _metadata: HashMap<String, String>,
@@ -849,8 +853,8 @@ struct CheckpointCreateBody<'a> {
 }
 
 #[derive(Deserialize)]
-struct CheckpointInfo {
-    id: String,
+pub(crate) struct CheckpointInfo {
+    pub(crate) id: String,
 }
 
 #[derive(Deserialize)]
