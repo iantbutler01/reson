@@ -2,6 +2,8 @@ import * as native from "./native.js";
 import type { ZodType } from "zod";
 export type { RunResult, ToolCallJs, ToolSchemaJs, StreamEvent, Message, MediaPartInput, GatewayOptions, ProviderConfigInput, AnthropicCacheConfig, VfsMetadata, VfsObjectState, } from "./native.js";
 export { McpClient, McpServer, VfsStorage, version } from "./native.js";
+export { createVfsGatewayServer } from "./vfs-gateway-server.js";
+export type { VfsGatewayServerOptions } from "./vfs-gateway-server.js";
 /** Error thrown by Chevalier, carrying a machine-readable `code` and a
  *  `retryable` hint parsed from the engine. */
 export declare class ChevalierError extends Error {

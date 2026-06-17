@@ -4,7 +4,8 @@
 //! follow-up.)
 
 use chevalier_agentic::types::{
-    ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage, ReasoningSegment, ToolResult,
+    AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage,
+    ReasoningSegment, ResponsePart, ToolCall, ToolResult,
 };
 use chevalier_agentic::utils::ConversationMessage;
 use napi_derive::napi;
@@ -20,8 +21,21 @@ pub struct MediaPartInput {
     pub image_url: Option<String>,
 }
 
+/// A tool call within an `assistantResponse` history message. `args` is the
+/// JSON-encoded arguments object (parsed back into a value here).
+#[napi(object)]
+pub struct ToolCallInput {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub args: String,
+}
+
 /// A conversation message. `type` selects the variant:
 /// - `chat` → `{ role: "user"|"assistant"|"system", content }`
+/// - `assistantResponse` → `{ content?, toolCalls: [{ toolUseId, toolName, args }] }`
+///   — a SINGLE assistant turn carrying ordered text + tool_use blocks, so
+///   providers that require the assistant `tool_use` to precede a `tool_result`
+///   (Anthropic/Bedrock) get a well-formed message.
 /// - `toolResult` → `{ toolUseId, content, isError?, toolName? }`
 /// - `reasoning` → `{ content }`
 /// - `multimodal` → `{ parts: [{ type:"text", text } | { type:"image", imageBase64, mimeType }] }`
@@ -35,6 +49,7 @@ pub struct Message {
     pub tool_name: Option<String>,
     pub is_error: Option<bool>,
     pub parts: Option<Vec<MediaPartInput>>,
+    pub tool_calls: Option<Vec<ToolCallInput>>,
 }
 
 fn to_media_part(p: &MediaPartInput) -> MediaPart {
@@ -86,6 +101,31 @@ pub fn to_conversation_message(m: &Message) -> ConversationMessage {
                 tr = tr.with_tool_name(name.clone());
             }
             ConversationMessage::ToolResult(tr)
+        }
+        "assistantResponse" | "assistant_response" => {
+            let mut parts: Vec<ResponsePart> = Vec::new();
+            if let Some(text) = &m.content {
+                if !text.is_empty() {
+                    parts.push(ResponsePart::Text { text: text.clone() });
+                }
+            }
+            if let Some(calls) = &m.tool_calls {
+                for c in calls {
+                    let args: serde_json::Value = serde_json::from_str(&c.args)
+                        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                    parts.push(ResponsePart::Tool {
+                        call: ToolCall {
+                            tool_use_id: c.tool_use_id.clone(),
+                            tool_name: c.tool_name.clone(),
+                            args,
+                            raw_arguments: Some(c.args.clone()),
+                            signature: None,
+                            tool_obj: None,
+                        },
+                    });
+                }
+            }
+            ConversationMessage::AssistantResponse(AssistantResponse::new(parts))
         }
         "reasoning" => {
             ConversationMessage::Reasoning(ReasoningSegment::new(m.content.clone().unwrap_or_default()))

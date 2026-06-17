@@ -37,7 +37,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Runtime = exports.ChevalierError = exports.version = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
+exports.Runtime = exports.ChevalierError = exports.createVfsGatewayServer = exports.version = exports.VfsStorage = exports.McpServer = exports.McpClient = void 0;
 exports.agentic = agentic;
 const native = __importStar(require("./native.js"));
 const zod_to_json_schema_1 = require("zod-to-json-schema");
@@ -46,6 +46,12 @@ Object.defineProperty(exports, "McpClient", { enumerable: true, get: function ()
 Object.defineProperty(exports, "McpServer", { enumerable: true, get: function () { return native_js_1.McpServer; } });
 Object.defineProperty(exports, "VfsStorage", { enumerable: true, get: function () { return native_js_1.VfsStorage; } });
 Object.defineProperty(exports, "version", { enumerable: true, get: function () { return native_js_1.version; } });
+// The TS implementation of chevalier's VFS gateway SERVER (the missing third
+// corner — the Rust server + Rust/TS clients already exist). A pure-Node
+// `Request -> Response` handler that speaks the gateway wire protocol, backed by
+// any `VfsStorage`. The bound `VfsStorage.gateway` client talks to it unchanged.
+var vfs_gateway_server_js_1 = require("./vfs-gateway-server.js");
+Object.defineProperty(exports, "createVfsGatewayServer", { enumerable: true, get: function () { return vfs_gateway_server_js_1.createVfsGatewayServer; } });
 /** Error thrown by Chevalier, carrying a machine-readable `code` and a
  *  `retryable` hint parsed from the engine. */
 class ChevalierError extends Error {

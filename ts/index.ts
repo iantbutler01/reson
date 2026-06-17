@@ -21,6 +21,12 @@ export type {
   VfsObjectState,
 } from "./native.js";
 export { McpClient, McpServer, VfsStorage, version } from "./native.js";
+// The TS implementation of chevalier's VFS gateway SERVER (the missing third
+// corner — the Rust server + Rust/TS clients already exist). A pure-Node
+// `Request -> Response` handler that speaks the gateway wire protocol, backed by
+// any `VfsStorage`. The bound `VfsStorage.gateway` client talks to it unchanged.
+export { createVfsGatewayServer } from "./vfs-gateway-server.js";
+export type { VfsGatewayServerOptions } from "./vfs-gateway-server.js";
 
 /** Error thrown by Chevalier, carrying a machine-readable `code` and a
  *  `retryable` hint parsed from the engine. */

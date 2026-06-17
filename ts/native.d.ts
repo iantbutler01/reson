@@ -169,6 +169,10 @@ export interface MediaPartInput {
 /**
  * A conversation message. `type` selects the variant:
  * - `chat` → `{ role: "user"|"assistant"|"system", content }`
+ * - `assistantResponse` → `{ content?, toolCalls: [{ toolUseId, toolName, args }] }`
+ *   — a SINGLE assistant turn carrying ordered text + tool_use blocks, so
+ *   providers that require the assistant `tool_use` to precede a `tool_result`
+ *   (Anthropic/Bedrock) get a well-formed message.
  * - `toolResult` → `{ toolUseId, content, isError?, toolName? }`
  * - `reasoning` → `{ content }`
  * - `multimodal` → `{ parts: [{ type:"text", text } | { type:"image", imageBase64, mimeType }] }`
@@ -181,6 +185,7 @@ export interface Message {
   toolName?: string
   isError?: boolean
   parts?: Array<MediaPartInput>
+  toolCalls?: Array<ToolCallInput>
 }
 
 /** Provider-specific request shaping. */
@@ -247,6 +252,16 @@ export interface StreamEvent {
   toolCall?: ToolCallJs
   /** Raw payload for `toolPartial` (partial args), `usage`, `complete` (full response). */
   data?: any
+}
+
+/**
+ * A tool call within an `assistantResponse` history message. `args` is the
+ * JSON-encoded arguments object (parsed back into a value here).
+ */
+export interface ToolCallInput {
+  toolUseId: string
+  toolName: string
+  args: string
 }
 
 /** A tool call emitted by the model. */

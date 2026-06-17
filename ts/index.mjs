@@ -3,5 +3,5 @@
 // "type": "module" projects without relying on named-export auto-detection.
 import cjs from "./index.js";
 
-export const { Runtime, agentic, ChevalierError, McpClient, McpServer, VfsStorage, version } = cjs;
+export const { Runtime, agentic, ChevalierError, McpClient, McpServer, VfsStorage, version, createVfsGatewayServer } = cjs;
 export default cjs;
