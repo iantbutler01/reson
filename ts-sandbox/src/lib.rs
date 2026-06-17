@@ -1,6 +1,6 @@
 //! Node-API bindings for the Chevalier sandbox CLIENT. Connects to an external
-//! `vmd` daemon; never spawns it. Isolated from the core `chevalier` binding so
-//! the in-progress provider work in the sandbox crate can't break the core.
+//! sandbox provider; never spawns one. Isolated from the core `chevalier`
+//! binding so sandbox provider work can't break the core.
 //!
 //! v1 surface: connect/session/attachSession, exec (bidirectional ExecHandle),
 //! readFile/writeFile, fork, sessionId/vmId. (shell, forwardPort, listDir,
@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chevalier_sandbox::{
-    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, Sandbox as EngineSandbox,
-    SandboxConfig, SandboxError, Session as EngineSession, SessionOptions,
+    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, OpenComputerBackendConfig,
+    OpenComputerMountConfig, Sandbox as EngineSandbox, SandboxConfig, SandboxError,
+    SandboxProviderConfig, Session as EngineSession, SessionOptions,
 };
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -251,9 +252,99 @@ pub struct SandboxConnectOptions {
     pub auth_token: Option<String>,
     pub connect_timeout_ms: Option<f64>,
     pub default_image: Option<String>,
+    pub provider: Option<String>,
+    pub open_computer: Option<OpenComputerProviderOpts>,
 }
 
-/// A connection to a `vmd` sandbox daemon.
+#[napi(object)]
+pub struct OpenComputerProviderOpts {
+    pub api_url: Option<String>,
+    pub api_key: Option<String>,
+    pub template_id: Option<String>,
+    pub timeout_secs: Option<f64>,
+    pub default_cpu_count: Option<u32>,
+    pub default_memory_mb: Option<u32>,
+    pub default_disk_mb: Option<u32>,
+    pub burst: Option<bool>,
+    pub secret_store: Option<String>,
+    pub egress_allowlist: Option<Vec<String>>,
+    pub mounts: Option<Vec<OpenComputerMountOpts>>,
+    pub shared_mounts: Option<HashMap<String, OpenComputerMountOpts>>,
+}
+
+#[napi(object)]
+pub struct OpenComputerMountOpts {
+    pub path: Option<String>,
+    pub driver: Option<String>,
+    pub remote: Option<String>,
+    pub backend: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub env: Option<HashMap<String, String>>,
+    pub secrets: Option<HashMap<String, String>>,
+    pub creds: Option<HashMap<String, String>>,
+    pub rclone_config: Option<String>,
+    pub read_only: Option<bool>,
+    pub mount_options: Option<Vec<String>>,
+}
+
+impl OpenComputerMountOpts {
+    fn into_config(self) -> OpenComputerMountConfig {
+        OpenComputerMountConfig {
+            path: self.path.unwrap_or_default(),
+            driver: self.driver,
+            remote: self.remote.unwrap_or_default(),
+            backend: self.backend,
+            command: self.command.unwrap_or_default(),
+            env: self.env.unwrap_or_default(),
+            secrets: self.secrets.unwrap_or_default(),
+            creds: self.creds.unwrap_or_default(),
+            rclone_config: self.rclone_config,
+            read_only: self.read_only,
+            mount_options: self.mount_options.unwrap_or_default(),
+        }
+    }
+}
+
+fn opencomputer_config_from_options(
+    options: Option<OpenComputerProviderOpts>,
+) -> Result<OpenComputerBackendConfig, SandboxError> {
+    let mut cfg = OpenComputerBackendConfig::from_env()?;
+    if let Some(options) = options {
+        if let Some(api_url) = options.api_url {
+            cfg.api_url = api_url;
+        }
+        if let Some(api_key) = options.api_key {
+            cfg.api_key = api_key;
+        }
+        if let Some(template_id) = options.template_id {
+            cfg.template_id = template_id;
+        }
+        if let Some(timeout_secs) = options.timeout_secs {
+            cfg.timeout_secs = timeout_secs as u64;
+        }
+        cfg.default_cpu_count = options.default_cpu_count.or(cfg.default_cpu_count);
+        cfg.default_memory_mb = options.default_memory_mb.or(cfg.default_memory_mb);
+        cfg.default_disk_mb = options.default_disk_mb.or(cfg.default_disk_mb);
+        cfg.burst = options.burst.or(cfg.burst);
+        cfg.secret_store = options.secret_store.or(cfg.secret_store);
+        cfg.egress_allowlist = options.egress_allowlist.or(cfg.egress_allowlist);
+        if let Some(mounts) = options.mounts {
+            cfg.mounts = mounts
+                .into_iter()
+                .map(OpenComputerMountOpts::into_config)
+                .collect();
+        }
+        if let Some(shared_mounts) = options.shared_mounts {
+            cfg.shared_mounts = shared_mounts
+                .into_iter()
+                .map(|(key, mount)| (key, mount.into_config()))
+                .collect();
+        }
+    }
+    Ok(cfg)
+}
+
+/// A connection to a Chevalier sandbox provider.
 #[napi]
 pub struct Sandbox {
     inner: EngineSandbox,
@@ -261,7 +352,7 @@ pub struct Sandbox {
 
 #[napi]
 impl Sandbox {
-    /// Connect to an external `vmd` at `endpoint` (e.g. `http://127.0.0.1:8052`).
+    /// Connect to a sandbox provider.
     #[napi(factory)]
     pub async fn connect(
         endpoint: String,
@@ -280,6 +371,20 @@ impl Sandbox {
             }
             if let Some(img) = o.default_image {
                 cfg.default_image = img;
+            }
+            let provider = o.provider.unwrap_or_else(|| "chevalier".to_string());
+            match provider.as_str() {
+                "chevalier" | "local" | "vmd" => {}
+                "opencomputer" | "open-computer" => {
+                    cfg.provider = SandboxProviderConfig::OpenComputer(
+                        opencomputer_config_from_options(o.open_computer).map_err(sb_err)?,
+                    );
+                }
+                other => {
+                    return Err(sb_err(SandboxError::InvalidConfig(format!(
+                        "unsupported sandbox provider `{other}`"
+                    ))));
+                }
             }
         }
         let sb = EngineSandbox::connect(endpoint, cfg)

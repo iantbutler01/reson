@@ -10,9 +10,9 @@ export declare class ExecHandle {
   next(): Promise<ExecEventJs | null>
 }
 
-/** A connection to a `vmd` sandbox daemon. */
+/** A connection to a Chevalier sandbox provider. */
 export declare class Sandbox {
-  /** Connect to an external `vmd` at `endpoint` (e.g. `http://127.0.0.1:8052`). */
+  /** Connect to a sandbox provider. */
   static connect(endpoint: string, options?: SandboxConnectOptions | undefined | null): Promise<Sandbox>
   /** Create a new session (microVM). */
   session(options?: SessionOpts | undefined | null): Promise<Session>
@@ -55,10 +55,41 @@ export interface ForkOpts {
   autoStartChild?: boolean
 }
 
+export interface OpenComputerMountOpts {
+  path?: string
+  driver?: string
+  remote?: string
+  backend?: string
+  command?: Array<string>
+  env?: Record<string, string>
+  secrets?: Record<string, string>
+  creds?: Record<string, string>
+  rcloneConfig?: string
+  readOnly?: boolean
+  mountOptions?: Array<string>
+}
+
+export interface OpenComputerProviderOpts {
+  apiUrl?: string
+  apiKey?: string
+  templateId?: string
+  timeoutSecs?: number
+  defaultCpuCount?: number
+  defaultMemoryMb?: number
+  defaultDiskMb?: number
+  burst?: boolean
+  secretStore?: string
+  egressAllowlist?: Array<string>
+  mounts?: Array<OpenComputerMountOpts>
+  sharedMounts?: Record<string, OpenComputerMountOpts>
+}
+
 export interface SandboxConnectOptions {
   authToken?: string
   connectTimeoutMs?: number
   defaultImage?: string
+  provider?: string
+  openComputer?: OpenComputerProviderOpts
 }
 
 export interface SessionOpts {
@@ -68,5 +99,5 @@ export interface SessionOpts {
   architecture?: string
   metadata?: Record<string, string>
   autoStart?: boolean
-  egressAllowlist?: string[]
+  egressAllowlist?: Array<string>
 }

@@ -2,8 +2,9 @@
 
 MicroVM **sandbox client** bindings for Chevalier. This is a thin, typed
 [napi-rs](https://napi.rs) wrapper over the Rust sandbox client; it connects to
-an external `vmd` daemon over gRPC and **never spawns one**. Kept separate from
-the core [`chevalier`](../ts) package because it pulls in a gRPC stack.
+an external sandbox provider and **never spawns one**. Kept separate from the
+core [`chevalier`](../ts) package because the local provider pulls in a gRPC
+stack.
 
 ```bash
 npm install chevalier-sandbox
@@ -42,6 +43,23 @@ const child = await sess.fork();           // returns the child Session
 const again = await sb.attachSession(sess.sessionId);
 ```
 
+### OpenComputer
+
+The same `Sandbox` facade can target OpenComputer by changing connect config:
+
+```ts
+const sb = await Sandbox.connect("opencomputer", {
+  provider: "opencomputer",
+  openComputer: {
+    apiKey: process.env.OPENCOMPUTER_API_KEY,
+    templateId: "base",
+    egressAllowlist: ["api.anthropic.com", "*.openai.com"],
+  },
+});
+
+const sess = await sb.session({ name: "research", image: "ubuntu:22.04" });
+```
+
 ## Status
 
 v1 covers `connect`, `session`/`attachSession`, `exec` (bidirectional),
@@ -49,7 +67,8 @@ v1 covers `connect`, `session`/`attachSession`, `exec` (bidirectional),
 `forwardPort`, `listDir`, and snapshot/restore + daemon-manager (the last two
 need facade methods added to the Rust sandbox crate).
 
-Requires a running `vmd` daemon — there is no live test here without one.
+The default provider requires a running `vmd` daemon. OpenComputer is selected
+with `provider: "opencomputer"`.
 
 ## License
 
