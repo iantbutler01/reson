@@ -9,7 +9,7 @@ use chevalier_sandbox::vfs::{
     VFS_OPERATION_MKDIR, VFS_OPERATION_RENAME, VFS_OPERATION_RMDIR, VFS_OPERATION_SETATTR_SIZE,
     VFS_OPERATION_UNLINK, VFS_OPERATION_WRITE_THROUGH, VFS_SURFACE_KIND_VM_SHARED,
     VFS_SURFACE_KIND_VM_WORKSPACE, VfsDirEntry as RemoteDirEntry, VfsLeaseGrant as LeaseGrant,
-    VfsMetadata as RemoteMetadata,
+    VfsMetadata as RemoteMetadata, scoped_vfs_path,
 };
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -136,19 +136,21 @@ pub struct RemoteFuseFs {
     inodes: Mutex<InodeTable>,
     handles: Mutex<HandleTable>,
     read_only: bool,
+    scope_path: String,
     tokio: Handle,
     uid: u32,
     gid: u32,
 }
 
 impl RemoteFuseFs {
-    pub fn new(client: RemoteVfsClient, read_only: bool, tokio: Handle) -> Self {
+    pub fn new(client: RemoteVfsClient, read_only: bool, scope_path: &str, tokio: Handle) -> Self {
         Self {
             client,
             cache: RemoteFuseCache::default(),
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(HandleTable::default()),
             read_only,
+            scope_path: scope_path.trim_matches('/').to_string(),
             tokio,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
@@ -381,7 +383,7 @@ impl RemoteFuseFs {
             let _ = self.tokio.block_on(self.client.release_lease(&lease));
             return Err(Errno::EBUSY);
         }
-        let surface = Self::surface_kind_for_path(&state.path);
+        let surface = self.surface_kind_for_path(&state.path);
         let write_result = if already_persisted {
             Ok(())
         } else {
@@ -445,7 +447,7 @@ impl RemoteFuseFs {
             .tokio
             .block_on(self.client.acquire_lease(path, 1, "resize vfs fuse file"))
             .map_err(|_| Errno::EIO)?;
-        let surface = Self::surface_kind_for_path(path);
+        let surface = self.surface_kind_for_path(path);
         let write_result = self.tokio.block_on(self.client.write_file(
             path,
             &bytes,
@@ -472,7 +474,7 @@ impl RemoteFuseFs {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        let surface = Self::surface_kind_for_path(path);
+        let surface = self.surface_kind_for_path(path);
         let lease = self
             .tokio
             .block_on(
@@ -509,7 +511,15 @@ impl RemoteFuseFs {
         Ok(())
     }
 
-    fn surface_kind_for_path(path: &str) -> &'static str {
+    fn scoped_path(&self, path: &str) -> String {
+        scoped_vfs_path(self.scope_path.as_str(), path)
+    }
+
+    fn surface_kind_for_path(&self, path: &str) -> &'static str {
+        Self::surface_kind_for_scoped_path(self.scoped_path(path).as_str())
+    }
+
+    fn surface_kind_for_scoped_path(path: &str) -> &'static str {
         if path.contains("/shared") {
             VFS_SURFACE_KIND_VM_SHARED
         } else {
@@ -601,6 +611,22 @@ mod tests {
             "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/a.txt",
             "conversations/11111111-1111-1111-1111-111111111111/shared/a.txt"
         ));
+    }
+
+    #[test]
+    fn surface_kind_uses_scoped_path_not_mount_relative_path() {
+        assert_eq!(
+            RemoteFuseFs::surface_kind_for_scoped_path(
+                "conversations/11111111-1111-1111-1111-111111111111/shared/note.txt"
+            ),
+            chevalier_sandbox::vfs::VFS_SURFACE_KIND_VM_SHARED
+        );
+        assert_eq!(
+            RemoteFuseFs::surface_kind_for_scoped_path(
+                "conversations/11111111-1111-1111-1111-111111111111/0001_assistant/mount/note.txt"
+            ),
+            chevalier_sandbox::vfs::VFS_SURFACE_KIND_VM_WORKSPACE
+        );
     }
 
     #[test]
@@ -1046,7 +1072,7 @@ impl Filesystem for RemoteFuseFs {
             let newparent_path = self.path_for_ino(newparent)?;
             let from = Self::child_path(parent_path.as_str(), name)?;
             let to = Self::child_path(newparent_path.as_str(), newname)?;
-            if !Self::same_scope(&from, &to) {
+            if !Self::same_scope(&self.scoped_path(&from), &self.scoped_path(&to)) {
                 return Err(Errno::EXDEV);
             }
             self.mutate_namespace(&from, |lease, surface| {

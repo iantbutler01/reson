@@ -52,24 +52,46 @@ pub async fn mount_vfs_fuse(
         anyhow!("missing CHEVALIER_SANDBOX_VFS_INTERNAL_SERVICE_TOKEN for fuse-backed mount")
     })?;
     let mountpoint = vm_dir.join("fuse-mounts").join(&mount.mount_tag);
+    mount_remote_vfs_fuse(
+        &mount.vfs_endpoint,
+        auth_token,
+        &mount.vfs_scope_path,
+        &mount.mount_tag,
+        &mountpoint,
+        mount.read_only,
+    )
+    .await
+}
+
+pub async fn mount_remote_vfs_fuse(
+    endpoint: &str,
+    auth_token: &str,
+    scope_path: &str,
+    mount_tag: &str,
+    mountpoint: &Path,
+    read_only: bool,
+) -> Result<FuseHandle> {
+    if !cfg!(target_os = "linux") {
+        bail!("vfs fuse mounts are only supported on linux hosts");
+    }
     tokio::fs::create_dir_all(&mountpoint)
         .await
         .with_context(|| format!("create fuse mountpoint {}", mountpoint.display()))?;
 
-    let client = RemoteVfsClient::new(&mount.vfs_endpoint, auth_token, &mount.vfs_scope_path)?;
-    let filesystem = RemoteFuseFs::new(client, mount.read_only, Handle::current());
-    let options = filesystem.mount_options(&mount.mount_tag);
-    let session = fuser::spawn_mount2(filesystem, &mountpoint, &options)
+    let client = RemoteVfsClient::new(endpoint, auth_token, scope_path)?;
+    let filesystem = RemoteFuseFs::new(client, read_only, scope_path, Handle::current());
+    let options = filesystem.mount_options(mount_tag);
+    let session = fuser::spawn_mount2(filesystem, mountpoint, &options)
         .with_context(|| format!("mount fuse filesystem at {}", mountpoint.display()))?;
 
     let handle = FuseHandle {
         session: Arc::new(Mutex::new(Some(session))),
-        mountpoint: mountpoint.clone(),
+        mountpoint: mountpoint.to_path_buf(),
     };
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if mountpoint_is_active(&mountpoint).await? {
+        if mountpoint_is_active(mountpoint).await? {
             return Ok(handle);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
