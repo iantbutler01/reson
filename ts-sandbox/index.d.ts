@@ -68,4 +68,5 @@ export interface SessionOpts {
   architecture?: string
   metadata?: Record<string, string>
   autoStart?: boolean
+  egressAllowlist?: string[]
 }
