@@ -5,12 +5,12 @@
 //! - integration_tests/test_native_streaming_tools.py
 //! - integration_tests/test_reasoning_stream.py
 
-use chevalier_agentic::providers::{
+use chevalier::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use chevalier_agentic::types::{ChatMessage, ToolCall};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::types::{ChatMessage, ToolCall};
+use chevalier::utils::ConversationMessage;
 use futures::StreamExt;
 use std::env;
 
@@ -254,11 +254,9 @@ async fn test_anthropic_streaming_with_tools() {
     );
 
     // Streaming accumulator emits tool calls in OpenAI format {id, function: {name, arguments}}
-    let tc = ToolCall::from_provider_format(
-        tool_calls[0].clone(),
-        chevalier_agentic::types::Provider::OpenAI,
-    )
-    .expect("Failed to parse tool call");
+    let tc =
+        ToolCall::from_provider_format(tool_calls[0].clone(), chevalier::types::Provider::OpenAI)
+            .expect("Failed to parse tool call");
     assert_eq!(tc.tool_name, "add_numbers");
 }
 

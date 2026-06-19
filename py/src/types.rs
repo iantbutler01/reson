@@ -50,24 +50,24 @@ impl ChatRole {
     }
 }
 
-impl From<chevalier_agentic::types::ChatRole> for ChatRole {
-    fn from(role: chevalier_agentic::types::ChatRole) -> Self {
+impl From<chevalier_core::types::ChatRole> for ChatRole {
+    fn from(role: chevalier_core::types::ChatRole) -> Self {
         match role {
-            chevalier_agentic::types::ChatRole::System => ChatRole::System,
-            chevalier_agentic::types::ChatRole::User => ChatRole::User,
-            chevalier_agentic::types::ChatRole::Assistant => ChatRole::Assistant,
-            chevalier_agentic::types::ChatRole::Tool => ChatRole::Tool,
+            chevalier_core::types::ChatRole::System => ChatRole::System,
+            chevalier_core::types::ChatRole::User => ChatRole::User,
+            chevalier_core::types::ChatRole::Assistant => ChatRole::Assistant,
+            chevalier_core::types::ChatRole::Tool => ChatRole::Tool,
         }
     }
 }
 
-impl From<ChatRole> for chevalier_agentic::types::ChatRole {
+impl From<ChatRole> for chevalier_core::types::ChatRole {
     fn from(role: ChatRole) -> Self {
         match role {
-            ChatRole::System => chevalier_agentic::types::ChatRole::System,
-            ChatRole::User => chevalier_agentic::types::ChatRole::User,
-            ChatRole::Assistant => chevalier_agentic::types::ChatRole::Assistant,
-            ChatRole::Tool => chevalier_agentic::types::ChatRole::Tool,
+            ChatRole::System => chevalier_core::types::ChatRole::System,
+            ChatRole::User => chevalier_core::types::ChatRole::User,
+            ChatRole::Assistant => chevalier_core::types::ChatRole::Assistant,
+            ChatRole::Tool => chevalier_core::types::ChatRole::Tool,
         }
     }
 }
@@ -185,8 +185,8 @@ impl ChatMessage {
     }
 }
 
-impl From<chevalier_agentic::types::ChatMessage> for ChatMessage {
-    fn from(msg: chevalier_agentic::types::ChatMessage) -> Self {
+impl From<chevalier_core::types::ChatMessage> for ChatMessage {
+    fn from(msg: chevalier_core::types::ChatMessage) -> Self {
         Self {
             role: msg.role.into(),
             content: msg.content,
@@ -196,13 +196,13 @@ impl From<chevalier_agentic::types::ChatMessage> for ChatMessage {
     }
 }
 
-impl From<ChatMessage> for chevalier_agentic::types::ChatMessage {
+impl From<ChatMessage> for chevalier_core::types::ChatMessage {
     fn from(msg: ChatMessage) -> Self {
         Self {
             role: msg.role.into(),
             content: msg.content,
             cache_marker: if msg.cache_marker {
-                Some(chevalier_agentic::types::CacheMarker::Ephemeral)
+                Some(chevalier_core::types::CacheMarker::Ephemeral)
             } else {
                 None
             },
@@ -308,13 +308,13 @@ impl ToolCall {
         };
 
         // Call Rust create function
-        let result = chevalier_agentic::types::ToolCall::create(json_value).map_err(|e| {
+        let result = chevalier_core::types::ToolCall::create(json_value).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Unsupported tool call format: {}", e))
         })?;
 
         // Convert result back to Python
         match result {
-            chevalier_agentic::types::CreateResult::Single(mut tc) => {
+            chevalier_core::types::CreateResult::Single(mut tc) => {
                 // Apply signature override if provided
                 if signature.is_some() {
                     tc.signature = signature;
@@ -324,7 +324,7 @@ impl ToolCall {
                 py_tc.tool_obj_registry_key = Some(registry_key);
                 Ok(py_tc.into_pyobject(py)?.unbind().into_any())
             }
-            chevalier_agentic::types::CreateResult::Multiple(tcs) => {
+            chevalier_core::types::CreateResult::Multiple(tcs) => {
                 let py_list: Vec<ToolCall> = tcs
                     .into_iter()
                     .map(|mut tc| {
@@ -338,7 +338,7 @@ impl ToolCall {
                     .collect();
                 Ok(py_list.into_pyobject(py)?.unbind().into_any())
             }
-            chevalier_agentic::types::CreateResult::Empty => Err(
+            chevalier_core::types::CreateResult::Empty => Err(
                 pyo3::exceptions::PyValueError::new_err("No tool calls provided"),
             ),
         }
@@ -402,8 +402,8 @@ impl ToolCall {
         provider: &crate::services::InferenceProvider,
     ) -> PyResult<PyObject> {
         // Convert to Rust type, call method, convert back
-        let rust_provider: chevalier_agentic::types::Provider = (*provider).into();
-        let rust_tc: chevalier_agentic::types::ToolCall = self.clone().into();
+        let rust_provider: chevalier_core::types::Provider = (*provider).into();
+        let rust_tc: chevalier_core::types::ToolCall = self.clone().into();
         let result = rust_tc.to_provider_assistant_message(rust_provider);
 
         pythonize::pythonize(py, &result)
@@ -474,8 +474,8 @@ impl ToolCall {
     }
 }
 
-impl From<chevalier_agentic::types::ToolCall> for ToolCall {
-    fn from(tc: chevalier_agentic::types::ToolCall) -> Self {
+impl From<chevalier_core::types::ToolCall> for ToolCall {
+    fn from(tc: chevalier_core::types::ToolCall) -> Self {
         Self {
             tool_use_id: tc.tool_use_id,
             tool_name: tc.tool_name,
@@ -488,7 +488,7 @@ impl From<chevalier_agentic::types::ToolCall> for ToolCall {
     }
 }
 
-impl From<ToolCall> for chevalier_agentic::types::ToolCall {
+impl From<ToolCall> for chevalier_core::types::ToolCall {
     fn from(tc: ToolCall) -> Self {
         Self {
             tool_use_id: tc.tool_use_id,
@@ -590,8 +590,8 @@ impl ToolResult {
     }
 }
 
-impl From<chevalier_agentic::types::ToolResult> for ToolResult {
-    fn from(tr: chevalier_agentic::types::ToolResult) -> Self {
+impl From<chevalier_core::types::ToolResult> for ToolResult {
+    fn from(tr: chevalier_core::types::ToolResult) -> Self {
         Self {
             tool_use_id: tr.tool_use_id,
             content: tr.content,
@@ -602,7 +602,7 @@ impl From<chevalier_agentic::types::ToolResult> for ToolResult {
     }
 }
 
-impl From<ToolResult> for chevalier_agentic::types::ToolResult {
+impl From<ToolResult> for chevalier_core::types::ToolResult {
     fn from(tr: ToolResult) -> Self {
         Self {
             tool_use_id: tr.tool_use_id,
@@ -722,8 +722,8 @@ impl ReasoningSegment {
     }
 }
 
-impl From<chevalier_agentic::types::ReasoningSegment> for ReasoningSegment {
-    fn from(rs: chevalier_agentic::types::ReasoningSegment) -> Self {
+impl From<chevalier_core::types::ReasoningSegment> for ReasoningSegment {
+    fn from(rs: chevalier_core::types::ReasoningSegment) -> Self {
         Self {
             content: rs.content,
             signature: rs.signature,
@@ -736,7 +736,7 @@ impl From<chevalier_agentic::types::ReasoningSegment> for ReasoningSegment {
     }
 }
 
-impl From<ReasoningSegment> for chevalier_agentic::types::ReasoningSegment {
+impl From<ReasoningSegment> for chevalier_core::types::ReasoningSegment {
     fn from(rs: ReasoningSegment) -> Self {
         Self {
             content: rs.content,

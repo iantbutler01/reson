@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use chevalier_agentic::types::{ResponsePart, ResponseStreamEvent};
+use chevalier_core::types::{ResponsePart, ResponseStreamEvent};
 use napi_derive::napi;
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::AbortHandle;
 
 use crate::types::ToolCallJs;

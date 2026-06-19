@@ -170,25 +170,31 @@ impl McpServer {
         let tools = self.tools.lock().await;
         for t in tools.iter() {
             let handler = t.handler.clone();
-            builder = builder.with_tool(&t.name, &t.description, t.schema.clone(), move |_name, args| {
-                let handler = handler.clone();
-                Box::pin(async move {
-                    let args_value = serde_json::Value::Object(args.unwrap_or_default());
-                    match handler.call_async(args_value).await {
-                        Ok(promise) => match promise.await {
-                            Ok(s) => Ok(CallToolResult::success(vec![Content::text(s)])),
+            builder = builder.with_tool(
+                &t.name,
+                &t.description,
+                t.schema.clone(),
+                move |_name, args| {
+                    let handler = handler.clone();
+                    Box::pin(async move {
+                        let args_value = serde_json::Value::Object(args.unwrap_or_default());
+                        match handler.call_async(args_value).await {
+                            Ok(promise) => match promise.await {
+                                Ok(s) => Ok(CallToolResult::success(vec![Content::text(s)])),
+                                Err(e) => Err(ErrorData::internal_error(
+                                    format!("handler rejected: {e}"),
+                                    None,
+                                )),
+                            },
                             Err(e) => Err(ErrorData::internal_error(
-                                format!("handler rejected: {e}"),
+                                format!("handler call failed: {e}"),
                                 None,
                             )),
-                        },
-                        Err(e) => Err(ErrorData::internal_error(
-                            format!("handler call failed: {e}"),
-                            None,
-                        )),
-                    }
-                }) as BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
-            });
+                        }
+                    })
+                        as BoxFuture<'static, std::result::Result<CallToolResult, ErrorData>>
+                },
+            );
         }
         drop(tools);
 
@@ -204,7 +210,7 @@ impl McpServer {
             other => {
                 return Err(napi::Error::from_reason(format!(
                     "unknown transport: {other}"
-                )))
+                )));
             }
         };
         server

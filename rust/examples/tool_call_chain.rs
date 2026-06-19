@@ -6,8 +6,8 @@
 //!
 //! Run with: `cargo run --example tool_call_chain`
 
-use chevalier_agentic::types::{ChatMessage, ToolCall, ToolResult};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::types::{ChatMessage, ToolCall, ToolResult};
+use chevalier::utils::ConversationMessage;
 use serde_json::{Value, json};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

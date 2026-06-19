@@ -3,8 +3,8 @@
 //! These tests demonstrate that the #[agentic], #[tool], and #[deserializable]
 //! macros compile and generate correct code.
 
-use chevalier_agentic::Deserializable;
-use chevalier_agentic::parsers::Deserializable as DeserializableTrait;
+use chevalier::Deserializable;
+use chevalier::parsers::Deserializable as DeserializableTrait;
 use serde::{Deserialize, Serialize};
 
 #[test]
@@ -70,7 +70,7 @@ fn test_deserializable_macro_partial() {
 fn test_tool_macro_snake_case_conversion() {
     // Test that the Tool derive macro generates proper methods
 
-    use chevalier_agentic::Tool;
+    use chevalier::Tool;
     use serde::{Deserialize, Serialize};
 
     /// A calculator tool for basic math operations
@@ -128,8 +128,8 @@ fn test_tool_macro_snake_case_conversion() {
 
 #[test]
 fn test_tool_macro_with_schema_generator() {
-    use chevalier_agentic::Tool;
-    use chevalier_agentic::schema::AnthropicSchemaGenerator;
+    use chevalier::Tool;
+    use chevalier::schema::AnthropicSchemaGenerator;
     use serde::{Deserialize, Serialize};
 
     /// Get current weather for a location
@@ -154,7 +154,7 @@ fn test_tool_macro_with_schema_generator() {
 
 #[test]
 fn test_tool_macro_with_nested_arrays() {
-    use chevalier_agentic::Tool;
+    use chevalier::Tool;
     use serde::{Deserialize, Serialize};
 
     /// A single item in a thread
@@ -223,21 +223,18 @@ fn test_tool_macro_with_nested_arrays() {
 
 #[cfg(test)]
 mod agentic_macro_tests {
-    use chevalier_agentic::agentic;
-    use chevalier_agentic::error::Result;
+    use chevalier::agentic;
+    use chevalier::error::Result;
 
     type AgentFuture = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<chevalier_agentic::types::AssistantResponse>>
-                + Send,
-        >,
+        Box<dyn std::future::Future<Output = Result<chevalier::types::AssistantResponse>> + Send>,
     >;
 
     #[allow(clippy::too_many_arguments)]
     fn run_params(
         prompt: Option<&str>,
         system: Option<&str>,
-        history: Option<Vec<chevalier_agentic::utils::ConversationMessage>>,
+        history: Option<Vec<chevalier::utils::ConversationMessage>>,
         output_type: Option<&str>,
         output_schema: Option<serde_json::Value>,
         temperature: Option<f32>,
@@ -245,8 +242,8 @@ mod agentic_macro_tests {
         max_tokens: Option<u32>,
         model: Option<&str>,
         api_key: Option<&str>,
-    ) -> chevalier_agentic::runtime::RunParams {
-        chevalier_agentic::runtime::RunParams {
+    ) -> chevalier::runtime::RunParams {
+        chevalier::runtime::RunParams {
             prompt: prompt.map(|s| s.to_string()),
             system: system.map(|s| s.to_string()),
             history,
@@ -267,7 +264,7 @@ mod agentic_macro_tests {
     async fn simple_agentic_fn(
         input: String,
         runtime: Runtime,
-    ) -> Result<chevalier_agentic::types::AssistantResponse> {
+    ) -> Result<chevalier::types::AssistantResponse> {
         // Mark runtime as used by calling run()
         // Note: This won't actually call an LLM in tests, it will fail without API key
         // but the point is to verify the macro generates valid code
@@ -302,7 +299,7 @@ mod agentic_macro_tests {
     async fn no_model_agentic_fn(
         data: i32,
         runtime: Runtime,
-    ) -> Result<chevalier_agentic::types::AssistantResponse> {
+    ) -> Result<chevalier::types::AssistantResponse> {
         let _ = data; // Use the parameter
         runtime
             .run(run_params(
@@ -332,7 +329,7 @@ mod agentic_macro_tests {
         name: String,
         count: u32,
         runtime: Runtime,
-    ) -> Result<chevalier_agentic::types::AssistantResponse> {
+    ) -> Result<chevalier::types::AssistantResponse> {
         let prompt = format!("Name: {}, Count: {}", name, count);
         runtime
             .run(run_params(

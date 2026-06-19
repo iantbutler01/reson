@@ -83,13 +83,13 @@ impl RetryConfig {
 ///
 /// # Example
 /// ```no_run
-/// use chevalier_agentic::retry::{retry_with_backoff, RetryConfig};
+/// use chevalier::retry::{retry_with_backoff, RetryConfig};
 ///
 /// async fn example() {
 ///     let config = RetryConfig::default();
 ///     let result = retry_with_backoff(config, || async {
 ///         // Your retryable operation
-///         Ok::<_, chevalier_agentic::error::Error>(42)
+///         Ok::<_, chevalier::error::Error>(42)
 ///     }).await;
 /// }
 /// ```

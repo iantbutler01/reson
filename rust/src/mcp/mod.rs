@@ -1,4 +1,4 @@
-//! MCP (Model Context Protocol) integration for chevalier-agentic
+//! MCP (Model Context Protocol) integration for chevalier
 //!
 //! Provides:
 //! - **Client bridge**: `runtime.mcp("http://...")` to consume remote MCP tools transparently
@@ -29,10 +29,10 @@ pub use chevalier_mcp::apps::{
 ///
 /// # Example
 /// ```rust,no_run
-/// use chevalier_agentic::mcp::{McpServer, ServerTransport};
+/// use chevalier::mcp::{McpServer, ServerTransport};
 /// use chevalier_mcp::{CallToolResult, Content};
 ///
-/// # async fn example() -> chevalier_agentic::error::Result<()> {
+/// # async fn example() -> chevalier::error::Result<()> {
 /// McpServer::new("my-server")
 ///     .tool("echo", "Echo a message", serde_json::json!({
 ///         "type": "object",

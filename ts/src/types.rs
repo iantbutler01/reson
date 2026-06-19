@@ -2,8 +2,8 @@
 //! plus conversions. Kept as `#[napi(object)]` so napi generates clean TS
 //! interfaces rather than `any`.
 
-use chevalier_agentic::runtime::ToolSchemaInfo;
-use chevalier_agentic::types::{AssistantResponse, ToolCall};
+use chevalier_core::runtime::ToolSchemaInfo;
+use chevalier_core::types::{AssistantResponse, ToolCall};
 use napi_derive::napi;
 
 /// A tool call emitted by the model.
@@ -60,7 +60,11 @@ impl From<ToolSchemaInfo> for ToolSchemaJs {
 
 impl From<AssistantResponse> for RunResult {
     fn from(resp: AssistantResponse) -> Self {
-        let tool_calls = resp.tool_calls().iter().map(|tc| ToolCallJs::from(*tc)).collect();
+        let tool_calls = resp
+            .tool_calls()
+            .iter()
+            .map(|tc| ToolCallJs::from(*tc))
+            .collect();
         let signatures = resp.signatures().iter().map(|s| s.to_string()).collect();
         Self {
             text: resp.text(),

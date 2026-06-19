@@ -15,15 +15,15 @@ type ChunkStream = Pin<
     Box<
         dyn Stream<
                 Item = Result<
-                    chevalier_agentic::types::ResponseStreamEvent,
-                    chevalier_agentic::error::Error,
+                    chevalier_core::types::ResponseStreamEvent,
+                    chevalier_core::error::Error,
                 >,
             > + Send,
     >,
 >;
 
 fn response_stream_event_to_chunk(
-    event: chevalier_agentic::types::ResponseStreamEvent,
+    event: chevalier_core::types::ResponseStreamEvent,
 ) -> (String, serde_json::Value) {
     fn serialize_or_error<T: serde::Serialize>(value: &T) -> serde_json::Value {
         match serde_json::to_value(value) {
@@ -35,27 +35,27 @@ fn response_stream_event_to_chunk(
     }
 
     match event {
-        chevalier_agentic::types::ResponseStreamEvent::Output(part) => match part {
-            chevalier_agentic::types::ResponsePart::Text { text } => {
+        chevalier_core::types::ResponseStreamEvent::Output(part) => match part {
+            chevalier_core::types::ResponsePart::Text { text } => {
                 ("content".to_string(), serde_json::Value::String(text))
             }
-            chevalier_agentic::types::ResponsePart::Reasoning { text } => {
+            chevalier_core::types::ResponsePart::Reasoning { text } => {
                 ("reasoning".to_string(), serde_json::Value::String(text))
             }
-            chevalier_agentic::types::ResponsePart::Tool { call } => {
+            chevalier_core::types::ResponsePart::Tool { call } => {
                 ("tool_call".to_string(), serialize_or_error(&call))
             }
-            chevalier_agentic::types::ResponsePart::Signature { value } => {
+            chevalier_core::types::ResponsePart::Signature { value } => {
                 ("signature".to_string(), serde_json::Value::String(value))
             }
         },
-        chevalier_agentic::types::ResponseStreamEvent::ToolPartial(payload) => {
+        chevalier_core::types::ResponseStreamEvent::ToolPartial(payload) => {
             ("tool_call_partial".to_string(), payload)
         }
-        chevalier_agentic::types::ResponseStreamEvent::Usage(usage) => {
+        chevalier_core::types::ResponseStreamEvent::Usage(usage) => {
             ("usage".to_string(), serialize_or_error(&usage))
         }
-        chevalier_agentic::types::ResponseStreamEvent::Complete(response) => {
+        chevalier_core::types::ResponseStreamEvent::Complete(response) => {
             ("complete".to_string(), serialize_or_error(&response))
         }
     }
@@ -289,7 +289,7 @@ struct StreamParams {
     model: String,
     api_key: Option<String>,
     system: Option<String>,
-    history: Option<Vec<chevalier_agentic::utils::ConversationMessage>>,
+    history: Option<Vec<chevalier_core::utils::ConversationMessage>>,
     output_type_name: Option<String>,
     output_schema: Option<serde_json::Value>,
     temperature: Option<f32>,
@@ -330,20 +330,19 @@ impl StreamIterator {
                 if let Some(p) = params_guard.take() {
                     // Create the stream
                     let rust_tools: Arc<
-                        RwLock<HashMap<String, chevalier_agentic::runtime::ToolFunction>>,
+                        RwLock<HashMap<String, chevalier_core::runtime::ToolFunction>>,
                     > = Arc::new(RwLock::new(HashMap::new()));
                     let rust_tool_schemas: Arc<
-                        RwLock<HashMap<String, chevalier_agentic::runtime::ToolSchemaInfo>>,
+                        RwLock<HashMap<String, chevalier_core::runtime::ToolSchemaInfo>>,
                     > = Arc::new(RwLock::new(HashMap::new()));
                     let call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>> =
                         Arc::new(RwLock::new(None));
-                    let accumulators = Arc::new(RwLock::new(
-                        chevalier_agentic::runtime::Accumulators::default(),
-                    ));
+                    let accumulators =
+                        Arc::new(RwLock::new(chevalier_core::runtime::Accumulators::default()));
 
                     let rust_tool_order: Arc<RwLock<Vec<String>>> =
                         Arc::new(RwLock::new(Vec::new()));
-                    let new_stream = chevalier_agentic::runtime::inference::call_llm_stream(
+                    let new_stream = chevalier_core::runtime::inference::call_llm_stream(
                         p.prompt.as_deref(),
                         &p.model,
                         rust_tools,
@@ -424,7 +423,8 @@ pub struct Runtime {
     // We store Python tool functions separately since they can't go in the Rust Runtime
     tools: Arc<RwLock<HashMap<String, PyObject>>>,
     tool_types: Arc<RwLock<HashMap<String, PyObject>>>,
-    tool_schemas: Arc<RwLock<HashMap<String, chevalier_agentic::runtime::ToolSchemaInfo>>>,
+    #[allow(dead_code)]
+    tool_schemas: Arc<RwLock<HashMap<String, chevalier_core::runtime::ToolSchemaInfo>>>,
     model: Option<String>,
     api_key: Option<String>,
     native_tools: bool,
@@ -432,7 +432,7 @@ pub struct Runtime {
     // Accumulators
     raw_response: Arc<RwLock<Vec<String>>>,
     reasoning: Arc<RwLock<Vec<String>>>,
-    reasoning_segments: Arc<RwLock<Vec<chevalier_agentic::types::ReasoningSegment>>>,
+    reasoning_segments: Arc<RwLock<Vec<chevalier_core::types::ReasoningSegment>>>,
 }
 
 #[pymethods]
@@ -784,21 +784,19 @@ impl Runtime {
         let effective_api_key = api_key.or_else(|| self.api_key.clone());
 
         // Convert history to Rust types
-        let rust_history: Option<Vec<chevalier_agentic::utils::ConversationMessage>> =
+        let rust_history: Option<Vec<chevalier_core::utils::ConversationMessage>> =
             if let Some(hist) = history {
                 let mut messages = Vec::new();
                 for item in hist.iter() {
                     // Try to convert each item
                     if let Ok(msg) = item.extract::<ChatMessage>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::Chat(
-                            msg.into(),
-                        ));
+                        messages.push(chevalier_core::utils::ConversationMessage::Chat(msg.into()));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::ToolResult(
+                        messages.push(chevalier_core::utils::ConversationMessage::ToolResult(
                             tr.into(),
                         ));
                     } else if let Ok(rs) = item.extract::<ReasoningSegment>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::Reasoning(
+                        messages.push(chevalier_core::utils::ConversationMessage::Reasoning(
                             rs.into(),
                         ));
                     }
@@ -841,12 +839,12 @@ impl Runtime {
             reasoning_acc.write().await.clear();
 
             // Convert Python tools to Rust tool functions (empty for now - tools are Python side)
-            let rust_tools: Arc<RwLock<HashMap<String, chevalier_agentic::runtime::ToolFunction>>> =
+            let rust_tools: Arc<RwLock<HashMap<String, chevalier_core::runtime::ToolFunction>>> =
                 Arc::new(RwLock::new(HashMap::new()));
 
             // Convert tool schemas
             let rust_tool_schemas: Arc<
-                RwLock<HashMap<String, chevalier_agentic::runtime::ToolSchemaInfo>>,
+                RwLock<HashMap<String, chevalier_core::runtime::ToolSchemaInfo>>,
             > = Arc::new(RwLock::new(HashMap::new()));
 
             // Create call context
@@ -855,7 +853,7 @@ impl Runtime {
 
             // Call the Rust inference engine
             let rust_tool_order: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
-            let result = chevalier_agentic::runtime::inference::call_llm(
+            let result = chevalier_core::runtime::inference::call_llm(
                 prompt_clone.as_deref(),
                 &effective_model,
                 rust_tools,
@@ -962,20 +960,18 @@ impl Runtime {
         let effective_api_key = api_key.or_else(|| self.api_key.clone());
 
         // Convert history to Rust types
-        let rust_history: Option<Vec<chevalier_agentic::utils::ConversationMessage>> =
+        let rust_history: Option<Vec<chevalier_core::utils::ConversationMessage>> =
             if let Some(hist) = history {
                 let mut messages = Vec::new();
                 for item in hist.iter() {
                     if let Ok(msg) = item.extract::<ChatMessage>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::Chat(
-                            msg.into(),
-                        ));
+                        messages.push(chevalier_core::utils::ConversationMessage::Chat(msg.into()));
                     } else if let Ok(tr) = item.extract::<ToolResult>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::ToolResult(
+                        messages.push(chevalier_core::utils::ConversationMessage::ToolResult(
                             tr.into(),
                         ));
                     } else if let Ok(rs) = item.extract::<ReasoningSegment>() {
-                        messages.push(chevalier_agentic::utils::ConversationMessage::Reasoning(
+                        messages.push(chevalier_core::utils::ConversationMessage::Reasoning(
                             rs.into(),
                         ));
                     }
@@ -1014,10 +1010,10 @@ impl Runtime {
 
         // Create StreamIterator with params for lazy stream initialization
         let params = StreamParams {
-            prompt: prompt,
+            prompt,
             model: effective_model,
             api_key: effective_api_key,
-            system: system,
+            system,
             history: rust_history,
             output_type_name,
             output_schema,

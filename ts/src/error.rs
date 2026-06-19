@@ -2,7 +2,7 @@
 //! `code` and a `retryable` hint (encoded in the message for now; a richer
 //! error class can come later).
 
-use chevalier_agentic::error::Error as EngineError;
+use chevalier_core::error::Error as EngineError;
 
 /// Stable string code for each engine error variant — surfaced to JS.
 pub fn error_code(e: &EngineError) -> &'static str {

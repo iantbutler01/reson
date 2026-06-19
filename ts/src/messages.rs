@@ -3,11 +3,11 @@
 //! the message kinds a multi-turn agent loop needs. (Multimodal history is a
 //! follow-up.)
 
-use chevalier_agentic::types::{
+use chevalier_core::types::{
     AssistantResponse, ChatMessage, ChatRole, MediaPart, MediaSource, MultimodalMessage,
     ReasoningSegment, ResponsePart, ToolCall, ToolResult,
 };
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier_core::utils::ConversationMessage;
 use napi_derive::napi;
 
 /// A part of a multimodal message. `type` is `text` or `image`.
@@ -60,7 +60,9 @@ fn to_media_part(p: &MediaPartInput) -> MediaPart {
             } else {
                 MediaPart::image(MediaSource::base64(
                     p.image_base64.clone().unwrap_or_default(),
-                    p.mime_type.clone().unwrap_or_else(|| "image/png".to_string()),
+                    p.mime_type
+                        .clone()
+                        .unwrap_or_else(|| "image/png".to_string()),
                 ))
             }
         }
@@ -104,10 +106,10 @@ pub fn to_conversation_message(m: &Message) -> ConversationMessage {
         }
         "assistantResponse" | "assistant_response" => {
             let mut parts: Vec<ResponsePart> = Vec::new();
-            if let Some(text) = &m.content {
-                if !text.is_empty() {
-                    parts.push(ResponsePart::Text { text: text.clone() });
-                }
+            if let Some(text) = &m.content
+                && !text.is_empty()
+            {
+                parts.push(ResponsePart::Text { text: text.clone() });
             }
             if let Some(calls) = &m.tool_calls {
                 for c in calls {
@@ -127,9 +129,9 @@ pub fn to_conversation_message(m: &Message) -> ConversationMessage {
             }
             ConversationMessage::AssistantResponse(AssistantResponse::new(parts))
         }
-        "reasoning" => {
-            ConversationMessage::Reasoning(ReasoningSegment::new(m.content.clone().unwrap_or_default()))
-        }
+        "reasoning" => ConversationMessage::Reasoning(ReasoningSegment::new(
+            m.content.clone().unwrap_or_default(),
+        )),
         "multimodal" => {
             let parts = m
                 .parts

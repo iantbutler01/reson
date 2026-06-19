@@ -3,18 +3,22 @@ members = [".", "macros"]
 resolver = "2"
 
 [package]
-name = "chevalier-agentic"
-version = "0.5.1"
+name = "chevalier"
+version = "0.7.0"
 edition = "2024"
 authors = ["Chevalier Contributors"]
 description = "Agents are just functions - production-grade LLM agent framework"
 license = "Apache-2.0"
 repository = "https://github.com/iantbutler01/chevalier"
 homepage = "https://github.com/iantbutler01/chevalier"
-documentation = "https://docs.rs/chevalier-agentic"
+documentation = "https://docs.rs/chevalier"
 readme = "README.md"
 keywords = ["llm", "ai", "agents", "framework", "mcp"]
 categories = ["api-bindings", "asynchronous"]
+
+[lib]
+name = "chevalier"
+path = "src/lib.rs"
 
 [dependencies]
 # Proc macros

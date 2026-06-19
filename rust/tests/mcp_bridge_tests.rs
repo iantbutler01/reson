@@ -1,16 +1,16 @@
-//! Integration tests for MCP bridge (chevalier-agentic <-> chevalier-mcp)
+//! Integration tests for MCP bridge (chevalier <-> chevalier-mcp)
 //!
 //! Tests use in-process WebSocket MCP servers to avoid external dependencies.
 
 #![cfg(feature = "mcp")]
 
-use chevalier_agentic::agentic;
-use chevalier_agentic::mcp::{McpServer, ServerTransport};
-use chevalier_agentic::runtime::{RunParams, Runtime};
-use chevalier_agentic::types::{
+use chevalier::agentic;
+use chevalier::mcp::{McpServer, ServerTransport};
+use chevalier::runtime::{RunParams, Runtime};
+use chevalier::types::{
     AssistantResponse, ChatMessage, CreateResult, ResponsePart, ToolCall, ToolResult,
 };
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::utils::ConversationMessage;
 use chevalier_mcp::{CallToolResult, Content};
 use serde_json::json;
 use std::env;
@@ -159,7 +159,7 @@ async fn test_mcp_client_mixed_with_local_tools() {
     runtime
         .register_tool(
             "local_echo",
-            chevalier_agentic::runtime::ToolFunction::Sync(Box::new(|args| {
+            chevalier::runtime::ToolFunction::Sync(Box::new(|args| {
                 let msg = args
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -421,7 +421,7 @@ async fn test_mcp_as_avoids_conflicts() {
 #[cfg(feature = "mcp-apps")]
 #[tokio::test]
 async fn test_server_with_ui_resource() {
-    use chevalier_agentic::mcp::UiResource;
+    use chevalier::mcp::UiResource;
 
     let html = "<html><body><h1>Calculator UI</h1></body></html>";
     let ui = UiResource::new("calc-server", "calculator-ui", html)
@@ -523,7 +523,7 @@ async fn test_server_with_ui_resource() {
 #[cfg(feature = "mcp-apps")]
 #[tokio::test]
 async fn test_ui_resource_with_csp_and_permissions() {
-    use chevalier_agentic::mcp::{UiResource, UiResourceCsp};
+    use chevalier::mcp::{UiResource, UiResourceCsp};
 
     let html = "<html><body>Secure App</body></html>";
     let csp = UiResourceCsp {
@@ -588,7 +588,7 @@ async fn test_ui_resource_with_csp_and_permissions() {
 #[cfg(feature = "mcp-apps")]
 #[tokio::test]
 async fn test_runtime_skips_app_only_tools() {
-    use chevalier_agentic::mcp::{UiResource, Visibility};
+    use chevalier::mcp::{UiResource, Visibility};
 
     let server = McpServer::new("vis-filter-server")
         .tool(
@@ -645,7 +645,7 @@ async fn test_runtime_skips_app_only_tools() {
 #[cfg(feature = "mcp-apps")]
 #[tokio::test]
 async fn test_runtime_includes_tools_with_no_visibility() {
-    use chevalier_agentic::mcp::UiResource;
+    use chevalier::mcp::UiResource;
 
     // Default visibility (None) means ["model", "app"] — should be registered
     let server = McpServer::new("default-vis-server")
@@ -817,7 +817,7 @@ async fn test_tool_returning_multiple_content_blocks() {
 
 #[tokio::test]
 async fn test_mcp_as_with_agent_server_e2e() {
-    // Use McpServer wrapper (chevalier-agentic's) with namespacing
+    // Use McpServer wrapper (chevalier's) with namespacing
     let server = McpServer::new("math-service").agent(
         "square",
         "Square a number",
@@ -942,15 +942,15 @@ fn get_google_key() -> Option<String> {
     env::var("GOOGLE_GEMINI_API_KEY").ok()
 }
 
-fn require_first_tool_call(
-    response: &AssistantResponse,
-) -> chevalier_agentic::error::Result<&ToolCall> {
-    response.tool_calls().into_iter().next().ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool call".to_string())
-    })
+fn require_first_tool_call(response: &AssistantResponse) -> chevalier::error::Result<&ToolCall> {
+    response
+        .tool_calls()
+        .into_iter()
+        .next()
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool call".to_string()))
 }
 
-fn require_tool_call_id(response: &AssistantResponse) -> chevalier_agentic::error::Result<String> {
+fn require_tool_call_id(response: &AssistantResponse) -> chevalier::error::Result<String> {
     let tool_call = require_first_tool_call(response)?;
     tool_call
         .tool_obj
@@ -959,9 +959,7 @@ fn require_tool_call_id(response: &AssistantResponse) -> chevalier_agentic::erro
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
         .map(|s| s.to_string())
-        .ok_or_else(|| {
-            chevalier_agentic::error::Error::NonRetryable("Missing tool call id".to_string())
-        })
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool call id".to_string()))
 }
 
 fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
@@ -972,38 +970,31 @@ fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn require_i64_field(
-    response: &AssistantResponse,
-    field: &str,
-) -> chevalier_agentic::error::Result<i64> {
+fn require_i64_field(response: &AssistantResponse, field: &str) -> chevalier::error::Result<i64> {
     let value = &require_first_tool_call(response)?.args;
     // Try top-level (args are flattened by call_llm)
-    if let Some(raw) = value.get(field) {
-        if let Some(v) = parse_i64_value(raw) {
-            return Ok(v);
-        }
+    if let Some(raw) = value.get(field)
+        && let Some(v) = parse_i64_value(raw)
+    {
+        return Ok(v);
     }
     // Try nested input (Anthropic format)
-    if let Some(input) = value.get("input") {
-        if let Some(raw) = input.get(field) {
-            if let Some(v) = parse_i64_value(raw) {
-                return Ok(v);
-            }
-        }
+    if let Some(input) = value.get("input")
+        && let Some(raw) = input.get(field)
+        && let Some(v) = parse_i64_value(raw)
+    {
+        return Ok(v);
     }
     // Try nested arguments (OpenAI format)
-    if let Some(func) = value.get("function") {
-        if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
-                if let Some(raw) = args.get(field) {
-                    if let Some(v) = parse_i64_value(raw) {
-                        return Ok(v);
-                    }
-                }
-            }
-        }
+    if let Some(func) = value.get("function")
+        && let Some(args_str) = func.get("arguments").and_then(|a| a.as_str())
+        && let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str)
+        && let Some(raw) = args.get(field)
+        && let Some(v) = parse_i64_value(raw)
+    {
+        return Ok(v);
     }
-    Err(chevalier_agentic::error::Error::NonRetryable(format!(
+    Err(chevalier::error::Error::NonRetryable(format!(
         "Missing '{}' field in {:?}",
         field, value
     )))
@@ -1016,7 +1007,7 @@ async fn anthropic_mcp_tool_agent(
     prompt: String,
     mcp_url: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     // Connect to the MCP server - its tools become available to the runtime
     runtime.mcp(&mcp_url).await?;
 
@@ -1039,7 +1030,7 @@ async fn anthropic_mcp_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Expected tool call, got: {:?}",
             tool_call
         )));
@@ -1097,7 +1088,7 @@ async fn google_mcp_tool_agent(
     prompt: String,
     mcp_url: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     runtime.mcp(&mcp_url).await?;
 
     let tool_call = runtime
@@ -1118,7 +1109,7 @@ async fn google_mcp_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Expected tool call, got: {:?}",
             tool_call
         )));

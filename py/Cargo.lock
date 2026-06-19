@@ -586,8 +586,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "chevalier-agentic"
-version = "0.5.1"
+name = "chevalier"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -646,7 +646,7 @@ dependencies = [
 name = "chevalier-py"
 version = "0.1.1"
 dependencies = [
- "chevalier-agentic",
+ "chevalier",
  "futures",
  "once_cell",
  "pyo3",

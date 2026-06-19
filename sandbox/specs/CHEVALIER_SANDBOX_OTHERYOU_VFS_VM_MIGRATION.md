@@ -508,7 +508,7 @@ Chevalier changes:
 
 - Added `sandbox/crates/sandbox/src/vfs.rs` with generic VFS protocol headers, DTOs, endpoint helpers, scope-path joining, range parsing, gateway errors, and an opt-in `vfs-server` Axum route builder.
 - Added `chevalier-sandbox` feature `vfs-server`, keeping Axum and async-trait out of the default VM client surface unless a consumer needs the HTTP gateway.
-- Added `rust` feature `sandbox-vfs-server` so consumers can access the gateway through `chevalier_agentic::sandbox`.
+- Added `rust` feature `sandbox-vfs-server` so consumers can access the gateway through `chevalier::sandbox`.
 - Updated vmd's FUSE client/cache/fs code to use the shared chevalier VFS DTOs, header constants, operation names, surface-kind constants, and scope path helper.
 - Kept the vmd FUSE server/client generic: no OtherYou, product, or legacy `x-nymfs-*` names exist in the new chevalier VFS module or vmd FUSE protocol code.
 
@@ -518,7 +518,7 @@ OtherYou changes:
 - Mounted the generic chevalier route at `/v1/internal/chevalier/vfs/{owner_id}`.
 - Kept `/v1/internal/nymfs/{nym_id}` as a compatibility alias using the same chevalier gateway route builder and the same OtherYou backend.
 - Kept product path aliases, task/conversation scope derivation, product write leases, mutation ledger calls, auth, and ingress authorization in OtherYou.
-- Updated `api/src/services/computer/chevalier.rs` to build new VFS endpoints through `chevalier_agentic::sandbox::vfs::owner_vfs_endpoint`, so new VM mounts target `/v1/internal/chevalier/vfs/{owner_id}` instead of hard-coding the legacy product route.
+- Updated `api/src/services/computer/chevalier.rs` to build new VFS endpoints through `chevalier::sandbox::vfs::owner_vfs_endpoint`, so new VM mounts target `/v1/internal/chevalier/vfs/{owner_id}` instead of hard-coding the legacy product route.
 - Fixed the GCS-backed VFS adapter startup path so blocking cloud-client construction runs safely inside the Tokio runtime.
 - Fixed current-task mount binding so `.runtime/current-task-workspace` resolves from actual task anchor entries, prefers the active task, and falls back to the latest nonterminal task anchor after pause/resume clears `active_task_id`.
 - Classified corvidae's unsupported QEMU background-snapshot response and preserved `live-pause-resume` checkpoints by pausing the VM without inventing a snapshot identity when the host kernel cannot background-snapshot.

@@ -204,15 +204,15 @@ impl GoogleAnthropicClient {
         }
 
         // Add tools if provided
-        if let Some(ref tools) = config.tools {
-            if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.normalized_tools(tools));
-                // Enable parallel tool calling via tool_choice
-                request["tool_choice"] = serde_json::json!({
-                    "type": "auto",
-                    "disable_parallel_tool_use": false
-                });
-            }
+        if let Some(ref tools) = config.tools
+            && !tools.is_empty()
+        {
+            request["tools"] = serde_json::json!(self.normalized_tools(tools));
+            // Enable parallel tool calling via tool_choice
+            request["tool_choice"] = serde_json::json!({
+                "type": "auto",
+                "disable_parallel_tool_use": false
+            });
         }
 
         // Add extended thinking if configured
@@ -275,17 +275,17 @@ impl GoogleAnthropicClient {
     /// Wrap string content in [{"type": "text", "text": "..."}] format
     fn wrap_string_content(&self, mut messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         for msg in messages.iter_mut() {
-            if let Some(content) = msg.get("content") {
-                if let Some(text) = content.as_str() {
-                    if !text.is_empty() {
-                        msg["content"] = serde_json::json!([{
-                            "type": "text",
-                            "text": text
-                        }]);
-                    } else {
-                        // Empty content - convert to empty array
-                        msg["content"] = serde_json::json!([]);
-                    }
+            if let Some(content) = msg.get("content")
+                && let Some(text) = content.as_str()
+            {
+                if !text.is_empty() {
+                    msg["content"] = serde_json::json!([{
+                        "type": "text",
+                        "text": text
+                    }]);
+                } else {
+                    // Empty content - convert to empty array
+                    msg["content"] = serde_json::json!([]);
                 }
             }
         }
@@ -299,21 +299,21 @@ impl GoogleAnthropicClient {
             for block in blocks {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Text {
-                                    text: text.to_string(),
-                                });
-                            }
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            response.push_output(ResponsePart::Text {
+                                text: text.to_string(),
+                            });
                         }
                     }
                     Some("thinking") => {
-                        if let Some(text) = block["thinking"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Reasoning {
-                                    text: text.to_string(),
-                                });
-                            }
+                        if let Some(text) = block["thinking"].as_str()
+                            && !text.is_empty()
+                        {
+                            response.push_output(ResponsePart::Reasoning {
+                                text: text.to_string(),
+                            });
                         }
                         if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
                             response.push_output(ResponsePart::Signature {

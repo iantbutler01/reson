@@ -1,6 +1,6 @@
 //! Node-API (TypeScript) bindings for Chevalier — agents are just functions.
 //!
-//! Wraps the high-level `chevalier_agentic::runtime::Runtime` directly. The hard
+//! Wraps the high-level `chevalier_core::runtime::Runtime` directly. The hard
 //! parts (JS tool callbacks via ThreadsafeFunction, streaming via async
 //! iterators) are layered on in later phases.
 

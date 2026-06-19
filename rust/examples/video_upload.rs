@@ -8,12 +8,12 @@
 //! 3. Uploading videos via Google File API
 //! 4. Multi-turn conversation with tools and video context
 
-use chevalier_agentic::Tool;
-use chevalier_agentic::agentic;
-use chevalier_agentic::providers::{FileState, GoogleGenAIClient};
-use chevalier_agentic::runtime::{RunParams, ToolFunction};
-use chevalier_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::Tool;
+use chevalier::agentic;
+use chevalier::providers::{FileState, GoogleGenAIClient};
+use chevalier::runtime::{RunParams, ToolFunction};
+use chevalier::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
+use chevalier::utils::ConversationMessage;
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -62,7 +62,7 @@ async fn analyze_video(
     mime_type: String,
     user_query: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     // Register tools with the runtime using schema information
     runtime
         .register_tool_with_schema(

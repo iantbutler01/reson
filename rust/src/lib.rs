@@ -6,7 +6,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use chevalier_agentic::prelude::*;
+//! use chevalier::prelude::*;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
@@ -15,7 +15,7 @@
 //! }
 //! ```
 
-// @dive-file: Crate root for chevalier-agentic exports, feature gates, and prelude wiring.
+// @dive-file: Crate root for chevalier exports, feature gates, and prelude wiring.
 // @dive-rel: Exposes optional protocol/runtime integrations such as MCP and sandbox behind features.
 // @dive-rel: Re-exports macros and convenience types consumed by downstream agent services.
 

@@ -9,21 +9,21 @@
 //! Run with: cargo test --test integration_tests -- --ignored
 //! Or specific test: cargo test --test integration_tests test_anthropic_simple -- --ignored
 
-use chevalier_agentic::Tool;
-use chevalier_agentic::agentic;
-use chevalier_agentic::providers::{
+use chevalier::Tool;
+use chevalier::agentic;
+use chevalier::providers::{
     AnthropicClient, AnthropicProviderConfig, GenerationConfig, GoogleGenAIClient, InferenceClient,
     OAIClient, OpenRouterClient, ProviderConfig,
 };
-use chevalier_agentic::runtime::{RunParams, Runtime, ToolFunction};
-use chevalier_agentic::schema::{
+use chevalier::runtime::{RunParams, Runtime, ToolFunction};
+use chevalier::schema::{
     AnthropicSchemaGenerator, GoogleSchemaGenerator, OpenAISchemaGenerator, SchemaGenerator,
 };
-use chevalier_agentic::types::{
+use chevalier::types::{
     AssistantResponse, CacheMarker, ChatMessage, Provider, ResponsePart, ResponseStreamEvent,
     TokenUsage, ToolCall, ToolResult,
 };
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::utils::ConversationMessage;
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -92,7 +92,7 @@ fn run_params(
 async fn stream_to_text_and_usage(
     runtime: &mut Runtime,
     params: RunParams,
-) -> chevalier_agentic::error::Result<(String, TokenUsage)> {
+) -> chevalier::error::Result<(String, TokenUsage)> {
     use futures::StreamExt;
 
     let mut stream = runtime.run_stream(params).await?;
@@ -107,10 +107,8 @@ async fn stream_to_text_and_usage(
             ResponseStreamEvent::Usage(value) => {
                 usage = value;
             }
-            ResponseStreamEvent::Complete(response) => {
-                if text.is_empty() {
-                    text = response.text();
-                }
+            ResponseStreamEvent::Complete(response) if text.is_empty() => {
+                text = response.text();
             }
             _ => {}
         }
@@ -197,7 +195,7 @@ struct MultiplyNumbers {
     b: i64,
 }
 
-async fn register_add_numbers_tool(runtime: &Runtime) -> chevalier_agentic::error::Result<()> {
+async fn register_add_numbers_tool(runtime: &Runtime) -> chevalier::error::Result<()> {
     runtime
         .register_tool_with_schema(
             AddNumbers::tool_name(),
@@ -212,7 +210,7 @@ async fn register_add_numbers_tool(runtime: &Runtime) -> chevalier_agentic::erro
         .await
 }
 
-async fn register_multiply_numbers_tool(runtime: &Runtime) -> chevalier_agentic::error::Result<()> {
+async fn register_multiply_numbers_tool(runtime: &Runtime) -> chevalier::error::Result<()> {
     runtime
         .register_tool_with_schema(
             MultiplyNumbers::tool_name(),
@@ -246,19 +244,19 @@ fn parse_tool_call_args(value: &serde_json::Value) -> Option<serde_json::Value> 
 }
 
 trait ToolCallCarrier {
-    fn first_tool_call_value(&self) -> chevalier_agentic::error::Result<serde_json::Value>;
+    fn first_tool_call_value(&self) -> chevalier::error::Result<serde_json::Value>;
 }
 
 impl ToolCallCarrier for serde_json::Value {
-    fn first_tool_call_value(&self) -> chevalier_agentic::error::Result<serde_json::Value> {
+    fn first_tool_call_value(&self) -> chevalier::error::Result<serde_json::Value> {
         Ok(self.clone())
     }
 }
 
 impl ToolCallCarrier for AssistantResponse {
-    fn first_tool_call_value(&self) -> chevalier_agentic::error::Result<serde_json::Value> {
+    fn first_tool_call_value(&self) -> chevalier::error::Result<serde_json::Value> {
         let tool_call = self.tool_calls().first().copied().ok_or_else(|| {
-            chevalier_agentic::error::Error::NonRetryable(
+            chevalier::error::Error::NonRetryable(
                 "Assistant response did not contain a tool call".to_string(),
             )
         })?;
@@ -271,7 +269,7 @@ impl ToolCallCarrier for AssistantResponse {
 
 fn extract_tool_call_args<T: ToolCallCarrier>(
     tool_call: &T,
-) -> chevalier_agentic::error::Result<serde_json::Value> {
+) -> chevalier::error::Result<serde_json::Value> {
     let tool_call = tool_call.first_tool_call_value()?;
     let direct_args = tool_call
         .get("arguments")
@@ -288,7 +286,7 @@ fn extract_tool_call_args<T: ToolCallCarrier>(
         }
     }
 
-    Err(chevalier_agentic::error::Error::NonRetryable(
+    Err(chevalier::error::Error::NonRetryable(
         "Missing tool arguments".to_string(),
     ))
 }
@@ -306,40 +304,30 @@ fn tool_call_name(tool_call: &serde_json::Value) -> Option<&str> {
         })
 }
 
-fn require_i64_field<T: ToolCallCarrier>(
-    value: &T,
-    field: &str,
-) -> chevalier_agentic::error::Result<i64> {
+fn require_i64_field<T: ToolCallCarrier>(value: &T, field: &str) -> chevalier::error::Result<i64> {
     let value = value.first_tool_call_value()?;
     if let Some(raw) = value.get(field) {
         return parse_i64_value(raw).ok_or_else(|| {
-            chevalier_agentic::error::Error::NonRetryable(format!(
-                "Invalid '{}' value: {}",
-                field, raw
-            ))
+            chevalier::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
         });
     }
 
     let args = extract_tool_call_args(&value)?;
     let raw = args.get(field).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable(format!("Missing '{}' field", field))
+        chevalier::error::Error::NonRetryable(format!("Missing '{}' field", field))
     })?;
     parse_i64_value(raw).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
+        chevalier::error::Error::NonRetryable(format!("Invalid '{}' value: {}", field, raw))
     })
 }
 
-fn require_tool_call_id<T: ToolCallCarrier>(
-    tool_call: &T,
-) -> chevalier_agentic::error::Result<String> {
+fn require_tool_call_id<T: ToolCallCarrier>(tool_call: &T) -> chevalier::error::Result<String> {
     let tool_call = tool_call.first_tool_call_value()?;
     let id = tool_call
         .get("id")
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            chevalier_agentic::error::Error::NonRetryable("Missing tool call id".to_string())
-        })?;
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool call id".to_string()))?;
     Ok(id.to_string())
 }
 
@@ -347,7 +335,7 @@ fn require_tool_call_id<T: ToolCallCarrier>(
 async fn openai_responses_simple_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     let response = runtime
         .run(run_params(
             Some(&prompt),
@@ -373,7 +361,7 @@ async fn openai_responses_simple_agent(
 async fn openai_responses_tool_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     register_add_numbers_tool(&runtime).await?;
 
     let tool_call = runtime
@@ -392,16 +380,16 @@ async fn openai_responses_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(
+        return Err(chevalier::error::Error::NonRetryable(
             "Expected tool call".to_string(),
         ));
     }
 
-    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool name".to_string())
-    })?;
+    let tool_name = runtime
+        .get_tool_name(&tool_call)
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool name".to_string()))?;
     if tool_name != "add_numbers" {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
             tool_name
         )));
@@ -411,7 +399,7 @@ async fn openai_responses_tool_agent(
     let a = require_i64_field(&tool_call, "a")?;
     let b = require_i64_field(&tool_call, "b")?;
     if a != 25 || b != 35 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected add_numbers args: a={}, b={}",
             a, b
         )));
@@ -419,13 +407,13 @@ async fn openai_responses_tool_agent(
 
     let tool_output = runtime.execute_tool(&tool_call).await?;
     let output_value = tool_output.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Tool output should be integer, got: {}",
             tool_output
         ))
     })?;
     if output_value != 60 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool output: {}",
             tool_output
         )));
@@ -462,13 +450,13 @@ async fn openai_responses_tool_agent(
         .map(|s| s.to_string())
         .unwrap_or_else(|| response.to_string());
     let response_value = response_str.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Response should be integer, got: {}",
             response_str
         ))
     })?;
     if response_value != 60 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected response: {}",
             response_str
         )));
@@ -481,7 +469,7 @@ async fn openai_responses_tool_agent(
 async fn openai_responses_tool_stream_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<bool> {
+) -> chevalier::error::Result<bool> {
     use futures::StreamExt;
 
     register_add_numbers_tool(&runtime).await?;
@@ -512,14 +500,14 @@ async fn openai_responses_tool_stream_agent(
                     .unwrap_or_else(|| serde_json::to_value(&call).unwrap());
                 let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 if id.is_empty() {
-                    return Err(chevalier_agentic::error::Error::NonRetryable(
+                    return Err(chevalier::error::Error::NonRetryable(
                         "Missing tool call id in stream".to_string(),
                     ));
                 }
 
                 let name = tool_call_name(&value);
                 if name != Some("add_numbers") {
-                    return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+                    return Err(chevalier::error::Error::NonRetryable(format!(
                         "Unexpected tool name in stream: {:?}",
                         name
                     )));
@@ -528,7 +516,7 @@ async fn openai_responses_tool_stream_agent(
                 let a = require_i64_field(&value, "a")?;
                 let b = require_i64_field(&value, "b")?;
                 if a != 25 || b != 35 {
-                    return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+                    return Err(chevalier::error::Error::NonRetryable(format!(
                         "Unexpected stream args: a={}, b={}",
                         a, b
                     )));
@@ -538,7 +526,7 @@ async fn openai_responses_tool_stream_agent(
             }
             Ok(_) => {}
             Err(e) => {
-                return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+                return Err(chevalier::error::Error::NonRetryable(format!(
                     "Stream error: {}",
                     e
                 )));
@@ -553,7 +541,7 @@ async fn openai_responses_tool_stream_agent(
 async fn openai_responses_multi_turn_tool_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     register_add_numbers_tool(&runtime).await?;
     register_multiply_numbers_tool(&runtime).await?;
 
@@ -573,16 +561,16 @@ async fn openai_responses_multi_turn_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(
+        return Err(chevalier::error::Error::NonRetryable(
             "Expected add_numbers tool call".to_string(),
         ));
     }
 
-    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool name".to_string())
-    })?;
+    let tool_name = runtime
+        .get_tool_name(&tool_call)
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool name".to_string()))?;
     if tool_name != "add_numbers" {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
             tool_name
         )));
@@ -594,20 +582,20 @@ async fn openai_responses_multi_turn_tool_agent(
     let a = require_i64_field(&tool_call, "a")?;
     let b = require_i64_field(&tool_call, "b")?;
     if a != 10 || b != 20 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected add_numbers args: a={}, b={}",
             a, b
         )));
     }
 
     let add_output_value = tool_output.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Tool output should be integer, got: {}",
             tool_output
         ))
     })?;
     if add_output_value != 30 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected add_numbers output: {}",
             tool_output
         )));
@@ -641,16 +629,16 @@ async fn openai_responses_multi_turn_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(
+        return Err(chevalier::error::Error::NonRetryable(
             "Expected multiply_numbers tool call".to_string(),
         ));
     }
 
-    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool name".to_string())
-    })?;
+    let tool_name = runtime
+        .get_tool_name(&tool_call)
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool name".to_string()))?;
     if tool_name != "multiply_numbers" {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
             tool_name
         )));
@@ -662,20 +650,20 @@ async fn openai_responses_multi_turn_tool_agent(
     let a = require_i64_field(&tool_call, "a")?;
     let b = require_i64_field(&tool_call, "b")?;
     if a != add_output_value || b != 3 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected multiply_numbers args: a={}, b={}",
             a, b
         )));
     }
 
     let multiply_output_value = tool_output.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Tool output should be integer, got: {}",
             tool_output
         ))
     })?;
     if multiply_output_value != 90 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected multiply_numbers output: {}",
             tool_output
         )));
@@ -712,13 +700,13 @@ async fn openai_responses_multi_turn_tool_agent(
         .map(|s| s.to_string())
         .unwrap_or_else(|| response.to_string());
     let response_value = response_str.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Response should be integer, got: {}",
             response_str
         ))
     })?;
     if response_value != 90 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected response: {}",
             response_str
         )));
@@ -731,7 +719,7 @@ async fn openai_responses_multi_turn_tool_agent(
 async fn openrouter_responses_simple_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     let response = runtime
         .run(run_params(
             Some(&prompt),
@@ -757,7 +745,7 @@ async fn openrouter_responses_simple_agent(
 async fn openrouter_responses_tool_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     register_add_numbers_tool(&runtime).await?;
 
     let tool_call = runtime
@@ -776,16 +764,16 @@ async fn openrouter_responses_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(
+        return Err(chevalier::error::Error::NonRetryable(
             "Expected tool call".to_string(),
         ));
     }
 
-    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool name".to_string())
-    })?;
+    let tool_name = runtime
+        .get_tool_name(&tool_call)
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool name".to_string()))?;
     if tool_name != "add_numbers" {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
             tool_name
         )));
@@ -795,7 +783,7 @@ async fn openrouter_responses_tool_agent(
     let a = require_i64_field(&tool_call, "a")?;
     let b = require_i64_field(&tool_call, "b")?;
     if a != 25 || b != 35 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected add_numbers args: a={}, b={}",
             a, b
         )));
@@ -803,13 +791,13 @@ async fn openrouter_responses_tool_agent(
 
     let tool_output = runtime.execute_tool(&tool_call).await?;
     let output_value = tool_output.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Tool output should be integer, got: {}",
             tool_output
         ))
     })?;
     if output_value != 60 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool output: {}",
             tool_output
         )));
@@ -846,13 +834,13 @@ async fn openrouter_responses_tool_agent(
         .map(|s| s.to_string())
         .unwrap_or_else(|| response.to_string());
     let response_value = response_str.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Response should be integer, got: {}",
             response_str
         ))
     })?;
     if response_value != 60 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected response: {}",
             response_str
         )));
@@ -865,7 +853,7 @@ async fn openrouter_responses_tool_agent(
 async fn openrouter_responses_multi_turn_tool_agent(
     prompt: String,
     runtime: Runtime,
-) -> chevalier_agentic::error::Result<String> {
+) -> chevalier::error::Result<String> {
     register_add_numbers_tool(&runtime).await?;
     register_multiply_numbers_tool(&runtime).await?;
 
@@ -885,16 +873,16 @@ async fn openrouter_responses_multi_turn_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(
+        return Err(chevalier::error::Error::NonRetryable(
             "Expected add_numbers tool call".to_string(),
         ));
     }
 
-    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool name".to_string())
-    })?;
+    let tool_name = runtime
+        .get_tool_name(&tool_call)
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool name".to_string()))?;
     if tool_name != "add_numbers" {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
             tool_name
         )));
@@ -906,20 +894,20 @@ async fn openrouter_responses_multi_turn_tool_agent(
     let a = require_i64_field(&tool_call, "a")?;
     let b = require_i64_field(&tool_call, "b")?;
     if a != 10 || b != 20 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected add_numbers args: a={}, b={}",
             a, b
         )));
     }
 
     let add_output_value = tool_output.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Tool output should be integer, got: {}",
             tool_output
         ))
     })?;
     if add_output_value != 30 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected add_numbers output: {}",
             tool_output
         )));
@@ -953,16 +941,16 @@ async fn openrouter_responses_multi_turn_tool_agent(
         .await?;
 
     if !runtime.is_tool_call(&tool_call) {
-        return Err(chevalier_agentic::error::Error::NonRetryable(
+        return Err(chevalier::error::Error::NonRetryable(
             "Expected multiply_numbers tool call".to_string(),
         ));
     }
 
-    let tool_name = runtime.get_tool_name(&tool_call).ok_or_else(|| {
-        chevalier_agentic::error::Error::NonRetryable("Missing tool name".to_string())
-    })?;
+    let tool_name = runtime
+        .get_tool_name(&tool_call)
+        .ok_or_else(|| chevalier::error::Error::NonRetryable("Missing tool name".to_string()))?;
     if tool_name != "multiply_numbers" {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected tool name: {}",
             tool_name
         )));
@@ -974,20 +962,20 @@ async fn openrouter_responses_multi_turn_tool_agent(
     let a = require_i64_field(&tool_call, "a")?;
     let b = require_i64_field(&tool_call, "b")?;
     if a != add_output_value || b != 3 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected multiply_numbers args: a={}, b={}",
             a, b
         )));
     }
 
     let multiply_output_value = tool_output.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Tool output should be integer, got: {}",
             tool_output
         ))
     })?;
     if multiply_output_value != 90 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected multiply_numbers output: {}",
             tool_output
         )));
@@ -1024,13 +1012,13 @@ async fn openrouter_responses_multi_turn_tool_agent(
         .map(|s| s.to_string())
         .unwrap_or_else(|| response.to_string());
     let response_value = response_str.trim().parse::<i64>().map_err(|_| {
-        chevalier_agentic::error::Error::NonRetryable(format!(
+        chevalier::error::Error::NonRetryable(format!(
             "Response should be integer, got: {}",
             response_str
         ))
     })?;
     if response_value != 90 {
-        return Err(chevalier_agentic::error::Error::NonRetryable(format!(
+        return Err(chevalier::error::Error::NonRetryable(format!(
             "Unexpected response: {}",
             response_str
         )));
@@ -1669,15 +1657,15 @@ async fn test_openrouter_with_tools_streaming() {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => match chunk {
-                        chevalier_agentic::providers::StreamChunk::Content(text) => {
+                        chevalier::providers::StreamChunk::Content(text) => {
                             print!("{}", text);
                             content.push_str(&text);
                         }
-                        chevalier_agentic::providers::StreamChunk::ToolCallComplete(tc) => {
+                        chevalier::providers::StreamChunk::ToolCallComplete(tc) => {
                             println!("Tool call complete: {:?}", tc);
                             tool_calls.push(tc);
                         }
-                        chevalier_agentic::providers::StreamChunk::Usage {
+                        chevalier::providers::StreamChunk::Usage {
                             input_tokens,
                             output_tokens,
                             ..
@@ -1922,11 +1910,11 @@ async fn test_anthropic_streaming() {
             Ok(chunk) => {
                 chunk_count += 1;
                 match chunk {
-                    chevalier_agentic::providers::StreamChunk::Content(text) => {
+                    chevalier::providers::StreamChunk::Content(text) => {
                         print!("{}", text);
                         full_content.push_str(&text);
                     }
-                    chevalier_agentic::providers::StreamChunk::Usage {
+                    chevalier::providers::StreamChunk::Usage {
                         input_tokens,
                         output_tokens,
                         ..
@@ -1969,7 +1957,7 @@ async fn test_google_streaming() {
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
-                if let chevalier_agentic::providers::StreamChunk::Content(text) = chunk {
+                if let chevalier::providers::StreamChunk::Content(text) = chunk {
                     print!("{}", text);
                     full_content.push_str(&text);
                 }
@@ -2059,7 +2047,7 @@ fn test_provider_supports_native_tools() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_simple() {
-    use chevalier_agentic::providers::GoogleAnthropicClient;
+    use chevalier::providers::GoogleAnthropicClient;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -2078,7 +2066,7 @@ async fn test_google_anthropic_simple() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_with_tools() {
-    use chevalier_agentic::providers::GoogleAnthropicClient;
+    use chevalier::providers::GoogleAnthropicClient;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
 
@@ -2104,7 +2092,7 @@ async fn test_google_anthropic_with_tools() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_streaming() {
-    use chevalier_agentic::providers::GoogleAnthropicClient;
+    use chevalier::providers::GoogleAnthropicClient;
     use futures::StreamExt;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
@@ -2122,11 +2110,11 @@ async fn test_google_anthropic_streaming() {
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => match chunk {
-                chevalier_agentic::providers::StreamChunk::Content(text) => {
+                chevalier::providers::StreamChunk::Content(text) => {
                     print!("{}", text);
                     full_content.push_str(&text);
                 }
-                chevalier_agentic::providers::StreamChunk::Usage {
+                chevalier::providers::StreamChunk::Usage {
                     input_tokens,
                     output_tokens,
                     ..
@@ -2151,7 +2139,7 @@ async fn test_google_anthropic_streaming() {
 #[tokio::test]
 #[ignore = "Requires GOOGLE_APPLICATION_CREDENTIALS"]
 async fn test_google_anthropic_streaming_with_tools() {
-    use chevalier_agentic::providers::GoogleAnthropicClient;
+    use chevalier::providers::GoogleAnthropicClient;
     use futures::StreamExt;
 
     let client = GoogleAnthropicClient::from_adc("claude-3-5-sonnet-v2@20241022", "us-east5");
@@ -2173,15 +2161,15 @@ async fn test_google_anthropic_streaming_with_tools() {
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => match chunk {
-                chevalier_agentic::providers::StreamChunk::Content(text) => {
+                chevalier::providers::StreamChunk::Content(text) => {
                     print!("{}", text);
                     content.push_str(&text);
                 }
-                chevalier_agentic::providers::StreamChunk::ToolCallComplete(tc) => {
+                chevalier::providers::StreamChunk::ToolCallComplete(tc) => {
                     println!("Tool call complete: {:?}", tc);
                     tool_calls.push(tc);
                 }
-                chevalier_agentic::providers::StreamChunk::Usage {
+                chevalier::providers::StreamChunk::Usage {
                     input_tokens,
                     output_tokens,
                     ..

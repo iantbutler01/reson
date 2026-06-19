@@ -1,5 +1,5 @@
 # @dive-file: Cargo manifest for the public chevalier-sandbox facade crate and distributed-control feature surface.
-# @dive-rel: Builds crates/sandbox/src/lib.rs and distributed adapter modules consumed by chevalier-agentic.
+# @dive-rel: Builds crates/sandbox/src/lib.rs and distributed adapter modules consumed by chevalier.
 # @dive-rel: Defines dependency boundaries for control-plane transports, protobufs, and runtime async tooling.
 [package]
 name = "chevalier-sandbox"

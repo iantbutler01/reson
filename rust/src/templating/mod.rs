@@ -29,7 +29,7 @@ impl TemplateEngine {
     ///
     /// # Example
     /// ```no_run
-    /// use chevalier_agentic::templating::TemplateEngine;
+    /// use chevalier::templating::TemplateEngine;
     ///
     /// let engine = TemplateEngine::new();
     /// let result = engine.render_str("Hello {{ name }}!", &[("name", "World")]).unwrap();

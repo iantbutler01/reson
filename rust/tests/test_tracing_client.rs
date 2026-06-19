@@ -6,12 +6,12 @@
 //!
 //! Run with: cargo test --test test_tracing_client -- --ignored
 
-use chevalier_agentic::providers::{
+use chevalier::providers::{
     AnthropicClient, CostInfo, GenerationConfig, InferenceClient, MemoryCostStore, OAIClient,
     TracingInferenceClient,
 };
-use chevalier_agentic::types::ChatMessage;
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::types::ChatMessage;
+use chevalier::utils::ConversationMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,7 +88,7 @@ async fn test_tracing_client_callback_invoked() {
     let count_clone = callback_count.clone();
     let cost_clone = callback_cost.clone();
 
-    let callback: chevalier_agentic::providers::TraceCallback =
+    let callback: chevalier::providers::TraceCallback =
         Arc::new(move |_id, _msgs, _resp, cost: &CostInfo| {
             count_clone.fetch_add(1, Ordering::Relaxed);
             cost_clone.fetch_add(cost.total_microdollars(), Ordering::Relaxed);
@@ -246,7 +246,7 @@ async fn test_tracing_client_trace_output() {
 
 #[tokio::test]
 async fn test_cost_info_calculations() {
-    use chevalier_agentic::types::TokenUsage;
+    use chevalier::types::TokenUsage;
 
     // Test Sonnet pricing
     let usage = TokenUsage::new(1000, 500, 0);

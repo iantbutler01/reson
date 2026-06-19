@@ -4,13 +4,13 @@
 //! Mirrors Python tests from:
 //! - integration_tests/test_tool_call_format_validation.py
 
-use chevalier_agentic::prelude::*;
-use chevalier_agentic::providers::{
+use chevalier::prelude::*;
+use chevalier::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use chevalier_agentic::schema::get_schema_generator;
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::schema::get_schema_generator;
+use chevalier::utils::ConversationMessage;
 use futures::StreamExt;
 use std::env;
 

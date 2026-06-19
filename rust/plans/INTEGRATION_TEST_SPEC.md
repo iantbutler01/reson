@@ -280,7 +280,7 @@ cargo test --test integration_tests -- --ignored --nocapture
 ## Test File Organization
 
 ```
-chevalier_agentic/tests/
+chevalier/tests/
 ├── integration_tests.rs          # Main integration tests (current)
 ├── test_native_tools.rs          # Native tool calling tests
 ├── test_streaming.rs             # Streaming tests

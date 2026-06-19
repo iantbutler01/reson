@@ -3,10 +3,10 @@
 //! Run with: ANTHROPIC_API_KEY=xxx cargo test --test test_native_tools -- --nocapture --ignored
 //! Or: OPENROUTER_API_KEY=xxx cargo test --test test_native_tools -- --nocapture --ignored
 
-use chevalier_agentic::agentic;
-use chevalier_agentic::error::Result;
-use chevalier_agentic::parsers::Deserializable;
-use chevalier_agentic::types::ToolResult;
+use chevalier::agentic;
+use chevalier::error::Result;
+use chevalier::parsers::Deserializable;
+use chevalier::types::ToolResult;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 fn run_params(
     prompt: Option<&str>,
     system: Option<&str>,
-    history: Option<Vec<chevalier_agentic::utils::ConversationMessage>>,
+    history: Option<Vec<chevalier::utils::ConversationMessage>>,
     output_type: Option<&str>,
     output_schema: Option<serde_json::Value>,
     temperature: Option<f32>,
@@ -22,8 +22,8 @@ fn run_params(
     max_tokens: Option<u32>,
     model: Option<&str>,
     api_key: Option<&str>,
-) -> chevalier_agentic::runtime::RunParams {
-    chevalier_agentic::runtime::RunParams {
+) -> chevalier::runtime::RunParams {
+    chevalier::runtime::RunParams {
         prompt: prompt.map(|s| s.to_string()),
         system: system.map(|s| s.to_string()),
         history,
@@ -60,10 +60,7 @@ fn default_max_results() -> i32 {
 impl Deserializable for SearchQuery {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!(
-                "Failed to parse SearchQuery: {}",
-                e
-            ))
+            chevalier::error::Error::NonRetryable(format!("Failed to parse SearchQuery: {}", e))
         })
     }
 
@@ -71,21 +68,21 @@ impl Deserializable for SearchQuery {
         Ok(())
     }
 
-    fn field_descriptions() -> Vec<chevalier_agentic::parsers::FieldDescription> {
+    fn field_descriptions() -> Vec<chevalier::parsers::FieldDescription> {
         vec![
-            chevalier_agentic::parsers::FieldDescription {
+            chevalier::parsers::FieldDescription {
                 name: "text".to_string(),
                 field_type: "string".to_string(),
                 description: "The search text".to_string(),
                 required: true,
             },
-            chevalier_agentic::parsers::FieldDescription {
+            chevalier::parsers::FieldDescription {
                 name: "category".to_string(),
                 field_type: "string".to_string(),
                 description: "Category to search in".to_string(),
                 required: false,
             },
-            chevalier_agentic::parsers::FieldDescription {
+            chevalier::parsers::FieldDescription {
                 name: "max_results".to_string(),
                 field_type: "number".to_string(),
                 description: "Maximum number of results".to_string(),
@@ -107,10 +104,7 @@ struct MathOperation {
 impl Deserializable for MathOperation {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!(
-                "Failed to parse MathOperation: {}",
-                e
-            ))
+            chevalier::error::Error::NonRetryable(format!("Failed to parse MathOperation: {}", e))
         })
     }
 
@@ -118,15 +112,15 @@ impl Deserializable for MathOperation {
         Ok(())
     }
 
-    fn field_descriptions() -> Vec<chevalier_agentic::parsers::FieldDescription> {
+    fn field_descriptions() -> Vec<chevalier::parsers::FieldDescription> {
         vec![
-            chevalier_agentic::parsers::FieldDescription {
+            chevalier::parsers::FieldDescription {
                 name: "a".to_string(),
                 field_type: "number".to_string(),
                 description: "First number".to_string(),
                 required: true,
             },
-            chevalier_agentic::parsers::FieldDescription {
+            chevalier::parsers::FieldDescription {
                 name: "b".to_string(),
                 field_type: "number".to_string(),
                 description: "Second number".to_string(),
@@ -146,10 +140,7 @@ struct FactorialInput {
 impl Deserializable for FactorialInput {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
         serde_json::from_value(value).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!(
-                "Failed to parse FactorialInput: {}",
-                e
-            ))
+            chevalier::error::Error::NonRetryable(format!("Failed to parse FactorialInput: {}", e))
         })
     }
 
@@ -157,8 +148,8 @@ impl Deserializable for FactorialInput {
         Ok(())
     }
 
-    fn field_descriptions() -> Vec<chevalier_agentic::parsers::FieldDescription> {
-        vec![chevalier_agentic::parsers::FieldDescription {
+    fn field_descriptions() -> Vec<chevalier::parsers::FieldDescription> {
+        vec![chevalier::parsers::FieldDescription {
             name: "n".to_string(),
             field_type: "number".to_string(),
             description: "Number to calculate factorial of".to_string(),
@@ -236,20 +227,21 @@ async fn native_multi_agent(query: String, runtime: Runtime) -> Result<String> {
         turn_count += 1;
         let tool_calls = result.tool_calls();
         if tool_calls.is_empty() {
-            return Err(chevalier_agentic::error::Error::NonRetryable(
+            return Err(chevalier::error::Error::NonRetryable(
                 "Expected tool calls in assistant response".to_string(),
             ));
         }
 
-        history
-            .push(chevalier_agentic::utils::ConversationMessage::AssistantResponse(result.clone()));
+        history.push(chevalier::utils::ConversationMessage::AssistantResponse(
+            result.clone(),
+        ));
 
         for tool_call in tool_calls {
             println!("🔧 Native turn {}: {}", turn_count, tool_call.tool_name);
             let tool_result_str = runtime.execute_tool_call(tool_call).await?;
             println!("🔧 Native tool result {}: {}", turn_count, tool_result_str);
 
-            history.push(chevalier_agentic::utils::ConversationMessage::ToolResult(
+            history.push(chevalier::utils::ConversationMessage::ToolResult(
                 ToolResult::success(&tool_call.tool_use_id, &tool_result_str)
                     .with_tool_name(&tool_call.tool_name),
             ));

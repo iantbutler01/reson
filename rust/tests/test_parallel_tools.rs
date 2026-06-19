@@ -4,13 +4,13 @@
 //! Mirrors Python tests from:
 //! - integration_tests/test_parallel_tool_calling.py
 
-use chevalier_agentic::providers::{
+use chevalier::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use chevalier_agentic::schema::get_schema_generator;
-use chevalier_agentic::types::{ChatMessage, ToolCall, ToolResult};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::schema::get_schema_generator;
+use chevalier::types::{ChatMessage, ToolCall, ToolResult};
+use chevalier::utils::ConversationMessage;
 use futures::StreamExt;
 use std::env;
 
@@ -445,7 +445,7 @@ async fn test_backwards_compatibility_single_tool() {
             if !response.tool_calls.is_empty() {
                 let tc = ToolCall::from_provider_format(
                     response.tool_calls[0].clone(),
-                    chevalier_agentic::types::Provider::OpenRouter,
+                    chevalier::types::Provider::OpenRouter,
                 )
                 .expect("Failed to parse tool call");
                 assert_eq!(tc.tool_name, "calculate");

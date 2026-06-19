@@ -8,9 +8,9 @@
 //! OPENROUTER_API_KEY=xxx cargo run --example tool_hydration
 //! ```
 
-use chevalier_agentic::agentic;
-use chevalier_agentic::error::Result;
-use chevalier_agentic::parsers::{Deserializable, FieldDescription};
+use chevalier::agentic;
+use chevalier::error::Result;
+use chevalier::parsers::{Deserializable, FieldDescription};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 fn run_params(
     prompt: Option<&str>,
     system: Option<&str>,
-    history: Option<Vec<chevalier_agentic::utils::ConversationMessage>>,
+    history: Option<Vec<chevalier::utils::ConversationMessage>>,
     output_type: Option<&str>,
     output_schema: Option<serde_json::Value>,
     temperature: Option<f32>,
@@ -26,8 +26,8 @@ fn run_params(
     max_tokens: Option<u32>,
     model: Option<&str>,
     api_key: Option<&str>,
-) -> chevalier_agentic::runtime::RunParams {
-    chevalier_agentic::runtime::RunParams {
+) -> chevalier::runtime::RunParams {
+    chevalier::runtime::RunParams {
         prompt: prompt.map(|s| s.to_string()),
         system: system.map(|s| s.to_string()),
         history,
@@ -56,9 +56,8 @@ struct WeatherQuery {
 
 impl Deserializable for WeatherQuery {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
-        serde_json::from_value(value).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!("Failed to parse: {}", e))
-        })
+        serde_json::from_value(value)
+            .map_err(|e| chevalier::error::Error::NonRetryable(format!("Failed to parse: {}", e)))
     }
 
     fn validate_complete(&self) -> Result<()> {
@@ -91,9 +90,8 @@ struct MathOperation {
 
 impl Deserializable for MathOperation {
     fn from_partial(value: serde_json::Value) -> Result<Self> {
-        serde_json::from_value(value).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!("Failed to parse: {}", e))
-        })
+        serde_json::from_value(value)
+            .map_err(|e| chevalier::error::Error::NonRetryable(format!("Failed to parse: {}", e)))
     }
 
     fn validate_complete(&self) -> Result<()> {

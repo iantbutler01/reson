@@ -3,6 +3,14 @@
 //! This crate provides PyO3 bindings to expose the Rust chevalier library to Python,
 //! allowing existing Python integration tests to run unchanged.
 
+#![allow(deprecated)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::match_like_matches_macro)]
+#![allow(clippy::match_result_ok)]
+#![allow(clippy::only_used_in_recursion)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::upper_case_acronyms)]
+
 use pyo3::prelude::*;
 
 mod decorators;

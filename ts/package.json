@@ -32,6 +32,8 @@
     "index.d.ts",
     "native.js",
     "native.d.ts",
+    "vfs-gateway-server.js",
+    "vfs-gateway-server.d.ts",
     "*.node"
   ],
   "scripts": {

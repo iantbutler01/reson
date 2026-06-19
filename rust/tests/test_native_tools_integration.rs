@@ -6,13 +6,13 @@
 //! - integration_tests/test_native_tools_real_apis.py
 //! - integration_tests/test_comprehensive_native_tools.py
 
-use chevalier_agentic::providers::{
+use chevalier::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
     OpenRouterClient,
 };
-use chevalier_agentic::schema::get_schema_generator;
-use chevalier_agentic::types::{ChatMessage, Provider, ToolCall, ToolResult};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::schema::get_schema_generator;
+use chevalier::types::{ChatMessage, Provider, ToolCall, ToolResult};
+use chevalier::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================

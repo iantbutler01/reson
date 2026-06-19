@@ -1,4 +1,4 @@
-# PyO3 Bindings Specification for chevalier_agentic
+# PyO3 Bindings Specification for chevalier
 
 ## Overview
 
@@ -7,7 +7,7 @@ This document specifies the Python bindings needed to replace the pure-Python ch
 ## Architecture
 
 ```
-chevalier_agentic/
+chevalier/
 ├── src/                    # Core Rust library
 ├── chevalier-macros/           # Proc macros (#[agentic], #[tool], etc.)
 └── py/               # NEW: PyO3 bindings crate
@@ -579,7 +579,7 @@ chevalier = { path = ".." }  # Core Rust library
 2. **Integration Tests**: Run existing Python tests unchanged:
    ```bash
    cd /Users/crow/SoftwareProjects/chevalier
-   pip install ./chevalier_agentic/py  # Install Rust bindings
+   pip install ./chevalier/py  # Install Rust bindings
    pytest integration_tests/          # Run existing tests
    ```
 

@@ -654,8 +654,8 @@ impl Runtime {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # use chevalier_agentic::runtime::Runtime;
-    /// # async fn example() -> chevalier_agentic::error::Result<()> {
+    /// # use chevalier::runtime::Runtime;
+    /// # async fn example() -> chevalier::error::Result<()> {
     /// # let runtime = Runtime::new();
     /// runtime.mcp("http://localhost:8080/mcp").await?;
     /// runtime.mcp("npx @modelcontextprotocol/server-filesystem /tmp").await?;
@@ -677,8 +677,8 @@ impl Runtime {
     ///
     /// # Example
     /// ```rust,no_run
-    /// # use chevalier_agentic::runtime::Runtime;
-    /// # async fn example() -> chevalier_agentic::error::Result<()> {
+    /// # use chevalier::runtime::Runtime;
+    /// # async fn example() -> chevalier::error::Result<()> {
     /// # let runtime = Runtime::new();
     /// runtime.mcp_as("http://server1:8080", "s1").await?; // s1_search, s1_read
     /// runtime.mcp_as("http://server2:8080", "s2").await?; // s2_search, s2_write

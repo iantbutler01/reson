@@ -1,6 +1,6 @@
 //! Services module - inference_clients and related types
 
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier_core::utils::ConversationMessage;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
@@ -39,44 +39,36 @@ impl InferenceProvider {
     }
 }
 
-impl From<InferenceProvider> for chevalier_agentic::types::Provider {
+impl From<InferenceProvider> for chevalier_core::types::Provider {
     fn from(provider: InferenceProvider) -> Self {
         match provider {
-            InferenceProvider::OPENAI => chevalier_agentic::types::Provider::OpenAI,
-            InferenceProvider::OPENAI_RESPONSES => {
-                chevalier_agentic::types::Provider::OpenAIResponses
-            }
-            InferenceProvider::ANTHROPIC => chevalier_agentic::types::Provider::Anthropic,
-            InferenceProvider::GOOGLE_GENAI => chevalier_agentic::types::Provider::GoogleGenAI,
-            InferenceProvider::OPENROUTER => chevalier_agentic::types::Provider::OpenRouter,
+            InferenceProvider::OPENAI => chevalier_core::types::Provider::OpenAI,
+            InferenceProvider::OPENAI_RESPONSES => chevalier_core::types::Provider::OpenAIResponses,
+            InferenceProvider::ANTHROPIC => chevalier_core::types::Provider::Anthropic,
+            InferenceProvider::GOOGLE_GENAI => chevalier_core::types::Provider::GoogleGenAI,
+            InferenceProvider::OPENROUTER => chevalier_core::types::Provider::OpenRouter,
             InferenceProvider::OPENROUTER_RESPONSES => {
-                chevalier_agentic::types::Provider::OpenRouterResponses
+                chevalier_core::types::Provider::OpenRouterResponses
             }
-            InferenceProvider::BEDROCK => chevalier_agentic::types::Provider::Bedrock,
-            InferenceProvider::GOOGLE_ANTHROPIC => {
-                chevalier_agentic::types::Provider::GoogleAnthropic
-            }
+            InferenceProvider::BEDROCK => chevalier_core::types::Provider::Bedrock,
+            InferenceProvider::GOOGLE_ANTHROPIC => chevalier_core::types::Provider::GoogleAnthropic,
         }
     }
 }
 
-impl From<chevalier_agentic::types::Provider> for InferenceProvider {
-    fn from(provider: chevalier_agentic::types::Provider) -> Self {
+impl From<chevalier_core::types::Provider> for InferenceProvider {
+    fn from(provider: chevalier_core::types::Provider) -> Self {
         match provider {
-            chevalier_agentic::types::Provider::OpenAI => InferenceProvider::OPENAI,
-            chevalier_agentic::types::Provider::OpenAIResponses => {
-                InferenceProvider::OPENAI_RESPONSES
-            }
-            chevalier_agentic::types::Provider::Anthropic => InferenceProvider::ANTHROPIC,
-            chevalier_agentic::types::Provider::GoogleGenAI => InferenceProvider::GOOGLE_GENAI,
-            chevalier_agentic::types::Provider::OpenRouter => InferenceProvider::OPENROUTER,
-            chevalier_agentic::types::Provider::OpenRouterResponses => {
+            chevalier_core::types::Provider::OpenAI => InferenceProvider::OPENAI,
+            chevalier_core::types::Provider::OpenAIResponses => InferenceProvider::OPENAI_RESPONSES,
+            chevalier_core::types::Provider::Anthropic => InferenceProvider::ANTHROPIC,
+            chevalier_core::types::Provider::GoogleGenAI => InferenceProvider::GOOGLE_GENAI,
+            chevalier_core::types::Provider::OpenRouter => InferenceProvider::OPENROUTER,
+            chevalier_core::types::Provider::OpenRouterResponses => {
                 InferenceProvider::OPENROUTER_RESPONSES
             }
-            chevalier_agentic::types::Provider::Bedrock => InferenceProvider::BEDROCK,
-            chevalier_agentic::types::Provider::GoogleAnthropic => {
-                InferenceProvider::GOOGLE_ANTHROPIC
-            }
+            chevalier_core::types::Provider::Bedrock => InferenceProvider::BEDROCK,
+            chevalier_core::types::Provider::GoogleAnthropic => InferenceProvider::GOOGLE_ANTHROPIC,
         }
     }
 }
@@ -118,16 +110,16 @@ impl InferenceClient {
         for item in messages.iter() {
             // Try to extract as each type
             if let Ok(chat_msg) = item.extract::<ChatMessage>() {
-                let rust_msg: chevalier_agentic::types::ChatMessage = chat_msg.into();
+                let rust_msg: chevalier_core::types::ChatMessage = chat_msg.into();
                 conversation_messages.push(ConversationMessage::Chat(rust_msg));
             } else if let Ok(tool_call) = item.extract::<ToolCall>() {
-                let rust_tc: chevalier_agentic::types::ToolCall = tool_call.into();
+                let rust_tc: chevalier_core::types::ToolCall = tool_call.into();
                 conversation_messages.push(ConversationMessage::ToolCall(rust_tc));
             } else if let Ok(tool_result) = item.extract::<ToolResult>() {
-                let rust_tr: chevalier_agentic::types::ToolResult = tool_result.into();
+                let rust_tr: chevalier_core::types::ToolResult = tool_result.into();
                 conversation_messages.push(ConversationMessage::ToolResult(rust_tr));
             } else if let Ok(reasoning) = item.extract::<ReasoningSegment>() {
-                let rust_rs: chevalier_agentic::types::ReasoningSegment = reasoning.into();
+                let rust_rs: chevalier_core::types::ReasoningSegment = reasoning.into();
                 conversation_messages.push(ConversationMessage::Reasoning(rust_rs));
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -138,21 +130,21 @@ impl InferenceClient {
         }
 
         // Convert using the Rust function
-        let rust_provider: chevalier_agentic::types::Provider = provider.into();
+        let rust_provider: chevalier_core::types::Provider = provider.into();
         let converted = if matches!(
             rust_provider,
-            chevalier_agentic::types::Provider::OpenAIResponses
-                | chevalier_agentic::types::Provider::OpenRouterResponses
+            chevalier_core::types::Provider::OpenAIResponses
+                | chevalier_core::types::Provider::OpenRouterResponses
         ) {
             let (_instructions, input_items) =
-                chevalier_agentic::utils::convert_messages_to_responses_input(
+                chevalier_core::utils::convert_messages_to_responses_input(
                     &conversation_messages,
                     rust_provider,
                 )
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             input_items
         } else {
-            chevalier_agentic::utils::convert_messages_to_provider_format(
+            chevalier_core::utils::convert_messages_to_provider_format(
                 &conversation_messages,
                 rust_provider,
             )

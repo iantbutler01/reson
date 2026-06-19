@@ -1678,7 +1678,7 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #fn_vis async fn #fn_name(#fn_inputs) #fn_output {
             // Initialize runtime
-            let runtime = ::chevalier_agentic::Runtime::builder()
+            let runtime = ::chevalier::Runtime::builder()
                 .model(#(attrs.model))
                 .store(#(attrs.store))
                 .return_type::<#return_type>()
@@ -1695,7 +1695,7 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // Validate runtime was used
             if !runtime.was_used().await {
-                return Err(::chevalier_agentic::Error::RuntimeNotUsed);
+                return Err(::chevalier::Error::RuntimeNotUsed);
             }
 
             result
@@ -1723,7 +1723,7 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
     // Generate Tool implementation
     let expanded = quote! {
         #[async_trait]
-        impl ::chevalier_agentic::Tool for #name {
+        impl ::chevalier::Tool for #name {
             fn tool_name(&self) -> &str {
                 stringify!(#name)
             }
@@ -1737,11 +1737,11 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
                 &self.tool_use_id
             }
 
-            async fn execute(&self, runtime: &::chevalier_agentic::Runtime) -> ::chevalier_agentic::Result<String> {
+            async fn execute(&self, runtime: &::chevalier::Runtime) -> ::chevalier::Result<String> {
                 self.execute_impl(runtime).await
             }
 
-            fn schema(&self, generator: &dyn ::chevalier_agentic::SchemaGenerator) -> serde_json::Value {
+            fn schema(&self, generator: &dyn ::chevalier::SchemaGenerator) -> serde_json::Value {
                 generator.generate_schema::<Self>()
             }
         }
@@ -1760,19 +1760,19 @@ pub fn derive_deserializable(input: TokenStream) -> TokenStream {
     let name = &input.ident;
 
     let expanded = quote! {
-        impl ::chevalier_agentic::Deserializable for #name {
-            fn from_partial(partial: serde_json::Value) -> ::chevalier_agentic::Result<Self> {
+        impl ::chevalier::Deserializable for #name {
+            fn from_partial(partial: serde_json::Value) -> ::chevalier::Result<Self> {
                 // Generate partial construction logic
                 // Handle missing fields with defaults
                 Ok(serde_json::from_value(partial)?)
             }
 
-            fn validate_complete(&self) -> ::chevalier_agentic::Result<()> {
+            fn validate_complete(&self) -> ::chevalier::Result<()> {
                 // Check all required fields are present
                 Ok(())
             }
 
-            fn field_descriptions() -> Vec<::chevalier_agentic::FieldDescription> {
+            fn field_descriptions() -> Vec<::chevalier::FieldDescription> {
                 // Extract from field doc comments
                 vec![]
             }
@@ -2010,7 +2010,7 @@ syn = { version = "2.0", features = ["full"] }
 ### Basic Usage
 
 ```rust
-use chevalier_agentic::{agentic, Runtime, Deserializable};
+use chevalier::{agentic, Runtime, Deserializable};
 
 #[derive(Deserializable, Serialize, Deserialize)]
 struct Person {

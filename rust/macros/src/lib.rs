@@ -85,8 +85,8 @@ impl Parse for AgenticArgs {
 ///
 /// # Example
 /// ```ignore
-/// use chevalier_agentic::prelude::*;
-/// use chevalier_agentic::agentic;
+/// use chevalier::prelude::*;
+/// use chevalier::agentic;
 ///
 /// #[agentic(model = "anthropic:claude-3-5-sonnet-20241022")]
 /// async fn extract_people(text: String, runtime: Runtime) -> Result<Vec<Person>> {
@@ -169,7 +169,7 @@ pub fn agentic(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#fn_attrs)*
         #fn_vis #fn_asyncness fn #fn_name #fn_generics(#(#other_params),*) #fn_output {
             // Create Runtime with native tools enabled
-            let mut runtime = ::chevalier_agentic::runtime::Runtime::with_config(
+            let mut runtime = ::chevalier::runtime::Runtime::with_config(
                 #model_setup,
                 #api_key_setup,
             );
@@ -368,7 +368,7 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
             }
 
             /// Generate provider-specific tool schema using a SchemaGenerator
-            pub fn tool_schema(generator: &dyn ::chevalier_agentic::schema::SchemaGenerator) -> serde_json::Value {
+            pub fn tool_schema(generator: &dyn ::chevalier::schema::SchemaGenerator) -> serde_json::Value {
                 generator.generate_schema(
                     #tool_name,
                     #struct_description,
@@ -436,7 +436,7 @@ pub fn derive_deserializable(input: TokenStream) -> TokenStream {
         let is_required = !is_optional;
 
         field_desc_tokens.push(quote! {
-            ::chevalier_agentic::parsers::FieldDescription {
+            ::chevalier::parsers::FieldDescription {
                 name: #field_name_str.to_string(),
                 field_type: ::std::any::type_name::<#field_type>().to_string(),
                 description: #field_desc.to_string(),
@@ -448,8 +448,8 @@ pub fn derive_deserializable(input: TokenStream) -> TokenStream {
         if is_required {
             validation_checks.push(quote! {
                 if let serde_json::Value::Null = serde_json::to_value(&self.#field_name)
-                    .map_err(|e| ::chevalier_agentic::error::Error::NonRetryable(e.to_string()))? {
-                    return Err(::chevalier_agentic::error::Error::NonRetryable(
+                    .map_err(|e| ::chevalier::error::Error::NonRetryable(e.to_string()))? {
+                    return Err(::chevalier::error::Error::NonRetryable(
                         format!("Required field '{}' is missing or null", #field_name_str)
                     ));
                 }
@@ -467,18 +467,18 @@ pub fn derive_deserializable(input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        impl ::chevalier_agentic::parsers::Deserializable for #name {
-            fn from_partial(partial: serde_json::Value) -> ::chevalier_agentic::error::Result<Self> {
+        impl ::chevalier::parsers::Deserializable for #name {
+            fn from_partial(partial: serde_json::Value) -> ::chevalier::error::Result<Self> {
                 serde_json::from_value(partial).map_err(|e| {
-                    ::chevalier_agentic::error::Error::NonRetryable(format!("Failed to parse {}: {}", stringify!(#name), e))
+                    ::chevalier::error::Error::NonRetryable(format!("Failed to parse {}: {}", stringify!(#name), e))
                 })
             }
 
-            fn validate_complete(&self) -> ::chevalier_agentic::error::Result<()> {
+            fn validate_complete(&self) -> ::chevalier::error::Result<()> {
                 #validation_logic
             }
 
-            fn field_descriptions() -> Vec<::chevalier_agentic::parsers::FieldDescription> {
+            fn field_descriptions() -> Vec<::chevalier::parsers::FieldDescription> {
                 vec![
                     #(#field_desc_tokens),*
                 ]

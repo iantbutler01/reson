@@ -215,8 +215,8 @@ Returns ParsedToolResult
 ## Usage Example
 
 ```rust
-use chevalier_agentic::runtime::Runtime;
-use chevalier_agentic::parsers::{Deserializable, ParsedTool};
+use chevalier::runtime::Runtime;
+use chevalier::parsers::{Deserializable, ParsedTool};
 
 // 1. Define tool type
 #[derive(Serialize, Deserialize)]

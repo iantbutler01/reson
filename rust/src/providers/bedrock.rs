@@ -119,14 +119,14 @@ impl BedrockClient {
         // Wrap string content in [{"type": "text"}] format
         // Skip empty strings to avoid "text content blocks must be non-empty" error
         for msg in &mut formatted_messages {
-            if let Some(content) = msg.get_mut("content") {
-                if let Some(text) = content.as_str() {
-                    let text_owned = text.to_string();
-                    if !text_owned.is_empty() {
-                        *content = serde_json::json!([{"type": "text", "text": text_owned}]);
-                    } else {
-                        *content = serde_json::json!([]);
-                    }
+            if let Some(content) = msg.get_mut("content")
+                && let Some(text) = content.as_str()
+            {
+                let text_owned = text.to_string();
+                if !text_owned.is_empty() {
+                    *content = serde_json::json!([{"type": "text", "text": text_owned}]);
+                } else {
+                    *content = serde_json::json!([]);
                 }
             }
         }
@@ -151,15 +151,15 @@ impl BedrockClient {
         }
 
         // Add tools if provided
-        if let Some(ref tools) = config.tools {
-            if !tools.is_empty() {
-                request["tools"] = serde_json::json!(self.normalized_tools(tools));
-                // Enable parallel tool calling via tool_choice
-                request["tool_choice"] = serde_json::json!({
-                    "type": "auto",
-                    "disable_parallel_tool_use": false
-                });
-            }
+        if let Some(ref tools) = config.tools
+            && !tools.is_empty()
+        {
+            request["tools"] = serde_json::json!(self.normalized_tools(tools));
+            // Enable parallel tool calling via tool_choice
+            request["tool_choice"] = serde_json::json!({
+                "type": "auto",
+                "disable_parallel_tool_use": false
+            });
         }
 
         // Add structured output schema if provided
@@ -180,10 +180,10 @@ impl BedrockClient {
         &self,
         messages: &'a [ConversationMessage],
     ) -> Result<(Option<String>, &'a [ConversationMessage])> {
-        if let Some(ConversationMessage::Chat(chat_msg)) = messages.first() {
-            if chat_msg.role == crate::types::ChatRole::System {
-                return Ok((Some(chat_msg.content.clone()), &messages[1..]));
-            }
+        if let Some(ConversationMessage::Chat(chat_msg)) = messages.first()
+            && chat_msg.role == crate::types::ChatRole::System
+        {
+            return Ok((Some(chat_msg.content.clone()), &messages[1..]));
         }
         Ok((None, messages))
     }
@@ -223,20 +223,20 @@ impl InferenceClient for BedrockClient {
             if let Some(blocks) = content_blocks {
                 for block in blocks {
                     if block["type"] == "text" {
-                        if let Some(text) = block["text"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Text {
-                                    text: text.to_string(),
-                                });
-                            }
+                        if let Some(text) = block["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            response.push_output(ResponsePart::Text {
+                                text: text.to_string(),
+                            });
                         }
                     } else if block["type"] == "thinking" {
-                        if let Some(text) = block["thinking"].as_str() {
-                            if !text.is_empty() {
-                                response.push_output(ResponsePart::Reasoning {
-                                    text: text.to_string(),
-                                });
-                            }
+                        if let Some(text) = block["thinking"].as_str()
+                            && !text.is_empty()
+                        {
+                            response.push_output(ResponsePart::Reasoning {
+                                text: text.to_string(),
+                            });
                         }
                         if let Some(signature) = block.get("signature").and_then(|v| v.as_str()) {
                             response.push_output(ResponsePart::Signature {

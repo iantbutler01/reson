@@ -3,12 +3,12 @@
 //! These tests are ignored by default and only do real provider calls when
 //! `CHEVALIER_LIVE_IMAGE_TESTS=1` is present.
 
-use chevalier_agentic::providers::{
+use chevalier::providers::{
     AnthropicClient, GenerationConfig, InferenceClient, OAIClient, OpenAIResponsesClient,
     OpenRouterClient, OpenRouterResponsesClient, StreamChunk,
 };
-use chevalier_agentic::types::{MediaPart, MediaSource, MultimodalMessage};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::types::{MediaPart, MediaSource, MultimodalMessage};
+use chevalier::utils::ConversationMessage;
 use futures::StreamExt;
 
 const LETTER_L_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAgKADAAQAAAABAAAAgAAAAABIjgR3AAAChElEQVR4Ae2dQW4bQBDD6iL//3KK/mDBcCCgZc4rKSA9Jx/8+f7+/tXfjsDv3XTLfwkkYPw5SEACxgTG811AAsYExvNdQALGBMbzXUACxgTG811AAsYExvNdQALGBMbzXUACxgTG811AAsYExvNdwFjA18X+5/PBtf/bd9RdAP6oOMEEOBxxSwIwOieYAIcjbkkARucEE+BwxC0JwOicYAIcjrglARidE0yAwxG3JACjc4IJcDjilgRgdE4wAQ5H3JIAjM4JJsDhiFsSgNE5wQQ4HHFLAjA6J5gAhyNuSQBG5wQT4HDELQnA6JxgAhyOuCUBGJ0TTIDDEbckAKNzgglwOOKWBGB0TjABDkfckgCMzgkmwOGIWxKA0TnBBDgccUsCMDonmACHI25JAEbnBBPgcMQtCcDonGACHI64JQEYnRNMgMMRtyQAo3OCCXA44pYEYHROMAEOR9ySAIzOCSbA4YhbEoDROcEEOBxxSwIwOieYAIcjbkkARucEE+BwxC0JwOicYAIcjrglARidE0yAwxG3JACjc4IJcDjilgRgdE4wAQ5H3JIAjM4Jnvx+wE/+tZ/89sBPdl+yF79t0AW8kD98k4BDuC/VCXihdPgmAYdwX6oT8ELp8E0CDuG+VCfghdLhmwQcwn2pTsALpcM3CTiE+1KdgBdKh28ScAj3pToBL5QO3yTgEO5LdQJeKB2+ScAh3JfqBLxQOnyTgEO4L9UJeKF0+OZz8T3n4f/7z1V3AWOlCUjAmMB4vgtIwJjAeL4LSMCYwHi+C0jAmMB4vgtIwJjAeL4LSMCYwHi+C0jAmMB4vgtIwJjAeL4LSMCYwHi+C0jAmMB4vgtIwJjAeP4PlA4M/SsN784AAAAASUVORK5CYII=";
@@ -145,7 +145,7 @@ async fn live_google_gemini_image_input_non_streaming_and_streaming() {
     let api_key = std::env::var("GOOGLE_GEMINI_API_KEY").expect("GOOGLE_GEMINI_API_KEY not set");
     let model = std::env::var("CHEVALIER_LIVE_GOOGLE_IMAGE_MODEL")
         .unwrap_or_else(|_| "gemini-2.5-flash".to_string());
-    let client = chevalier_agentic::providers::GoogleGenAIClient::new(api_key, &model);
+    let client = chevalier::providers::GoogleGenAIClient::new(api_key, &model);
     let messages = letter_l_message();
     let config = GenerationConfig::new(&model).with_max_tokens(64);
 
@@ -222,7 +222,7 @@ async fn live_google_anthropic_image_input_non_streaming_and_streaming() {
         .unwrap_or_else(|_| "claude-3-5-sonnet-v2@20241022".to_string());
     let region = std::env::var("CHEVALIER_LIVE_GOOGLE_ANTHROPIC_REGION")
         .unwrap_or_else(|_| "us-east5".to_string());
-    let client = chevalier_agentic::providers::GoogleAnthropicClient::from_adc(&model, region);
+    let client = chevalier::providers::GoogleAnthropicClient::from_adc(&model, region);
     let messages = letter_l_message();
     let config = GenerationConfig::new(&model).with_max_tokens(64);
 
@@ -250,7 +250,7 @@ async fn live_bedrock_claude_image_input_non_streaming_and_streaming() {
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .ok();
-    let client = chevalier_agentic::providers::BedrockClient::new(&model, region);
+    let client = chevalier::providers::BedrockClient::new(&model, region);
     let messages = letter_l_message();
     let config = GenerationConfig::new(&model).with_max_tokens(64);
 

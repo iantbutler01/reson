@@ -1,14 +1,14 @@
-//! The `Runtime` napi class — wraps `chevalier_agentic::runtime::Runtime`
+//! The `Runtime` napi class — wraps `chevalier_core::runtime::Runtime`
 //! directly (the high-level engine, which already does the tool loop, streaming,
 //! structured output and MCP).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use chevalier_agentic::error::{Error as EngineError, Result as EngineResult};
-use chevalier_agentic::providers::{AnthropicProviderConfig, ProviderConfig};
-use chevalier_agentic::runtime::{RunParams, Runtime as EngineRuntime, ToolFunction};
-use chevalier_agentic::types::{CacheMarker, ToolCall};
+use chevalier_core::error::{Error as EngineError, Result as EngineResult};
+use chevalier_core::providers::{AnthropicProviderConfig, ProviderConfig};
+use chevalier_core::runtime::{RunParams, Runtime as EngineRuntime, ToolFunction};
+use chevalier_core::types::{CacheMarker, ToolCall};
 use futures::future::BoxFuture;
 use napi::bindgen_prelude::Promise;
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -16,7 +16,7 @@ use napi_derive::napi;
 use tokio::sync::Mutex;
 
 use crate::error::{format_error, to_napi};
-use crate::messages::{to_chat_message, to_conversation_message, Message};
+use crate::messages::{Message, to_chat_message, to_conversation_message};
 use crate::stream::{StreamEvent, StreamHandle};
 use crate::types::{RunResult, ToolSchemaJs};
 

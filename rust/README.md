@@ -1,44 +1,47 @@
-# chevalier-agentic
+# chevalier
 
-Agents are just functions - production-grade LLM agent framework for Rust.
+Rust runtime for Chevalier's model/provider and tool-calling surface.
 
-## Features
+Use this crate when you want direct Rust access to:
 
-- **Multi-provider support**: Anthropic, OpenAI, Google Gemini, OpenRouter, AWS Bedrock
-- **Native tool calling** with structured outputs via `#[derive(Tool)]`
-- **Agent macro** for ergonomic agent definitions with `#[agentic]`
-- **Streaming responses** with reasoning/thinking support
-- **OpenAI/OpenRouter Responses API** support (`openai:resp:*`, `openrouter:resp:*`)
-- **Google File API** for video/large media uploads
-- **Retry with exponential backoff**
-- **Clone-friendly clients** for use in async contexts
+- provider clients for Anthropic, OpenAI, Google Gemini, OpenRouter, Bedrock, and Vertex/Google Anthropic
+- typed tool schemas with `#[derive(Tool)]`
+- agent wrappers with `#[agentic]`
+- streaming model events, reasoning, tool calls, tool results, and usage
+- optional MCP, sandbox, and VFS integration
+- request tracing and cost accounting
 
-## Installation
+## Install
 
 ```toml
 [dependencies]
-chevalier-agentic = "0.1"
+chevalier = "0.7.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ```
 
-## Quick Start
+Enable only what you need:
 
-### Basic Chat
+```toml
+chevalier = { version = "0.7.0", features = ["mcp", "vfs"] }
+```
+
+## Basic Provider Call
 
 ```rust
-use chevalier_agentic::providers::{GoogleGenAIClient, GenerationConfig, InferenceClient};
-use chevalier_agentic::types::ChatMessage;
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::providers::{GenerationConfig, GoogleGenAIClient, InferenceClient};
+use chevalier::types::ChatMessage;
+use chevalier::utils::ConversationMessage;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = GoogleGenAIClient::new("your-api-key", "gemini-2.0-flash");
+    let client = GoogleGenAIClient::new(
+        std::env::var("GOOGLE_GEMINI_API_KEY")?,
+        "gemini-2.0-flash",
+    );
 
-    let messages = vec![
-        ConversationMessage::Chat(ChatMessage::user("Hello!"))
-    ];
-
+    let messages = vec![ConversationMessage::Chat(ChatMessage::user("Hello"))];
     let config = GenerationConfig::new("gemini-2.0-flash");
     let response = client.get_generation(&messages, &config).await?;
 
@@ -47,233 +50,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Tool Definitions with `#[derive(Tool)]`
+## Tools
 
-Define type-safe tools that automatically generate JSON schemas for LLM function calling:
+`#[derive(Tool)]` turns Rust structs into model-callable JSON schemas:
 
 ```rust
-use chevalier_agentic::Tool;
+use chevalier::Tool;
 use serde::{Deserialize, Serialize};
 
-/// Search the web for information
 #[derive(Tool, Serialize, Deserialize, Debug)]
 struct WebSearch {
-    /// The search query to execute
+    /// Query to search for.
     query: String,
-    /// Maximum number of results to return
+    /// Maximum number of results.
     max_results: Option<u32>,
 }
 
-/// Get weather for a location
-#[derive(Tool, Serialize, Deserialize, Debug)]
-struct GetWeather {
-    /// City name or coordinates
-    location: String,
-    /// Temperature unit: "celsius" or "fahrenheit"
-    unit: Option<String>,
-}
-
-// Access generated schema
-let schema = WebSearch::schema();       // JSON Schema object
-let name = WebSearch::tool_name();      // "web_search"
-let desc = WebSearch::description();    // "Search the web for information"
+let name = WebSearch::tool_name();
+let description = WebSearch::description();
+let schema = WebSearch::schema();
 ```
 
-The `#[derive(Tool)]` macro:
-- Converts struct name to snake_case for the tool name
-- Uses doc comments as descriptions (struct doc -> tool description, field docs -> parameter descriptions)
-- Generates proper JSON Schema with types, required fields, and array items
-- Supports `String`, `bool`, `i32`/`i64`/`u32`/`u64`, `f32`/`f64`, `Vec<T>`, and `Option<T>`
+## Optional Feature Flags
 
-## Agent Functions with `#[agentic]`
-
-The `#[agentic]` macro transforms an async function into an agent. It:
-1. Creates a `Runtime` automatically and injects it into the function
-2. Validates that `runtime.run()` or `runtime.run_stream()` is called
-3. Configures the model from the macro attribute
-
-```rust
-use chevalier_agentic::agentic;
-use chevalier_agentic::runtime::{Runtime, ToolFunction};
-use chevalier_agentic::error::Result;
-
-/// Analyze text and answer questions
-#[agentic(model = "gemini:gemini-2.0-flash")]
-async fn analyze_text(
-    text: String,
-    question: String,
-    runtime: Runtime,  // Injected by macro - callers don't pass this
-) -> Result<serde_json::Value> {
-    // Register tools with the runtime
-    runtime.register_tool_with_schema(
-        WebSearch::tool_name(),
-        WebSearch::description(),
-        WebSearch::schema(),
-        ToolFunction::Sync(Box::new(|args| {
-            let query = args["query"].as_str().unwrap_or("");
-            Ok(format!("Search results for: {}", query))
-        })),
-    ).await?;
-
-    // Run the agent - runtime is mutable internally
-    runtime.run(
-        Some(&format!("Text: {}\n\nQuestion: {}", text, question)),
-        Some("You are a helpful assistant. Use tools when needed."),
-        None,  // history
-        None,  // output_type
-        None,  // temperature
-        None,  // top_p
-        None,  // max_tokens
-        None,  // model override
-        None,  // api_key override
-    ).await
-}
-
-// Call the agent - runtime parameter is NOT passed by caller
-let result = analyze_text(
-    "The quick brown fox...".to_string(),
-    "What animal is mentioned?".to_string(),
-).await?;
-```
-
-## Video/Media Upload (Google Gemini)
-
-Upload and analyze videos using Google's File API:
-
-```rust
-use chevalier_agentic::providers::{GoogleGenAIClient, FileState};
-use chevalier_agentic::types::{ChatRole, MediaPart, MediaSource, MultimodalMessage};
-
-let client = GoogleGenAIClient::new(api_key, "gemini-2.0-flash");
-
-// Upload video
-let video_bytes = std::fs::read("video.mp4")?;
-let uploaded = client.upload_file(&video_bytes, "video/mp4", Some("my-video")).await?;
-
-// Wait for processing (required for videos)
-if uploaded.state == FileState::Processing {
-    client.wait_for_file_processing(&uploaded.name, Some(120)).await?;
-}
-
-// Create multimodal message
-let message = MultimodalMessage {
-    role: ChatRole::User,
-    parts: vec![
-        MediaPart::Video {
-            source: MediaSource::FileUri {
-                uri: uploaded.uri.clone(),
-                mime_type: Some("video/mp4".to_string()),
-            },
-            metadata: None,
-        },
-        MediaPart::Text { text: "Describe this video".to_string() },
-    ],
-    cache_marker: None,
-};
-
-// Clean up when done
-client.delete_file(&uploaded.name).await?;
-```
-
-### Supported Media Types
-
-| Type | Formats | Max Size |
-|------|---------|----------|
-| Video | MP4, MOV, AVI, WebM, MKV, FLV, 3GP | 2GB |
-| Image | JPEG, PNG, GIF, WebP, HEIC | 20MB inline |
-| Audio | MP3, WAV, FLAC, AAC, OGG, M4A | 2GB |
-| Document | PDF, TXT, HTML, CSS, JS, etc. | Varies |
-
-## Providers
-
-| Provider | Client | Model Format |
-|----------|--------|--------------|
-| Google Gemini | `GoogleGenAIClient` | `gemini-2.0-flash` |
-| Anthropic | `AnthropicClient` | `claude-sonnet-4-20250514` |
-| OpenAI | `OAIClient` | `gpt-4o` |
-| OpenRouter | `OpenRouterClient` | `anthropic/claude-sonnet-4` |
-| AWS Bedrock | `BedrockClient` | `anthropic.claude-sonnet-4-20250514-v1:0` |
-| Vertex AI (Claude)* | `GoogleAnthropicClient` | `claude-sonnet-4@20250514` |
-
-*Requires `google-adc` feature: `chevalier-agentic = { version = "0.1", features = ["google-adc"] }`
-
-All clients implement `Clone` for easy use in async contexts.
-
-## Cost Tracking
-
-Track API costs with `TracingInferenceClient`:
-
-```rust
-use chevalier_agentic::providers::{
-    AnthropicClient, TracingInferenceClient, MemoryCostStore,
-    GenerationConfig, InferenceClient,
-};
-use std::sync::Arc;
-
-let client = AnthropicClient::new(api_key, "claude-sonnet-4-20250514");
-let store = Arc::new(MemoryCostStore::new());
-let tracing_client = TracingInferenceClient::new(Box::new(client))
-    .with_cost_store(store.clone());
-
-// Make requests as normal
-let response = tracing_client.get_generation(&messages, &config).await?;
-
-// Check accumulated cost
-let credits = store.credits();  // microdollars ($1 = 1,000,000)
-println!("Total cost: ${:.6}", credits as f64 / 1_000_000.0);
-```
-
-### Cost Sources
-
-| Provider | Source | Accuracy |
-|----------|--------|----------|
-| OpenRouter | `usage.cost` from API | Exact (provider-reported) |
-| OpenRouter Responses | `usage.cost` from API | Exact (provider-reported) |
-| Anthropic | Calculated from tokens | Estimated |
-| OpenAI | Calculated from tokens | Estimated |
-| Google Gemini | Calculated from tokens | Estimated |
-| Bedrock | Calculated from tokens | Estimated |
-
-OpenRouter is the only provider that returns actual cost in the response. For others, cost is calculated from token counts using pricing tables.
-
-### Features
-
-- **Microdollar precision**: Costs stored as `u64` ($1 = 1,000,000 microdollars) to avoid floating-point errors
-- **CostStore trait**: Implement custom storage backends (database, metrics, etc.)
-- **Trace callbacks**: Hook into every request for custom logging
-- **CHEVALIER_TRACE env var**: Set to a directory path to write JSON traces
-
-## Examples
-
-See the [examples](./examples) directory:
-
-- `video_upload.rs` - Video analysis with Google Gemini and `#[agentic]` macro
-- `simple_tools.rs` - Basic tool registration and execution
-- `tool_call_chain.rs` - Multi-turn tool calling
-- `dynamic_tool_parsing.rs` - Type-safe tool parsing with `Deserializable`
-- `templating_example.rs` - Prompt templates with minijinja
-- `store_usage.rs` - Context storage patterns
-
-Run examples with:
-```bash
-GOOGLE_GEMINI_API_KEY=your_key cargo run --example video_upload -- video.mp4
-```
-
-## Feature Flags
-
-```toml
-[dependencies]
-chevalier-agentic = { version = "0.1", features = ["full"] }
-```
-
-| Feature | Description |
-|---------|-------------|
-| `full` | All features enabled |
-| `storage` | Redis + SQLx storage backends |
-| `bedrock` | AWS Bedrock support |
+| Feature | Enables |
+| --- | --- |
+| `full` | Bedrock, templating, telemetry, Google ADC, MCP |
+| `bedrock` | AWS Bedrock provider |
 | `templating` | Minijinja prompt templates |
-| `telemetry` | OpenTelemetry tracing |
-| `google-adc` | Google Application Default Credentials (Vertex AI) |
+| `telemetry` | OpenTelemetry hooks |
+| `google-adc` | Google Application Default Credentials |
+| `mcp` | `chevalier-mcp` client/server support |
+| `mcp-apps` | MCP Apps UI resources |
+| `sandbox` | Remote sandbox facade client |
+| `sandbox-local` | Sandbox client plus local host support |
+| `sandbox-distributed-control` | etcd/NATS distributed sandbox routing |
+| `sandbox-vfs-server` | Sandbox VFS server routes |
+| `vfs` | `chevalier-vfs` integration |
+
+## Development
+
+```bash
+cargo test --all-features
+cargo clippy --all-features -- -D warnings
+cargo fmt --all -- --check
+```
+
+Run provider integration tests only with the relevant live API keys set.
 
 ## License
 

@@ -3,8 +3,8 @@
 //! This example demonstrates how Chevalier's NativeToolParser dynamically constructs
 //! tool objects from JSON using a type registry, similar to Python's runtime type lookup.
 
-use chevalier_agentic::parsers::{Deserializable, FieldDescription};
-use chevalier_agentic::runtime::Runtime;
+use chevalier::parsers::{Deserializable, FieldDescription};
+use chevalier::runtime::Runtime;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
@@ -18,20 +18,20 @@ struct Chat {
 }
 
 impl Deserializable for Chat {
-    fn from_partial(partial: serde_json::Value) -> chevalier_agentic::error::Result<Self> {
+    fn from_partial(partial: serde_json::Value) -> chevalier::error::Result<Self> {
         serde_json::from_value(partial).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!("Failed to parse Chat: {}", e))
+            chevalier::error::Error::NonRetryable(format!("Failed to parse Chat: {}", e))
         })
     }
 
-    fn validate_complete(&self) -> chevalier_agentic::error::Result<()> {
+    fn validate_complete(&self) -> chevalier::error::Result<()> {
         if self.recipient.is_empty() {
-            return Err(chevalier_agentic::error::Error::NonRetryable(
+            return Err(chevalier::error::Error::NonRetryable(
                 "recipient is required".to_string(),
             ));
         }
         if self.message.is_empty() {
-            return Err(chevalier_agentic::error::Error::NonRetryable(
+            return Err(chevalier::error::Error::NonRetryable(
                 "message is required".to_string(),
             ));
         }
@@ -66,15 +66,15 @@ struct FileOp {
 }
 
 impl Deserializable for FileOp {
-    fn from_partial(partial: serde_json::Value) -> chevalier_agentic::error::Result<Self> {
+    fn from_partial(partial: serde_json::Value) -> chevalier::error::Result<Self> {
         serde_json::from_value(partial).map_err(|e| {
-            chevalier_agentic::error::Error::NonRetryable(format!("Failed to parse FileOp: {}", e))
+            chevalier::error::Error::NonRetryable(format!("Failed to parse FileOp: {}", e))
         })
     }
 
-    fn validate_complete(&self) -> chevalier_agentic::error::Result<()> {
+    fn validate_complete(&self) -> chevalier::error::Result<()> {
         if self.path.is_empty() {
-            return Err(chevalier_agentic::error::Error::NonRetryable(
+            return Err(chevalier::error::Error::NonRetryable(
                 "path is required".to_string(),
             ));
         }
@@ -100,7 +100,7 @@ impl Deserializable for FileOp {
 }
 
 #[tokio::main]
-async fn main() -> chevalier_agentic::error::Result<()> {
+async fn main() -> chevalier::error::Result<()> {
     println!("=== Dynamic Tool Parsing Example ===\n");
 
     // Create a runtime
@@ -111,32 +111,30 @@ async fn main() -> chevalier_agentic::error::Result<()> {
     // In Rust:   runtime.tool::<Chat, _>(handle_chat, Some("Chat"))
 
     // Handlers now receive typed structs directly (not ParsedTool)
-    let chat_handler =
-        |chat: Chat| -> BoxFuture<'static, chevalier_agentic::error::Result<String>> {
-            Box::pin(async move {
-                println!(
-                    "📨 Chat handler called: {} -> {}",
-                    chat.recipient, chat.message
-                );
-                Ok(format!("Sent message to {}", chat.recipient))
-            })
-        };
+    let chat_handler = |chat: Chat| -> BoxFuture<'static, chevalier::error::Result<String>> {
+        Box::pin(async move {
+            println!(
+                "📨 Chat handler called: {} -> {}",
+                chat.recipient, chat.message
+            );
+            Ok(format!("Sent message to {}", chat.recipient))
+        })
+    };
 
     runtime.tool::<Chat, _>(chat_handler, Some("Chat")).await?;
 
-    let fileop_handler =
-        |file_op: FileOp| -> BoxFuture<'static, chevalier_agentic::error::Result<String>> {
-            Box::pin(async move {
-                println!(
-                    "📁 FileOp handler called: {} ({})",
-                    file_op.path, file_op.operation
-                );
-                Ok(format!(
-                    "Performed {} on {}",
-                    file_op.operation, file_op.path
-                ))
-            })
-        };
+    let fileop_handler = |file_op: FileOp| -> BoxFuture<'static, chevalier::error::Result<String>> {
+        Box::pin(async move {
+            println!(
+                "📁 FileOp handler called: {} ({})",
+                file_op.path, file_op.operation
+            );
+            Ok(format!(
+                "Performed {} on {}",
+                file_op.operation, file_op.path
+            ))
+        })
+    };
 
     runtime
         .tool::<FileOp, _>(fileop_handler, Some("FileOp"))

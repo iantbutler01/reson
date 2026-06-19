@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chevalier_agentic::error::{Error as ChevalierError, Result as ChevalierResult};
-use chevalier_agentic::runtime::{RunParams, Runtime, ToolFunction};
-use chevalier_agentic::types::{AssistantResponse, ChatMessage, ResponsePart, ToolResult};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::error::{Error as ChevalierError, Result as ChevalierResult};
+use chevalier::runtime::{RunParams, Runtime, ToolFunction};
+use chevalier::types::{AssistantResponse, ChatMessage, ResponsePart, ToolResult};
+use chevalier::utils::ConversationMessage;
 use chevalier_sandbox::{
     DistributedControlConfig, ExecEvent, ExecHandle, ExecInput, ExecOptions, Sandbox,
     SandboxConfig, SandboxError, Session, SessionOptions,

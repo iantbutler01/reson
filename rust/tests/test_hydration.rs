@@ -4,8 +4,8 @@
 //! Mirrors Python tests from:
 //! - integration_tests/test_toolcall_hydration.py
 
-use chevalier_agentic::prelude::*;
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::prelude::*;
+use chevalier::utils::ConversationMessage;
 use std::env;
 
 // ============================================================================
@@ -428,7 +428,7 @@ fn get_openrouter_key() -> Option<String> {
 #[tokio::test]
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_toolcall_in_conversation_history() {
-    use chevalier_agentic::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
+    use chevalier::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
 
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
 
@@ -497,7 +497,7 @@ async fn test_toolcall_in_conversation_history() {
 #[tokio::test]
 #[ignore = "Requires OPENROUTER_API_KEY"]
 async fn test_toolcall_hydration_workflow() {
-    use chevalier_agentic::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
+    use chevalier::providers::{GenerationConfig, InferenceClient, OpenRouterClient};
 
     let api_key = get_openrouter_key().expect("OPENROUTER_API_KEY not set");
 

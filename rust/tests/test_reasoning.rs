@@ -6,12 +6,12 @@
 //! - integration_tests/test_reasoning_segments.py
 //! - integration_tests/test_reasoning_stream.py
 
-use chevalier_agentic::providers::{
+use chevalier::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OpenRouterClient,
     StreamChunk,
 };
-use chevalier_agentic::types::{ChatMessage, ReasoningSegment};
-use chevalier_agentic::utils::ConversationMessage;
+use chevalier::types::{ChatMessage, ReasoningSegment};
+use chevalier::utils::ConversationMessage;
 use futures::StreamExt;
 use std::env;
 
@@ -418,7 +418,7 @@ fn test_reasoning_segment_with_metadata() {
 
 #[test]
 fn test_reasoning_segment_anthropic_format() {
-    use chevalier_agentic::providers::Provider;
+    use chevalier::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string())
@@ -439,7 +439,7 @@ fn test_reasoning_segment_anthropic_format() {
 
 #[test]
 fn test_reasoning_segment_openai_format() {
-    use chevalier_agentic::providers::Provider;
+    use chevalier::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string());
@@ -459,7 +459,7 @@ fn test_reasoning_segment_openai_format() {
 
 #[test]
 fn test_reasoning_segment_google_format() {
-    use chevalier_agentic::providers::Provider;
+    use chevalier::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string());
@@ -479,7 +479,7 @@ fn test_reasoning_segment_google_format() {
 
 #[test]
 fn test_reasoning_segment_openrouter_format() {
-    use chevalier_agentic::providers::Provider;
+    use chevalier::providers::Provider;
 
     let segment = ReasoningSegment::new("This is test reasoning content".to_string())
         .with_signature("test_signature_123".to_string());
