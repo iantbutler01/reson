@@ -1153,12 +1153,13 @@ pub struct VirtiofsdSpawn {
 /// FUSE-style CLI (`-o source=`, `-o cache=`, etc.) which is NOT what we invoke here.
 ///
 /// Invocation:
-///   `virtiofsd --socket-path=<sock> --shared-dir=<host> --cache=auto --sandbox=chroot
+///   `virtiofsd --socket-path=<sock> --shared-dir=<host> --cache=auto --sandbox=<mode>
 ///    --log-level=warn [--readonly]`
 ///
-/// `--sandbox=chroot` is chosen because namespace-based sandboxing needs
-/// `CAP_SYS_ADMIN` and unshare privileges that container runtimes may refuse; `chroot`
-/// only needs read access to the source directory.
+/// The sandbox mode is selected at runtime. Root daemons use `chroot`; non-root
+/// daemons use `namespace`, which Rust virtiofsd supports through an unprivileged
+/// user namespace. Override with `CHEVALIER_SANDBOX_VIRTIOFSD_SANDBOX` when a host
+/// has stricter namespace policy.
 ///
 /// The parent directory of `socket_path` must already exist. Caller is expected to put
 /// it under `<vm_dir>/` alongside qmp.sock and qemu.pid.
@@ -1187,7 +1188,8 @@ pub async fn spawn_virtiofsd(
         spawn.source_path.to_string_lossy()
     ));
     cmd.arg("--cache=auto");
-    cmd.arg("--sandbox=chroot");
+    let sandbox_mode = configured_virtiofsd_sandbox_mode();
+    cmd.arg(format!("--sandbox={sandbox_mode}"));
     cmd.arg("--log-level=warn");
     // @dive: `--migration-mode=find-paths` is required for vhost-user migration
     //        cooperation. Without it, virtiofsd doesn't advertise the
@@ -1260,6 +1262,7 @@ pub async fn spawn_virtiofsd(
         source = %spawn.source_path.display(),
         tag = %spawn.tag,
         read_only = spawn.read_only,
+        sandbox_mode = %sandbox_mode,
         "virtiofsd ready"
     );
 
@@ -1270,6 +1273,33 @@ pub async fn spawn_virtiofsd(
         tag: spawn.tag.clone(),
         read_only: spawn.read_only,
     })
+}
+
+fn configured_virtiofsd_sandbox_mode() -> String {
+    std::env::var("CHEVALIER_SANDBOX_VIRTIOFSD_SANDBOX")
+        .or_else(|_| std::env::var("BRACKET_SANDBOX_VIRTIOFSD_SANDBOX"))
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "namespace" | "chroot" | "none"))
+        .unwrap_or_else(default_virtiofsd_sandbox_mode)
+}
+
+fn default_virtiofsd_sandbox_mode() -> String {
+    if running_as_root() {
+        "chroot".to_string()
+    } else {
+        "namespace".to_string()
+    }
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 /// Terminate a running virtiofsd by PID. Best-effort; if the daemon already exited
