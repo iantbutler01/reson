@@ -32,6 +32,14 @@ export declare class Session {
   writeFile(path: string, data: Buffer): Promise<void>
   /** Fork this session (CoW); returns the child session. */
   fork(options?: ForkOpts | undefined | null): Promise<Session>
+  /** Create a checkpoint/snapshot for this session. */
+  checkpoint(name: string): Promise<SessionCheckpointJs>
+  /** Restore a checkpoint into a new session. */
+  restoreCheckpoint(checkpointId: string): Promise<Session>
+  /** Close the session handle without deleting the VM. */
+  close(): Promise<void>
+  /** Delete the backing VM/sandbox and purge provider resources. */
+  discard(): Promise<void>
 }
 
 /** A single exec event. `type` is `stdout` | `stderr` | `exit` | `timeout`. */
@@ -90,6 +98,10 @@ export interface SandboxConnectOptions {
   defaultImage?: string
   provider?: string
   openComputer?: OpenComputerProviderOpts
+}
+
+export interface SessionCheckpointJs {
+  id: string
 }
 
 export interface SessionOpts {

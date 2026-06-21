@@ -256,6 +256,11 @@ pub struct Session {
     inner: EngineSession,
 }
 
+#[napi(object)]
+pub struct SessionCheckpointJs {
+    pub id: String,
+}
+
 #[napi]
 impl Session {
     #[napi(getter)]
@@ -308,6 +313,36 @@ impl Session {
         });
         let r = self.inner.fork(opts).await.map_err(sb_err)?;
         Ok(Session { inner: r.child })
+    }
+
+    /// Create a checkpoint/snapshot for this session.
+    #[napi]
+    pub async fn checkpoint(&self, name: String) -> napi::Result<SessionCheckpointJs> {
+        let checkpoint = self.inner.checkpoint(&name).await.map_err(sb_err)?;
+        Ok(SessionCheckpointJs { id: checkpoint.id })
+    }
+
+    /// Restore a checkpoint into a new session.
+    #[napi]
+    pub async fn restore_checkpoint(&self, checkpoint_id: String) -> napi::Result<Session> {
+        let session = self
+            .inner
+            .restore_checkpoint(&checkpoint_id)
+            .await
+            .map_err(sb_err)?;
+        Ok(Session { inner: session })
+    }
+
+    /// Close the session handle without deleting the VM.
+    #[napi]
+    pub async fn close(&self) -> napi::Result<()> {
+        self.inner.clone().close().await.map_err(sb_err)
+    }
+
+    /// Delete the backing VM/sandbox and purge provider resources.
+    #[napi]
+    pub async fn discard(&self) -> napi::Result<()> {
+        self.inner.clone().discard().await.map_err(sb_err)
     }
 }
 
