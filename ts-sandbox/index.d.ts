@@ -40,6 +40,22 @@ export declare class Session {
   checkpoint(name: string): Promise<SessionCheckpointJs>
   /** Restore a checkpoint into a new session. */
   restoreCheckpoint(checkpointId: string): Promise<Session>
+  /** Read the current VM state from the sandbox provider. */
+  getState(): Promise<string>
+  /** Pause the VM without deleting it. */
+  pause(): Promise<string>
+  /** Resume a paused VM. */
+  resume(): Promise<string>
+  /** Stop the VM without deleting its record. */
+  stop(): Promise<string>
+  /** Create a VM snapshot/checkpoint. */
+  snapshot(options?: SessionSnapshotOpts | undefined | null): Promise<SessionSnapshotJs>
+  /** Restore this VM from a snapshot. */
+  restore(snapshotId: string): Promise<string>
+  /** List snapshots for this VM. */
+  listSnapshots(): Promise<Array<SessionSnapshotJs>>
+  /** Delete a VM snapshot. */
+  deleteSnapshot(snapshotId: string): Promise<void>
   /** Close the session handle without deleting the VM. */
   close(): Promise<void>
   /** Delete the backing VM/sandbox and purge provider resources. */
@@ -127,6 +143,18 @@ export interface SessionOpts {
   autoStart?: boolean
   sharedMounts?: Array<SharedMountOpts>
   egressAllowlist?: Array<string>
+}
+
+export interface SessionSnapshotJs {
+  id: string
+  name: string
+  label: string
+  description: string
+}
+
+export interface SessionSnapshotOpts {
+  label?: string
+  description?: string
 }
 
 export interface SharedMountOpts {

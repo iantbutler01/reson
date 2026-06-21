@@ -65,9 +65,9 @@ use proto::bracket::portproxy::v1::{
 };
 use proto::vmd::v1::vmd_service_client::VmdServiceClient;
 use proto::vmd::v1::{
-    CreateSnapshotRequest, CreateVmRequest, ForkVmRequest, GetVmRequest, ListVMsRequest, Metadata,
-    PreDownloadVmImageRequest, ResourceSpec, RestoreSnapshotRequest, Vm, VmActionRequest, VmSource,
-    VmSourceType,
+    CreateSnapshotRequest, CreateVmRequest, DeleteSnapshotRequest, ForkVmRequest, GetVmRequest,
+    ListSnapshotsRequest, ListVMsRequest, Metadata, PreDownloadVmImageRequest, ResourceSpec,
+    RestoreSnapshotRequest, Vm, VmActionRequest, VmSource, VmSourceType,
 };
 
 const META_SESSION_ID: &str = "chevalier.session_id";
@@ -829,6 +829,14 @@ pub struct SessionCheckpoint {
     pub id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionSnapshot {
+    pub id: String,
+    pub name: String,
+    pub label: String,
+    pub description: String,
+}
+
 #[derive(Clone)]
 pub struct Sandbox {
     inner: Arc<SandboxInner>,
@@ -885,6 +893,13 @@ enum RebindRestorePolicy {
     RequireTierBRestoreMarker,
     #[allow(dead_code)]
     AllowLiveReclaimWithoutRestoreMarker,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SessionVmAction {
+    Pause,
+    Resume,
+    Stop,
 }
 
 impl RebindRestorePolicy {
@@ -2188,10 +2203,70 @@ impl Session {
         ))
     }
 
-    pub async fn checkpoint(&self, name: &str) -> Result<SessionCheckpoint> {
+    pub async fn state(&self) -> Result<i32> {
         if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
-            let checkpoint = control.create_checkpoint(&self.vm_id, name).await?;
-            return Ok(SessionCheckpoint { id: checkpoint.id });
+            control.get_sandbox(&self.vm_id).await?;
+            return Ok(proto::vmd::v1::VmState::Running as i32);
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let vm = client
+            .get_vm(self.sandbox.request_with_auth(GetVmRequest {
+                vm_id: self.vm_id.clone(),
+            }))
+            .await?
+            .into_inner();
+        Ok(vm.state)
+    }
+
+    async fn vm_action(&self, action: SessionVmAction) -> Result<i32> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(format!(
+                "{action:?} is only available for vmd-backed sandboxes"
+            )));
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let request = self.sandbox.request_with_auth(VmActionRequest {
+            vm_id: self.vm_id.clone(),
+        });
+        let vm = match action {
+            SessionVmAction::Pause => client.pause_vm(request).await?.into_inner(),
+            SessionVmAction::Resume => client.resume_vm(request).await?.into_inner(),
+            SessionVmAction::Stop => client.stop_vm(request).await?.into_inner(),
+        };
+        self.sandbox
+            .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
+            .await;
+        Ok(vm.state)
+    }
+
+    pub async fn pause(&self) -> Result<i32> {
+        self.vm_action(SessionVmAction::Pause).await
+    }
+
+    pub async fn resume(&self) -> Result<i32> {
+        self.vm_action(SessionVmAction::Resume).await
+    }
+
+    pub async fn stop(&self) -> Result<i32> {
+        self.vm_action(SessionVmAction::Stop).await
+    }
+
+    pub async fn snapshot(&self, label: &str, description: &str) -> Result<SessionSnapshot> {
+        if let ControlBackend::OpenComputer(control) = &self.sandbox.inner.control_backend {
+            let checkpoint = control.create_checkpoint(&self.vm_id, label).await?;
+            return Ok(SessionSnapshot {
+                id: checkpoint.id,
+                name: String::new(),
+                label: label.to_string(),
+                description: description.to_string(),
+            });
         }
 
         let node_endpoint = self.resolve_session_endpoint().await?;
@@ -2199,12 +2274,99 @@ impl Session {
         let snapshot = client
             .create_snapshot(self.sandbox.request_with_auth(CreateSnapshotRequest {
                 vm_id: self.vm_id.clone(),
-                label: name.to_string(),
-                description: String::new(),
+                label: label.to_string(),
+                description: description.to_string(),
             }))
             .await?
             .into_inner();
+        Ok(SessionSnapshot {
+            id: snapshot.id,
+            name: snapshot.name,
+            label: snapshot.label,
+            description: snapshot.description,
+        })
+    }
+
+    pub async fn checkpoint(&self, name: &str) -> Result<SessionCheckpoint> {
+        let snapshot = self.snapshot(name, "").await?;
         Ok(SessionCheckpoint { id: snapshot.id })
+    }
+
+    pub async fn list_snapshots(&self) -> Result<Vec<SessionSnapshot>> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "list_snapshots is only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let snapshots = client
+            .list_snapshots(self.sandbox.request_with_auth(ListSnapshotsRequest {
+                vm_id: self.vm_id.clone(),
+            }))
+            .await?
+            .into_inner()
+            .snapshots;
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| SessionSnapshot {
+                id: snapshot.id,
+                name: snapshot.name,
+                label: snapshot.label,
+                description: snapshot.description,
+            })
+            .collect())
+    }
+
+    pub async fn restore(&self, snapshot_id: &str) -> Result<i32> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "restore is only available for vmd-backed sandboxes; use restore_checkpoint for provider-managed sandboxes"
+                    .to_string(),
+            ));
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        let vm = client
+            .restore_snapshot(self.sandbox.request_with_auth(RestoreSnapshotRequest {
+                vm_id: self.vm_id.clone(),
+                snapshot_id: snapshot_id.to_string(),
+            }))
+            .await?
+            .into_inner();
+        self.sandbox
+            .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
+            .await;
+        Ok(vm.state)
+    }
+
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        if matches!(
+            &self.sandbox.inner.control_backend,
+            ControlBackend::OpenComputer(_)
+        ) {
+            return Err(SandboxError::Unsupported(
+                "delete_snapshot is only available for vmd-backed sandboxes".to_string(),
+            ));
+        }
+
+        let node_endpoint = self.resolve_session_endpoint().await?;
+        let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
+        client
+            .delete_snapshot(self.sandbox.request_with_auth(DeleteSnapshotRequest {
+                vm_id: self.vm_id.clone(),
+                snapshot_id: snapshot_id.to_string(),
+            }))
+            .await?;
+        Ok(())
     }
 
     pub async fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<Session> {

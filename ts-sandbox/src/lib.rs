@@ -263,6 +263,20 @@ pub struct SessionCheckpointJs {
 }
 
 #[napi(object)]
+pub struct SessionSnapshotOpts {
+    pub label: Option<String>,
+    pub description: Option<String>,
+}
+
+#[napi(object)]
+pub struct SessionSnapshotJs {
+    pub id: String,
+    pub name: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[napi(object)]
 pub struct SessionInfoJs {
     pub session_id: String,
     pub vm_id: String,
@@ -285,6 +299,18 @@ impl From<EngineSessionInfo> for SessionInfoJs {
             fork_id: info.fork_id,
         }
     }
+}
+
+fn vm_state_label(state: i32) -> String {
+    match state {
+        1 => "creating",
+        2 => "stopped",
+        3 => "running",
+        4 => "paused",
+        5 => "error",
+        _ => "unknown",
+    }
+    .to_string()
 }
 
 #[napi]
@@ -357,6 +383,87 @@ impl Session {
             .await
             .map_err(sb_err)?;
         Ok(Session { inner: session })
+    }
+
+    /// Read the current VM state from the sandbox provider.
+    #[napi]
+    pub async fn get_state(&self) -> napi::Result<String> {
+        self.inner.state().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    /// Pause the VM without deleting it.
+    #[napi]
+    pub async fn pause(&self) -> napi::Result<String> {
+        self.inner.pause().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    /// Resume a paused VM.
+    #[napi]
+    pub async fn resume(&self) -> napi::Result<String> {
+        self.inner.resume().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    /// Stop the VM without deleting its record.
+    #[napi]
+    pub async fn stop(&self) -> napi::Result<String> {
+        self.inner.stop().await.map(vm_state_label).map_err(sb_err)
+    }
+
+    /// Create a VM snapshot/checkpoint.
+    #[napi]
+    pub async fn snapshot(
+        &self,
+        options: Option<SessionSnapshotOpts>,
+    ) -> napi::Result<SessionSnapshotJs> {
+        let label = options
+            .as_ref()
+            .and_then(|opts| opts.label.clone())
+            .unwrap_or_else(|| "snapshot".to_string());
+        let description = options
+            .and_then(|opts| opts.description)
+            .unwrap_or_default();
+        let snapshot = self
+            .inner
+            .snapshot(&label, &description)
+            .await
+            .map_err(sb_err)?;
+        Ok(SessionSnapshotJs {
+            id: snapshot.id,
+            name: snapshot.name,
+            label: snapshot.label,
+            description: snapshot.description,
+        })
+    }
+
+    /// Restore this VM from a snapshot.
+    #[napi]
+    pub async fn restore(&self, snapshot_id: String) -> napi::Result<String> {
+        self.inner
+            .restore(&snapshot_id)
+            .await
+            .map(vm_state_label)
+            .map_err(sb_err)
+    }
+
+    /// List snapshots for this VM.
+    #[napi]
+    pub async fn list_snapshots(&self) -> napi::Result<Vec<SessionSnapshotJs>> {
+        let snapshots = self.inner.list_snapshots().await.map_err(sb_err)?;
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| SessionSnapshotJs {
+                id: snapshot.id,
+                name: snapshot.name,
+                label: snapshot.label,
+                description: snapshot.description,
+            })
+            .collect())
+    }
+
+    /// Delete a VM snapshot.
+    #[napi]
+    pub async fn delete_snapshot(&self, snapshot_id: String) -> napi::Result<()> {
+        self.inner.delete_snapshot(&snapshot_id).await.map_err(sb_err)
     }
 
     /// Close the session handle without deleting the VM.
