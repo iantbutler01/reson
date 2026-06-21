@@ -18,6 +18,10 @@ export declare class Sandbox {
   session(options?: SessionOpts | undefined | null): Promise<Session>
   /** Attach to an existing session by id. */
   attachSession(sessionId: string): Promise<Session>
+  /** List live sessions visible to this sandbox provider. */
+  listSessions(): Promise<Array<SessionInfoJs>>
+  /** Discard a provider session by id, even if this process does not hold a Session handle. */
+  discardSessionById(sessionId: string): Promise<void>
 }
 
 /** A sandbox session (one microVM). */
@@ -102,6 +106,16 @@ export interface SandboxConnectOptions {
 
 export interface SessionCheckpointJs {
   id: string
+}
+
+export interface SessionInfoJs {
+  sessionId: string
+  vmId: string
+  name: string
+  state: number
+  branchId?: string
+  parentSessionId?: string
+  forkId?: string
 }
 
 export interface SessionOpts {

@@ -13,7 +13,8 @@ use std::time::Duration;
 use chevalier_sandbox::{
     EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, OpenComputerBackendConfig,
     OpenComputerMountConfig, Sandbox as EngineSandbox, SandboxConfig, SandboxError,
-    SandboxProviderConfig, Session as EngineSession, SessionOptions, SharedMount,
+    SandboxProviderConfig, Session as EngineSession, SessionInfo as EngineSessionInfo,
+    SessionOptions, SharedMount,
     SharedMountAvailability, SharedMountContinuity,
 };
 use napi::bindgen_prelude::Buffer;
@@ -259,6 +260,31 @@ pub struct Session {
 #[napi(object)]
 pub struct SessionCheckpointJs {
     pub id: String,
+}
+
+#[napi(object)]
+pub struct SessionInfoJs {
+    pub session_id: String,
+    pub vm_id: String,
+    pub name: String,
+    pub state: i32,
+    pub branch_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub fork_id: Option<String>,
+}
+
+impl From<EngineSessionInfo> for SessionInfoJs {
+    fn from(info: EngineSessionInfo) -> Self {
+        Self {
+            session_id: info.session_id,
+            vm_id: info.vm_id,
+            name: info.name,
+            state: info.state,
+            branch_id: info.branch_id,
+            parent_session_id: info.parent_session_id,
+            fork_id: info.fork_id,
+        }
+    }
 }
 
 #[napi]
@@ -511,5 +537,21 @@ impl Sandbox {
             .await
             .map_err(sb_err)?;
         Ok(Session { inner: s })
+    }
+
+    /// List live sessions visible to this sandbox provider.
+    #[napi]
+    pub async fn list_sessions(&self) -> napi::Result<Vec<SessionInfoJs>> {
+        let sessions = self.inner.list_sessions().await.map_err(sb_err)?;
+        Ok(sessions.into_iter().map(Into::into).collect())
+    }
+
+    /// Discard a provider session by id, even if this process does not hold a Session handle.
+    #[napi]
+    pub async fn discard_session_by_id(&self, session_id: String) -> napi::Result<()> {
+        self.inner
+            .discard_session_by_id(&session_id)
+            .await
+            .map_err(sb_err)
     }
 }
