@@ -591,6 +591,122 @@ async fn configure_background_snapshot_parameters(
         .map(|_| ())
 }
 
+async fn configure_paused_file_migration(
+    monitor: &MonitorHandle,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<()> {
+    let args = json!({
+        "capabilities": [
+            { "capability": "background-snapshot", "state": false }
+        ]
+    });
+    monitor
+        .execute("migrate-set-capabilities", Some(args))
+        .await?;
+    configure_background_snapshot_parameters(monitor, opts, RAM_SNAPSHOT_FORMAT_LEGACY).await
+}
+
+async fn poll_file_migration(
+    monitor: &MonitorHandle,
+    disk_snapshot_name: &str,
+    ram_format: &str,
+) -> Result<MigrationStatus> {
+    let deadline = Instant::now() + Duration::from_secs(BACKGROUND_SNAPSHOT_TIMEOUT_SECS);
+    loop {
+        let status = query_migrate(monitor).await?;
+        trace!(
+            status = %status.status,
+            bytes = ?status.bytes_transferred,
+            snapshot = %disk_snapshot_name,
+            "snapshot migrate poll"
+        );
+        match status.status.as_str() {
+            "completed" => {
+                let mut status = status;
+                status.ram_format = ram_format.to_string();
+                return Ok(status);
+            }
+            "failed" | "cancelled" | "cancelling" => {
+                bail!(
+                    "snapshot migrate ended in status {}: {}",
+                    status.status,
+                    status.error_desc.as_deref().unwrap_or("<no detail>")
+                );
+            }
+            // setup | active | pre-switchover | device | postcopy-* | wait-unplug — still in flight
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "snapshot migrate timed out after {}s",
+                BACKGROUND_SNAPSHOT_TIMEOUT_SECS
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn save_vm_paused_after_disk_snapshot(
+    monitor: &MonitorHandle,
+    disk_snapshot_name: &str,
+    ram_path: &Path,
+    opts: &BackgroundSnapshotOptions,
+) -> Result<MigrationStatus> {
+    let was_running = monitor
+        .query_status()
+        .await
+        .map(|status| status.running)
+        .unwrap_or(true);
+    if was_running {
+        stop(monitor)
+            .await
+            .with_context(|| "pause VM before paused-file snapshot")?;
+    }
+    let resume_on_error = || async {
+        if was_running {
+            let _ = cont(monitor).await;
+        }
+    };
+
+    if let Err(err) = configure_paused_file_migration(monitor, opts)
+        .await
+        .with_context(|| "configure paused-file migration")
+    {
+        resume_on_error().await;
+        return Err(err);
+    }
+
+    if let Some(parent) = ram_path.parent() {
+        if let Err(err) = tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| "create ram snapshot directory")
+        {
+            resume_on_error().await;
+            return Err(err);
+        }
+    }
+    let _ = tokio::fs::remove_file(ram_path).await;
+
+    let migrate_uri = format!("file:{}", ram_path.display());
+    if let Err(err) = monitor
+        .execute("migrate", Some(json!({ "uri": migrate_uri })))
+        .await
+        .map(|_| ())
+        .with_context(|| "initiate paused-file migration")
+    {
+        resume_on_error().await;
+        return Err(err);
+    }
+
+    match poll_file_migration(monitor, disk_snapshot_name, RAM_SNAPSHOT_FORMAT_LEGACY).await {
+        Ok(status) => Ok(status),
+        Err(err) => {
+            resume_on_error().await;
+            Err(err)
+        }
+    }
+}
+
 pub async fn start_incoming_migration_from_file(
     monitor: &MonitorHandle,
     ram_path: &Path,
@@ -711,24 +827,61 @@ pub async fn save_vm_background(
                     "mapped-ram background snapshot setup failed; falling back to legacy migration stream"
                 );
                 if let Err(err) = configure_legacy_background_snapshot(monitor, opts).await {
-                    let _ = blockdev_snapshot_delete_internal_sync(
+                    warn!(
+                        error = %err,
+                        mapped_error = %mapped_err,
+                        "legacy background snapshot setup failed; pausing VM for file-migration snapshot"
+                    );
+                    let fallback = save_vm_paused_after_disk_snapshot(
                         monitor,
-                        &device,
                         disk_snapshot_name,
+                        ram_path,
+                        opts,
                     )
                     .await;
-                    return Err(err.context(format!(
-                        "configure legacy background snapshot after mapped-ram setup failed: {mapped_err}"
-                    )));
+                    return match fallback {
+                        Ok(status) => Ok(status),
+                        Err(fallback_err) => {
+                            let _ = blockdev_snapshot_delete_internal_sync(
+                                monitor,
+                                &device,
+                                disk_snapshot_name,
+                            )
+                            .await;
+                            let _ = tokio::fs::remove_file(ram_path).await;
+                            Err(fallback_err.context(format!(
+                                "paused-file snapshot after legacy background setup failed: {err}; mapped setup failed: {mapped_err}"
+                            )))
+                        }
+                    };
                 }
                 RAM_SNAPSHOT_FORMAT_LEGACY
             }
         }
     } else {
         if let Err(err) = configure_legacy_background_snapshot(monitor, opts).await {
-            let _ =
-                blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
-            return Err(err.context("configure legacy background snapshot"));
+            warn!(
+                error = %err,
+                "legacy background snapshot setup failed; pausing VM for file-migration snapshot"
+            );
+            let fallback =
+                save_vm_paused_after_disk_snapshot(monitor, disk_snapshot_name, ram_path, opts)
+                    .await;
+            return match fallback {
+                Ok(status) => Ok(status),
+                Err(fallback_err) => {
+                    let _ = blockdev_snapshot_delete_internal_sync(
+                        monitor,
+                        &device,
+                        disk_snapshot_name,
+                    )
+                    .await;
+                    let _ = tokio::fs::remove_file(ram_path).await;
+                    Err(fallback_err.context(format!(
+                        "paused-file snapshot after legacy background setup failed: {err}"
+                    )))
+                }
+            };
         }
         RAM_SNAPSHOT_FORMAT_LEGACY
     };
@@ -756,47 +909,14 @@ pub async fn save_vm_background(
         return Err(err.context("initiate background-snapshot migrate"));
     }
 
-    // Poll until the migration converges. background-snapshot does not iterate (no dirty
-    // re-tracking after the initial WP pass), so once qemu reports `completed` the RAM file
-    // is fully written. If qemu fails or the user cancels, surface the error.
-    let deadline = Instant::now() + Duration::from_secs(BACKGROUND_SNAPSHOT_TIMEOUT_SECS);
-    loop {
-        let status = query_migrate(monitor).await?;
-        trace!(
-            status = %status.status,
-            bytes = ?status.bytes_transferred,
-            "background-snapshot migrate poll"
-        );
-        match status.status.as_str() {
-            "completed" => {
-                let mut status = status;
-                status.ram_format = ram_format.to_string();
-                return Ok(status);
-            }
-            "failed" | "cancelled" | "cancelling" => {
-                let _ =
-                    blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name)
-                        .await;
-                let _ = tokio::fs::remove_file(ram_path).await;
-                bail!(
-                    "background-snapshot migrate ended in status {}: {}",
-                    status.status,
-                    status.error_desc.as_deref().unwrap_or("<no detail>")
-                );
-            }
-            // setup | active | pre-switchover | device | postcopy-* | wait-unplug — still in flight
-            _ => {}
-        }
-        if Instant::now() >= deadline {
+    match poll_file_migration(monitor, disk_snapshot_name, &ram_format).await {
+        Ok(status) => Ok(status),
+        Err(err) => {
             let _ =
                 blockdev_snapshot_delete_internal_sync(monitor, &device, disk_snapshot_name).await;
             let _ = tokio::fs::remove_file(ram_path).await;
-            bail!(
-                "background-snapshot migrate timed out after {}s",
-                BACKGROUND_SNAPSHOT_TIMEOUT_SECS
-            );
+            Err(err)
         }
-        sleep(Duration::from_millis(250)).await;
     }
 }
 
