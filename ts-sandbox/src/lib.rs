@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chevalier_sandbox::{
-    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, OpenComputerBackendConfig,
-    OpenComputerMountConfig, Sandbox as EngineSandbox, SandboxConfig, SandboxError,
+    EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, ForwardHandle as EngineForwardHandle,
+    OpenComputerBackendConfig, OpenComputerMountConfig,
+    Sandbox as EngineSandbox, SandboxConfig, SandboxError,
     SandboxProviderConfig, Session as EngineSession, SessionInfo as EngineSessionInfo,
     SessionOptions, SharedMount,
     SharedMountAvailability, SharedMountContinuity,
@@ -249,6 +250,30 @@ impl From<ForkOpts> for ForkOptions {
     }
 }
 
+/// A local host-port forward into a guest port. Close it to release the listener.
+#[napi]
+pub struct ForwardHandle {
+    inner: EngineForwardHandle,
+}
+
+#[napi]
+impl ForwardHandle {
+    #[napi(getter)]
+    pub fn guest_port(&self) -> u32 {
+        self.inner.guest_port.into()
+    }
+
+    #[napi(getter)]
+    pub fn host_port(&self) -> u32 {
+        self.inner.host_port.into()
+    }
+
+    #[napi]
+    pub async fn close(&self) -> napi::Result<()> {
+        self.inner.close().await.map_err(sb_err)
+    }
+}
+
 // ---------------- session ----------------
 
 /// A sandbox session (one microVM).
@@ -464,6 +489,26 @@ impl Session {
     #[napi]
     pub async fn delete_snapshot(&self, snapshot_id: String) -> napi::Result<()> {
         self.inner.delete_snapshot(&snapshot_id).await.map_err(sb_err)
+    }
+
+    /// Forward a guest TCP port to a local host port.
+    #[napi]
+    pub async fn forward_port(&self, guest_port: u32) -> napi::Result<ForwardHandle> {
+        let guest_port = u16::try_from(guest_port)
+            .map_err(|_| napi::Error::from_reason("guestPort must fit in uint16"))?;
+        let handle = self.inner.forward_port(guest_port).await.map_err(sb_err)?;
+        Ok(ForwardHandle { inner: handle })
+    }
+
+    /// Return a provider-managed preview URL when the provider supports one.
+    #[napi]
+    pub async fn provider_preview_url(&self, guest_port: u32) -> napi::Result<String> {
+        let guest_port = u16::try_from(guest_port)
+            .map_err(|_| napi::Error::from_reason("guestPort must fit in uint16"))?;
+        self.inner
+            .provider_preview_url(guest_port)
+            .await
+            .map_err(sb_err)
     }
 
     /// Close the session handle without deleting the VM.

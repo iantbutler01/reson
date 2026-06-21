@@ -10,6 +10,13 @@ export declare class ExecHandle {
   next(): Promise<ExecEventJs | null>
 }
 
+/** A local host-port forward into a guest port. Close it to release the listener. */
+export declare class ForwardHandle {
+  get guestPort(): number
+  get hostPort(): number
+  close(): Promise<void>
+}
+
 /** A connection to a Chevalier sandbox provider. */
 export declare class Sandbox {
   /** Connect to a sandbox provider. */
@@ -56,6 +63,10 @@ export declare class Session {
   listSnapshots(): Promise<Array<SessionSnapshotJs>>
   /** Delete a VM snapshot. */
   deleteSnapshot(snapshotId: string): Promise<void>
+  /** Forward a guest TCP port to a local host port. */
+  forwardPort(guestPort: number): Promise<ForwardHandle>
+  /** Return a provider-managed preview URL when the provider supports one. */
+  providerPreviewUrl(guestPort: number): Promise<string>
   /** Close the session handle without deleting the VM. */
   close(): Promise<void>
   /** Delete the backing VM/sandbox and purge provider resources. */
