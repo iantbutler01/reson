@@ -13,7 +13,8 @@ use std::time::Duration;
 use chevalier_sandbox::{
     EventStream, ExecEvent, ExecInput, ExecOptions, ForkOptions, OpenComputerBackendConfig,
     OpenComputerMountConfig, Sandbox as EngineSandbox, SandboxConfig, SandboxError,
-    SandboxProviderConfig, Session as EngineSession, SessionOptions,
+    SandboxProviderConfig, Session as EngineSession, SessionOptions, SharedMount,
+    SharedMountAvailability, SharedMountContinuity,
 };
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
@@ -140,6 +141,64 @@ impl From<ExecOpts> for ExecOptions {
 }
 
 #[napi(object)]
+pub struct SharedMountOpts {
+    pub host_path: Option<String>,
+    pub guest_path: String,
+    pub mount_tag: String,
+    pub read_only: Option<bool>,
+    pub availability: Option<String>,
+    pub continuity: Option<String>,
+    pub backend_profile: Option<String>,
+    pub vfs_endpoint: Option<String>,
+    pub vfs_scope_path: Option<String>,
+}
+
+fn shared_mount_availability(value: Option<String>) -> SharedMountAvailability {
+    match value.as_deref() {
+        Some("shared-storage") | Some("shared_storage") | Some("sharedStorage") => {
+            SharedMountAvailability::SharedStorage
+        }
+        _ => SharedMountAvailability::NodeLocal,
+    }
+}
+
+fn shared_mount_continuity(
+    value: Option<String>,
+    availability: &SharedMountAvailability,
+) -> SharedMountContinuity {
+    match value.as_deref() {
+        Some("restore-cross-node") | Some("restore_cross_node") | Some("restoreCrossNode") => {
+            SharedMountContinuity::RestoreCrossNode
+        }
+        Some("restart-same-node") | Some("restart_same_node") | Some("restartSameNode") => {
+            SharedMountContinuity::RestartSameNode
+        }
+        _ => match availability {
+            SharedMountAvailability::SharedStorage => SharedMountContinuity::RestoreCrossNode,
+            SharedMountAvailability::NodeLocal => SharedMountContinuity::RestartSameNode,
+        },
+    }
+}
+
+impl SharedMountOpts {
+    fn into_shared_mount(self) -> SharedMount {
+        let availability = shared_mount_availability(self.availability);
+        let continuity = shared_mount_continuity(self.continuity, &availability);
+        SharedMount {
+            host_path: self.host_path.unwrap_or_default(),
+            guest_path: self.guest_path,
+            mount_tag: self.mount_tag,
+            read_only: self.read_only.unwrap_or(false),
+            availability,
+            continuity,
+            backend_profile: self.backend_profile.unwrap_or_default(),
+            vfs_endpoint: self.vfs_endpoint.unwrap_or_default(),
+            vfs_scope_path: self.vfs_scope_path.unwrap_or_default(),
+        }
+    }
+}
+
+#[napi(object)]
 pub struct SessionOpts {
     pub session_id: Option<String>,
     pub name: Option<String>,
@@ -147,6 +206,7 @@ pub struct SessionOpts {
     pub architecture: Option<String>,
     pub metadata: Option<HashMap<String, String>>,
     pub auto_start: Option<bool>,
+    pub shared_mounts: Option<Vec<SharedMountOpts>>,
     pub egress_allowlist: Option<Vec<String>>,
 }
 
@@ -159,6 +219,12 @@ impl From<SessionOpts> for SessionOptions {
             architecture: o.architecture,
             metadata: o.metadata.unwrap_or_default(),
             auto_start: o.auto_start.unwrap_or(true),
+            shared_mounts: o
+                .shared_mounts
+                .unwrap_or_default()
+                .into_iter()
+                .map(SharedMountOpts::into_shared_mount)
+                .collect(),
             egress_allowlist: o.egress_allowlist,
             ..Default::default()
         }

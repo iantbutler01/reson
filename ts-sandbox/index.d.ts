@@ -99,5 +99,18 @@ export interface SessionOpts {
   architecture?: string
   metadata?: Record<string, string>
   autoStart?: boolean
+  sharedMounts?: Array<SharedMountOpts>
   egressAllowlist?: Array<string>
+}
+
+export interface SharedMountOpts {
+  hostPath?: string
+  guestPath: string
+  mountTag: string
+  readOnly?: boolean
+  availability?: string
+  continuity?: string
+  backendProfile?: string
+  vfsEndpoint?: string
+  vfsScopePath?: string
 }
