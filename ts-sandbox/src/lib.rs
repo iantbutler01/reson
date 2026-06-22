@@ -531,6 +531,7 @@ pub struct SandboxConnectOptions {
     pub auth_token: Option<String>,
     pub connect_timeout_ms: Option<f64>,
     pub default_image: Option<String>,
+    pub default_architecture: Option<String>,
     pub provider: Option<String>,
     pub open_computer: Option<OpenComputerProviderOpts>,
 }
@@ -650,6 +651,9 @@ impl Sandbox {
             }
             if let Some(img) = o.default_image {
                 cfg.default_image = img;
+            }
+            if let Some(architecture) = o.default_architecture {
+                cfg.default_architecture = Some(architecture);
             }
             let provider = o.provider.unwrap_or_else(|| "chevalier".to_string());
             match provider.as_str() {

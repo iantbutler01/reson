@@ -127,6 +127,7 @@ export interface SandboxConnectOptions {
   authToken?: string
   connectTimeoutMs?: number
   defaultImage?: string
+  defaultArchitecture?: string
   provider?: string
   openComputer?: OpenComputerProviderOpts
 }
