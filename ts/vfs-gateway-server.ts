@@ -74,12 +74,14 @@ export function createVfsGatewayServer(
 
       // ---- reads ----------------------------------------------------------
       if (method === "GET" && op === "stat") {
+        if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         const md = await store.stat(relPath);
         if (md === null) return errorResponse(404, `not found: ${relPath}`);
         return json(200, toRemoteMetadata(md));
       }
 
       if (method === "GET" && op === "file/raw") {
+        if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         let buf: Buffer;
         try {
           buf = await store.read(relPath);
@@ -104,6 +106,7 @@ export function createVfsGatewayServer(
       }
 
       if (method === "GET" && op === "tree") {
+        if (isGitExcludedPath(relPath)) return errorResponse(404, `not found: ${relPath}`);
         const dir = relPath === "" ? "." : relPath;
         let entries: VfsMetadata[];
         try {
@@ -114,6 +117,7 @@ export function createVfsGatewayServer(
         const nameLike = q.get("name_like");
         const nameNotLike = q.get("name_not_like");
         const out = entries
+          .filter((entry) => !isGitExcludedPath(entry.path))
           .map(toRemoteDirEntry)
           .filter((e) => (nameLike === null || e.name.includes(nameLike)))
           .filter((e) => (nameNotLike === null || !e.name.includes(nameNotLike)));
@@ -130,6 +134,7 @@ export function createVfsGatewayServer(
 
       // ---- single-file mutations -----------------------------------------
       if (method === "PUT" && op === "file") {
+        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         const precond = req.headers.get(PRECONDITION_FINGERPRINT_HEADER);
         if (precond !== null && precond !== "") {
           const cur = await store.stat(relPath);
@@ -157,6 +162,7 @@ export function createVfsGatewayServer(
       }
 
       if (method === "DELETE" && op === "file") {
+        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         let previous: ReturnType<typeof toRemoteMetadata> | null = null;
         if (q.get("return_metadata") === "true") {
           const cur = await store.stat(relPath);
@@ -171,10 +177,12 @@ export function createVfsGatewayServer(
       }
 
       if (method === "PUT" && op === "dir") {
+        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         await store.mkdir(relPath);
         return new Response(null, { status: 204 });
       }
       if (method === "DELETE" && op === "dir") {
+        if (isGitExcludedPath(relPath)) return errorResponse(400, `excluded path: ${relPath}`);
         try {
           await store.rmdir(relPath);
         } catch {
@@ -187,6 +195,9 @@ export function createVfsGatewayServer(
         const from = normalizePath(q.get("from"));
         const to = normalizePath(q.get("to"));
         if (from === "" || to === "") return errorResponse(400, "rename requires from + to");
+        if (isGitExcludedPath(from) || isGitExcludedPath(to)) {
+          return errorResponse(400, `excluded path: ${isGitExcludedPath(from) ? from : to}`);
+        }
         const previous = q.get("return_metadata") === "true" ? await store.stat(from) : null;
         await store.rename(from, to);
         const current = q.get("return_metadata") === "true" ? await store.stat(to) : null;
@@ -202,7 +213,8 @@ export function createVfsGatewayServer(
         const { paths } = (await req.json()) as { paths: string[] };
         const entries: (ReturnType<typeof toRemoteMetadata> | null)[] = [];
         for (const p of paths) {
-          const md = await store.stat(normalizePath(p));
+          const path = normalizePath(p);
+          const md = isGitExcludedPath(path) ? null : await store.stat(path);
           entries.push(md === null ? null : toRemoteMetadata(md));
         }
         return json(200, { entries });
@@ -212,8 +224,13 @@ export function createVfsGatewayServer(
         const { paths } = (await req.json()) as { paths: string[] };
         const entries: (number[] | null)[] = [];
         for (const p of paths) {
+          const path = normalizePath(p);
+          if (isGitExcludedPath(path)) {
+            entries.push(null);
+            continue;
+          }
           try {
-            const buf = await store.read(normalizePath(p));
+            const buf = await store.read(path);
             entries.push([...buf]);
           } catch {
             entries.push(null);
@@ -228,9 +245,11 @@ export function createVfsGatewayServer(
         };
         // Atomic-ish: check all preconditions first, then apply. Any mismatch -> 409.
         for (const w of body.writes) {
+          const path = normalizePath(w.path);
+          if (isGitExcludedPath(path)) return errorResponse(400, `excluded path: ${path}`);
           const fp = w.precondition?.fingerprint ?? null;
           if (fp !== null) {
-            const cur = await store.stat(normalizePath(w.path));
+            const cur = await store.stat(path);
             if (fp !== (cur?.contentHash ?? null)) {
               return errorResponse(409, `precondition failed for ${w.path}`);
             }
@@ -274,6 +293,14 @@ function normalizePath(raw: string | null): string {
   if (raw === null) return "";
   const t = raw.trim().replace(/^\/+/, "").replace(/\/+$/, "");
   return t === "." ? "" : t;
+}
+
+function isGitExcludedPath(path: string): boolean {
+  return path
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part !== "" && part !== ".")
+    .some((part) => part === ".git");
 }
 
 /** `VfsStorage` metadata `kind` is "File"|"Directory"; the wire wants "file"|"directory". */
