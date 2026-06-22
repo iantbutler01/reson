@@ -123,7 +123,10 @@ async fn opencomputer_live_facade_smoke() {
     )
     .await
     .expect("shell timeout");
-    assert!(shell_output.contains("shell-ok"));
+    assert!(
+        shell_output.contains("shell-ok"),
+        "shell output: {shell_output:?}"
+    );
 
     sandbox
         .discard_session_by_id(&requested_session_id)

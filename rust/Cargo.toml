@@ -35,6 +35,8 @@ serde_json = "1.0"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream"] }
+http = "1"
+tokio-websockets = { version = "0.10.1", features = ["client", "native-tls", "ring", "fastrand"] }
 
 # SSE parsing
 eventsource-stream = "0.2"
@@ -56,6 +58,7 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 
 # Utilities
 bytes = "1.7"
+base64 = "0.22"
 
 # Optional: AWS Bedrock
 aws-config = { version = "1.5", optional = true }

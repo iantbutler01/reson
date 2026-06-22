@@ -17,6 +17,7 @@ export type {
   GatewayOptions,
   ProviderConfigInput,
   AnthropicCacheConfig,
+  CodexSubscriptionConfigInput,
   VfsMetadata,
   VfsObjectState,
 } from "./native.js";

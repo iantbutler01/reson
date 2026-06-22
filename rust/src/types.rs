@@ -67,6 +67,7 @@ impl Provider {
             let provider = match parts[0] {
                 "openai" => Provider::OpenAIResponses,
                 "openrouter" => Provider::OpenRouterResponses,
+                "openai-codex-responses" => Provider::OpenAIResponses,
                 _ => return Err(Error::InvalidProvider(parts[0].to_string())),
             };
             return Ok((provider, parts[2..].join(":")));
@@ -77,6 +78,7 @@ impl Provider {
         let provider = match provider_str {
             "anthropic" => Provider::Anthropic,
             "openai" => Provider::OpenAI,
+            "openai-codex-responses" => Provider::OpenAIResponses,
             "bedrock" => Provider::Bedrock,
             "google-genai" | "gemini" | "google-gemini" => Provider::GoogleGenAI,
             "google-anthropic" | "vertexai" => Provider::GoogleAnthropic,

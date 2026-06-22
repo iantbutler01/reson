@@ -1,5 +1,7 @@
 # RFC 0003: Codex Subscription Provider
 
+Status: Implemented 2026-06-19 for first-party Rust provider, TypeScript `codexSubscription` config, SSE/WebSocket transports, and OpenBracket consumption. Live provider smoke requires a real ChatGPT/Codex subscription token.
+
 ## Summary
 
 Add a first-party Chevalier provider for ChatGPT/Codex subscription-backed coding models. The provider lives in Chevalier's Rust core, is exposed through the Chevalier TypeScript package, and is consumed by OpenBracket as a normal `Runtime` model integration.

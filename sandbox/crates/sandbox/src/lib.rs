@@ -207,6 +207,7 @@ pub struct OpenComputerBackendConfig {
     pub api_url: String,
     pub api_key: String,
     pub template_id: String,
+    pub checkpoint_id: String,
     pub timeout_secs: u64,
     pub default_cpu_count: Option<u32>,
     pub default_memory_mb: Option<u32>,
@@ -247,6 +248,7 @@ impl Default for OpenComputerBackendConfig {
             api_url: "https://app.opencomputer.dev".to_string(),
             api_key: String::new(),
             template_id: "base".to_string(),
+            checkpoint_id: String::new(),
             timeout_secs: 0,
             default_cpu_count: None,
             default_memory_mb: None,
@@ -333,6 +335,9 @@ impl OpenComputerBackendConfig {
         };
         if let Ok(template_id) = std::env::var("OPENCOMPUTER_TEMPLATE_ID") {
             cfg.template_id = template_id;
+        }
+        if let Ok(checkpoint_id) = std::env::var("OPENCOMPUTER_CHECKPOINT_ID") {
+            cfg.checkpoint_id = checkpoint_id;
         }
         if let Ok(timeout) = std::env::var("OPENCOMPUTER_SANDBOX_TIMEOUT_SECS") {
             cfg.timeout_secs = timeout.parse().map_err(|err| {
@@ -2209,7 +2214,7 @@ impl Session {
             return Ok(proto::vmd::v1::VmState::Running as i32);
         }
 
-        let node_endpoint = self.resolve_session_endpoint().await?;
+        let node_endpoint = self.current_node_endpoint().await;
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
         let vm = client
             .get_vm(self.sandbox.request_with_auth(GetVmRequest {
@@ -2230,7 +2235,7 @@ impl Session {
             )));
         }
 
-        let node_endpoint = self.resolve_session_endpoint().await?;
+        let node_endpoint = self.current_node_endpoint().await;
         let mut client = self.sandbox.vmd_client_for_endpoint(&node_endpoint).await?;
         let request = self.sandbox.request_with_auth(VmActionRequest {
             vm_id: self.vm_id.clone(),
@@ -2240,9 +2245,11 @@ impl Session {
             SessionVmAction::Resume => client.resume_vm(request).await?.into_inner(),
             SessionVmAction::Stop => client.stop_vm(request).await?.into_inner(),
         };
-        self.sandbox
-            .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
-            .await;
+        if matches!(action, SessionVmAction::Pause | SessionVmAction::Stop) {
+            self.sandbox
+                .invalidate_ready_vm_rpc(&self.vm_id, &node_endpoint)
+                .await;
+        }
         Ok(vm.state)
     }
 
@@ -2375,6 +2382,8 @@ impl Session {
                 .create_from_checkpoint(
                     checkpoint_id,
                     HashMap::new(),
+                    None,
+                    None,
                     self.shared_mounts.as_slice(),
                 )
                 .await?;
@@ -4181,12 +4190,14 @@ impl Sandbox {
             let mut ready = self.inner.ready_vm_rpc.lock().await;
             ready.remove(&ready_key(endpoint, vm_id));
             drop(ready);
-            vm = client
-                .start_vm(self.request_with_auth(VmActionRequest {
-                    vm_id: vm_id.to_string(),
-                }))
-                .await?
-                .into_inner();
+            let action_request = self.request_with_auth(VmActionRequest {
+                vm_id: vm_id.to_string(),
+            });
+            vm = if vm.state == proto::vmd::v1::VmState::Paused as i32 {
+                client.resume_vm(action_request).await?.into_inner()
+            } else {
+                client.start_vm(action_request).await?.into_inner()
+            };
         }
 
         Ok(vm)

@@ -142,6 +142,20 @@ export interface AnthropicCacheConfig {
   toolDefinitionsCacheBreakpoint?: string
 }
 
+/** ChatGPT Codex subscription provider config. */
+export interface CodexSubscriptionConfigInput {
+  token: string
+  accountId?: string
+  baseUrl?: string
+  transport?: string
+  sseHeaderTimeoutMs?: number
+  websocketConnectTimeoutMs?: number
+  reasoningEffort?: string
+  reasoningSummary?: string
+  textVerbosity?: string
+  serviceTier?: string
+}
+
 /** Options for the HTTP gateway backend. */
 export interface GatewayOptions {
   endpoint: string
@@ -191,6 +205,7 @@ export interface Message {
 /** Provider-specific request shaping. */
 export interface ProviderConfigInput {
   anthropic?: AnthropicCacheConfig
+  codexSubscription?: CodexSubscriptionConfigInput
 }
 
 /** Options for a single `run` / `runStream` call. */

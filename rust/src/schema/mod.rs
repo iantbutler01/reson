@@ -19,9 +19,11 @@ pub use normalized::{AdditionalProperties, SchemaType, ToolParametersSchema};
 /// This function modifies the schema in-place to match provider requirements.
 pub fn fix_output_schema_for_provider(schema: &mut Value, provider: &str) {
     match provider {
-        "openai" | "openrouter" | "openai-responses" | "openrouter-responses" => {
-            fix_schema_for_openai(schema)
-        }
+        "openai"
+        | "openrouter"
+        | "openai-responses"
+        | "openrouter-responses"
+        | "openai-codex-responses" => fix_schema_for_openai(schema),
         "anthropic" | "bedrock" | "google-anthropic" | "vertexai" => {
             fix_schema_for_anthropic(schema)
         }
@@ -105,6 +107,7 @@ pub fn fix_tool_schema_for_provider(tool: &mut Value, provider: &str) {
         }
         "openai-responses"
         | "openrouter-responses"
+        | "openai-codex-responses"
         | "google"
         | "google_gemini"
         | "vertex_gemini"
@@ -469,7 +472,7 @@ pub(crate) fn apply_tool_strict_for_provider(
                 function.insert("strict".to_string(), Value::Bool(strict));
             }
         }
-        "openai-responses" | "openrouter-responses" => {
+        "openai-responses" | "openrouter-responses" | "openai-codex-responses" => {
             if let Some(object) = tool.as_object_mut() {
                 object.insert("strict".to_string(), Value::Bool(strict));
             }
@@ -487,6 +490,7 @@ pub fn get_schema_generator(provider: &str) -> Result<Box<dyn SchemaGenerator>> 
         "custom-openai" => Ok(Box::new(OpenAISchemaGenerator)), // custom-openai uses OpenAI format
         "openai-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "openrouter-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
+        "openai-codex-responses" => Ok(Box::new(OpenAIResponsesSchemaGenerator)),
         "google" | "google_gemini" | "vertex_gemini" | "gemini" | "google-genai"
         | "google-gemini" => Ok(Box::new(GoogleSchemaGenerator)),
         "bedrock" => Ok(Box::new(AnthropicSchemaGenerator)), // Bedrock uses Anthropic format

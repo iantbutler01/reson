@@ -29,7 +29,7 @@ Use `distributed-control` for etcd/NATS-backed routing and HA control paths. Use
 
 ## VFS Mounts
 
-Shared mounts carry Chevalier VFS metadata through the same session API. With OpenComputer, command mounts require the guest template to include `chevalier-vfs-fuse`; see [Sandbox and VFS](../docs/sandbox-vfs.md).
+Shared mounts carry Chevalier VFS metadata through the same session API. With OpenComputer, command mounts require `chevalier-vfs-fuse` to be present in the guest, either through a prepared checkpoint or an install/download step that runs before the mount command.
 
 ## Verification
 

@@ -11,8 +11,8 @@ use tokio::sync::RwLock;
 use crate::error::{Error, Result};
 use crate::providers::{
     AnthropicClient, GenerationConfig, GoogleGenAIClient, InferenceClient, OAIClient,
-    OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient, PromptCacheRetention,
-    ProviderConfig, StreamChunk,
+    OpenAICodexResponsesClient, OpenAIResponsesClient, OpenRouterClient, OpenRouterResponsesClient,
+    PromptCacheRetention, ProviderConfig, StreamChunk,
 };
 use crate::schema::{
     apply_tool_strict_for_provider, fix_output_schema_for_provider,
@@ -69,6 +69,9 @@ fn build_runtime_messages(
 }
 
 fn resolve_provider_for_caching(model: &str) -> Option<Provider> {
+    if resolve_provider_key(model) == "openai-codex-responses" {
+        return Some(Provider::OpenAIResponses);
+    }
     Provider::from_model_string(model)
         .ok()
         .map(|(provider, _)| provider)
@@ -323,6 +326,7 @@ fn resolve_provider_key(model: &str) -> String {
         match parts[0] {
             "openai" => "openai-responses".to_string(),
             "openrouter" => "openrouter-responses".to_string(),
+            "openai-codex-responses" => "openai-codex-responses".to_string(),
             other => other.to_string(),
         }
     } else {
@@ -355,6 +359,14 @@ pub fn create_inference_client(
     model_str: &str,
     api_key: Option<&str>,
 ) -> Result<Box<dyn InferenceClient>> {
+    create_inference_client_with_config(model_str, api_key, None)
+}
+
+fn create_inference_client_with_config(
+    model_str: &str,
+    api_key: Option<&str>,
+    provider_config: Option<&ProviderConfig>,
+) -> Result<Box<dyn InferenceClient>> {
     let parsed = parse_model_string(model_str)?;
     let provider = parsed.provider;
     let reasoning = parsed.reasoning;
@@ -375,6 +387,7 @@ pub fn create_inference_client(
                 .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
             "openai-responses" => std::env::var("OPENAI_API_KEY")
                 .map_err(|_| Error::NonRetryable("OPENAI_API_KEY not set".to_string()))?,
+            "openai-codex-responses" => resolve_codex_subscription_token(api_key, provider_config)?,
             "openrouter" => std::env::var("OPENROUTER_API_KEY")
                 .or_else(|_| std::env::var("OPENROUTER_KEY"))
                 .map_err(|_| Error::NonRetryable("OPENROUTER_API_KEY not set".to_string()))?,
@@ -450,6 +463,14 @@ pub fn create_inference_client(
             }
             Box::new(client)
         }
+        "openai-codex-responses" => {
+            let config = resolve_codex_subscription_config(key, server_url, provider_config)?;
+            let mut client = OpenAICodexResponsesClient::new(config, model_name)?;
+            if let Some(r) = reasoning {
+                client = client.with_reasoning(r);
+            }
+            Box::new(client)
+        }
         "openrouter" => {
             let mut client = OpenRouterClient::new(key, model_name, None, None);
             if let Some(r) = reasoning {
@@ -496,6 +517,98 @@ pub fn create_inference_client(
     Ok(client)
 }
 
+fn resolve_codex_subscription_token(
+    api_key: Option<&str>,
+    provider_config: Option<&ProviderConfig>,
+) -> Result<String> {
+    if let Some(ProviderConfig::CodexSubscription(config)) = provider_config {
+        return Ok(config.token.clone());
+    }
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        return Ok(api_key.to_string());
+    }
+    std::env::var("OPENBRACKET_CODEX_SUBSCRIPTION_TOKEN")
+        .or_else(|_| std::env::var("CODEX_SUBSCRIPTION_TOKEN"))
+        .map_err(|_| {
+            Error::NonRetryable(
+                "OPENBRACKET_CODEX_SUBSCRIPTION_TOKEN not set for openai-codex-responses"
+                    .to_string(),
+            )
+        })
+}
+
+fn resolve_codex_subscription_config(
+    token: String,
+    server_url: Option<String>,
+    provider_config: Option<&ProviderConfig>,
+) -> Result<crate::providers::CodexSubscriptionProviderConfig> {
+    if let Some(ProviderConfig::CodexSubscription(config)) = provider_config {
+        let mut config = config.clone();
+        if config.base_url.is_none() {
+            config.base_url = server_url;
+        }
+        return Ok(config);
+    }
+
+    let account_id = std::env::var("OPENBRACKET_CODEX_ACCOUNT_ID")
+        .or_else(|_| std::env::var("CODEX_ACCOUNT_ID"))
+        .ok();
+    let base_url = server_url
+        .or_else(|| std::env::var("OPENBRACKET_CODEX_BASE_URL").ok())
+        .or_else(|| std::env::var("CODEX_BASE_URL").ok());
+    let transport = std::env::var("OPENBRACKET_CODEX_TRANSPORT")
+        .or_else(|_| std::env::var("CODEX_TRANSPORT"))
+        .ok()
+        .as_deref()
+        .map(parse_codex_transport)
+        .transpose()?;
+    let sse_header_timeout = std::env::var("OPENBRACKET_CODEX_SSE_HEADER_TIMEOUT_MS")
+        .ok()
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()?;
+    let websocket_connect_timeout = std::env::var("OPENBRACKET_CODEX_WEBSOCKET_CONNECT_TIMEOUT_MS")
+        .ok()
+        .as_deref()
+        .map(parse_duration_ms)
+        .transpose()?;
+
+    Ok(crate::providers::CodexSubscriptionProviderConfig {
+        token,
+        account_id,
+        base_url,
+        transport,
+        sse_header_timeout,
+        websocket_connect_timeout,
+        reasoning_effort: None,
+        reasoning_summary: None,
+        text_verbosity: None,
+        service_tier: None,
+    })
+}
+
+fn parse_codex_transport(value: &str) -> Result<crate::providers::CodexSubscriptionTransport> {
+    match value {
+        "auto" => Ok(crate::providers::CodexSubscriptionTransport::Auto),
+        "websocket" | "ws" => Ok(crate::providers::CodexSubscriptionTransport::WebSocket),
+        "sse" => Ok(crate::providers::CodexSubscriptionTransport::Sse),
+        other => Err(Error::NonRetryable(format!(
+            "Unsupported Codex transport '{}'. Expected auto, websocket, or sse.",
+            other
+        ))),
+    }
+}
+
+fn parse_duration_ms(value: &str) -> Result<std::time::Duration> {
+    let millis = value.parse::<u64>().map_err(|_| {
+        Error::NonRetryable(format!(
+            "Invalid Codex timeout '{}'. Expected milliseconds.",
+            value
+        ))
+    })?;
+    Ok(std::time::Duration::from_millis(millis))
+}
+
 /// Execute a non-streaming LLM call
 #[allow(clippy::too_many_arguments)]
 pub async fn call_llm(
@@ -519,7 +632,7 @@ pub async fn call_llm(
     _call_context: Arc<RwLock<Option<HashMap<String, serde_json::Value>>>>,
 ) -> Result<CallResult> {
     // Create client
-    let client = create_inference_client(model, api_key)?;
+    let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     let message_provider = resolve_provider_for_caching(model);
@@ -615,7 +728,7 @@ pub async fn call_llm_stream(
     accumulators: Arc<RwLock<Accumulators>>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<ResponseStreamEvent>> + Send>>> {
     // Create client
-    let client = create_inference_client(model, api_key)?;
+    let client = create_inference_client_with_config(model, api_key, provider_config.as_ref())?;
     let parsed_model = parse_model_string(model)?;
     let provider_key = resolve_provider_key(model);
     let message_provider = resolve_provider_for_caching(model);

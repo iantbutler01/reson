@@ -19,9 +19,31 @@ pub struct AnthropicProviderConfig {
     pub tool_definitions_cache_breakpoint: Option<CacheMarker>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexSubscriptionTransport {
+    Auto,
+    WebSocket,
+    Sse,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexSubscriptionProviderConfig {
+    pub token: String,
+    pub account_id: Option<String>,
+    pub base_url: Option<String>,
+    pub transport: Option<CodexSubscriptionTransport>,
+    pub sse_header_timeout: Option<std::time::Duration>,
+    pub websocket_connect_timeout: Option<std::time::Duration>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_summary: Option<String>,
+    pub text_verbosity: Option<String>,
+    pub service_tier: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProviderConfig {
     Anthropic(AnthropicProviderConfig),
+    CodexSubscription(CodexSubscriptionProviderConfig),
 }
 
 // Provider implementations
@@ -32,6 +54,7 @@ pub mod google;
 #[cfg(feature = "google-adc")]
 pub mod google_anthropic;
 pub mod openai;
+pub mod openai_codex_responses;
 pub mod openai_responses;
 pub(crate) mod openai_responses_streaming;
 pub(crate) mod openai_streaming;
@@ -46,6 +69,7 @@ pub use google::{FileState, GoogleGenAIClient, UploadedFile};
 #[cfg(feature = "google-adc")]
 pub use google_anthropic::GoogleAnthropicClient;
 pub use openai::OAIClient;
+pub use openai_codex_responses::OpenAICodexResponsesClient;
 pub use openai_responses::OpenAIResponsesClient;
 pub use openrouter::OpenRouterClient;
 pub use openrouter_responses::OpenRouterResponsesClient;

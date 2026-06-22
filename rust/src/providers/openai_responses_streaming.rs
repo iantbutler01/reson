@@ -9,6 +9,7 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct ResponsesToolAccumulator {
     current_tool_calls: HashMap<usize, PartialToolCall>,
+    emitted_reasoning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -22,7 +23,16 @@ impl ResponsesToolAccumulator {
     pub fn new() -> Self {
         Self {
             current_tool_calls: HashMap::new(),
+            emitted_reasoning: false,
         }
+    }
+
+    fn mark_reasoning_emitted(&mut self) {
+        self.emitted_reasoning = true;
+    }
+
+    fn has_emitted_reasoning(&self) -> bool {
+        self.emitted_reasoning
     }
 
     pub fn start_tool(&mut self, index: usize, call_id: Option<&str>, name: Option<&str>) {
@@ -116,6 +126,43 @@ impl ResponsesToolAccumulator {
     }
 }
 
+fn push_reasoning(
+    chunks: &mut Vec<StreamChunk>,
+    accumulator: &mut ResponsesToolAccumulator,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    accumulator.mark_reasoning_emitted();
+    chunks.push(StreamChunk::Reasoning(text.to_string()));
+}
+
+fn reasoning_summary_text(item: &Value) -> String {
+    let Some(summary) = item.get("summary").and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    summary
+        .iter()
+        .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn response_reasoning_summary_text(response: &Value) -> String {
+    let Some(output) = response.get("output").and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    output
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+        .map(reasoning_summary_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Parse a Responses API SSE event into StreamChunks.
 pub fn parse_openai_responses_event(
     event_json: &Value,
@@ -147,7 +194,19 @@ pub fn parse_openai_responses_event(
             if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str())
                 && !delta.is_empty()
             {
-                chunks.push(StreamChunk::Reasoning(delta.to_string()));
+                push_reasoning(&mut chunks, accumulator, delta);
+            }
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_summary.delta" => {
+            if let Some(delta) = event_json.get("delta").and_then(|v| v.as_str()) {
+                push_reasoning(&mut chunks, accumulator, delta);
+            }
+        }
+        "response.reasoning_summary_text.done" | "response.reasoning_summary.done" => {
+            if !accumulator.has_emitted_reasoning()
+                && let Some(text) = event_json.get("text").and_then(|v| v.as_str())
+            {
+                push_reasoning(&mut chunks, accumulator, text);
             }
         }
         "response.output_item.added" if has_tools => {
@@ -195,13 +254,14 @@ pub fn parse_openai_responses_event(
                 chunks.push(StreamChunk::ToolCallComplete(completed));
             }
         }
-        "response.output_item.done" if has_tools => {
+        "response.output_item.done" => {
             let output_index = event_json
                 .get("output_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
             if let Some(item) = event_json.get("item")
                 && item.get("type").and_then(|v| v.as_str()) == Some("function_call")
+                && has_tools
             {
                 let call_id = item
                     .get("call_id")
@@ -215,6 +275,12 @@ pub fn parse_openai_responses_event(
                 if let Some(completed) = accumulator.complete_tool(output_index) {
                     chunks.push(StreamChunk::ToolCallComplete(completed));
                 }
+            } else if !accumulator.has_emitted_reasoning()
+                && let Some(item) = event_json.get("item")
+                && item.get("type").and_then(|value| value.as_str()) == Some("reasoning")
+            {
+                let summary = reasoning_summary_text(item);
+                push_reasoning(&mut chunks, accumulator, &summary);
             }
         }
         "response.done" => {
@@ -237,6 +303,12 @@ pub fn parse_openai_responses_event(
                         .unwrap_or(0),
                     cache_write_input_tokens: 0,
                 });
+            }
+            if !accumulator.has_emitted_reasoning()
+                && let Some(response) = event_json.get("response")
+            {
+                let summary = response_reasoning_summary_text(response);
+                push_reasoning(&mut chunks, accumulator, &summary);
             }
         }
         _ => {}
@@ -309,6 +381,52 @@ mod tests {
                 assert_eq!(tc["function"]["name"], "get_weather");
             }
             _ => panic!("Expected ToolCallComplete chunk"),
+        }
+    }
+
+    #[test]
+    fn test_parse_reasoning_summary_delta() {
+        let event = serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "I need to inspect the call path."
+        });
+        let mut acc = ResponsesToolAccumulator::new();
+        let chunks = parse_openai_responses_event(&event, &mut acc, false);
+
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::Reasoning(text) => {
+                assert_eq!(text, "I need to inspect the call path.");
+            }
+            _ => panic!("Expected Reasoning chunk"),
+        }
+    }
+
+    #[test]
+    fn test_parse_final_reasoning_summary_from_done_response() {
+        let event = serde_json::json!({
+            "type": "response.done",
+            "response": {
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [
+                            { "type": "summary_text", "text": "Checked the failing path." },
+                            { "type": "summary_text", "text": "Validated the fix." }
+                        ]
+                    }
+                ]
+            }
+        });
+        let mut acc = ResponsesToolAccumulator::new();
+        let chunks = parse_openai_responses_event(&event, &mut acc, false);
+
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            StreamChunk::Reasoning(text) => {
+                assert_eq!(text, "Checked the failing path.\nValidated the fix.");
+            }
+            _ => panic!("Expected Reasoning chunk"),
         }
     }
 

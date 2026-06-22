@@ -35,6 +35,7 @@ impl OpenComputerControl {
         if cfg.template_id.is_empty() {
             cfg.template_id = "base".to_string();
         }
+        cfg.checkpoint_id = cfg.checkpoint_id.trim().to_string();
         if cfg.api_key.trim().is_empty() {
             return Err(SandboxError::InvalidConfig(
                 "OPENCOMPUTER_API_KEY is required when SandboxConfig.provider is OpenComputer"
@@ -60,14 +61,25 @@ impl OpenComputerControl {
         egress_allowlist: Option<Vec<String>>,
         shared_mounts: &[SharedMount],
     ) -> Result<OpenComputerSandbox> {
+        let template_id = template_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if template_id.is_none() && !self.cfg.checkpoint_id.is_empty() {
+            let resource_fields = resolve_resource_fields(resources.as_ref(), &self.cfg);
+            return self
+                .create_from_checkpoint_with_resource_fields(
+                    self.cfg.checkpoint_id.as_str(),
+                    metadata,
+                    envs,
+                    egress_allowlist,
+                    resource_fields,
+                    shared_mounts,
+                )
+                .await;
+        }
         let resource_fields = resolve_resource_fields(resources.as_ref(), &self.cfg);
         let body = CreateSandboxBody {
-            template_id: Some(
-                template_id
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| self.cfg.template_id.clone()),
-            ),
+            template_id: Some(template_id.unwrap_or_else(|| self.cfg.template_id.clone())),
             timeout: Some(self.cfg.timeout_secs),
             envs,
             metadata: (!metadata.is_empty()).then_some(metadata),
@@ -95,8 +107,19 @@ impl OpenComputerControl {
     }
 
     pub(crate) async fn delete_sandbox(&self, sandbox_id: &str) -> Result<()> {
-        self.send_empty(self.client.delete(self.sandbox_url(sandbox_id, "")))
+        let response = self
+            .client
+            .delete(self.sandbox_url(sandbox_id, ""))
+            .header(API_KEY_HEADER, self.cfg.api_key.as_str())
+            .send()
             .await
+            .map_err(|err| {
+                SandboxError::DaemonUnavailable(format!("OpenComputer request failed: {err}"))
+            })?;
+        if delete_sandbox_status_ok(response.status()) {
+            return Ok(());
+        }
+        Err(opencomputer_response_error(response).await)
     }
 
     pub(crate) async fn ensure_configured_mounts(
@@ -232,7 +255,7 @@ impl OpenComputerControl {
         let (ws, response) = connect_async(&ws_url).await.map_err(|err| {
             SandboxError::DaemonUnavailable(format!("OpenComputer shell ws: {err}"))
         })?;
-        if !response.status().is_success() {
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Err(SandboxError::InvalidResponse(format!(
                 "OpenComputer shell websocket returned {}",
                 response.status()
@@ -320,6 +343,8 @@ impl OpenComputerControl {
             .create_from_checkpoint(
                 checkpoint.id.as_str(),
                 opts.child_metadata,
+                None,
+                None,
                 parent.shared_mounts.as_slice(),
             )
             .await?;
@@ -358,7 +383,7 @@ impl OpenComputerControl {
         let (ws, response) = connect_async(&ws_url).await.map_err(|err| {
             SandboxError::DaemonUnavailable(format!("OpenComputer exec ws: {err}"))
         })?;
-        if !response.status().is_success() {
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Err(SandboxError::InvalidResponse(format!(
                 "OpenComputer exec websocket returned {}",
                 response.status()
@@ -456,13 +481,41 @@ impl OpenComputerControl {
     pub(crate) async fn create_from_checkpoint(
         &self,
         checkpoint_id: &str,
-        _metadata: HashMap<String, String>,
+        metadata: HashMap<String, String>,
+        envs: Option<HashMap<String, String>>,
+        egress_allowlist: Option<Vec<String>>,
+        shared_mounts: &[SharedMount],
+    ) -> Result<OpenComputerSandbox> {
+        self.create_from_checkpoint_with_resource_fields(
+            checkpoint_id,
+            metadata,
+            envs,
+            egress_allowlist,
+            resolve_resource_fields(None, &self.cfg),
+            shared_mounts,
+        )
+        .await
+    }
+
+    async fn create_from_checkpoint_with_resource_fields(
+        &self,
+        checkpoint_id: &str,
+        metadata: HashMap<String, String>,
+        envs: Option<HashMap<String, String>>,
+        egress_allowlist: Option<Vec<String>>,
+        resource_fields: ResourceFields,
         shared_mounts: &[SharedMount],
     ) -> Result<OpenComputerSandbox> {
         let body = CreateFromCheckpointBody {
             timeout: Some(self.cfg.timeout_secs),
-            envs: None,
+            envs,
+            metadata: (!metadata.is_empty()).then_some(metadata),
+            burst: self.cfg.burst,
+            cpu_count: resource_fields.cpu_count,
+            memory_mb: resource_fields.memory_mb,
+            disk_mb: resource_fields.disk_mb,
             secret_store: self.cfg.secret_store.clone(),
+            egress_allowlist: egress_allowlist.or_else(|| self.cfg.egress_allowlist.clone()),
         };
         let response = self
             .send(
@@ -643,18 +696,10 @@ fn resolve_resource_fields(
     resources: Option<&crate::ResourceLimits>,
     cfg: &OpenComputerBackendConfig,
 ) -> ResourceFields {
-    let fallback = crate::ResourceLimits::default();
-    let fallback = Some(&fallback);
     ResourceFields {
-        cpu_count: resource_vcpu(resources)
-            .or(cfg.default_cpu_count)
-            .or_else(|| resource_vcpu(fallback)),
-        memory_mb: resource_memory_mb(resources)
-            .or(cfg.default_memory_mb)
-            .or_else(|| resource_memory_mb(fallback)),
-        disk_mb: resource_disk_mb(resources)
-            .or(cfg.default_disk_mb)
-            .or_else(|| resource_disk_mb(fallback)),
+        cpu_count: resource_vcpu(resources).or(cfg.default_cpu_count),
+        memory_mb: resource_memory_mb(resources).or(cfg.default_memory_mb),
+        disk_mb: resource_disk_mb(resources).or(cfg.default_disk_mb),
     }
 }
 
@@ -680,8 +725,20 @@ struct CreateFromCheckpointBody {
     timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     envs: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    burst: Option<bool>,
+    #[serde(rename = "cpuCount", skip_serializing_if = "Option::is_none")]
+    cpu_count: Option<u32>,
+    #[serde(rename = "memoryMB", skip_serializing_if = "Option::is_none")]
+    memory_mb: Option<u32>,
+    #[serde(rename = "diskMB", skip_serializing_if = "Option::is_none")]
+    disk_mb: Option<u32>,
     #[serde(rename = "secretStore", skip_serializing_if = "Option::is_none")]
     secret_store: Option<String>,
+    #[serde(rename = "egressAllowlist", skip_serializing_if = "Option::is_none")]
+    egress_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -942,6 +999,10 @@ async fn opencomputer_response_error(response: reqwest::Response) -> SandboxErro
     SandboxError::InvalidResponse(format!("OpenComputer request failed with {status}: {body}"))
 }
 
+fn delete_sandbox_status_ok(status: StatusCode) -> bool {
+    status == StatusCode::NOT_FOUND || status == StatusCode::NO_CONTENT || status.is_success()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,13 +1077,13 @@ mod tests {
     }
 
     #[test]
-    fn crate_resource_defaults_apply_without_opencomputer_overrides() {
+    fn opencomputer_omits_resource_fields_without_explicit_resources_or_defaults() {
         assert_eq!(
             resolve_resource_fields(None, &OpenComputerBackendConfig::default()),
             ResourceFields {
-                cpu_count: Some(2),
-                memory_mb: Some(2048),
-                disk_mb: Some(10 * 1024)
+                cpu_count: None,
+                memory_mb: None,
+                disk_mb: None
             }
         );
     }
@@ -1053,6 +1114,44 @@ mod tests {
                 "egressAllowlist": ["api.anthropic.com", "*.openai.com"],
             })
         );
+    }
+
+    #[test]
+    fn create_from_checkpoint_body_includes_resource_and_egress_fields() {
+        let mut metadata = HashMap::new();
+        metadata.insert("tenant_id".to_string(), "tenant".to_string());
+        let body = CreateFromCheckpointBody {
+            timeout: Some(60),
+            envs: None,
+            metadata: Some(metadata),
+            burst: Some(false),
+            cpu_count: Some(1),
+            memory_mb: Some(4096),
+            disk_mb: Some(20 * 1024),
+            secret_store: None,
+            egress_allowlist: Some(vec!["example.com".to_string()]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(body).unwrap(),
+            json!({
+                "timeout": 60,
+                "metadata": {"tenant_id": "tenant"},
+                "burst": false,
+                "cpuCount": 1,
+                "memoryMB": 4096,
+                "diskMB": 20480,
+                "egressAllowlist": ["example.com"],
+            })
+        );
+    }
+
+    #[test]
+    fn delete_sandbox_statuses_are_idempotent_for_missing_sandboxes() {
+        assert!(delete_sandbox_status_ok(StatusCode::NO_CONTENT));
+        assert!(delete_sandbox_status_ok(StatusCode::OK));
+        assert!(delete_sandbox_status_ok(StatusCode::NOT_FOUND));
+        assert!(!delete_sandbox_status_ok(StatusCode::INTERNAL_SERVER_ERROR));
     }
 
     #[test]

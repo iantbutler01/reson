@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chevalier_core::error::{Error as EngineError, Result as EngineResult};
-use chevalier_core::providers::{AnthropicProviderConfig, ProviderConfig};
+use chevalier_core::providers::{
+    AnthropicProviderConfig, CodexSubscriptionProviderConfig, CodexSubscriptionTransport,
+    ProviderConfig,
+};
 use chevalier_core::runtime::{RunParams, Runtime as EngineRuntime, ToolFunction};
 use chevalier_core::types::{CacheMarker, ToolCall};
 use futures::future::BoxFuture;
@@ -98,12 +101,37 @@ pub struct AnthropicCacheConfig {
 #[napi(object)]
 pub struct ProviderConfigInput {
     pub anthropic: Option<AnthropicCacheConfig>,
+    pub codex_subscription: Option<CodexSubscriptionConfigInput>,
+}
+
+/// ChatGPT Codex subscription provider config.
+#[napi(object)]
+pub struct CodexSubscriptionConfigInput {
+    pub token: String,
+    pub account_id: Option<String>,
+    pub base_url: Option<String>,
+    pub transport: Option<String>,
+    pub sse_header_timeout_ms: Option<f64>,
+    pub websocket_connect_timeout_ms: Option<f64>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_summary: Option<String>,
+    pub text_verbosity: Option<String>,
+    pub service_tier: Option<String>,
 }
 
 fn cache_marker(s: &str) -> Option<CacheMarker> {
     match s {
         "ephemeral" => Some(CacheMarker::Ephemeral),
         "ephemeral1h" => Some(CacheMarker::Ephemeral1h),
+        _ => None,
+    }
+}
+
+fn codex_subscription_transport(s: &str) -> Option<CodexSubscriptionTransport> {
+    match s {
+        "auto" => Some(CodexSubscriptionTransport::Auto),
+        "websocket" | "ws" => Some(CodexSubscriptionTransport::WebSocket),
+        "sse" => Some(CodexSubscriptionTransport::Sse),
         _ => None,
     }
 }
@@ -277,18 +305,42 @@ impl Runtime {
     /// Set provider-specific request shaping (e.g. Anthropic prompt caching).
     #[napi]
     pub async fn set_provider_config(&self, config: ProviderConfigInput) {
-        let pc = config.anthropic.map(|a| {
-            ProviderConfig::Anthropic(AnthropicProviderConfig {
-                automatic_prompt_caching: a
-                    .automatic_prompt_caching
-                    .as_deref()
-                    .and_then(cache_marker),
-                tool_definitions_cache_breakpoint: a
-                    .tool_definitions_cache_breakpoint
-                    .as_deref()
-                    .and_then(cache_marker),
+        let pc = if let Some(codex) = config.codex_subscription {
+            Some(ProviderConfig::CodexSubscription(
+                CodexSubscriptionProviderConfig {
+                    token: codex.token,
+                    account_id: codex.account_id,
+                    base_url: codex.base_url,
+                    transport: codex
+                        .transport
+                        .as_deref()
+                        .and_then(codex_subscription_transport),
+                    sse_header_timeout: codex
+                        .sse_header_timeout_ms
+                        .map(|ms| Duration::from_millis(ms.max(0.0).floor() as u64)),
+                    websocket_connect_timeout: codex
+                        .websocket_connect_timeout_ms
+                        .map(|ms| Duration::from_millis(ms.max(0.0).floor() as u64)),
+                    reasoning_effort: codex.reasoning_effort,
+                    reasoning_summary: codex.reasoning_summary,
+                    text_verbosity: codex.text_verbosity,
+                    service_tier: codex.service_tier,
+                },
+            ))
+        } else {
+            config.anthropic.map(|a| {
+                ProviderConfig::Anthropic(AnthropicProviderConfig {
+                    automatic_prompt_caching: a
+                        .automatic_prompt_caching
+                        .as_deref()
+                        .and_then(cache_marker),
+                    tool_definitions_cache_breakpoint: a
+                        .tool_definitions_cache_breakpoint
+                        .as_deref()
+                        .and_then(cache_marker),
+                })
             })
-        });
+        };
         self.inner.lock().await.set_provider_config(pc).await;
     }
 
