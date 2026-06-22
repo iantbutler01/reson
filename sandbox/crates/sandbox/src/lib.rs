@@ -2725,14 +2725,14 @@ impl Sandbox {
         let image = opts
             .image
             .unwrap_or_else(|| self.inner.cfg.default_image.clone());
-        let architecture = opts.architecture.unwrap_or_else(|| {
+        let architecture = normalize_architecture_label(&opts.architecture.unwrap_or_else(|| {
             self.inner
                 .cfg
                 .default_architecture
                 .clone()
                 .or_else(detect_host_architecture_label)
                 .unwrap_or_default()
-        });
+        }));
 
         let session_shared_mounts = opts.shared_mounts.clone();
         let request = CreateVmRequest {

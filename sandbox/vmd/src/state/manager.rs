@@ -628,6 +628,7 @@ impl Manager {
         info!(
             name = %name,
             source = %params.source.reference,
+            requested_architecture = %params.architecture,
             shared_mount_count = params.shared_mounts.len(),
             shared_mounts = ?params.shared_mounts,
             "creating vm with normalized shared mounts"
